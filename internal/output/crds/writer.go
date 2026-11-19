@@ -158,27 +158,27 @@ func (w *Writer) Sync(ctx context.Context) error {
 	keep, dropped := w.selectFindings(open, minPriority)
 	w.reportCap(dropped)
 
-	findingCRs, vulnCRs := map[string]desiredCR{}, map[string]desiredCR{}
+	var findingCRs, vulnCRs []desiredCR
+	vulnWritten := map[string]bool{} // advisory ids with a desired Vulnerability
 	for _, f := range keep {
 		st := findingStatus(w.o.Config.ClusterName, f, owners[f.Owner.Key()], advs[f.AdvisoryID])
-		cr := &v1alpha1.Finding{
+		findingCRs = append(findingCRs, desiredCR{obj: &v1alpha1.Finding{
 			ObjectMeta: metav1.ObjectMeta{Name: FindingName(f.Owner, f.AdvisoryID), Namespace: w.namespaceOf(f),
 				Labels:      map[string]string{LabelManagedBy: managedByFFS, LabelPriority: st.Priority},
 				Annotations: map[string]string{AnnotationFingerprint: f.Fingerprint}},
 			Status: st,
-		}
-		findingCRs[objectKey(cr)] = desiredCR{obj: cr, hash: findingHash(st)}
+		}, hash: findingHash(st)})
 
-		name := VulnerabilityName(f.AdvisoryID)
-		if _, ok := vulnCRs[name]; ok {
+		if vulnWritten[f.AdvisoryID] {
 			continue
 		}
+		vulnWritten[f.AdvisoryID] = true
 		vst := vulnerabilityStatus(f.AdvisoryID, advs[f.AdvisoryID], byAdvisory[f.AdvisoryID])
-		vulnCRs[name] = desiredCR{obj: &v1alpha1.Vulnerability{
-			ObjectMeta: metav1.ObjectMeta{Name: name,
+		vulnCRs = append(vulnCRs, desiredCR{obj: &v1alpha1.Vulnerability{
+			ObjectMeta: metav1.ObjectMeta{Name: VulnerabilityName(f.AdvisoryID),
 				Labels: map[string]string{LabelManagedBy: managedByFFS, LabelPriority: vst.HighestPriority}},
 			Status: vst,
-		}, hash: contentHash(vst)}
+		}, hash: contentHash(vst)})
 	}
 
 	return errors.Join(
@@ -239,9 +239,14 @@ func (w *Writer) namespaceOf(f model.Finding) string {
 	return f.Owner.Namespace
 }
 
-// apply makes the managed resources of one kind match desired (keyed by objectKey).
-func (w *Writer) apply(ctx context.Context, k crKind, desired map[string]desiredCR) error {
+// apply makes the managed resources of one kind match desired. Desired and existing resources are
+// both keyed by objectKey here, so a cluster-scoped resource ("/name") matches its existing copy.
+func (w *Writer) apply(ctx context.Context, k crKind, desiredCRs []desiredCR) error {
 	log := ctrllog.FromContext(ctx).WithName("crds")
+	desired := make(map[string]desiredCR, len(desiredCRs))
+	for _, d := range desiredCRs {
+		desired[objectKey(d.obj)] = d
+	}
 	if err := w.o.Client.List(ctx, k.list, client.MatchingLabels{LabelManagedBy: managedByFFS}); err != nil {
 		return fmt.Errorf("crds: list %s resources: %w", k.name, err)
 	}

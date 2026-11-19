@@ -116,6 +116,7 @@ func TestCRWriter_HashGatedWrites(t *testing.T) {
 	apply(t, st, f)
 	w, _ := newWriter(t, st, nil)
 	key := "web/deployment-api-cve-2026-41873"
+	const vkey = "cve-2026-41873"
 
 	require.NoError(t, w.Sync(ctx))
 	first := findingCRs(t)[key]
@@ -123,8 +124,14 @@ func TestCRWriter_HashGatedWrites(t *testing.T) {
 	require.Equal(t, f.Fingerprint, first.Annotations[AnnotationFingerprint])
 	require.Equal(t, "urgent", first.Labels[LabelPriority])
 	require.Equal(t, "urgent", first.Status.Priority)
+	firstVuln := vulnerabilityCRs(t)[vkey]
+	require.NotEmpty(t, firstVuln.Annotations[AnnotationContentHash])
+	require.Equal(t, "urgent", firstVuln.Status.HighestPriority)
 	require.NoError(t, w.Sync(ctx))
 	require.Equal(t, first.ResourceVersion, findingCRs(t)[key].ResourceVersion, "an unchanged finding is not rewritten")
+	vuln := vulnerabilityCRs(t)[vkey]
+	require.Equal(t, firstVuln.UID, vuln.UID, "an unchanged Vulnerability is not recreated")
+	require.Equal(t, firstVuln.ResourceVersion, vuln.ResourceVersion, "an unchanged Vulnerability is not rewritten")
 
 	f.Priority = model.PriorityHigh
 	apply(t, st, f)
@@ -134,11 +141,18 @@ func TestCRWriter_HashGatedWrites(t *testing.T) {
 	require.NotEqual(t, first.Annotations[AnnotationContentHash], second.Annotations[AnnotationContentHash])
 	require.Equal(t, "high", second.Status.Priority)
 	require.Equal(t, "high", second.Labels[LabelPriority])
+	secondVuln := vulnerabilityCRs(t)[vkey]
+	require.Equal(t, firstVuln.UID, secondVuln.UID, "a changed Vulnerability is updated in place, not recreated")
+	require.NotEqual(t, firstVuln.ResourceVersion, secondVuln.ResourceVersion)
+	require.NotEqual(t, firstVuln.Annotations[AnnotationContentHash], secondVuln.Annotations[AnnotationContentHash])
+	require.Equal(t, "high", secondVuln.Status.HighestPriority)
+	require.Equal(t, "high", secondVuln.Labels[LabelPriority])
 
 	f.LastSeen = f.LastSeen.Add(time.Hour) // same UTC day
 	apply(t, st, f)
 	require.NoError(t, w.Sync(ctx))
 	require.Equal(t, second.ResourceVersion, findingCRs(t)[key].ResourceVersion, "liveness within the day is not rewritten")
+	require.Equal(t, secondVuln.ResourceVersion, vulnerabilityCRs(t)[vkey].ResourceVersion, "liveness does not rewrite the Vulnerability")
 }
 
 func TestCRWriter_DeletesStale(t *testing.T) {

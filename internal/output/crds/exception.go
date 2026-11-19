@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -53,7 +54,8 @@ type ExceptionStore interface {
 }
 
 // ExceptionReconciler caches each valid Exception as a findings.ExceptionRule, asks the engine to
-// recompute when the cached rules change, and reports what the Exception matches in its status.
+// recompute when the cached rules change or an expired rule still excepts findings, and reports
+// what the Exception matches in its status.
 type ExceptionReconciler struct {
 	Client client.Client
 	Store  ExceptionStore
@@ -67,6 +69,11 @@ type ExceptionReconciler struct {
 	// recomputeOwed is set when the cached rules changed but OnExceptionsChanged failed, so the
 	// next reconcile retries the call even though the cache no longer reports a change.
 	recomputeOwed atomic.Bool
+
+	expiryMu sync.Mutex
+	// expiryRecomputed maps a rule key to the expiry this process already asked the engine to
+	// reopen findings for, so an expired rule triggers at most one recompute per expiry.
+	expiryRecomputed map[string]time.Time
 }
 
 // ValidateException checks what the CRD schema cannot: reason, expires at most maxDuration from
@@ -101,6 +108,8 @@ func durationText(d time.Duration) string {
 
 // Reconcile caches or drops one Exception's rule and refreshes its status. A valid Exception is
 // requeued at its expiry or within 2 minutes, whichever is sooner, so its counts stay current.
+// The engine recomputes when the cached rule changed or was dropped, and once per expiry when an
+// expired rule still excepts findings (see reopenExpired); never merely because of the requeue.
 func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
 	var ex v1alpha1.Exception
 	if err := r.Client.Get(ctx, req.NamespacedName, &ex); err != nil {
@@ -133,6 +142,9 @@ func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	}
 	st, err := r.status(ctx, &ex, rule, now)
 	if err != nil {
+		return reconcile.Result{}, err
+	}
+	if err := r.reopenExpired(ctx, rule, st, changed); err != nil {
 		return reconcile.Result{}, err
 	}
 	if err := r.writeStatus(ctx, &ex, st); err != nil {
@@ -190,7 +202,38 @@ func (r *ExceptionReconciler) forget(ctx context.Context, namespace, name string
 	if err != nil {
 		return fmt.Errorf("drop exception rule: %w", err)
 	}
+	r.expiryMu.Lock()
+	delete(r.expiryRecomputed, findings.ExceptionRule{Namespace: namespace, Name: name}.Key())
+	r.expiryMu.Unlock()
 	return r.rulesChanged(ctx, deleted)
+}
+
+// reopenExpired asks the engine to recompute when rule has expired but findings are still excepted
+// by it. That happens when the rule expired while ffs was down: the cached rule is unchanged, so
+// PutExceptionRule reports no change, and the engine's expiry check only sees expiries after it
+// started. The call is made once per rule expiry in this process (the engine retries owners whose
+// recompute fails), so the 2-minute requeue never repeats it; changed means rulesChanged already
+// made it.
+func (r *ExceptionReconciler) reopenExpired(ctx context.Context, rule findings.ExceptionRule, st v1alpha1.ExceptionStatus,
+	changed bool) error {
+	if !st.Expired || st.MatchedFindings == 0 {
+		return nil
+	}
+	r.expiryMu.Lock()
+	defer r.expiryMu.Unlock()
+	if done, ok := r.expiryRecomputed[rule.Key()]; ok && done.Equal(rule.Expires) {
+		return nil
+	}
+	if !changed {
+		if err := r.Engine.OnExceptionsChanged(ctx); err != nil {
+			return fmt.Errorf("recompute after exception expiry: %w", err)
+		}
+	}
+	if r.expiryRecomputed == nil {
+		r.expiryRecomputed = map[string]time.Time{}
+	}
+	r.expiryRecomputed[rule.Key()] = rule.Expires
+	return nil
 }
 
 // rulesChanged calls OnExceptionsChanged when the cached rules changed, or when an earlier call

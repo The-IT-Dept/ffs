@@ -198,6 +198,43 @@ func TestExceptionReconciler_StatusCounts(t *testing.T) {
 	require.Equal(t, "Expired", ready.Reason)
 }
 
+func TestExceptionReconciler_ExpiredWhileDownRecomputes(t *testing.T) {
+	needEnv(t)
+	st := newStore(t)
+	seedAdvisory(t, st)
+	now := t0
+	r, eng := newReconciler(t, st, &now)
+	expires := t0.Add(24 * time.Hour)
+	createException(t, "web", "accept", acceptSpec(cve, expires))
+	reconcileException(t, r, "web", "accept")
+	require.Equal(t, 1, eng.calls)
+	excepted := openFinding(deployment("web", "a"), debianRepo, cve, model.PriorityHigh, t0)
+	excepted.State, excepted.ExceptedBy = model.StateExcepted, "web/accept"
+	apply(t, st, excepted)
+
+	// ffs restarts after the expiry: the cached rule is identical, but the finding is still excepted.
+	now = expires.Add(time.Hour)
+	r, eng = newReconciler(t, st, &now)
+	reconcileException(t, r, "web", "accept")
+	require.Equal(t, 1, eng.calls, "an expired rule that still excepts findings recomputes")
+	s := getException(t, "web", "accept").Status
+	require.True(t, s.Expired)
+	require.Equal(t, int32(1), s.MatchedFindings)
+	reconcileException(t, r, "web", "accept")
+	require.Equal(t, 1, eng.calls, "the requeue does not repeat the recompute for the same expiry")
+
+	excepted.State, excepted.ExceptedBy = model.StateOpen, ""
+	apply(t, st, excepted)
+	reconcileException(t, r, "web", "accept")
+	require.Equal(t, 1, eng.calls)
+	require.Zero(t, getException(t, "web", "accept").Status.MatchedFindings)
+
+	// A restart once the findings reopened does not recompute.
+	r, eng = newReconciler(t, st, &now)
+	reconcileException(t, r, "web", "accept")
+	require.Zero(t, eng.calls, "an expired rule that excepts nothing does not recompute")
+}
+
 func TestExceptionReconciler_DeletedRemovesRule(t *testing.T) {
 	needEnv(t)
 	st := newStore(t)
