@@ -1,0 +1,37 @@
+# The Secret lives in the ffs namespace. Its url key holds the Slack incoming webhook URL.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: slack-security
+  namespace: ffs
+type: Opaque
+stringData:
+  url: https://hooks.slack.com/services/REPLACE/WITH/YOUR-WEBHOOK
+---
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: AlertTarget
+metadata:
+  name: slack-security
+spec:
+  type: slack
+  secretRef:
+    name: slack-security
+  immediate:
+    minPriority: high
+  digest:
+    schedule: "0 9 * * 1-5"
+    timeZone: Australia/Sydney
+    minPriority: medium
+    includeResolved: true
+  quietHours:
+    intervals:
+      - times:
+          - startTime: "18:00"
+            endTime: "24:00"
+          - startTime: "00:00"
+            endTime: "08:00"
+        location: Australia/Sydney
+      - weekdays: ["saturday:sunday"]
+        location: Australia/Sydney
+    allowUrgent: true
+  notifyOnFeedStale: true

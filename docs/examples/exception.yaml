@@ -1,0 +1,16 @@
+# Applies to findings in its own namespace. Only Exceptions in the ffs namespace apply
+# cluster-wide and can except urgent findings.
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: Exception
+metadata:
+  name: php-cve-2026-41873
+  namespace: shop
+spec:
+  advisories:
+    - CVE-2026-41873
+  imageRepositories:
+    - docker.io/library/php
+  reason: The affected extension is not built into this image. Reviewed by the platform team.
+  expires: "2027-05-31T00:00:00Z"
+  vexStatus: not_affected
+  justification: vulnerable_code_not_present

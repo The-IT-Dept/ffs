@@ -1,0 +1,30 @@
+# The Secret lives in the ffs namespace. signingSecret is "whsec_" followed by the base64 of 24 to
+# 64 random bytes, for example: echo "whsec_$(openssl rand -base64 32)"
+apiVersion: v1
+kind: Secret
+metadata:
+  name: webhook-incidents
+  namespace: ffs
+type: Opaque
+stringData:
+  url: https://incidents.example.com/hooks/ffs
+  signingSecret: whsec_REPLACE-WITH-GENERATED-SECRET
+---
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: AlertTarget
+metadata:
+  name: webhook-incidents
+spec:
+  type: webhook
+  secretRef:
+    name: webhook-incidents
+  immediate:
+    minPriority: high
+  digest:
+    schedule: "0 * * * *"
+    minPriority: low
+    includeResolved: true
+  namespaces:
+    - shop
+    - payments
+  notifyOnFeedStale: true

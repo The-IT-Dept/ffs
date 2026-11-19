@@ -1,0 +1,12 @@
+.git
+.github
+bin
+dist
+docs
+charts
+hack
+test
+**/*_test.go
+# Local, gitignored state: never part of a CI build context.
+.cache
+.superpowers
