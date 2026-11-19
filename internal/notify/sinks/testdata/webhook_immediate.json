@@ -1,0 +1,66 @@
+{
+  "cluster": "prod",
+  "items": [
+    {
+      "advisoryId": "CVE-2026-0001",
+      "event": "detected",
+      "fixedIn": [
+        "3.0.2"
+      ],
+      "links": [
+        "https://example.com/a?x=1\u0026y=2"
+      ],
+      "observed": "2026-11-19T03:04:05Z",
+      "owners": [
+        {
+          "kind": "Deployment",
+          "name": "app-000",
+          "namespace": "ns"
+        },
+        {
+          "kind": "Deployment",
+          "name": "app-001",
+          "namespace": "ns"
+        }
+      ],
+      "packages": [
+        {
+          "ecosystem": "deb",
+          "fixed": [
+            "3.0.2"
+          ],
+          "installed": "3.0.1",
+          "name": "openssl",
+          "path": "/usr/lib"
+        },
+        {
+          "fixed": [],
+          "installed": "1.2",
+          "name": "zlib"
+        }
+      ],
+      "priority": "urgent",
+      "provisional": false,
+      "published": "2026-11-17T03:04:05Z",
+      "reasons": [
+        "in the CISA KEV catalogue",
+        "internet exposed"
+      ],
+      "suggestion": {
+        "fixes": {
+          "high": 2,
+          "medium": 1
+        },
+        "fromTag": "1.0",
+        "introduces": {},
+        "repo": "docker.io/x/app",
+        "tier": "patch",
+        "toTag": "1.1"
+      },
+      "title": "Remote code execution in \u003cscript\u003e\u0026"
+    }
+  ],
+  "kind": "immediate",
+  "target": "ops",
+  "title": "New urgent finding: CVE-2026-0001 affects 1 workload"
+}
