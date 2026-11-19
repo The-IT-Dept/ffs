@@ -56,20 +56,26 @@ func (s *Store) ApplyFindings(ctx context.Context, upserts []model.Finding, ts [
 				return fmt.Errorf("store: finding %q: %w", f.Fingerprint, err)
 			}
 		}
-		for _, t := range ts {
-			t.ID = 0
-			t.At = orNow(t.At)
-			data, err := jsonText(t)
-			if err != nil {
-				return err
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(fingerprint, data, at) VALUES(?, ?, ?)`,
-				t.Fingerprint, data, nanos(t.At)); err != nil {
-				return fmt.Errorf("store: transition for %q: %w", t.Fingerprint, err)
-			}
-		}
-		return nil
+		return appendTransitions(ctx, tx, ts)
 	})
+}
+
+// appendTransitions appends ts to the transitions outbox in slice order. t.ID is ignored and a
+// zero t.At is set to now.
+func appendTransitions(ctx context.Context, tx *sql.Tx, ts []model.Transition) error {
+	for _, t := range ts {
+		t.ID = 0
+		t.At = orNow(t.At)
+		data, err := jsonText(t)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO transitions(fingerprint, data, at) VALUES(?, ?, ?)`,
+			t.Fingerprint, data, nanos(t.At)); err != nil {
+			return fmt.Errorf("store: transition for %q: %w", t.Fingerprint, err)
+		}
+	}
+	return nil
 }
 
 // RekeyFindings applies alias re-keys in one transaction. When no finding holds NewFingerprint,

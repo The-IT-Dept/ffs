@@ -2,6 +2,7 @@ package upgrade
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,11 +38,15 @@ var (
 // index "<x>-idx" to the platform manifest "<x>-<arch>".
 type fakeRegistry struct {
 	tags      []string
+	listErr   error // ListTags fails with it when set
 	resolve   map[string]string
 	platforms []string // PlatformManifest platforms, in call order
 }
 
 func (f *fakeRegistry) ListTags(context.Context, string, registry.CredSet) ([]string, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.tags, nil
 }
 
@@ -361,6 +366,54 @@ func TestResolver_CandidateFailureSkipsCandidate(t *testing.T) {
 	require.Equal(t, []string{"1.30.6", "1.31.9"}, tags(got.Candidates), "the quarantined patch is skipped")
 }
 
+func TestResolver_ListTagsFailureKeepsRefresh(t *testing.T) {
+	rg := newRig(t)
+	rg.reg.listErr = errors.New("tags/list: denied")
+	rg.resolve()
+
+	got := rg.suggestion()
+	require.Equal(t, model.TierRefresh, got.Suggestion.Tier)
+	require.Equal(t, "sha256:new-idx", got.Suggestion.ToDigest)
+	require.Equal(t, []string{"1.30.6"}, tags(got.Candidates), "only the refresh is scored when the tags cannot be listed")
+	require.Empty(t, got.Suggestion.Notes, "a repository whose tags could not be listed is not called a dead end")
+	require.Len(t, rg.upgradeTransitions(), 2)
+}
+
+func TestResolver_FailedPassKeepsStoredSuggestion(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve()
+	stored := rg.suggestion()
+	rg.now = rnow.Add(24 * time.Hour)
+
+	// the refresh tag does not resolve and the tags cannot be listed: no candidate at all
+	rg.reg.listErr = errors.New("tags/list: unavailable")
+	delete(rg.reg.resolve, "1.30.6")
+	rg.resolve()
+	require.Equal(t, stored, rg.suggestion(), "a pass in which nothing survived leaves the stored suggestion")
+
+	// every candidate is found, and every one fails to catalogue
+	rg.reg.listErr = nil
+	rg.reg.resolve["1.30.6"] = "sha256:new-idx"
+	rg.acq.errs = map[string]error{"sha256:new-amd64": sbom.ErrQuarantined, "sha256:c77-amd64": sbom.ErrQuarantined,
+		"sha256:c319-amd64": sbom.ErrQuarantined}
+	rg.resolve()
+	require.Equal(t, stored, rg.suggestion())
+	require.Len(t, rg.upgradeTransitions(), 2)
+}
+
+func TestResolver_FailedPassWithoutStoredSuggestion(t *testing.T) {
+	rg := newRig(t)
+	rg.reg.listErr = errors.New("tags/list: denied")
+	rg.reg.resolve["1.30.6"] = curIdx // no refresh either
+	rg.resolve()
+
+	got := rg.suggestion()
+	require.Equal(t, model.TierNone, got.Suggestion.Tier, "with nothing stored, the tier-none result is stored")
+	require.Empty(t, got.Suggestion.Notes, "a repository whose tags could not be listed is not called a dead end")
+	require.Empty(t, got.Candidates)
+	require.Empty(t, rg.upgradeTransitions())
+}
+
 func TestResolver_InvalidatesOnCandidateDelta(t *testing.T) {
 	rg := newRig(t)
 	rg.resolve()
@@ -427,13 +480,22 @@ func TestResolver_ConsumeTransitions(t *testing.T) {
 	announced := at(model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"}, "CVE-2026-2004", model.PriorityHigh, true)
 	upgrade := created(announced)
 	upgrade.FromState, upgrade.FromPriority, upgrade.Trigger = model.StateOpen, model.PriorityHigh, model.TriggerUpgradeAvailable
-	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{qualifying, tooLow, noFix, announced},
-		[]model.Transition{created(qualifying), created(tooLow), created(noFix), upgrade}))
+	// an open finding that just gained a fix qualifies, though its state and priority are unchanged
+	searchRef := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "search"}
+	gainedFix := at(searchRef, "CVE-2026-2005", model.PriorityMedium, true)
+	fixed := created(gainedFix)
+	fixed.FromState, fixed.FromPriority, fixed.Trigger = model.StateOpen, model.PriorityMedium, model.TriggerFixAvailable
+	// an open finding whose priority fell does not newly qualify
+	lowered := at(model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "queue"}, "CVE-2026-2006", model.PriorityMedium, true)
+	fell := created(lowered)
+	fell.FromState, fell.FromPriority, fell.Trigger = model.StateOpen, model.PriorityHigh, model.TriggerPriorityChange
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{qualifying, tooLow, noFix, announced, gainedFix, lowered},
+		[]model.Transition{created(qualifying), created(tooLow), created(noFix), upgrade, fixed, fell}))
 
 	n, err := rg.r.ConsumeTransitions(rctx)
 	require.NoError(t, err)
-	require.Equal(t, 4, n)
-	require.Equal(t, []string{webKey}, rg.r.Pending())
+	require.Equal(t, 6, n)
+	require.Equal(t, []string{webKey, searchRef.Key()}, rg.r.Pending())
 	all, err := rg.st.TransitionsAfter(rctx, 0, 1000)
 	require.NoError(t, err)
 	cur, err := rg.st.Cursor(rctx, "upgrade")
@@ -454,6 +516,48 @@ func TestResolver_NoRefireWhenUnchanged(t *testing.T) {
 	rg.resolve()
 	require.Len(t, rg.upgradeTransitions(), 2, "the same recommendation is not announced again")
 	require.Equal(t, rg.now, rg.suggestion().Suggestion.ComputedAt, "the suggestion is still recomputed")
+}
+
+func TestResolver_NoRefireAfterCandidateDelta(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve()
+	require.Len(t, rg.upgradeTransitions(), 2)
+
+	rg.r.MatchesReplaced(rctx, []string{"sha256:new-amd64"})
+	require.Equal(t, []string{webKey}, rg.r.Pending())
+	rg.resolve()
+	require.Equal(t, "sha256:new-idx", rg.suggestion().Suggestion.ToDigest, "the re-matched refresh is recommended again")
+	require.Len(t, rg.upgradeTransitions(), 2, "the target already announced is not announced again")
+
+	rg.reg.resolve["1.30.6"] = "sha256:newer-idx"
+	rg.resolve()
+	require.Equal(t, "sha256:newer-idx", rg.suggestion().Suggestion.ToDigest)
+	require.Len(t, rg.upgradeTransitions(), 4, "a new target is announced")
+}
+
+func TestResolver_ReannouncesAfterRequalifying(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve()
+	require.Len(t, rg.upgradeTransitions(), 2)
+
+	lowered := func(f model.Finding) model.Finding {
+		f.Priority = model.PriorityLow
+		return f
+	}
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{lowered(rg.finding(advA, urgent, curAMD64)),
+		lowered(rg.finding(advB, high, curAMD64))}, nil))
+	rg.resolve()
+	_, ok, err := rg.st.GetSuggestion(rctx, webKey, nginx)
+	require.NoError(t, err)
+	require.False(t, ok, "the repository no longer qualifies")
+	_, _, ok, err = rg.st.Announced(rctx, webKey, nginx)
+	require.NoError(t, err)
+	require.False(t, ok, "its announcement goes with the suggestion")
+
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{rg.finding(advA, urgent, curAMD64),
+		rg.finding(advB, high, curAMD64)}, nil))
+	rg.resolve()
+	require.Len(t, rg.upgradeTransitions(), 4, "a repository that qualifies again is announced afresh")
 }
 
 func TestNextDaily(t *testing.T) {

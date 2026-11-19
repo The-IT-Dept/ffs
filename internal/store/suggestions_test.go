@@ -95,6 +95,59 @@ func TestStore_SuggestionFollowsFindings(t *testing.T) {
 	require.Empty(t, keys, "the owner's candidates go with it")
 }
 
+func TestStore_Announcements(t *testing.T) {
+	s := newStore(t)
+	const key, repo, other = "Deployment/netbox/netbox", "ghcr.io/x", "ghcr.io/y"
+	f := fd("fp-x", model.StateOpen, model.PriorityHigh)
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{f}, nil))
+	sg := model.Suggestion{Repo: repo, FromTag: "1.0", ToTag: "1.1", ToDigest: "sha256:idx", Tier: model.TierPatch, ComputedAt: t0}
+	require.NoError(t, s.PutSuggestion(ctx, key, sg, []CandidateDigest{{Tag: "1.1", Tier: model.TierPatch, Platform: "linux/amd64", Digest: "sha256:cand"}}))
+	announced := func(r string) (string, string, bool) {
+		t.Helper()
+		tag, digest, ok, err := s.Announced(ctx, key, r)
+		require.NoError(t, err)
+		return tag, digest, ok
+	}
+	_, _, ok := announced(repo)
+	require.False(t, ok)
+
+	up := model.Transition{Fingerprint: f.Fingerprint, Owner: f.Owner, AdvisoryID: f.AdvisoryID, FromState: model.StateOpen,
+		ToState: model.StateOpen, FromPriority: model.PriorityHigh, ToPriority: model.PriorityHigh, Trigger: model.TriggerUpgradeAvailable, At: t0}
+	require.NoError(t, s.AnnounceSuggestion(ctx, key, sg, []model.Transition{up}))
+	ts, err := s.TransitionsAfter(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, ts, 1)
+	require.Equal(t, model.TriggerUpgradeAvailable, ts[0].Trigger)
+	require.Equal(t, f.Fingerprint, ts[0].Fingerprint)
+	tag, digest, ok := announced(repo)
+	require.True(t, ok)
+	require.Equal(t, []string{"1.1", "sha256:idx"}, []string{tag, digest})
+	_, _, ok = announced(other)
+	require.False(t, ok)
+
+	require.NoError(t, s.DeleteSuggestions(ctx, key, nil))
+	_, _, ok = announced(repo)
+	require.True(t, ok, "a withdrawn suggestion keeps its announcement")
+
+	require.NoError(t, s.DeleteAnnouncements(ctx, key, []string{}), "an empty list deletes nothing")
+	require.NoError(t, s.DeleteAnnouncements(ctx, key, []string{other}))
+	_, _, ok = announced(repo)
+	require.True(t, ok)
+	require.NoError(t, s.DeleteAnnouncements(ctx, key, []string{repo}))
+	_, _, ok = announced(repo)
+	require.False(t, ok)
+
+	require.NoError(t, s.AnnounceSuggestion(ctx, key, sg, nil))
+	require.NoError(t, s.DeleteAnnouncements(ctx, key, nil))
+	_, _, ok = announced(repo)
+	require.False(t, ok, "nil deletes every repository's")
+
+	require.NoError(t, s.AnnounceSuggestion(ctx, key, sg, nil))
+	require.NoError(t, s.DeleteOwner(ctx, key))
+	_, _, ok = announced(repo)
+	require.False(t, ok, "the owner's announcements go with it")
+}
+
 func TestStore_PruneImages(t *testing.T) {
 	s := newStore(t)
 	now := t0

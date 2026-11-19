@@ -46,6 +46,9 @@ const (
 	suggestionSelect = `SELECT s.owner_key, s.repo, s.data, c.tag, c.tier, c.platform, c.digest
 		FROM suggestions s LEFT JOIN candidates c ON c.owner_key = s.owner_key AND c.repo = s.repo`
 	suggestionOrder = ` ORDER BY s.owner_key, s.repo, c.rowid`
+
+	deleteOwnerAnnouncements = `DELETE FROM announcements WHERE owner_key = ?`
+	deleteRepoAnnouncements  = deleteOwnerAnnouncements + ` AND repo` + inList
 )
 
 // PutSuggestion stores sg as the suggestion for ownerKey and sg.Repo, replaces its candidates with
@@ -117,6 +120,49 @@ func (s *Store) SuggestionKeysForDigests(ctx context.Context, digests []string) 
 		err := r.Scan(&k.OwnerKey, &k.Repo)
 		return k, err
 	}, `SELECT DISTINCT owner_key, repo FROM candidates WHERE digest`+inList+` ORDER BY owner_key, repo`, idList(digests))
+}
+
+// Announced returns the upgrade target (ToTag, ToDigest) last announced for ownerKey on repo.
+// DeleteSuggestions leaves it in place, so a suggestion withdrawn by a candidate's match change
+// and resolved again to the same target is not announced twice.
+func (s *Store) Announced(ctx context.Context, ownerKey, repo string) (toTag, toDigest string, ok bool, err error) {
+	err = s.rdb.QueryRowContext(ctx, `SELECT to_tag, to_digest FROM announcements WHERE owner_key = ? AND repo = ?`,
+		ownerKey, repo).Scan(&toTag, &toDigest)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return "", "", false, nil
+	case err != nil:
+		return "", "", false, fmt.Errorf("store: announcement %s %s: %w", ownerKey, repo, err)
+	}
+	return toTag, toDigest, true, nil
+}
+
+// AnnounceSuggestion appends ts (the UpgradeAvailable transitions announcing sg) and records sg's
+// target as the one announced for ownerKey on sg.Repo, in one transaction.
+func (s *Store) AnnounceSuggestion(ctx context.Context, ownerKey string, sg model.Suggestion, ts []model.Transition) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO announcements(owner_key, repo, to_tag, to_digest) VALUES(?, ?, ?, ?)`,
+			ownerKey, sg.Repo, sg.ToTag, sg.ToDigest); err != nil {
+			return fmt.Errorf("store: announcement %s %s: %w", ownerKey, sg.Repo, err)
+		}
+		return appendTransitions(ctx, tx, ts)
+	})
+}
+
+// DeleteAnnouncements forgets the targets announced for ownerKey on repos. nil repos means every
+// repository of the owner; an empty non-nil slice deletes nothing.
+func (s *Store) DeleteAnnouncements(ctx context.Context, ownerKey string, repos []string) error {
+	if repos != nil && len(repos) == 0 {
+		return nil
+	}
+	q, args := deleteOwnerAnnouncements, []any{ownerKey}
+	if repos != nil {
+		q, args = deleteRepoAnnouncements, []any{ownerKey, idList(repos)}
+	}
+	if _, err := s.wdb.ExecContext(ctx, q, args...); err != nil {
+		return fmt.Errorf("store: delete announcements of %s: %w", ownerKey, err)
+	}
+	return nil
 }
 
 // querySuggestions runs a suggestionSelect query, one row per candidate (or one row with NULL

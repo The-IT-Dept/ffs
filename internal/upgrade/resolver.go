@@ -439,6 +439,10 @@ func (r *Resolver) ResolveOwner(ctx context.Context, key string) error {
 		if err := r.o.Store.DeleteSuggestions(ctx, key, stale); err != nil {
 			errs = append(errs, fmt.Errorf("upgrade: delete suggestions of %s: %w", key, err))
 		}
+		// a repository that qualifies again later has its recommendation announced afresh
+		if err := r.o.Store.DeleteAnnouncements(ctx, key, stale); err != nil {
+			errs = append(errs, fmt.Errorf("upgrade: delete announcements of %s: %w", key, err))
+		}
 	}
 	return errors.Join(errs...)
 }
@@ -529,8 +533,9 @@ type candidate struct {
 }
 
 // resolveRepo recomputes, stores and announces the owner's suggestion on repo. before holds the
-// owner's open findings on repo. When the tags cannot be listed, or no candidate could be scored,
-// the stored suggestion stands until the next pass.
+// owner's open findings on repo. A candidate that fails at any step is dropped for this pass. When
+// something failed and no candidate survived, a stored suggestion stands until the next pass, so a
+// registry outage does not wipe it; with none stored, the tier-none result is stored.
 func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, before []model.Finding) error {
 	key := o.Ref.Key()
 	log := r.o.Log.WithValues("owner", key, "repo", repo)
@@ -542,20 +547,13 @@ func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, 
 	if err != nil {
 		return fmt.Errorf("upgrade: suggestion of %s on %s: %w", key, repo, err)
 	}
-	cands, err := r.candidates(ctx, repo, cur, log)
-	if err != nil {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		log.Info("listing tags failed; the stored suggestion stands", "error", err.Error())
-		return nil
-	}
+	cands, incomplete := r.candidates(ctx, repo, cur, log)
 	scored := r.score(ctx, o, repo, cur, before, cands, log)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(cands) > 0 && len(scored) == 0 {
-		log.Info("no upgrade candidate could be scored; the stored suggestion stands")
+	if len(scored) == 0 && (incomplete || len(cands) > 0) && hadPrev {
+		log.Info("no upgrade candidate survived this pass; the stored suggestion stands")
 		return nil
 	}
 
@@ -571,7 +569,7 @@ func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, 
 	if sg.EOL, err = r.eolText(ctx, repo, cur, now); err != nil {
 		return err
 	}
-	if len(cands) == 0 {
+	if len(cands) == 0 && !incomplete {
 		sg.Notes = append(sg.Notes, noteNoPath)
 	}
 	if !cur.known {
@@ -586,37 +584,47 @@ func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, 
 	if err := r.o.Store.PutSuggestion(ctx, key, sg, candidateRows(scored)); err != nil {
 		return fmt.Errorf("upgrade: store suggestion of %s on %s: %w", key, repo, err)
 	}
-	if sg.Tier == model.TierNone || (hadPrev && prev.Suggestion.ToTag == sg.ToTag && prev.Suggestion.ToDigest == sg.ToDigest) {
+	if sg.Tier == model.TierNone {
 		return nil
 	}
-	return r.announce(ctx, sg, before, now)
+	// compared with the last announced target, not the previous suggestion: a candidate's match
+	// change deletes the suggestion, and re-resolving to the same target must not announce it again
+	toTag, toDigest, announced, err := r.o.Store.Announced(ctx, key, repo)
+	if err != nil {
+		return fmt.Errorf("upgrade: announcement of %s on %s: %w", key, repo, err)
+	}
+	if announced && toTag == sg.ToTag && toDigest == sg.ToDigest {
+		return nil
+	}
+	return r.announce(ctx, key, sg, before, now)
 }
 
 // candidates returns repo's upgrade candidates nearest first, at most MaxCandidatesPerRepo: a
 // refresh when the current tag now points at an image the owner does not run, then the best patch,
-// minor and major tags. A tag that fails to resolve is skipped; the error is returned only when the
-// tags cannot be listed.
-func (r *Resolver) candidates(ctx context.Context, repo string, cur repoState, log logr.Logger) ([]candidate, error) {
+// minor and major tags. A tag that fails to resolve is skipped, and when the tags cannot be listed
+// only the refresh is returned; either failure is logged and makes incomplete true.
+func (r *Resolver) candidates(ctx context.Context, repo string, cur repoState, log logr.Logger) (out []candidate, incomplete bool) {
 	limit := r.o.Config.Upgrades.MaxCandidatesPerRepo
 	if limit <= 0 {
 		limit = defaultCandidates
 	}
-	var out []candidate
 	if cur.tag != "" {
 		d, err := r.o.Registry.ResolveTag(ctx, repo, cur.tag, cur.creds)
 		switch {
 		case err != nil:
+			incomplete = true
 			log.Info("skipping upgrade candidate this pass", "tag", cur.tag, "tier", model.TierRefresh, "error", err.Error())
 		case !cur.runs[d]:
 			out = append(out, candidate{cur.tag, model.TierRefresh, d})
 		}
 	}
 	if !cur.known || len(out) >= limit {
-		return out, nil
+		return out, incomplete
 	}
 	tags, err := r.o.Registry.ListTags(ctx, repo, cur.creds)
 	if err != nil {
-		return nil, err
+		log.Info("listing tags failed; skipping the patch, minor and major candidates this pass", "error", err.Error())
+		return out, true
 	}
 	best := r.o.Parser.Best(repo, cur.version, tags)
 	for _, tier := range []model.Tier{model.TierPatch, model.TierMinor, model.TierMajor} {
@@ -629,6 +637,7 @@ func (r *Resolver) candidates(ctx context.Context, repo string, cur repoState, l
 		}
 		d, err := r.o.Registry.ResolveTag(ctx, repo, v.Tag, cur.creds)
 		if err != nil {
+			incomplete = true
 			log.Info("skipping upgrade candidate this pass", "tag", v.Tag, "tier", tier, "error", err.Error())
 			continue
 		}
@@ -636,7 +645,7 @@ func (r *Resolver) candidates(ctx context.Context, repo string, cur repoState, l
 			out = append(out, candidate{v.Tag, tier, d})
 		}
 	}
-	return out, nil
+	return out, incomplete
 }
 
 // score scores each candidate. A candidate that fails at any step is logged and dropped for this
@@ -744,9 +753,10 @@ func candidateRows(scored []Scored) []store.CandidateDigest {
 	return out
 }
 
-// announce appends an UpgradeAvailable transition for each open finding the suggestion fixes. State,
-// priority and provisional are unchanged: an available upgrade never moves priority (spec §6.6).
-func (r *Resolver) announce(ctx context.Context, sg model.Suggestion, before []model.Finding, now time.Time) error {
+// announce appends an UpgradeAvailable transition for each open finding the suggestion fixes and
+// records the suggestion's target as announced, in one transaction. State, priority and provisional
+// are unchanged: an available upgrade never moves priority (spec §6.6).
+func (r *Resolver) announce(ctx context.Context, key string, sg model.Suggestion, before []model.Finding, now time.Time) error {
 	var ts []model.Transition
 	for _, f := range before {
 		if !slices.Contains(sg.FixedIDs, f.AdvisoryID) {
@@ -761,8 +771,8 @@ func (r *Resolver) announce(ctx context.Context, sg model.Suggestion, before []m
 	if len(ts) == 0 {
 		return nil
 	}
-	if err := r.o.Store.ApplyFindings(ctx, nil, ts); err != nil {
-		return fmt.Errorf("upgrade: announce %s on %s: %w", Target(sg), sg.Repo, err)
+	if err := r.o.Store.AnnounceSuggestion(ctx, key, sg, ts); err != nil {
+		return fmt.Errorf("upgrade: announce %s to %s: %w", Target(sg), key, err)
 	}
 	return nil
 }
