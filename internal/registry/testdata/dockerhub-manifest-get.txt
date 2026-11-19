@@ -1,0 +1,70 @@
+HTTP/1.1 200 OK
+Date: Thu, 19 Nov 2026 11:38:54 GMT
+Content-Type: application/vnd.oci.image.manifest.v1+json
+Content-Length: 2295
+Connection: keep-alive
+docker-content-digest: sha256:da837cfb72cb98fdd8efa8f2c8d3d29b89b327c07d45bf564d52835d787a0892
+docker-distribution-api-version: registry/2.0
+etag: "sha256:da837cfb72cb98fdd8efa8f2c8d3d29b89b327c07d45bf564d52835d787a0892"
+x-ratelimit-limit: 100;w=21600
+ratelimit-limit: 100;w=21600
+x-ratelimit-remaining: 76;w=21600
+ratelimit-remaining: 76;w=21600
+strict-transport-security: max-age=31536000
+
+{
+  "schemaVersion": 2,
+  "mediaType": "application/vnd.oci.image.manifest.v1+json",
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:c59e925d63f3aa135bfa9d82cb03fba9ee30edb22ebe6c9d4f43824312ba3d9b",
+    "size": 8582
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:c29f5b76f736a8b555fd191c48d6581bb918bcd605a7cbcc76205dd6acff3260",
+      "size": 28212303
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:ee083de5cedaf063e9b0af87973347bc8df247e524c0cfe8d29f7c86c8c3b260",
+      "size": 43842362
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:5afd6583b29c9cd2d9033bf7843788cfbbc402310e8a38739d1b8c39b64c11cf",
+      "size": 629
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:8c2914db26a3b019cf8b9dcd9ffec286f7aa4db2165ee79bb214b6e66dd461c2",
+      "size": 955
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:1e8aefce6919108c4f47b2f89139ba1158f337792297a4cf915c6296cbc837ea",
+      "size": 402
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:a982d09283a6d9c05e32de9bbc01d7f72454f236af45466e6cff9b8a03e8f851",
+      "size": 1209
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:ab571a6216e31ff4c8800306fce6a1ecbb75da7886746ed4b4372d10fb97eebd",
+      "size": 1396
+    }
+  ],
+  "annotations": {
+    "com.docker.official-images.bashbrew.arch": "amd64",
+    "org.opencontainers.image.base.digest": "sha256:44bccdd61bf09a081b1db8c61cf49bfabf30ac7afcc970010137c0ab587b209c",
+    "org.opencontainers.image.base.name": "debian:bookworm-slim",
+    "org.opencontainers.image.created": "2024-11-26T18:42:08Z",
+    "org.opencontainers.image.revision": "d21b4f2d90a1abb712a610678872e804267f4815",
+    "org.opencontainers.image.source": "https://github.com/nginxinc/docker-nginx.git#d21b4f2d90a1abb712a610678872e804267f4815:mainline/debian",
+    "org.opencontainers.image.url": "https://hub.docker.com/_/nginx",
+    "org.opencontainers.image.version": "1.27.3"
+  }
+}
