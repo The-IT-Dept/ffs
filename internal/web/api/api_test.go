@@ -2,6 +2,7 @@ package api_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -349,6 +350,33 @@ func TestAPI_Search(t *testing.T) {
 
 	code, _, _ := get(t, srv, "/api/v1/search?q=")
 	require.Equal(t, 400, code)
+}
+
+func TestAPI_SearchVersionFilterBeforeCap(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	srv := httptest.NewServer(api.NewHandler(svc))
+	t.Cleanup(srv.Close)
+	existing, err := st.PackagesForImage(t.Context(), webtest.DigestWeb)
+	require.NoError(t, err)
+	// 60 high versions sort before "6.0.0" as strings, so a SQL LIMIT 50 would drop the match.
+	for i := range 60 {
+		existing = append(existing, model.Package{Ecosystem: "binary", Name: "bulklib", Version: fmt.Sprintf("50.0.%02d", i),
+			Classifier: "bulklib-binary", Path: fmt.Sprintf("/opt/bulk%02d", i)})
+	}
+	existing = append(existing, model.Package{Ecosystem: "binary", Name: "bulklib", Version: "6.0.0", Classifier: "bulklib-binary", Path: "/opt/low"})
+	require.NoError(t, st.PutSBOM(t.Context(), webtest.DigestWeb, nil, existing))
+
+	code, d, body := get(t, srv, "/api/v1/search?q=bulklib&lt=10.0.0")
+	require.Equal(t, 200, code, body)
+	r := item(d)
+	require.Len(t, r["packages"], 1)
+	require.Equal(t, false, r["truncated"])
+
+	code, d, body = get(t, srv, "/api/v1/search?q=bulklib")
+	require.Equal(t, 200, code, body)
+	r = item(d)
+	require.Len(t, r["packages"], 50)
+	require.Equal(t, true, r["truncated"])
 }
 
 func TestAPI_ReadOnly(t *testing.T) {

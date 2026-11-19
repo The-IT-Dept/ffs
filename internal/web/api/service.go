@@ -26,6 +26,8 @@ const (
 	defaultLimit = 100
 	maxLimit     = 1000
 	searchLimit  = 50
+	// searchFetchAll is the per-kind store limit used when a post-filter must run before capping.
+	searchFetchAll = 1_000_000
 
 	dateFmt = "2006-01-02"
 )
@@ -351,6 +353,8 @@ type SearchResult struct {
 	Advisories   []AdvisoryHit `json:"advisories"`
 	Images       []ImageHit    `json:"images"`
 	Uncatalogued int           `json:"uncatalogued"`
+	// Truncated is true when any kind had more than searchLimit matches and was cut short.
+	Truncated bool `json:"truncated"`
 }
 
 // ---- helpers ----
@@ -1006,20 +1010,30 @@ func (s *Service) Feeds(ctx context.Context) ([]FeedView, error) {
 // Search finds packages, advisories and images matching q. A non-empty lt keeps only package hits
 // whose version is below it.
 func (s *Service) Search(ctx context.Context, q, lt string) (SearchResult, error) {
-	hits, err := s.o.Store.Search(ctx, q, searchLimit)
+	// Fetch one past the cap so truncation is detectable. With lt the version filter runs after
+	// the store's per-kind LIMIT, so pull everything and cap once the filter has been applied.
+	fetch := searchLimit + 1
+	if lt != "" {
+		fetch = searchFetchAll
+	}
+	hits, err := s.o.Store.Search(ctx, q, fetch)
 	if err != nil {
 		return SearchResult{}, err
 	}
 	res := SearchResult{Query: q, Packages: []PackageHit{}, Advisories: []AdvisoryHit{}, Images: []ImageHit{}}
+	kept := map[string]int{}
 	for _, h := range hits {
-		switch h.Kind {
-		case "advisory":
+		if h.Kind == "package" && lt != "" && upstream.CompareVersions(h.Version, lt) >= 0 {
+			continue
+		}
+		if kept[h.Kind] >= searchLimit {
+			res.Truncated = true
+			continue
+		}
+		kept[h.Kind]++
+		if h.Kind == "advisory" {
 			res.Advisories = append(res.Advisories, AdvisoryHit{ID: h.ID, Title: h.Label})
 			continue
-		case "package":
-			if lt != "" && upstream.CompareVersions(h.Version, lt) >= 0 {
-				continue
-			}
 		}
 		owners, err := s.o.Store.OwnersForDigests(ctx, h.Digests)
 		if err != nil {
