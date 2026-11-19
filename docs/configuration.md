@@ -116,6 +116,8 @@ These values configure the chart itself and are not part of `config.yaml`.
 
 Metrics are served on port 8443 behind Kubernetes authentication and authorisation. A scraper needs `get` on the `/metrics` non-resource URL, which the chart's ClusterRole `ffs-metrics-reader` grants; bind it to the scraper's ServiceAccount.
 
+The finding metrics (for example `ffs_findings_open`) carry a `namespace` label naming the workload's namespace, not the ffs namespace. The chart's ServiceMonitor sets `honorLabels: true` so Prometheus keeps it. If you scrape ffs with your own configuration, set `honor_labels: true` on that job too; otherwise Prometheus renames the label to `exported_namespace`, and the shipped alerts and dashboard report every finding in the ffs namespace.
+
 ## Exposing the dashboard
 
 The dashboard and API have no authentication. By default they listen on `127.0.0.1:8080` inside the pod, so they are reachable only through `kubectl -n ffs port-forward deploy/ffs 8080`, which needs RBAC `pods/portforward` in the ffs namespace.

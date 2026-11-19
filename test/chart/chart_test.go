@@ -522,3 +522,12 @@ func TestChart_NotesAndHiddenCategory(t *testing.T) {
 		return nil
 	}))
 }
+
+// TestChart_ServiceMonitorHonorsLabels pins honorLabels on the ServiceMonitor (F35): the finding
+// metrics carry the workload's namespace, which the target's namespace label must not replace.
+func TestChart_ServiceMonitorHonorsLabels(t *testing.T) {
+	sm := render(t, "metrics.serviceMonitor.enabled=true").get(t, "ServiceMonitor", "ffs")
+	eps, _, _ := unstructured.NestedSlice(sm.Object, "spec", "endpoints")
+	require.Len(t, eps, 1)
+	require.Equal(t, true, eps[0].(map[string]any)["honorLabels"])
+}

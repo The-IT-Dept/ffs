@@ -77,6 +77,9 @@ spec:
   endpoints:
     - port: metrics
       scheme: https
+      # ffs metrics carry the workload's own namespace label; without honorLabels the operator's
+      # target label (the ffs namespace) would replace it.
+      honorLabels: true
       interval: {{ .Values.metrics.serviceMonitor.interval }}
       bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
       tlsConfig:
