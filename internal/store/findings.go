@@ -67,7 +67,8 @@ func (s *Store) ApplyFindings(ctx context.Context, upserts []model.Finding, ts [
 
 // RekeyFindings applies alias re-keys in one transaction. When no finding holds NewFingerprint,
 // the old row takes the new fingerprint and advisory id (in its columns and data); otherwise the
-// old row is deleted. Transitions keep the old fingerprint as history.
+// old row is deleted. Notification ledger rows move to the new fingerprint either way, replacing
+// any already there. Transitions keep the old fingerprint as history.
 func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		for _, rk := range rks {
@@ -88,6 +89,13 @@ func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 			}
 			if err != nil {
 				return fmt.Errorf("store: rekey finding %q: %w", rk.OldFingerprint, err)
+			}
+			// The never-twice ledger follows the finding, so an alias merge is not re-alerted.
+			if rk.NewFingerprint != rk.OldFingerprint {
+				if _, err := tx.ExecContext(ctx, `UPDATE OR REPLACE notified SET fingerprint = ? WHERE fingerprint = ?`,
+					rk.NewFingerprint, rk.OldFingerprint); err != nil {
+					return fmt.Errorf("store: rekey ledger %q: %w", rk.OldFingerprint, err)
+				}
 			}
 		}
 		return nil
