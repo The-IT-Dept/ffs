@@ -148,7 +148,9 @@ type Advisory struct {
 	KEVAdded                      *time.Time
 	EPSS, EPSSPercentile          float64
 	Malicious                     bool // OSV MAL- record
-	Withdrawn                     bool
+	// Withdrawn means the CVE record is REJECTED in cvelistV5. A withdrawn OSV record never sets it:
+	// withdrawal is per record, and the record matchers drop that record's matches themselves.
+	Withdrawn bool
 }
 
 type Match struct {

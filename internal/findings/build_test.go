@@ -476,6 +476,8 @@ func TestBuild_PriorityInputs(t *testing.T) {
 	})
 }
 
+// TestBuild_WithdrawnAdvisoryIgnored covers a REJECTED CVE (cvelistV5), the only source of
+// Advisory.Withdrawn.
 func TestBuild_WithdrawnAdvisoryIgnored(t *testing.T) {
 	gone := advisory("CVE-W")
 	gone.Withdrawn = true

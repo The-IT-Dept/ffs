@@ -8,12 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/osv-scalibr/semantic"
 	"github.com/ossf/osv-schema/bindings/go/osvschema"
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
+	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
 	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/model"
@@ -502,4 +505,48 @@ func TestOSVFast_MaliciousPackage(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, a.Malicious)
+}
+
+// TestOSVFast_WithdrawnAliasKeepsLiveCVE is the F1 regression: GitHub withdrew GHSA-qf9m-vfgh-m389
+// as a duplicate but it still lists CVE-2024-24762, which is live. Delivering it (the PyPI bootstrap
+// does on every install) must not withdraw the CVE, and grype's match on another package must still
+// build a finding.
+func TestOSVFast_WithdrawnAliasKeepsLiveCVE(t *testing.T) {
+	const live = "CVE-2024-24762"
+	st := newStore(t)
+	m := osvfast.New(st)
+	multipart := model.Package{Ecosystem: "python", Name: "python-multipart", Version: "0.0.6",
+		PURL: "pkg:pypi/python-multipart@0.0.6", Path: "/usr/lib/python3/site-packages/python_multipart-0.0.6.dist-info/METADATA"}
+	pkgs := image(t, st, dPy, multipart)
+	require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: live, Title: "python-multipart ReDoS"}))
+	grypeMatch := model.Match{ImageDigest: dPy, PackageID: pkgs[0].ID, AdvisoryID: live, Source: model.SourceGrype,
+		FixState: model.FixFixed, FixedVersions: []string{"0.0.7"}, VendorSeverity: model.SeverityHigh,
+		VendorSeveritySource: "ghsa", Namespace: "github:language:python", DBBuilt: time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)}
+	_, err := st.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceGrype, Digests: []string{dPy}}, []model.Match{grypeMatch})
+	require.NoError(t, err)
+
+	withdrawn := changed(t, "PyPI", fixture(t, "GHSA-qf9m-vfgh-m389"))
+	deltas := apply(t, m, st, withdrawn)
+	require.Empty(t, byPackage(deltas), "a withdrawn record matches nothing")
+
+	canon, err := st.Canonical(ctx, "GHSA-qf9m-vfgh-m389")
+	require.NoError(t, err)
+	require.Equal(t, live, canon, "the withdrawn duplicate still aliases the live CVE")
+	a, ok, err := st.GetAdvisory(ctx, live)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, a.Withdrawn, "one withdrawn alias record does not withdraw the CVE")
+
+	advs, err := st.Advisories(ctx, []string{live})
+	require.NoError(t, err)
+	ms, err := st.MatchesForDigests(ctx, []string{dPy})
+	require.NoError(t, err)
+	const repo = "registry.example.com/web/api"
+	owner := model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"},
+		Containers: []model.ContainerUse{{Name: "api", Kind: model.ContainerRegular, Repo: repo, Digest: dPy}}}
+	fs := findings.Build(findings.BuildInput{Cluster: "prod", Owner: owner, Matches: ms,
+		Packages: map[string]model.Package{pkgs[0].ID: pkgs[0]}, Advisories: advs, Now: time.Now(),
+		PriorityConfig: config.Default().Priority})
+	require.Len(t, fs, 1, "grype's live match still builds a finding")
+	require.Equal(t, live, fs[0].AdvisoryID)
 }

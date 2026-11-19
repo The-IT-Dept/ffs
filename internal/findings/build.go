@@ -57,8 +57,8 @@ type verdict struct {
 }
 
 // Build returns the owner's findings, one per (image repository, canonical advisory), sorted by
-// fingerprint. Matches on withdrawn advisories, unknown packages and digests the owner does not run
-// are ignored. All findings are open or excepted; Diff decides what resolved.
+// fingerprint. Matches on rejected CVEs (Advisory.Withdrawn), unknown packages and digests the owner
+// does not run are ignored. All findings are open or excepted; Diff decides what resolved.
 func Build(in BuildInput) []model.Finding {
 	repos := digestRepos(in.Owner.Containers)
 	byTriple := map[triple][]model.Match{}
