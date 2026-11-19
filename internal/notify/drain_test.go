@@ -1,7 +1,9 @@
 package notify_test
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -144,4 +146,82 @@ func TestDrain_UnregisteredTargetLeftPending(t *testing.T) {
 	assert.Equal(t, store.DeliveryPending, ds[0].State)
 	assert.Zero(t, ds[0].Attempts)
 	assert.Zero(t, h.sink.calls)
+}
+
+func TestDrain_FailingEndpointHoldsBackTheRest(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	dev := &fakeSink{}
+	devCfg := h.cfg("ops")
+	devCfg.UID, devCfg.Name = "uid-dev", "dev"
+	require.NoError(t, h.eng.Register(ctx, devCfg, dev))
+	h.process() // baselines
+	h.batch(finding(dep("a", "x"), "CVE-2026-0001", urgent), finding(dep("a", "x"), "CVE-2026-0002", urgent),
+		finding(dep("a", "x"), "CVE-2026-0003", urgent))
+	require.NoError(t, h.eng.ProcessOnce(ctx))
+
+	h.sink.failNext(1, context.DeadlineExceeded) // the endpoint timed out
+	start, calls := h.now, h.sink.calls
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	assert.Equal(t, calls+1, h.sink.calls)             // one failed send, then the rest wait
+	assert.Len(t, dev.ofKind(notify.KindImmediate), 3) // another target is not held up
+	var head string
+	attempts := map[int]int{}
+	for _, d := range h.deliveries() {
+		if d.Kind != string(notify.KindImmediate) {
+			continue
+		}
+		assert.Equal(t, store.DeliveryPending, d.State)
+		attempts[d.Attempts]++
+		if d.Attempts == 1 {
+			head = d.ID
+		}
+	}
+	assert.Equal(t, map[int]int{0: 2, 1: 1}, attempts)
+
+	h.now = start.Add(4 * time.Second)
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	assert.Equal(t, calls+1, h.sink.calls) // still backing off: 5s at Rand 0.5
+
+	h.now = start.Add(5 * time.Second)
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	imm := h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 3)
+	assert.Equal(t, head, imm[0].ID) // the failed delivery still goes first
+	st, _, err := h.eng.Status(ctx, "uid-ops")
+	require.NoError(t, err)
+	assert.Zero(t, st.ConsecutiveFailures)
+}
+
+func TestDrain_UnsendableBacklogTakesNoPlace(t *testing.T) {
+	h := pendingHarness(t) // one urgent alert queued for ops
+	h.target("dead")
+	require.NoError(t, h.st.RecordAttempt(ctx, store.DeliveryAttempt{ID: "none", Target: "uid-dead", At: h.now,
+		State: store.DeliveryFailed, Disable: true, DisableReason: "endpoint returned HTTP 410 Gone"}))
+	payload, err := json.Marshal(notify.Message{ID: "ffs_old", Kind: notify.KindImmediate, Title: "t"})
+	require.NoError(t, err)
+	backlog := func(uid string) {
+		ds := make([]store.Delivery, 0, 200)
+		for i := range 200 { // a whole batch, all older than the ops alert
+			ds = append(ds, store.Delivery{ID: fmt.Sprintf("ffs_%s_%03d", uid, i), Kind: "immediate", Payload: payload,
+				CreatedAt: h.now.Add(-time.Hour)})
+		}
+		require.NoError(t, h.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, Deliveries: ds}))
+	}
+	backlog("uid-ghost") // never registered
+	backlog("uid-dead")  // registered but disabled
+
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	imm := h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 1)
+	assert.Equal(t, "ops", imm[0].TargetName)
+	for _, uid := range []string{"uid-ghost", "uid-dead"} {
+		ds, err := h.st.ListDeliveries(ctx, uid, 0)
+		require.NoError(t, err)
+		require.Len(t, ds, 200)
+		for _, d := range ds {
+			assert.Equal(t, store.DeliveryPending, d.State)
+			assert.Zero(t, d.Attempts)
+		}
+	}
 }

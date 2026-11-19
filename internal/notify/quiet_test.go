@@ -49,6 +49,14 @@ func TestQuietUntil_WeekdaysAndDaysOfMonth(t *testing.T) {
 	assertUntil(t, workHours, time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC), time.Date(2026, 11, 20, 17, 0, 0, 0, time.UTC))
 	assertNotQuiet(t, workHours, time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC))
 
+	// Weekday numbers run from 0 (Sunday) to 6 (Saturday), as in cron.
+	numbered := []notify.TimeInterval{{Weekdays: []string{"1:5"}, Times: []notify.TimeRange{{StartTime: "09:00", EndTime: "17:00"}}}}
+	assertUntil(t, numbered, time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC), time.Date(2026, 11, 20, 17, 0, 0, 0, time.UTC))
+	assertNotQuiet(t, numbered, time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC))
+	weekendNumbers := []notify.TimeInterval{{Weekdays: []string{"6:0"}}}
+	assertUntil(t, weekendNumbers, time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC), time.Date(2026, 11, 23, 0, 0, 0, 0, time.UTC))
+	assertNotQuiet(t, weekendNumbers, time.Date(2026, 11, 20, 10, 0, 0, 0, time.UTC))
+
 	lastDay := []notify.TimeInterval{{DaysOfMonth: []string{"-1"}}}
 	assertUntil(t, lastDay, time.Date(2026, 11, 30, 12, 0, 0, 0, time.UTC), time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC))
 	assertNotQuiet(t, lastDay, time.Date(2026, 11, 29, 12, 0, 0, 0, time.UTC))
@@ -71,6 +79,8 @@ func TestTimeInterval_ValidateRejectsBadInput(t *testing.T) {
 		"one digit":      {Times: []notify.TimeRange{{StartTime: "9:00", EndTime: "17:00"}}},
 		"backwards":      {Times: []notify.TimeRange{{StartTime: "17:00", EndTime: "09:00"}}},
 		"bad weekday":    {Weekdays: []string{"monday:funday"}},
+		"weekday 7":      {Weekdays: []string{"7"}},
+		"weekday -1":     {Weekdays: []string{"-1"}},
 		"day zero":       {DaysOfMonth: []string{"0"}},
 		"day 32":         {DaysOfMonth: []string{"32"}},
 		"month 13":       {Months: []string{"13"}},
@@ -79,7 +89,7 @@ func TestTimeInterval_ValidateRejectsBadInput(t *testing.T) {
 	} {
 		assert.Error(t, ti.Validate(), name)
 	}
-	ok := notify.TimeInterval{Times: []notify.TimeRange{{StartTime: "22:00", EndTime: "24:00"}}, Weekdays: []string{"saturday:sunday", "wednesday"},
+	ok := notify.TimeInterval{Times: []notify.TimeRange{{StartTime: "22:00", EndTime: "24:00"}}, Weekdays: []string{"saturday:sunday", "wednesday", "1:5", "0"},
 		DaysOfMonth: []string{"1:7", "-3:-1"}, Months: []string{"1:3", "december"}, Years: []string{"2026"}, Location: "Australia/Sydney"}
 	assert.NoError(t, ok.Validate())
 }

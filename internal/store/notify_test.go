@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -78,6 +79,36 @@ func TestStoreNotify_PendingRespectsWindows(t *testing.T) {
 	assert.Len(t, ds, 2)
 	ds, _ = st.PendingDeliveries(ctx, now.Add(time.Minute), 10)
 	assert.Len(t, ds, 5)
+}
+
+func TestStoreNotify_PendingForTargets(t *testing.T) {
+	st := newStore(t)
+	now := t0.Add(time.Hour)
+	var old []Delivery
+	for i := range 3 {
+		old = append(old, delivery(fmt.Sprintf("old-%d", i), t0))
+	}
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Deliveries: old}))
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u2", Deliveries: []Delivery{delivery("b", t0.Add(time.Minute))}}))
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u3", Deliveries: []Delivery{delivery("c", t0.Add(2*time.Minute))}}))
+
+	ids := func(ds []Delivery) []string {
+		var out []string
+		for _, d := range ds {
+			out = append(out, d.ID)
+		}
+		return out
+	}
+	ds, err := st.PendingDeliveriesFor(ctx, now, []string{"u2", "u3"}, 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b", "c"}, ids(ds)) // u1's older rows take no place in the batch
+	ds, _ = st.PendingDeliveriesFor(ctx, now, []string{"u3", "u1"}, 0)
+	assert.Equal(t, []string{"old-0", "old-1", "old-2", "c"}, ids(ds))
+	ds, _ = st.PendingDeliveriesFor(ctx, t0, []string{"u2"}, 10)
+	assert.Empty(t, ds) // the time windows still apply
+	ds, err = st.PendingDeliveriesFor(ctx, now, nil, 10)
+	require.NoError(t, err)
+	assert.Empty(t, ds)
 }
 
 func TestStoreNotify_RecordAttemptUpdatesTarget(t *testing.T) {

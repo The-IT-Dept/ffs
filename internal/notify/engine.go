@@ -57,8 +57,9 @@ type Engine struct {
 	started time.Time
 
 	mu      sync.Mutex
-	targets map[string]*target // by UID
-	uids    map[string]string  // name → UID
+	targets map[string]*target   // by UID
+	uids    map[string]string    // name → UID
+	backoff map[string]time.Time // by UID: after a failed send, nothing more goes to the target before this
 
 	// passMu serialises ProcessOnce with deleting a target's stored state, so a pass never
 	// writes state back for a target removed under it.
@@ -78,7 +79,7 @@ func New(st *store.Store, o Options) *Engine {
 		o.Ready = func(context.Context) bool { return true }
 	}
 	return &Engine{st: st, o: o, started: o.Now().UTC(), targets: map[string]*target{}, uids: map[string]string{},
-		feedSent: map[string]bool{}}
+		backoff: map[string]time.Time{}, feedSent: map[string]bool{}}
 }
 
 // now is the engine clock in UTC, the zone of every stored and sent time.
@@ -197,19 +198,13 @@ func (e *Engine) forget(ctx context.Context, uid string) error {
 
 // dropLocked removes uid from memory; e.mu must be held.
 func (e *Engine) dropLocked(uid string) {
+	delete(e.backoff, uid)
 	if t := e.targets[uid]; t != nil {
 		if e.uids[t.cfg.Name] == uid {
 			delete(e.uids, t.cfg.Name)
 		}
 		delete(e.targets, uid)
 	}
-}
-
-// registered returns the registered target uid, nil when there is none.
-func (e *Engine) registered(uid string) *target {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.targets[uid]
 }
 
 // snapshot returns the registered targets ordered by name.
@@ -318,8 +313,10 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 		return err
 	}
 	if t.cfg.Paused || st.Disabled {
-		// Move past everything without sending, so nothing old arrives once it is resumed.
-		if len(ts) == 0 {
+		// Move past everything without sending, so nothing old arrives once it is resumed. A digest
+		// fire time that passes meanwhile is spent too, so the first digest after resuming comes on
+		// schedule rather than at once. A pass with neither writes nothing.
+		if len(ts) == 0 && !digestDue(t.digestFire(st), now) {
 			return nil
 		}
 		return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid,

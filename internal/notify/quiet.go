@@ -13,10 +13,10 @@ import (
 type TimeRange struct{ StartTime, EndTime string }
 
 // TimeInterval follows Alertmanager's time_intervals: it matches when every non-empty field matches.
-// Weekdays are names ("monday", ranges "monday:friday"; a range may wrap past the end of the
-// week, so "saturday:sunday" is the weekend). Months are names or 1-12, DaysOfMonth 1-31 or
-// counted from the month's end as -1 to -31, Years numbers; all take inclusive "a:b" ranges.
-// Location is an IANA zone, UTC when empty.
+// Weekdays are names or 0-6 with Sunday 0, as in cron ("monday", "1", ranges "monday:friday" or
+// "1:5"; a range may wrap past the end of the week, so "saturday:sunday" is the weekend). Months
+// are names or 1-12, DaysOfMonth 1-31 or counted from the month's end as -1 to -31, Years numbers;
+// all take inclusive "a:b" ranges. Location is an IANA zone, UTC when empty.
 type TimeInterval struct {
 	Times                                []TimeRange
 	Weekdays, DaysOfMonth, Months, Years []string
@@ -237,9 +237,14 @@ func absDay(d int) int {
 
 var weekdays = map[string]int{"sunday": 0, "monday": 1, "tuesday": 2, "wednesday": 3, "thursday": 4, "friday": 5, "saturday": 6}
 
+// weekday reads a weekday name or its number, 0 (Sunday) to 6 (Saturday) as in cron and Go's
+// time.Weekday.
 func weekday(s string) (int, bool) {
-	v, ok := weekdays[s]
-	return v, ok
+	if v, ok := weekdays[s]; ok {
+		return v, true
+	}
+	v, err := strconv.Atoi(s)
+	return v, err == nil && v >= 0 && v <= 6
 }
 
 var months = map[string]int{"january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6, "july": 7,

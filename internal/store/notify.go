@@ -256,10 +256,24 @@ func scanDelivery(r scanner) (Delivery, error) {
 // PendingDeliveries returns up to limit pending deliveries that are due at now (both not_before and
 // next_attempt at or before it), oldest first. limit <= 0 means no limit.
 func (s *Store) PendingDeliveries(ctx context.Context, now time.Time, limit int) ([]Delivery, error) {
+	return s.pendingDeliveries(ctx, now, limit, "")
+}
+
+// PendingDeliveriesFor is PendingDeliveries for the given targets only, so the deliveries of other
+// targets (unregistered, disabled or backing off) never take a place in the batch. No targets
+// means no deliveries.
+func (s *Store) PendingDeliveriesFor(ctx context.Context, now time.Time, targets []string, limit int) ([]Delivery, error) {
+	if len(targets) == 0 {
+		return nil, nil
+	}
+	return s.pendingDeliveries(ctx, now, limit, ` AND target IN (SELECT value FROM json_each(?))`, idList(targets))
+}
+
+func (s *Store) pendingDeliveries(ctx context.Context, now time.Time, limit int, cond string, args ...any) ([]Delivery, error) {
 	at := now.UTC().UnixNano()
 	return queryAll(ctx, s.rdb, scanDelivery, `SELECT `+deliveryColumns+` FROM deliveries
-		WHERE state = ? AND not_before <= ? AND next_attempt <= ? ORDER BY created_at, id`+limitOffset(limit, 0),
-		string(DeliveryPending), at, at)
+		WHERE state = ? AND not_before <= ? AND next_attempt <= ?`+cond+` ORDER BY created_at, id`+limitOffset(limit, 0),
+		append([]any{string(DeliveryPending), at, at}, args...)...)
 }
 
 // RecordAttempt records one send attempt in a single transaction. The delivery's attempt count goes

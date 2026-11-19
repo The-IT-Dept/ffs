@@ -17,12 +17,8 @@ import (
 // against the ledger, which the immediate pass has already updated, keeps anything sent
 // immediately out of the digest.
 func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time) error {
-	from := st.LastDigestAt
-	if st.BaselineAt.After(from) {
-		from = st.BaselineAt
-	}
-	fire := t.sched.Next(from.In(t.cfg.Digest.Location))
-	if fire.IsZero() || now.Before(fire) {
+	fire := t.digestFire(st)
+	if !digestDue(fire, now) {
 		return nil
 	}
 	uid := t.cfg.UID
@@ -95,6 +91,19 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 	}
 	return e.st.CommitNotify(ctx, c)
 }
+
+// digestFire is the target's next digest time: the first scheduled time after its last digest, or
+// after its baseline when that is later. It is zero when the schedule never fires.
+func (t *target) digestFire(st store.NotifyTargetState) time.Time {
+	from := st.LastDigestAt
+	if st.BaselineAt.After(from) {
+		from = st.BaselineAt
+	}
+	return t.sched.Next(from.In(t.cfg.Digest.Location))
+}
+
+// digestDue reports whether a digest due at fire is due by now.
+func digestDue(fire, now time.Time) bool { return !fire.IsZero() && !now.Before(fire) }
 
 var digestEvents = []Event{EventDetected, EventReopened, EventEscalated, EventFixAvailable, EventResolved}
 

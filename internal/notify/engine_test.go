@@ -573,6 +573,30 @@ func TestNotify_PausedAdvancesWithoutSending(t *testing.T) {
 	assert.Equal(t, "CVE-2026-0002", imm[0].Items[0].AdvisoryID)
 }
 
+func TestNotify_PausedKeepsDigestSchedule(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	h.process() // baseline at 00:00; the digest fires daily at 09:00 UTC
+	h.target("ops", func(c *notify.TargetConfig) { c.Paused = true })
+	h.at("2026-11-19T10:00Z")
+	h.process() // the 09:00 digest passes while paused, with nothing to move past
+	st, _, err := h.eng.Status(ctx, "uid-ops")
+	require.NoError(t, err)
+	assert.Equal(t, h.now, st.LastDigestAt)
+
+	h.target("ops")
+	h.at("2026-11-19T11:00Z")
+	h.open(dep("a", "x"), "CVE-2026-0001", medium)
+	h.process()
+	assert.Empty(t, h.sink.ofKind(notify.KindDigest)) // no catch-up digest on resume
+
+	h.at("2026-11-20T09:00Z")
+	h.process()
+	d := h.sink.lastOfKind(notify.KindDigest)
+	require.Len(t, d.Items, 1)
+	assert.Equal(t, "CVE-2026-0001", d.Items[0].AdvisoryID)
+}
+
 func TestNotify_FeedStaleOncePerEpisode(t *testing.T) {
 	h := newHarness(t, func(o *notify.Options) { o.FeedStaleAfter = map[string]time.Duration{"osv": 2 * time.Hour} })
 	h.target("ops", func(c *notify.TargetConfig) { c.NotifyOnFeedStale = true })
