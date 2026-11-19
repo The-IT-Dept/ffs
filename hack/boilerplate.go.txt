@@ -1,0 +1,5 @@
+/*
+Copyright 2026 The ffs Authors.
+
+SPDX-License-Identifier: Apache-2.0
+*/

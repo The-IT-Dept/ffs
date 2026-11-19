@@ -1,0 +1,24 @@
+version: "2"
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - misspell
+    - nilerr
+    - noctx
+    - unconvert
+    - usestdlibvars
+  settings:
+    gosec:
+      excludes:
+        - G115
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/the-it-dept/ffs

@@ -2,3 +2,8 @@
 docs/superpowers/
 docs/research/
 .superpowers/
+/bin/
+/dist/
+*.test
+cover.out
+/.cache/
