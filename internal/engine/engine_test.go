@@ -833,3 +833,25 @@ func TestEngine_ProvisionalResolutionTrigger(t *testing.T) {
 		require.Equal(t, model.TriggerWithdrawn, lastTrigger(h), "even on an inventory-change recompute")
 	})
 }
+
+// TestEngine_PruneUnusedImagesAfterAWeek is the F30 regression: a superseded digest is pruned a week
+// after it is first found unused, not after resolved-finding retention (90 days).
+func TestEngine_PruneUnusedImagesAfterAWeek(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.DeleteOwner(ctx, cartKey))
+	_, err := h.e.Prune(ctx)
+	require.NoError(t, err)
+	_, ok, err := h.st.GetImage(ctx, d2)
+	require.NoError(t, err)
+	require.True(t, ok, "kept for a rollback")
+
+	h.clock.now = t0.Add(8 * 24 * time.Hour)
+	_, err = h.e.Prune(ctx)
+	require.NoError(t, err)
+	_, ok, err = h.st.GetImage(ctx, d2)
+	require.NoError(t, err)
+	require.False(t, ok, "unused for over a week")
+	_, ok, err = h.st.GetImage(ctx, d1)
+	require.NoError(t, err)
+	require.True(t, ok, "web/api still runs d1")
+}

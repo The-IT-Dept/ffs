@@ -43,7 +43,7 @@ type Store interface {
 	RekeyFindings(ctx context.Context, rks []store.FindingRekey) error
 	DigestsInUse(ctx context.Context) ([]string, error)
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
-	PruneImages(ctx context.Context, olderThan time.Time) (int, error)
+	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
 	GrypeDBBuilds(ctx context.Context) ([]time.Time, error)
 }
