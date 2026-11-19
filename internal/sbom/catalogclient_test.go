@@ -150,6 +150,8 @@ func TestCatalogSource_MapsErrors(t *testing.T) {
 			kind: FailQuarantine, reason: "compressed layers total 12 bytes, limit 10 bytes"},
 		{name: "429", status: 429, body: errBody(KindRateLimited, "slow down"), kind: FailTransient},
 		{name: "503", status: 503, body: errBody(KindBusy, "cataloguer is busy"), kind: FailTransient},
+		{name: "502", status: 502, body: errBody(KindUnavailable, "dial tcp: lookup ghcr.io: no such host"), kind: FailTransient,
+			reason: "registry not reachable from the cataloguer"},
 		{name: "socket missing", socket: filepath.Join(filepath.Dir(fake.socket), "missing.sock"), kind: FailTransient},
 		{name: "504", status: 504, body: errBody(KindTimeout, "late"), kind: FailCounted, reason: "cataloguer timed out after 10m0s"},
 		{name: "507", status: 507, body: errBody(KindScratchFull, "full"), kind: FailCounted,

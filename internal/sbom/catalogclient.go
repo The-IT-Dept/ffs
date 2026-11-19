@@ -32,6 +32,7 @@ const (
 	catalogReservation = 2
 
 	reasonStopped     = "cataloguer stopped while processing the image"
+	reasonUnavailable = "registry not reachable from the cataloguer"
 	reasonScratchFull = "image unpacked beyond the cataloguer scratch limit"
 )
 
@@ -148,6 +149,8 @@ func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) erro
 		return &AcquireError{Kind: FailQuarantine, Reason: ce.Error}
 	case http.StatusTooManyRequests:
 		return &AcquireError{Kind: FailTransient, Reason: "registry rate limited the cataloguer's pull"}
+	case http.StatusBadGateway:
+		return &AcquireError{Kind: FailTransient, Reason: reasonUnavailable, Err: errors.New(ce.Error)}
 	case http.StatusServiceUnavailable:
 		return &AcquireError{Kind: FailTransient, Reason: "cataloguer busy"}
 	case http.StatusGatewayTimeout:

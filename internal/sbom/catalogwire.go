@@ -43,6 +43,7 @@ const (
 	KindNotFound     = "not-found"    // 404
 	KindTooLarge     = "too-large"    // 413
 	KindRateLimited  = "rate-limited" // 429
+	KindUnavailable  = "unavailable"  // 502: the registry could not be reached or answered with a server error
 	KindFailed       = "failed"       // 500
 	KindBusy         = "busy"         // 503
 	KindTimeout      = "timeout"      // 504

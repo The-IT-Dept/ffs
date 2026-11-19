@@ -374,3 +374,34 @@ func TestCatalog_DebianImage(t *testing.T) {
 	}
 	require.True(t, found, "libssl3 not catalogued")
 }
+
+// TestCatalog_StaleJobDirsRemovedAtStart: the scratch volume outlives a killed catalog container, so
+// the job directories a previous run left behind are removed when the server starts; anything else
+// in the scratch directory is left alone.
+func TestCatalog_StaleJobDirsRemovedAtStart(t *testing.T) {
+	scratch := t.TempDir()
+	stale := filepath.Join(scratch, "job-0123456789abcdef")
+	require.NoError(t, os.MkdirAll(filepath.Join(stale, "layers", "sha256"), 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "layers", "sha256", "blob"), make([]byte, 4096), 0o600))
+	other := filepath.Join(scratch, "keep.txt")
+	require.NoError(t, os.WriteFile(other, []byte("not a job"), 0o600))
+
+	var calls atomic.Int32
+	serve(t, &catalog.Server{ScratchDir: scratch, Run: okRunner(&calls)})
+
+	require.NoDirExists(t, stale)
+	require.FileExists(t, other)
+}
+
+// TestExecRunner_SignalNamedOnce: a worker ended by a signal reports the signal once, not
+// "cataloguer killed by killed".
+func TestExecRunner_SignalNamedOnce(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "worker.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nkill -9 $$\n"), 0o700)) //nolint:gosec // G306: the test runs it
+
+	_, err := catalog.ExecRunner(script)(ctx, sbom.CatalogRequest{Ref: "r@sha256:" + strings.Repeat("a", 64)}, t.TempDir())
+	var we *catalog.WorkError
+	require.ErrorAs(t, err, &we)
+	require.Equal(t, sbom.KindFailed, we.Kind)
+	require.Equal(t, "cataloguer worker ended by signal 9 (killed)", we.Msg)
+}
