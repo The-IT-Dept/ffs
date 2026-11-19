@@ -283,11 +283,25 @@ func TestAPI_Suggestions(t *testing.T) {
 	srv := seeded(t)
 	_, d, _ := get(t, srv, "/api/v1/suggestions")
 	its := items(t, d)
-	require.Len(t, its, 1)
+	require.Len(t, its, 2)
 	require.Equal(t, "Deployment/shop/web", its[0]["owner"])
 	require.Equal(t, "nginx:1.30.7", its[0]["target"])
 	require.Equal(t, doc{"urgent": float64(1), "high": float64(1)}, its[0]["fixes"])
 	require.Equal(t, "fixes 1 urgent, 1 high; introduces none", its[0]["netChange"])
+
+	none := its[1]
+	require.Equal(t, "Deployment/shop/worker", none["owner"])
+	require.Equal(t, "none", none["tier"])
+	require.Equal(t, "", none["target"])
+	alt := none["alternatives"].([]any)[0].(doc)
+	require.Equal(t, "ghcr.io/example/worker:3.0.0", alt["target"])
+	require.Equal(t, "major", alt["tier"])
+
+	// a finding carries its owner's suggestion only when that upgrade fixes it
+	_, d, _ = get(t, srv, "/api/v1/findings?owner=Deployment/shop/worker&state=all")
+	for _, f := range items(t, d) {
+		require.Nil(t, f["suggestion"], f["advisory"])
+	}
 }
 
 func TestAPI_Exceptions(t *testing.T) {

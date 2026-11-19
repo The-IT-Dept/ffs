@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web"
 	"github.com/the-it-dept/ffs/internal/web/api"
 	"github.com/the-it-dept/ffs/internal/web/dashboard"
@@ -204,4 +205,34 @@ func TestDashboard_StaticAssetAndReadOnly(t *testing.T) {
 	post.Host = "localhost:8080"
 	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec, post)
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+// TestDashboard_TierNoneSuggestion is the regression test for F39: a suggestion with tier none has
+// no target, and the landing page rendered "<strong></strong> … 1.30.6 to" and "fixes none" while
+// the major alternative that does fix the findings appeared nowhere.
+func TestDashboard_TierNoneSuggestion(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	const repo = "docker.io/library/nginx"
+	require.NoError(t, st.PutSuggestion(t.Context(), webtest.Web.Key(), model.Suggestion{
+		Repo: repo, FromTag: "1.30.6", Tier: model.TierNone, EOL: "debian 12 reached end of life 2026-06-10",
+		Notes: []string{"no upgrade path in this repository"}, ComputedAt: webtest.Now,
+		Alternatives: []model.Suggestion{{Repo: repo, FromTag: "1.30.6", ToTag: "2.0.0", Tier: model.TierMajor,
+			Fixes:    map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityHigh: 1},
+			FixedIDs: []string{"CVE-2026-0001", "CVE-2026-0002"}}},
+	}, nil))
+	srv := serve(t, svc)
+	for _, p := range []string{"/", "/owners/Deployment/shop/web"} {
+		body := get(t, srv, p, 200)
+		require.NotContains(t, body, "<strong></strong>", p)
+		require.NotContains(t, body, "1.30.6 to <", p)
+		require.NotContains(t, body, "fixes none", p)
+		contains(t, body, "No upgrade in the current line fixes these findings", "debian 12 reached end of life 2026-06-10",
+			"no upgrade path in this repository", "nginx:2.0.0", "major", "fixes 1 urgent, 1 high; introduces none")
+	}
+}
+
+func TestDashboard_SeedTierNoneOnOwnerPage(t *testing.T) {
+	body := get(t, seeded(t), "/owners/Deployment/shop/worker", 200)
+	contains(t, body, "No upgrade in the current line fixes these findings", "ghcr.io/example/worker:3.0.0", "fixes 1 medium; introduces none")
+	require.NotContains(t, body, "<strong></strong>")
 }

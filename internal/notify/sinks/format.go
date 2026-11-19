@@ -92,8 +92,8 @@ func itemLines(it notify.Item) []string {
 		}
 		lines = append(lines, pkgLine(p))
 	}
-	if it.Suggestion != nil {
-		lines = append(lines, suggestionLine(it.Suggestion))
+	if s := it.Suggestion; s != nil && s.Tier != model.TierNone {
+		lines = append(lines, suggestionLine(s))
 	}
 	if l := timesLine(it); l != "" {
 		lines = append(lines, l)

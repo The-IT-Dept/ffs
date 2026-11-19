@@ -79,7 +79,8 @@ func Empty(t testing.TB) *api.Service {
 }
 
 // Seed builds the seeded fixture for cluster "test": five owners, their images, packages,
-// advisories, findings, one suggestion, feed states, end-of-life cycles, a node, and one Exception.
+// advisories, findings, two suggestions (a patch, and a tier none whose only fix is the next
+// major), feed states, end-of-life cycles, a node, and one Exception.
 func Seed(t testing.TB) (*api.Service, *store.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -183,6 +184,12 @@ func Seed(t testing.TB) (*api.Service, *store.Store) {
 		Repo: repoNginx, FromTag: "1.30.6", ToTag: "1.30.7", Tier: model.TierPatch,
 		Fixes:    map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityHigh: 1},
 		FixedIDs: []string{"CVE-2026-0001", "CVE-2026-0002"}, ComputedAt: Now,
+	}, nil))
+	// Nothing in the worker's 2.x line fixes its finding; only the next major does.
+	must(st.PutSuggestion(ctx, Worker.Key(), model.Suggestion{
+		Repo: repoWorker, FromTag: "2.1.0", Tier: model.TierNone, ComputedAt: Now,
+		Alternatives: []model.Suggestion{{Repo: repoWorker, FromTag: "2.1.0", ToTag: "3.0.0", Tier: model.TierMajor,
+			Fixes: map[model.Priority]int{model.PriorityMedium: 1}, FixedIDs: []string{"CVE-2026-0004"}, ComputedAt: Now}},
 	}, nil))
 
 	for _, f := range []struct {
