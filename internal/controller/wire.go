@@ -138,12 +138,18 @@ func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine, ev *eol.Ev
 	if c := cfg.Feeds.CVEList; c.Enabled {
 		fs = append(fs, cvelist.New(cvelist.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnCNARecords}))
 	}
+	// KEV and EPSS also observe the engine: a new match takes its KEV date and EPSS score from the
+	// last data applied before its findings are first built, not at the next sync.
 	if c := cfg.Feeds.KEV; c.Enabled {
-		fs = append(fs, kev.New(kev.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched, DataDir: cfg.DataDir}))
+		f := kev.New(kev.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched, DataDir: cfg.DataDir})
+		eng.AddObserver(f)
+		fs = append(fs, f)
 	}
 	if c := cfg.Feeds.EPSS; c.Enabled {
-		fs = append(fs, epss.New(epss.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched,
-			DataDir: cfg.DataDir, Thresholds: []float64{cfg.Priority.EPSSBump, cfg.Priority.EPSSHigh}}))
+		f := epss.New(epss.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched,
+			DataDir: cfg.DataDir, Thresholds: []float64{cfg.Priority.EPSSBump, cfg.Priority.EPSSHigh}})
+		eng.AddObserver(f)
+		fs = append(fs, f)
 	}
 	if c := cfg.Feeds.EOL; c.Enabled {
 		fs = append(fs, eolfeed.New(c, st, hc, ev.Reload))

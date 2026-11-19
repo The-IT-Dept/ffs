@@ -41,3 +41,9 @@ func canonical(ctx context.Context, q querier, id string) (string, error) {
 	m, err := canonicals(ctx, q, []string{id})
 	return m[id], err
 }
+
+// AdvisoryIDsOnDigests returns the sorted distinct advisory ids matched on digests.
+func (s *Store) AdvisoryIDsOnDigests(ctx context.Context, digests []string) ([]string, error) {
+	return queryAll(ctx, s.rdb, scanString,
+		`SELECT DISTINCT advisory_id FROM matches WHERE digest IN (SELECT value FROM json_each(?)) ORDER BY advisory_id`, idList(digests))
+}

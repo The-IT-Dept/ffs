@@ -1,6 +1,7 @@
 // Package kev reads the CISA Known Exploited Vulnerabilities catalogue (spec §6.4). A CVE in the
 // catalogue gets its KEVAdded date on the stored advisory, which makes its findings urgent
-// (spec §6.6). Only advisories already in use by a match are touched.
+// (spec §6.6). Only advisories in use by a match are touched: by the hourly sync, and, through the
+// engine observer hook, as soon as a new match is stored.
 package kev
 
 import (
@@ -14,7 +15,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 	"time"
+
+	"github.com/go-logr/logr"
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds"
@@ -47,8 +51,13 @@ type Options struct {
 	Now     func() time.Time // nil = time.Now
 }
 
-// Feed is the KEV feed. It implements feeds.Feed.
-type Feed struct{ o Options }
+// Feed is the KEV feed. It implements feeds.Feed and engine.Observer.
+type Feed struct {
+	o Options
+
+	mu    sync.Mutex
+	dates map[string]time.Time // the catalogue last applied; nil until read
+}
 
 // New returns the KEV feed.
 func New(o Options) *Feed {
@@ -93,6 +102,11 @@ func (f *Feed) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// Published before the advisories in use are read, so a match stored from now on is covered
+	// by MatchesReplaced if this pass misses it.
+	f.mu.Lock()
+	f.dates = dates
+	f.mu.Unlock()
 
 	inUse, err := f.o.Store.AdvisoryIDsInUse(ctx)
 	if err != nil {
@@ -135,6 +149,69 @@ func (f *Feed) Sync(ctx context.Context) error {
 	}
 	feeds.SetPending(&st, nil)
 	return f.o.Store.PutFeedState(ctx, st)
+}
+
+// MatchesReplaced is the engine.Observer hook. It gives the advisories now matched on digests the
+// KEV date of the catalogue last applied, so a new match is ranked with it from its first recompute:
+// the engine queues the owners after this returns. Without it a finding on a KEV-listed CVE would be
+// created at its base priority and escalate, alerting twice, at the next hourly sync; on a first
+// install that escalation would come after the baseline. Clearing a date stays with Sync. Errors are
+// logged: the next Sync applies the catalogue anyway.
+func (f *Feed) MatchesReplaced(ctx context.Context, digests []string) {
+	if err := f.applyCached(ctx, digests); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "applying the cached KEV catalogue to new matches failed; the next sync applies it")
+	}
+}
+
+// OwnersRecomputed implements engine.Observer; the feed has nothing to do then.
+func (f *Feed) OwnersRecomputed(context.Context, []string) {}
+
+func (f *Feed) applyCached(ctx context.Context, digests []string) error {
+	dates := f.cached(ctx)
+	if len(dates) == 0 {
+		return nil
+	}
+	ids, err := f.o.Store.AdvisoryIDsOnDigests(ctx, digests)
+	if err != nil {
+		return err
+	}
+	ids = slices.DeleteFunc(ids, func(id string) bool { _, ok := dates[id]; return !ok })
+	if len(ids) == 0 {
+		return nil
+	}
+	have, err := f.o.Store.Advisories(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		a, ok := have[id]
+		want := dates[id]
+		if !ok || (a.KEVAdded != nil && a.KEVAdded.Equal(want)) {
+			continue
+		}
+		if err := f.o.Store.SetAdvisoryKEV(ctx, id, &want); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cached returns the catalogue last applied, reading the cached copy on first use after a restart;
+// nil when there is none yet.
+func (f *Feed) cached(ctx context.Context) map[string]time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.dates == nil {
+		raw, err := os.ReadFile(filepath.Join(f.o.DataDir, cacheRel)) //nolint:gosec // G304: the path is under the configured data directory
+		if err != nil {
+			return nil
+		}
+		if f.dates, err = parse(raw); err != nil {
+			logr.FromContextOrDiscard(ctx).Info("the cached KEV catalogue is unreadable; new matches wait for the next sync", "error", err.Error())
+			f.dates = map[string]time.Time{} // read once; Sync replaces it
+		}
+	}
+	return f.dates
 }
 
 // savePending stores set as the feed's pending IDs.
