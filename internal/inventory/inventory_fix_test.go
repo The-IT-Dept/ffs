@@ -265,3 +265,26 @@ func TestStart_SyncsThenStops(t *testing.T) {
 		t.Fatal("Start did not return after its context ended")
 	}
 }
+
+// TestSyncAll_ExpiredUnresolvableViaIndexRetried (F9): containerd reports the index digest; a
+// platform manifest the cataloguer was refused is unresolvable, and once its window has passed it is
+// resolved again and handed back to the acquirer, also when reached through the recorded index.
+func TestSyncAll_ExpiredUnresolvableViaIndexRetried(t *testing.T) {
+	h := newHarness(t, newNode("n1", "amd64"), newPod("web", "n1", nil, "nginx:1.27", nginx+"@"+idx))
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.Equal(t, []string{mA}, h.acq.digests())
+	reason := fmt.Sprintf(registry.ReasonUnauthorized, nginx)
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: mA, IndexDigest: idx, Repo: nginx, Platform: "linux/amd64",
+		Status: model.ImageUnresolvable, StatusReason: reason, QuarantinedUntil: t0.Add(6 * time.Hour)}))
+
+	h.now = t0.Add(time.Hour)
+	h.restart()
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.Equal(t, []string{mA}, h.acq.digests(), "still inside the retry window")
+
+	h.now = t0.Add(6*time.Hour + time.Second)
+	h.restart()
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.Equal(t, []string{mA, mA}, h.acq.digests())
+}

@@ -213,10 +213,14 @@ func (n *Normalizer) Normalize(ctx context.Context, in ContainerImage) (model.Im
 		if !ok {
 			return model.Image{Digest: d, IndexDigest: digest, Repo: repo, Platform: key, Status: model.ImagePending}, nil
 		}
-		if repo != "" {
-			img.Repo = repo
+		// A platform manifest left unresolvable (the registry refused the cataloguer's pull, say) is
+		// retried through the registry once its window has passed, like any unresolvable image.
+		if img.Status != model.ImageUnresolvable || n.now().Before(img.QuarantinedUntil) {
+			if repo != "" {
+				img.Repo = repo
+			}
+			return img, nil
 		}
-		return img, nil
 	}
 	if m, err = n.r.PlatformManifest(ctx, repo, digest, key, in.Creds); err != nil {
 		return n.fail(ctx, err, digest, repo, ref, digest, key)
