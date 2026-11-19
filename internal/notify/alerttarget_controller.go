@@ -213,7 +213,8 @@ func (r *TargetReconciler) register(ctx context.Context, at *ffsv1alpha1.AlertTa
 		if apierrors.IsNotFound(err) {
 			return notReady("SecretNotFound", fmt.Sprintf("Secret %s was not found in namespace %s", key.Name, r.Namespace))
 		}
-		return notReady("SecretNotFound", fmt.Sprintf("Secret %s could not be read", key.Name))
+		ctrl.LoggerFrom(ctx).Error(err, "reading AlertTarget secret", "secret", key.String())
+		return notReady("SecretUnreadable", fmt.Sprintf("Secret %s could not be read: %v", key.Name, err))
 	}
 	cfg, sc, err := TargetConfigFrom(at, &sec, r.namespaceMatch(at))
 	if err != nil {

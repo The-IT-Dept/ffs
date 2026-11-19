@@ -2,6 +2,7 @@ package notify_test
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -282,4 +283,19 @@ func TestTargetReconciler_NamespaceMatch(t *testing.T) {
 	assert.True(t, m("web"), "matches the selector")
 	assert.False(t, m("db"))
 	assert.False(t, m("missing"))
+}
+
+type failingReader struct{ client.Reader }
+
+func (failingReader) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return errors.New("forbidden: boom")
+}
+
+func TestTargetReconciler_SecretReadErrorIsDistinct(t *testing.T) {
+	h := newRecHarness(t, alertTarget("slack", "s"))
+	h.r.Secrets = failingReader{h.c}
+	got := h.reconcile(t)
+	cond := assertCondition(t, got, "Ready", metav1.ConditionFalse, "SecretUnreadable")
+	assert.Contains(t, cond.Message, "forbidden: boom")
+	assert.Empty(t, h.factory.calls)
 }
