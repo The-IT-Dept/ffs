@@ -11,6 +11,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
+
 	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web/api"
@@ -28,6 +30,8 @@ type Dashboard struct {
 	tmpl map[string]*template.Template
 	css  []byte
 	mux  *http.ServeMux
+	// Log receives store and template failures; the zero value discards them.
+	Log logr.Logger
 }
 
 // page is what every template renders.
@@ -137,9 +141,10 @@ func New(svc *api.Service) (*Dashboard, error) {
 // ServeHTTP implements http.Handler.
 func (d *Dashboard) ServeHTTP(w http.ResponseWriter, r *http.Request) { d.mux.ServeHTTP(w, r) }
 
-func (d *Dashboard) render(w http.ResponseWriter, status int, name, title string, data any) {
+func (d *Dashboard) render(w http.ResponseWriter, r *http.Request, status int, name, title string, data any) {
 	var buf bytes.Buffer
 	if err := d.tmpl[name].ExecuteTemplate(&buf, "layout.html", page{Title: title, Cluster: d.svc.ClusterName(), Data: data}); err != nil {
+		d.Log.Error(err, "dashboard template failed", "path", r.URL.Path, "template", name)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -148,12 +153,13 @@ func (d *Dashboard) render(w http.ResponseWriter, status int, name, title string
 	_, _ = w.Write(buf.Bytes())
 }
 
-func (d *Dashboard) fail(w http.ResponseWriter, _ error) {
+func (d *Dashboard) fail(w http.ResponseWriter, r *http.Request, err error) {
+	d.Log.Error(err, "dashboard request failed", "path", r.URL.Path)
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-func (d *Dashboard) notFound(w http.ResponseWriter, _ *http.Request) {
-	d.render(w, http.StatusNotFound, "notfound", "Not found", nil)
+func (d *Dashboard) notFound(w http.ResponseWriter, r *http.Request) {
+	d.render(w, r, http.StatusNotFound, "notfound", "Not found", nil)
 }
 
 func (d *Dashboard) style(w http.ResponseWriter, _ *http.Request) {
@@ -168,7 +174,7 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 		pg, err := d.svc.Findings(ctx, api.FindingQuery{MinPriority: model.PriorityHigh,
 			States: []model.FindingState{model.StateOpen}, Limit: 1000, Offset: offset})
 		if err != nil {
-			d.fail(w, err)
+			d.fail(w, r, err)
 			return
 		}
 		fs = append(fs, pg.Items...)
@@ -179,7 +185,7 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 	}
 	owners, err := d.svc.Owners(ctx)
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	byKey := make(map[string]api.OwnerView, len(owners))
@@ -188,41 +194,41 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 	}
 	sgs, err := d.svc.Suggestions(ctx)
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "attention", "Needs attention", Attention(fs, byKey, sgs))
+	d.render(w, r, http.StatusOK, "attention", "Needs attention", Attention(fs, byKey, sgs))
 }
 
 func (d *Dashboard) workloads(w http.ResponseWriter, r *http.Request) {
 	os, err := d.svc.Owners(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "workloads", "Workloads", os)
+	d.render(w, r, http.StatusOK, "workloads", "Workloads", os)
 }
 
 func (d *Dashboard) images(w http.ResponseWriter, r *http.Request) {
 	is, err := d.svc.Images(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "images", "Images", is)
+	d.render(w, r, http.StatusOK, "images", "Images", is)
 }
 
 func (d *Dashboard) image(w http.ResponseWriter, r *http.Request) {
 	img, ok, err := d.svc.Image(r.Context(), r.PathValue("digest"))
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	if !ok {
 		d.notFound(w, r)
 		return
 	}
-	d.render(w, http.StatusOK, "image", "Image "+img.Repo, img)
+	d.render(w, r, http.StatusOK, "image", "Image "+img.Repo, img)
 }
 
 type ownerPage struct {
@@ -235,7 +241,7 @@ func (d *Dashboard) owner(w http.ResponseWriter, r *http.Request) {
 	ref := api.ParseOwnerPath(r.PathValue("kind"), r.PathValue("namespace"), r.PathValue("name"))
 	o, ok, err := d.svc.Owner(r.Context(), ref)
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	if !ok {
@@ -243,29 +249,29 @@ func (d *Dashboard) owner(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	groups, rest := groupStdlib(o.Findings)
-	d.render(w, http.StatusOK, "owner", keyLabel(ref.Key()), ownerPage{OwnerDetail: o, Groups: groups, Rest: rest})
+	d.render(w, r, http.StatusOK, "owner", keyLabel(ref.Key()), ownerPage{OwnerDetail: o, Groups: groups, Rest: rest})
 }
 
 func (d *Dashboard) vulnerabilities(w http.ResponseWriter, r *http.Request) {
 	vs, err := d.svc.Vulnerabilities(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "vulnerabilities", "Vulnerabilities", vs)
+	d.render(w, r, http.StatusOK, "vulnerabilities", "Vulnerabilities", vs)
 }
 
 func (d *Dashboard) vulnerability(w http.ResponseWriter, r *http.Request) {
 	v, ok, err := d.svc.Vulnerability(r.Context(), r.PathValue("id"))
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	if !ok {
 		d.notFound(w, r)
 		return
 	}
-	d.render(w, http.StatusOK, "vulnerability", v.ID, v)
+	d.render(w, r, http.StatusOK, "vulnerability", v.ID, v)
 }
 
 type clusterPage struct {
@@ -276,28 +282,28 @@ type clusterPage struct {
 func (d *Dashboard) cluster(w http.ResponseWriter, r *http.Request) {
 	c, err := d.svc.Cluster(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	ns, err := d.svc.Nodes(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "cluster", "Cluster", clusterPage{ClusterView: c, Nodes: ns})
+	d.render(w, r, http.StatusOK, "cluster", "Cluster", clusterPage{ClusterView: c, Nodes: ns})
 }
 
 func (d *Dashboard) node(w http.ResponseWriter, r *http.Request) {
 	n, ok, err := d.svc.Node(r.Context(), r.PathValue("name"))
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	if !ok {
 		d.notFound(w, r)
 		return
 	}
-	d.render(w, http.StatusOK, "node", "Node "+n.Name, n)
+	d.render(w, r, http.StatusOK, "node", "Node "+n.Name, n)
 }
 
 type exceptedPage struct {
@@ -308,15 +314,15 @@ type exceptedPage struct {
 func (d *Dashboard) excepted(w http.ResponseWriter, r *http.Request) {
 	pg, err := d.svc.Findings(r.Context(), api.FindingQuery{States: []model.FindingState{model.StateExcepted}, Limit: 1000})
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
 	es, err := d.svc.Exceptions(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es})
+	d.render(w, r, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es})
 }
 
 type feedsPage struct {
@@ -327,10 +333,10 @@ type feedsPage struct {
 func (d *Dashboard) feeds(w http.ResponseWriter, r *http.Request) {
 	fs, err := d.svc.Feeds(r.Context())
 	if err != nil {
-		d.fail(w, err)
+		d.fail(w, r, err)
 		return
 	}
-	d.render(w, http.StatusOK, "feeds", "Feeds", feedsPage{Feeds: fs, Sources: api.Sources})
+	d.render(w, r, http.StatusOK, "feeds", "Feeds", feedsPage{Feeds: fs, Sources: api.Sources})
 }
 
 func (d *Dashboard) search(w http.ResponseWriter, r *http.Request) {
@@ -339,9 +345,9 @@ func (d *Dashboard) search(w http.ResponseWriter, r *http.Request) {
 	if q != "" {
 		var err error
 		if res, err = d.svc.Search(r.Context(), q, ""); err != nil {
-			d.fail(w, err)
+			d.fail(w, r, err)
 			return
 		}
 	}
-	d.render(w, http.StatusOK, "search", "Search", res)
+	d.render(w, r, http.StatusOK, "search", "Search", res)
 }

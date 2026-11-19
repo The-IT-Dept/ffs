@@ -23,6 +23,7 @@ func Register(m manager.Manager, d deps.Deps) error {
 	if err != nil {
 		return fmt.Errorf("build dashboard: %w", err)
 	}
+	dash.Log = d.Log.WithName("dashboard")
 	if err := m.Add(NewServer(d.Config, api.NewHandler(svc), dash)); err != nil {
 		return fmt.Errorf("add web server: %w", err)
 	}
