@@ -17,6 +17,7 @@ import (
 const (
 	cnaSource      = "cna"
 	nvdSource      = "nvd"
+	osvSource      = "osv"
 	vexNotAffected = "not_affected"
 	runsAsRoot     = "runs as root"
 )
@@ -311,8 +312,12 @@ func (b builder) carried(c model.Finding) model.Finding {
 	if !adv.Published.IsZero() {
 		f.Published = adv.Published
 	}
-	if f.Severity == model.SeverityUnknown && adv.CNASeverity != model.SeverityUnknown {
+	switch {
+	case f.Severity != model.SeverityUnknown && f.SeveritySource != osvSource:
+	case adv.CNASeverity != model.SeverityUnknown:
 		f.Severity, f.SeveritySource = adv.CNASeverity, cnaSource
+	default:
+		f.Severity, f.SeveritySource = advisorySeverity(adv)
 	}
 	var fixed []string
 	for _, p := range f.Packages {
@@ -423,7 +428,9 @@ func fixState(vs []verdict) model.FixState {
 // vendor rating is the distro's for OS packages and GHSA's or the ecosystem's for language packages;
 // upstream and Kubernetes matches carry none (see merge), so they fall to the CNA rating. The highest
 // vendor rating wins, then the CNA rating, then a rating grype took from NVD, which comes last for
-// every kind of package.
+// every kind of package. With none of those the CVSS vectors of the advisory's OSV records rate it,
+// as source "osv": cvelistV5 backfills only 30 days, so an older CVE matched on the fast path, by
+// the upstream-runtime map or on Kubernetes would otherwise stay "severity pending" for good.
 func severity(vs []verdict, adv model.Advisory) (model.Severity, string) {
 	vendor, vendorSource, nvd := model.SeverityUnknown, "", model.SeverityUnknown
 	for _, v := range vs {
@@ -442,6 +449,14 @@ func severity(vs []verdict, adv model.Advisory) (model.Severity, string) {
 		return adv.CNASeverity, cnaSource
 	case nvd != model.SeverityUnknown:
 		return nvd, nvdSource
+	}
+	return advisorySeverity(adv)
+}
+
+// advisorySeverity is the advisory's own rating when no match carries one: its OSV records' CVSS.
+func advisorySeverity(adv model.Advisory) (model.Severity, string) {
+	if adv.OSVSeverity != model.SeverityUnknown {
+		return adv.OSVSeverity, osvSource
 	}
 	return model.SeverityUnknown, ""
 }

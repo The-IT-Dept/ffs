@@ -82,3 +82,15 @@ func TestMigration011_ClearsWithdrawn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "live", b.Title)
 }
+
+// TestUpsertAdvisory_OSVSeverityKeepsHighest (F28): records of one advisory may carry different CVSS
+// vectors; the stored rating is the highest, whatever the delivery order.
+func TestUpsertAdvisory_OSVSeverityKeepsHighest(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", OSVSeverity: model.SeverityHigh}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", OSVSeverity: model.SeverityMedium}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", Title: "no rating"}))
+	a, _, err := s.GetAdvisory(ctx, "CVE-2026-0005")
+	require.NoError(t, err)
+	require.Equal(t, model.SeverityHigh, a.OSVSeverity)
+}

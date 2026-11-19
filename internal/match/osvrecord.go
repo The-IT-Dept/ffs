@@ -48,6 +48,9 @@ func UpsertOSVAdvisory(ctx context.Context, st *store.Store, v *osvschema.Vulner
 		Modified:  osvTime(v.GetModified()),
 		Malicious: slices.ContainsFunc(cands, func(id string) bool { return strings.HasPrefix(id, "MAL-") }),
 	}
+	if v.GetWithdrawn() == nil {
+		a.OSVSeverity = RecordSeverity(v)
+	}
 	for _, r := range v.GetReferences() {
 		if u := r.GetUrl(); u != "" && !slices.Contains(a.Links, u) {
 			a.Links = append(a.Links, u)

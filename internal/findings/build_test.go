@@ -522,3 +522,33 @@ func TestBuild_CarriedFindings(t *testing.T) {
 	assert.Equal(t, model.FixNotFixed, f.FixState)
 	assert.Equal(t, model.SeverityLow, f.Severity)
 }
+
+// TestBuild_OSVSeverityFallback (F28): the CVSS rating of the advisory's OSV records is the last
+// resort, after the vendor, CNA and NVD ratings.
+func TestBuild_OSVSeverityFallback(t *testing.T) {
+	osvRated := func(a *model.Advisory) { a.OSVSeverity = model.SeverityHigh }
+	in := input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001", fixedIn("8.3.15"))}, advisory("CVE-2023-0001", osvRated))
+	f := one(t, Build(in))
+	assert.Equal(t, model.SeverityHigh, f.Severity)
+	assert.Equal(t, "osv", f.SeveritySource)
+	assert.NotContains(t, f.Reasons, "severity pending")
+
+	in = input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001", fixedIn("8.3.15"))},
+		advisory("CVE-2023-0001", osvRated, cna(model.SeverityMedium)))
+	f = one(t, Build(in))
+	assert.Equal(t, model.SeverityMedium, f.Severity, "the CNA rating comes first")
+	assert.Equal(t, "cna", f.SeveritySource)
+
+	in = input([]model.Match{match(model.SourceOSV, lodashAmd, "CVE-2023-0002", vendor(model.SeverityLow, "ghsa"))},
+		advisory("CVE-2023-0002", osvRated))
+	assert.Equal(t, model.SeverityLow, one(t, Build(in)).Severity, "a vendor rating comes first")
+
+	// a carried finding rated from OSV takes a CNA rating that arrives later
+	carried := one(t, Build(input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001")},
+		advisory("CVE-2023-0001", osvRated))))
+	in = input(nil, advisory("CVE-2023-0001", osvRated, cna(model.SeverityCritical)))
+	in.Carry = []model.Finding{carried}
+	f = one(t, Build(in))
+	assert.Equal(t, model.SeverityCritical, f.Severity)
+	assert.Equal(t, "cna", f.SeveritySource)
+}

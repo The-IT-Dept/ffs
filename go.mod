@@ -15,6 +15,7 @@ require (
 	github.com/klauspost/compress v1.20.3
 	github.com/openreports/reports-api v0.2.1
 	github.com/ossf/osv-schema/bindings/go v0.0.0-20260424063704-83285ce2a866
+	github.com/pandatix/go-cvss v0.6.4
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.2
 	github.com/robfig/cron/v3 v3.0.1
@@ -276,7 +277,6 @@ require (
 	github.com/opencontainers/selinux v1.15.1 // indirect
 	github.com/openvex/go-vex v0.2.9 // indirect
 	github.com/package-url/packageurl-go v0.1.7 // indirect
-	github.com/pandatix/go-cvss v0.6.4 // indirect
 	github.com/pborman/indent v1.2.1 // indirect
 	github.com/pelletier/go-toml v1.9.5 // indirect
 	github.com/pelletier/go-toml/v2 v2.4.3 // indirect

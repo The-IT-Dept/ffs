@@ -152,6 +152,8 @@ func mergeAdvisory(dst, src model.Advisory) model.Advisory {
 	if src.CNASource != "" {
 		dst.CNASource = src.CNASource
 	}
+	// the highest rating of any OSV record, so the result does not depend on delivery order
+	dst.OSVSeverity = max(dst.OSVSeverity, src.OSVSeverity)
 	if src.KEVAdded != nil {
 		dst.KEVAdded = src.KEVAdded
 	}
