@@ -1,0 +1,27 @@
+{
+  "schema_version": "1.7.3",
+  "id": "GO-2099-0001",
+  "published": "2025-01-01T00:00:00Z",
+  "modified": "2025-01-02T00:00:00Z",
+  "aliases": [
+    "CVE-2099-0002"
+  ],
+  "summary": "Fixture advisory for the cri-o module",
+  "affected": [
+    {
+      "package": {
+        "name": "github.com/cri-o/cri-o",
+        "ecosystem": "Go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            { "introduced": "1.30.0" },
+            { "fixed": "1.30.9" }
+          ]
+        }
+      ]
+    }
+  ]
+}

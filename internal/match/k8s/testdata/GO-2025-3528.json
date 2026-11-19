@@ -1,0 +1,46 @@
+{
+  "schema_version": "1.7.3",
+  "id": "GO-2025-3528",
+  "published": "2025-03-31T21:14:00Z",
+  "modified": "2025-04-01T15:00:00Z",
+  "aliases": [
+    "CVE-2024-40635",
+    "GHSA-265r-hfxg-fhmg"
+  ],
+  "summary": "containerd affected by a local privilege escalation via wide ownership UID or GID",
+  "details": "A container image with a UID or GID above the int32 range can run as root.",
+  "affected": [
+    {
+      "package": {
+        "name": "github.com/containerd/containerd",
+        "ecosystem": "Go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            { "introduced": "0" },
+            { "fixed": "1.6.38" },
+            { "introduced": "1.7.0" },
+            { "fixed": "1.7.27" }
+          ]
+        }
+      ]
+    },
+    {
+      "package": {
+        "name": "github.com/containerd/containerd/v2",
+        "ecosystem": "Go"
+      },
+      "ranges": [
+        {
+          "type": "SEMVER",
+          "events": [
+            { "introduced": "2.0.0" },
+            { "fixed": "2.0.4" }
+          ]
+        }
+      ]
+    }
+  ]
+}
