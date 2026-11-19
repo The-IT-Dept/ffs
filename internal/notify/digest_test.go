@@ -137,3 +137,39 @@ func TestDigest_GroupsGoStdlibPerVersion(t *testing.T) {
 	assert.Equal(t, []string{"1.22.12"}, it.FixedIn)
 	assert.Equal(t, []model.OwnerRef{owner}, it.Owners)
 }
+
+// TestDigest_BaselineFindingsBelowThresholdStayOut pins F34: the baseline records low findings
+// too, but their fixes and resolutions are not listed by a digest whose minimum is medium, so no
+// digest goes out on a day when nothing at or above medium changed. Their ledger still moves.
+func TestDigest_BaselineFindingsBelowThresholdStayOut(t *testing.T) {
+	sydney, err := time.LoadLocation("Australia/Sydney")
+	require.NoError(t, err)
+	h := newHarness(t)
+	h.at("2026-11-19T10:00+11:00")
+	lowFix := h.open(dep("shop", "a"), "CVE-L1", low)
+	lowGone := h.open(dep("shop", "b"), "CVE-L2", low)
+	medFix := h.open(dep("shop", "c"), "CVE-M1", medium)
+	h.target("ops", func(c *notify.TargetConfig) {
+		c.Digest = notify.DigestConfig{Schedule: "0 9 * * *", Location: sydney, MinPriority: medium, IncludeResolved: true}
+	})
+	h.process()
+	require.Len(t, h.sink.ofKind(notify.KindBaseline), 1)
+
+	h.at("2026-11-19T12:00+11:00")
+	h.move(lowFix, model.StateOpen, low, model.TriggerFixAvailable)
+	h.move(lowGone, model.StateResolved, low, model.TriggerInventoryChange)
+	h.at("2026-11-20T09:00+11:00")
+	h.process()
+	assert.Empty(t, h.sink.ofKind(notify.KindDigest), "nothing at or above medium changed")
+	l, err := h.st.Ledger(ctx, "uid-ops", []string{lowGone})
+	require.NoError(t, err)
+	assert.Equal(t, model.StateResolved, l[lowGone].LastState, "the resolution is still recorded")
+
+	h.at("2026-11-20T12:00+11:00")
+	h.move(medFix, model.StateOpen, medium, model.TriggerFixAvailable)
+	h.at("2026-11-21T09:00+11:00")
+	h.process()
+	d := h.sink.lastOfKind(notify.KindDigest)
+	assert.Equal(t, "ffs digest for test: 0 new, 0 escalated, 1 fix available, 0 resolved", d.Title)
+	assert.Equal(t, []string{"CVE-M1"}, ids(d, notify.EventFixAvailable))
+}

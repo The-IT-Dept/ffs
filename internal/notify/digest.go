@@ -12,8 +12,10 @@ import (
 
 // digest sends the target's scheduled summary when it is due (spec §6.10): what changed between
 // the digest cursor and the immediate cursor that was not already sent, in four sections (new,
-// escalated, fixes now available, resolved) plus feed health. When nothing qualifies, nothing is
-// sent; the cursor still moves and resolutions are still recorded in the ledger. Classifying
+// escalated, fixes now available, resolved) plus feed health. Every section keeps to the digest's
+// minimum priority; a fix or resolution counts at the priority the target was told about. When
+// nothing qualifies, nothing is sent; the cursor still moves and resolutions are still recorded in
+// the ledger. Classifying
 // against the ledger, which the immediate pass has already updated, keeps anything sent
 // immediately out of the digest.
 func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time) error {
@@ -61,10 +63,12 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 		case EventDetected, EventReopened, EventEscalated:
 			listed = tr.ToPriority >= d.MinPriority
 		case EventResolved:
-			listed = d.IncludeResolved
+			// Only what the target was told at or above its digest threshold: the baseline
+			// records every open finding, low ones included, and their resolution is no news.
+			listed = d.IncludeResolved && l.MaxPriority >= d.MinPriority
 		}
 		if (ev == "" || ev == EventFixAvailable) && r.fixSeen[fp] && tr.ToState == model.StateOpen &&
-			(l != nil || tr.ToPriority >= d.MinPriority) {
+			max(tr.ToPriority, told(l)) >= d.MinPriority {
 			ev, listed = EventFixAvailable, true
 		}
 		if listed {
@@ -90,6 +94,14 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 		c.Deliveries = []store.Delivery{dl}
 	}
 	return e.st.CommitNotify(ctx, c)
+}
+
+// told is the highest priority the target was told about a finding, PriorityNone when never.
+func told(l *store.LedgerEntry) model.Priority {
+	if l == nil {
+		return model.PriorityNone
+	}
+	return l.MaxPriority
 }
 
 // digestFire is the target's next digest time: the first scheduled time after its last digest, or
