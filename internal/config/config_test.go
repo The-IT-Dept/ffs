@@ -98,6 +98,9 @@ func TestValidate(t *testing.T) {
 		"nvd not supported":         {func(c *Config) { c.Feeds.NVD.Enabled = true }, "feeds.nvd: not supported in this release"},
 		"stale before interval":     {func(c *Config) { c.Feeds.OSV.StaleAfter = time.Minute }, "feeds.osv.staleAfter"},
 		"epss bump above high":      {func(c *Config) { c.Priority.EPSSBump = 0.6 }, "priority.epssBump"},
+		"allowed host with scheme":  {func(c *Config) { c.AllowedHosts = []string{"https://ffs.example.com"} }, "allowedHosts[0]"},
+		"allowed host with port":    {func(c *Config) { c.AllowedHosts = []string{"ffs.example.com", "ffs.example.com:443"} }, "allowedHosts[1]"},
+		"empty allowed host":        {func(c *Config) { c.AllowedHosts = []string{""} }, "allowedHosts[0]"},
 		"override without version group": {func(c *Config) {
 			c.Upgrades.Overrides = map[string]TagOverride{"docker.io/bitnami/postgresql": {Pattern: `^(\d+)-debian`}}
 		}, "upgrades.overrides[docker.io/bitnami/postgresql].pattern"},
@@ -108,6 +111,7 @@ func TestValidate(t *testing.T) {
 	}
 	c := Default()
 	c.Feeds.ChainguardOSV.Enabled = true // switch only: interval 0 and staleAfter 0 are fine
+	c.AllowedHosts = []string{"ffs.example.com", "ffs-web.ffs.svc.cluster.local", "FFS.Example.com."}
 	require.NoError(t, c.Validate())
 	c.CRD.MaxFindings, c.Catalog.Concurrency = -1, 0
 	err := c.Validate()

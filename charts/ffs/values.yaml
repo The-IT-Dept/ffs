@@ -131,6 +131,8 @@ config:
   dataDir: /var/lib/ffs
   # Dashboard and API listen address.
   listen: 127.0.0.1:8080
+  # Host names the dashboard answers besides localhost and IP addresses; web.service.enabled adds the Service's names.
+  allowedHosts: []
   # External dashboard URL used in links.
   dashboardURL: ""
   # Cataloguer socket and limits.

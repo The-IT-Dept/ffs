@@ -200,7 +200,8 @@ func TestDashboard_StaticAssetAndReadOnly(t *testing.T) {
 	require.Equal(t, "text/css; charset=utf-8", res.Header.Get("Content-Type"))
 
 	rec := httptest.NewRecorder()
-	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec,
-		httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil))
+	post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil)
+	post.Host = "localhost:8080"
+	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec, post)
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
 }

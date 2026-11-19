@@ -560,3 +560,23 @@ func TestChart_ScratchLimitQuantities(t *testing.T) {
 		require.ErrorContains(t, err, c.want, c.set)
 	}
 }
+
+// TestChart_WebServiceLoopbackGuardAndHosts covers the F11 chart side: the loopback guard knows
+// localhost and [::1], and a dashboard Service adds its own DNS names to config.allowedHosts so a
+// proxy that forwards the Service name is answered.
+func TestChart_WebServiceLoopbackGuardAndHosts(t *testing.T) {
+	for _, listen := range []string{"localhost:8080", "[::1]:8080", "127.0.0.2:8080"} {
+		_, err := renderErr(t, "web.service.enabled=true", "config.listen="+listen)
+		require.ErrorContains(t, err, "web.service.enabled needs config.listen bound beyond loopback", listen)
+	}
+	var c config.Config
+	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, render(t))), &c))
+	require.Empty(t, c.AllowedHosts)
+
+	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", "config.allowedHosts={ffs.example.com}")
+	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, o)), &c))
+	require.Equal(t, []string{"ffs.example.com", "ffs-web", "ffs-web.ffs", "ffs-web.ffs.svc", "ffs-web.ffs.svc.cluster.local"}, c.AllowedHosts)
+	path := writeTemp(t, renderedConfig(t, o))
+	_, err := config.Load(path)
+	require.NoError(t, err)
+}

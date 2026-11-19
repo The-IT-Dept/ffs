@@ -14,6 +14,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `storePath` | `/var/lib/ffs/ffs.db` | Path of the SQLite store. The chart requires it to be under `dataDir`, because only `dataDir` is on the persistent volume. |
 | `dataDir` | `/var/lib/ffs` | Directory for the store and feed data, including the Grype database. The chart mounts the persistent volume here. |
 | `listen` | `127.0.0.1:8080` | Listen address of the dashboard and read-only API. The default is reachable only through `kubectl port-forward`. See [Exposing the dashboard](#exposing-the-dashboard). |
+| `allowedHosts` | `[]` | Host names the dashboard and API answer to besides `localhost` and IP addresses, for example the name your authenticating proxy forwards. Requests for any other host get `421 Misdirected Request`, which stops a web page from reading the API through DNS rebinding while you port-forward. Names only, without scheme or port. With `web.service.enabled`, the chart adds the Service's DNS names. |
 | `dashboardURL` | `""` | External dashboard URL. When set, alerts link to `<dashboardURL>/vulnerabilities/<advisory-id>`. Must be an absolute http(s) URL. |
 | `catalog.socket` | `/run/ffs/catalog.sock` | Unix socket between the controller and catalog containers. The chart mounts its directory in both. |
 | `catalog.timeout` | `10m` | Time limit for cataloguing one image. |
@@ -125,9 +126,13 @@ To serve them to more people, put your own authenticating proxy (for example oau
 ```yaml
 config:
   listen: 0.0.0.0:8080
+  allowedHosts:
+    - ffs.example.com
 web:
   service:
     enabled: true
 ```
+
+The dashboard answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
 
 This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the dashboard shows, so restrict it with a NetworkPolicy to the proxy alone, and do not expose the Service directly through an Ingress or Gateway.

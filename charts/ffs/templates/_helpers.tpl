@@ -33,6 +33,12 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- $reg := get $c "registry" | default dict -}}
 {{- $_ = set $reg "readPullSecrets" .Values.rbac.readPullSecrets -}}
 {{- $_ = set $c "registry" $reg -}}
+{{- if .Values.web.service.enabled -}}
+{{- $svc := printf "%s-web" (include "ffs.fullname" .) -}}
+{{- $ns := .Release.Namespace -}}
+{{- $names := list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) -}}
+{{- $_ = set $c "allowedHosts" (concat (get $c "allowedHosts" | default list) $names | uniq) -}}
+{{- end -}}
 {{- toYaml $c -}}
 {{- end -}}
 
