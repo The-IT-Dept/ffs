@@ -105,8 +105,8 @@ func notePrefix(reason string, n int) string {
 
 // buildNote returns the event type and note for the items of one reason. Items are ordered by
 // priority descending, then advisory ID; listing stops, with " and N more", before the note would
-// pass MaxNoteBytes.
-func buildNote(reason string, items []item) (eventType, note string) {
+// pass MaxNoteBytes. The returned note includes ownerPrefix, which counts against the budget.
+func buildNote(reason, ownerPrefix string, items []item) (eventType, note string) {
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].priority != items[j].priority {
 			return items[i].priority > items[j].priority
@@ -119,6 +119,7 @@ func buildNote(reason string, items []item) (eventType, note string) {
 	}
 	prefix := notePrefix(reason, len(items))
 	var b strings.Builder
+	b.WriteString(ownerPrefix)
 	b.WriteString(prefix)
 	listed := 0
 	for i, it := range items {

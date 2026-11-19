@@ -150,8 +150,8 @@ func (e *Emitter) emitBatch(ctx context.Context, batch []model.Transition, min m
 			for _, t := range ts {
 				items = append(items, buildItem(reason, t, findings[t.Fingerprint]))
 			}
-			eventType, note := buildNote(reason, items)
-			e.o.Recorder.Eventf(ref, nil, eventType, reason, "Evaluate", "%s", prefix+note)
+			eventType, note := buildNote(reason, prefix, items)
+			e.o.Recorder.Eventf(ref, nil, eventType, reason, "Evaluate", "%s", note)
 		}
 	}
 	return nil
