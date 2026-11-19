@@ -1,0 +1,70 @@
+{
+  "schema_version": "1.9.0",
+  "id": "GHSA-9wx4-h78v-vm56",
+  "published": "2024-05-20T20:15:00Z",
+  "modified": "2026-09-10T03:50:13.740879755Z",
+  "aliases": [
+    "CVE-2024-35195",
+    "PYSEC-2026-1873"
+  ],
+  "summary": "Requests `Session` object does not verify requests after making first request with verify=False",
+  "details": "When using a `requests.Session`, if the first request to a given origin is made with `verify=False`, TLS certificate verification may remain disabled for all subsequent requests to that origin, even if `verify=True` is explicitly specified later.\n\nThis occurs because the underlying connection is reused from the session's connection pool, causing the initial TLS verification setting to persist for...",
+  "affected": [
+    {
+      "package": {
+        "name": "requests",
+        "ecosystem": "PyPI",
+        "purl": "pkg:pypi/requests"
+      },
+      "ranges": [
+        {
+          "type": "ECOSYSTEM",
+          "events": [
+            {
+              "introduced": "0"
+            },
+            {
+              "fixed": "2.32.0"
+            }
+          ]
+        }
+      ],
+      "versions": [
+        "2.30.0",
+        "2.31.0"
+      ],
+      "database_specific": {
+        "source": "https://github.com/github/advisory-database/blob/main/advisories/github-reviewed/2024/05/GHSA-9wx4-h78v-vm56/GHSA-9wx4-h78v-vm56.json"
+      }
+    }
+  ],
+  "references": [
+    {
+      "type": "WEB",
+      "url": "https://github.com/psf/requests/security/advisories/GHSA-9wx4-h78v-vm56"
+    },
+    {
+      "type": "ADVISORY",
+      "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-35195"
+    },
+    {
+      "type": "WEB",
+      "url": "https://github.com/psf/requests/pull/6655"
+    }
+  ],
+  "database_specific": {
+    "cwe_ids": [
+      "CWE-670"
+    ],
+    "github_reviewed": true,
+    "github_reviewed_at": "2024-05-20T20:15:00Z",
+    "nvd_published_at": "2024-05-20T21:15:09Z",
+    "severity": "MODERATE"
+  },
+  "severity": [
+    {
+      "type": "CVSS_V3",
+      "score": "CVSS:3.1/AV:L/AC:H/PR:H/UI:R/S:U/C:H/I:H/A:N"
+    }
+  ]
+}

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 
+	"github.com/the-it-dept/ffs/internal/feeds/osv"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -36,6 +37,13 @@ type Matcher interface {
 type Delta struct {
 	Scope   store.MatchScope
 	Matches []model.Match
+}
+
+// RecordMatcher is implemented by the record-driven matchers (osvfast, upstream, k8s). ApplyOSV
+// re-evaluates the advisories of changed OSV records and returns one Delta per advisory, scoped to
+// the matcher's source and that advisory, so matches the records no longer support are removed.
+type RecordMatcher interface {
+	ApplyOSV(ctx context.Context, recs []osv.Changed) ([]Delta, error)
 }
 
 // IsSynthetic reports whether digest names a synthetic cluster-level subject rather than an image.

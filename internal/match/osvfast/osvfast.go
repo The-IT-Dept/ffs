@@ -1,0 +1,357 @@
+// Package osvfast is the OSV fast path (spec §6.5). Changed OSV records reach the stored packages
+// through the inverted package index and are evaluated with osv-scalibr's semantic versions, so a
+// new or changed advisory produces matches within minutes instead of waiting for the next Grype DB.
+// Debian, Ubuntu, Alpine, Wolfi and Chainguard records name source packages and are joined through
+// the stored source name. Go vulndb is the authority for the Go standard library. Ecosystems that
+// semantic does not compare the way grype does (Linux, Android, Azure Linux, GIT) are skipped, as
+// are rpm entries whose epochs disagree with the installed version's and kernel-header packages.
+package osvfast
+
+import (
+	"context"
+	"errors"
+	"maps"
+	"slices"
+	"strings"
+
+	"github.com/go-logr/logr"
+	"github.com/google/osv-scalibr/semantic"
+	"github.com/ossf/osv-schema/bindings/go/osvschema"
+
+	"github.com/the-it-dept/ffs/internal/feeds/osv"
+	"github.com/the-it-dept/ffs/internal/match"
+	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
+)
+
+const (
+	bucketDebian = "Debian"
+	bucketPyPI   = "PyPI"
+	bucketMaven  = "Maven"
+	goModule     = "go-module"
+	goStdlib     = "stdlib"
+)
+
+// skippedBuckets are the ecosystems the fast path leaves to other matchers: semantic does not
+// compare them the way grype does, or (GIT) they are the upstream and Kubernetes matchers' records.
+var skippedBuckets = map[string]bool{osv.BucketGIT: true, "Linux": true, "Android": true, "Azure Linux": true}
+
+// Matcher is the OSV fast-path matcher. It is safe for concurrent use.
+type Matcher struct{ st *store.Store }
+
+var (
+	_ match.Matcher       = (*Matcher)(nil)
+	_ match.RecordMatcher = (*Matcher)(nil)
+)
+
+// New returns a matcher over the OSV records cached in st.
+func New(st *store.Store) *Matcher { return &Matcher{st: st} }
+
+// Source implements match.Matcher.
+func (m *Matcher) Source() model.MatchSource { return model.SourceOSV }
+
+// MatchImage implements match.Matcher. It looks up the cached records indexed under the image's
+// packages, bucket by bucket, and evaluates them against those packages. Synthetic digests get no
+// matches.
+func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
+	if match.IsSynthetic(in.Digest) {
+		return nil, nil
+	}
+	byBucket := map[string][]model.Package{}
+	for _, p := range in.Packages {
+		if eco, ok := osv.PackageEcosystem(p); ok {
+			b := osv.BucketOf(eco)
+			byBucket[b] = append(byBucket[b], p)
+		}
+	}
+	var ms matchSet
+	canon := map[string]string{}
+	for _, b := range slices.Sorted(maps.Keys(byBucket)) {
+		pkgs := byBucket[b]
+		var names []string
+		for _, p := range pkgs {
+			names = append(names, osv.PackageIndexNames(p)...)
+		}
+		slices.Sort(names)
+		ids, err := m.st.OSVRecordIDsByName(ctx, b, slices.Compact(names))
+		if err != nil {
+			return nil, err
+		}
+		recs, err := m.records(ctx, ids, nil)
+		if err != nil {
+			return nil, err
+		}
+		idx := indexPackages(pkgs)
+		for _, v := range recs {
+			adv, ok := canon[v.GetId()]
+			if !ok {
+				if adv, err = m.st.Canonical(ctx, v.GetId()); err != nil {
+					return nil, err
+				}
+				canon[v.GetId()] = adv
+			}
+			evalRecord(ctx, v, adv, idx, &ms)
+		}
+	}
+	return ms.list, nil
+}
+
+// ApplyOSV implements match.RecordMatcher. It stores the advisory of every changed record outside
+// the skipped ecosystems, then re-evaluates each advisory touched from all of its cached records,
+// the changed ones taking the place of their cached copies, against the packages they name. Each
+// advisory gets one Delta scoped to the osv source and that advisory, so a withdrawn or narrowed
+// record drops the matches it no longer supports. An unreadable record is skipped; only store
+// failures are errors.
+func (m *Matcher) ApplyOSV(ctx context.Context, recs []osv.Changed) ([]match.Delta, error) {
+	log := logr.FromContextOrDiscard(ctx)
+	changed := map[string]*osvschema.Vulnerability{}
+	for _, r := range recs {
+		if skippedBuckets[r.Ecosystem] || osv.SkipID(r.Ecosystem, r.ID) {
+			continue
+		}
+		v, err := match.ParseOSV(r.Raw)
+		if err != nil || v.GetId() == "" {
+			log.V(1).Info("skipping an unreadable OSV record", "bucket", r.Ecosystem, "id", r.ID, "error", err)
+			continue
+		}
+		if _, err := match.UpsertOSVAdvisory(ctx, m.st, v); err != nil {
+			return nil, err
+		}
+		changed[v.GetId()] = v
+	}
+	// Resolve canonicals once every record is stored: a later record can merge an earlier one's
+	// advisory into another.
+	byAdv := map[string]map[string]*osvschema.Vulnerability{}
+	for id, v := range changed {
+		adv, err := m.st.Canonical(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if byAdv[adv] == nil {
+			byAdv[adv] = map[string]*osvschema.Vulnerability{}
+		}
+		byAdv[adv][id] = v
+	}
+
+	deltas := make([]match.Delta, 0, len(byAdv))
+	for _, adv := range slices.Sorted(maps.Keys(byAdv)) {
+		ms, err := m.evalAdvisory(ctx, adv, byAdv[adv])
+		if err != nil {
+			return nil, err
+		}
+		deltas = append(deltas, match.Delta{
+			Scope:   store.MatchScope{Source: model.SourceOSV, AdvisoryIDs: []string{adv}},
+			Matches: ms,
+		})
+	}
+	return deltas, nil
+}
+
+// evalAdvisory evaluates every cached record of adv, with the changed records overriding their
+// cached copies, against the stored packages the records name.
+func (m *Matcher) evalAdvisory(ctx context.Context, adv string, changed map[string]*osvschema.Vulnerability) ([]model.Match, error) {
+	ids, err := match.AdvisoryRecordIDs(ctx, m.st, adv)
+	if err != nil {
+		return nil, err
+	}
+	recs, err := m.records(ctx, ids, changed)
+	if err != nil {
+		return nil, err
+	}
+	pkgs, err := m.candidates(ctx, recs)
+	if err != nil {
+		return nil, err
+	}
+	idx := indexPackages(pkgs)
+	var ms matchSet
+	for _, v := range recs {
+		evalRecord(ctx, v, adv, idx, &ms)
+	}
+	return ms.list, nil
+}
+
+// records returns the cached records with ids, with override replacing (or adding) records by id,
+// sorted by id. Cached records that do not parse are skipped.
+func (m *Matcher) records(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, error) {
+	raws, err := m.st.OSVRecordsByID(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	byID := maps.Clone(override)
+	if byID == nil {
+		byID = map[string]*osvschema.Vulnerability{}
+	}
+	for _, raw := range raws {
+		v, err := match.ParseOSV(raw)
+		if err != nil {
+			logr.FromContextOrDiscard(ctx).V(1).Info("skipping an unreadable cached OSV record", "error", err.Error())
+			continue
+		}
+		if _, ok := byID[v.GetId()]; !ok {
+			byID[v.GetId()] = v
+		}
+	}
+	out := make([]*osvschema.Vulnerability, 0, len(byID))
+	for _, id := range slices.Sorted(maps.Keys(byID)) {
+		out = append(out, byID[id])
+	}
+	return out, nil
+}
+
+// candidates returns the stored packages the affected entries of recs can name, from the inverted
+// index: by source and by binary name in source-join buckets, by name, lowercase name and index name
+// for PyPI, by artifact ID for Maven (the group is checked against the PURL later) and by name
+// elsewhere. Withdrawn records and skipped ecosystems name none.
+func (m *Matcher) candidates(ctx context.Context, recs []*osvschema.Vulnerability) ([]model.Package, error) {
+	type query struct {
+		typ, name string
+		bySource  bool
+	}
+	seen := map[query]bool{}
+	var out []model.Package
+	for _, v := range recs {
+		if v.GetWithdrawn() != nil {
+			continue
+		}
+		for _, a := range v.GetAffected() {
+			b := osv.BucketOf(osv.NormalizeRecordEcosystem(a.GetPackage().GetEcosystem()))
+			typ, name := osv.SyftType(b), a.GetPackage().GetName()
+			if skippedBuckets[b] || osv.SkipID(b, v.GetId()) || typ == "" || name == "" {
+				continue
+			}
+			var qs []query
+			switch {
+			case osv.SourceJoin(b):
+				qs = []query{{typ, name, true}, {typ, name, false}}
+			case b == bucketPyPI:
+				qs = []query{{typ, name, false}, {typ, strings.ToLower(name), false}, {typ, osv.IndexName(b, name), false}}
+			case b == bucketMaven:
+				_, artifact, _ := strings.Cut(name, ":")
+				qs = []query{{typ, artifact, false}}
+			default:
+				qs = []query{{typ, name, false}}
+			}
+			for _, q := range qs {
+				if seen[q] || q.name == "" {
+					continue
+				}
+				seen[q] = true
+				pkgs, err := m.st.PackagesByName(ctx, q.typ, nil, q.name, q.bySource)
+				if err != nil {
+					return nil, err
+				}
+				out = append(out, pkgs...)
+			}
+		}
+	}
+	return out, nil
+}
+
+// pkgKey is what an affected entry names: a normalised record ecosystem and an index name.
+type pkgKey struct{ eco, name string }
+
+// indexPackages indexes the packages the fast path may match by their ecosystem and index names,
+// once each, leaving out synthetic subjects, kernel-header packages and packages outside the OSV
+// ecosystems.
+func indexPackages(pkgs []model.Package) map[pkgKey][]model.Package {
+	idx := map[pkgKey][]model.Package{}
+	seen := map[string]bool{}
+	for _, p := range pkgs {
+		if p.ID != "" && seen[p.ID] || match.IsSynthetic(p.ImageDigest) || match.IsKernelHeader(p) {
+			continue
+		}
+		eco, ok := osv.PackageEcosystem(p)
+		if !ok {
+			continue
+		}
+		seen[p.ID] = true
+		for _, n := range osv.PackageIndexNames(p) {
+			k := pkgKey{eco, n}
+			idx[k] = append(idx[k], p)
+		}
+	}
+	return idx
+}
+
+// evalRecord adds to ms the matches of record v, whose canonical advisory is adv, against the
+// indexed packages. Withdrawn records, skipped ecosystems and notice records match nothing.
+func evalRecord(ctx context.Context, v *osvschema.Vulnerability, adv string, idx map[pkgKey][]model.Package, ms *matchSet) {
+	if v.GetWithdrawn() != nil {
+		return
+	}
+	log := logr.FromContextOrDiscard(ctx)
+	for _, a := range v.GetAffected() {
+		eco := osv.NormalizeRecordEcosystem(a.GetPackage().GetEcosystem())
+		b := osv.BucketOf(eco)
+		if skippedBuckets[b] || osv.SkipID(b, v.GetId()) {
+			continue
+		}
+		pkgs := idx[pkgKey{eco, osv.IndexName(b, a.GetPackage().GetName())}]
+		if len(pkgs) == 0 {
+			continue
+		}
+		sev, sevSource := vendorSeverity(v, a, b)
+		for _, p := range pkgs {
+			version, ok := InstalledVersion(p)
+			if !ok || osv.SyftType(b) == "rpm" && epochMismatch(a, version) {
+				continue
+			}
+			affected, fs, fixed, err := Evaluate(a, version)
+			if errors.Is(err, semantic.ErrUnsupportedEcosystem) {
+				break
+			}
+			if err != nil {
+				log.V(1).Info("skipping an OSV entry that does not evaluate", "id", v.GetId(), "ecosystem", eco,
+					"package", p.Name, "version", version, "error", err.Error())
+				continue
+			}
+			if !affected {
+				continue
+			}
+			ms.add(model.Match{
+				ImageDigest:          p.ImageDigest,
+				PackageID:            p.ID,
+				AdvisoryID:           adv,
+				Source:               model.SourceOSV,
+				FixState:             fs,
+				FixedVersions:        fixed,
+				VendorSeverity:       sev,
+				VendorSeveritySource: sevSource,
+				Namespace:            eco,
+			})
+		}
+	}
+}
+
+// matchSet collects matches, merging those for the same package and advisory: several records
+// (PYSEC and GHSA, say) or affected entries can name one package. Fixed versions are unioned and
+// the first vendor severity found is kept.
+type matchSet struct {
+	list []model.Match
+	at   map[[3]string]int
+}
+
+func (s *matchSet) add(m model.Match) {
+	k := [3]string{m.ImageDigest, m.PackageID, m.AdvisoryID}
+	i, ok := s.at[k]
+	if !ok {
+		if s.at == nil {
+			s.at = map[[3]string]int{}
+		}
+		s.at[k] = len(s.list)
+		s.list = append(s.list, m)
+		return
+	}
+	cur := &s.list[i]
+	for _, f := range m.FixedVersions {
+		if !slices.Contains(cur.FixedVersions, f) {
+			cur.FixedVersions = append(cur.FixedVersions, f)
+		}
+	}
+	if len(cur.FixedVersions) > 0 {
+		cur.FixState = model.FixFixed
+	}
+	if cur.VendorSeverity == model.SeverityUnknown {
+		cur.VendorSeverity, cur.VendorSeveritySource = m.VendorSeverity, m.VendorSeveritySource
+	}
+}
