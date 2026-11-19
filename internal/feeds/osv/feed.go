@@ -2,8 +2,9 @@
 // ecosystems present in the inventory (plus Go and GIT), reads each bucket's modified_id.csv down
 // to its watermark, caches the changed records locally and hands a record to the handler only when
 // its affected set, aliases or withdrawn time changed: most modifications only touch timestamps.
-// A weekly set-diff withdraws records that left the bucket, and records outside Go and GIT are
-// pruned after 14 days unless the osv source still matches them.
+// A cached GIT record that stops referencing the GitRepos repositories is handed off once more
+// and then dropped from the cache. A weekly set-diff withdraws records that left the bucket, and
+// records outside Go and GIT are pruned after 14 days unless the osv source still matches them.
 package osv
 
 import (
@@ -274,13 +275,18 @@ func (f *Feed) watermark(st store.FeedState, b string) time.Time {
 	return f.o.Now().UTC().Add(-firstPollWindow)
 }
 
-// take fetches and caches the records ids of b, returning the ones whose affected hash changed
-// (on an error, those changed so far, which the caller still hands off). Above the bulk threshold
-// it reads them from all.zip. Every candidate is pending while the cache is written, so a crash
-// between a record's write and its hand-off cannot lose it.
+// take fetches and caches the records ids of b, returning the ones to hand off: those whose
+// affected hash changed and dropped GIT records (see put); on an error, those so far, which the
+// caller still hands off. Above the bulk threshold it reads them from all.zip. Every candidate is
+// pending while the cache is written, so a crash between a record's write and its hand-off cannot
+// lose it.
 func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []string) ([]recKey, error) {
 	if len(ids) == 0 {
 		return nil, nil
+	}
+	gitCached, err := f.gitCached(ctx, b)
+	if err != nil {
+		return nil, err
 	}
 	setPendingKeys := func() error {
 		keys := make([]recKey, len(ids))
@@ -303,7 +309,7 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []st
 		for _, id := range ids {
 			want[id] = true
 		}
-		return f.storeZip(ctx, b, path, want)
+		return f.storeZip(ctx, b, path, want, gitCached)
 	}
 
 	raws, err := f.fetchRecords(ctx, b, ids)
@@ -313,20 +319,37 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []st
 	if err := setPendingKeys(); err != nil {
 		return nil, err
 	}
-	var changed []recKey
+	var out []recKey
 	for i, raw := range raws {
 		if raw == nil {
 			continue
 		}
-		_, ch, err := f.put(ctx, b, ids[i], raw)
+		res, err := f.put(ctx, b, ids[i], raw, gitCached)
 		if err != nil {
-			return changed, err
+			return out, err
 		}
-		if ch {
-			changed = append(changed, recKey{b, ids[i]})
+		if res == putChanged || res == putDropped {
+			out = append(out, recKey{b, ids[i]})
 		}
 	}
-	return changed, nil
+	return out, nil
+}
+
+// gitCached returns the IDs held in the GIT cache when b is GIT, else nil. put needs them to notice
+// a cached GIT record that no longer references a GitRepos repository.
+func (f *Feed) gitCached(ctx context.Context, b string) (map[string]bool, error) {
+	if b != BucketGIT {
+		return nil, nil
+	}
+	ids, err := f.o.Store.OSVRecordIDs(ctx, b)
+	if err != nil {
+		return nil, err
+	}
+	m := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		m[id] = true
+	}
+	return m, nil
 }
 
 // fetchRecords GETs <b>/<id>.json for each id, 8 at a time. A missing or oversized record is
@@ -355,10 +378,21 @@ func (f *Feed) fetchRecords(ctx context.Context, b string, ids []string) ([][]by
 	return out, g.Wait()
 }
 
-// put caches one record of b. kept is false when the record is skipped: unparseable, not the
-// requested ID, or a GIT record for a repository not in GitRepos. changed is true when its affected
-// hash is new or differs, and then its index names are rewritten.
-func (f *Feed) put(ctx context.Context, b, id string, raw []byte) (kept, changed bool, err error) {
+// putResult is what put did with a record.
+type putResult uint8
+
+const (
+	putSkipped   putResult = iota // unreadable, not the requested ID, or an uncached GIT record outside GitRepos
+	putUnchanged                  // cached, with the affected hash it already had
+	putChanged                    // new, or its affected hash changed; its index names were rewritten
+	putDropped                    // a cached GIT record that no longer references a GitRepos repository
+)
+
+// put caches one record of b. A GIT record that references no GitRepos repository is skipped,
+// unless the GIT cache holds it (gitCached): its repository mapping changed, and the cached copy
+// would keep matching the old repository for good. The new raw then replaces the cached one with
+// no index names, and deliverKeys hands it off and deletes it from the cache.
+func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[string]bool) (putResult, error) {
 	info, err := parseRecord(raw)
 	if err == nil && info.ID != id {
 		err = fmt.Errorf("osv: record %s has id %q", id, info.ID)
@@ -369,16 +403,31 @@ func (f *Feed) put(ctx context.Context, b, id string, raw []byte) (kept, changed
 	}
 	if err != nil {
 		logr.FromContextOrDiscard(ctx).Info("skipping an unreadable OSV record", "bucket", b, "id", id, "error", err.Error())
-		return false, false, nil
+		return putSkipped, nil
 	}
-	if b == BucketGIT && !slices.ContainsFunc(info.gitRepos(), func(r string) bool { return f.gitRepos[r] }) {
-		return false, false, nil
+	modified := info.modified(f.o.Now().UTC())
+	if b == BucketGIT && !f.tracked(info) {
+		if !gitCached[id] {
+			return putSkipped, nil
+		}
+		if _, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw); err != nil {
+			return putSkipped, err
+		}
+		return putDropped, f.o.Store.PutOSVRecordNames(ctx, b, id, nil)
 	}
-	changed, err = f.o.Store.PutOSVRecord(ctx, b, id, info.modified(f.o.Now().UTC()), hash, raw)
-	if err != nil || !changed {
-		return true, false, err
+	changed, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw)
+	switch {
+	case err != nil:
+		return putSkipped, err
+	case !changed:
+		return putUnchanged, nil
 	}
-	return true, true, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
+	return putChanged, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
+}
+
+// tracked reports whether a GIT record references one of the GitRepos repositories.
+func (f *Feed) tracked(info recordInfo) bool {
+	return slices.ContainsFunc(info.gitRepos(), func(r string) bool { return f.gitRepos[r] })
 }
 
 // downloadZip downloads <b>/all.zip to DataDir/osv/<b>-all.zip and returns its path.
@@ -395,10 +444,10 @@ func (f *Feed) downloadZip(ctx context.Context, b string) (string, error) {
 }
 
 // storeZip caches the records in the all.zip at path: those named in want, or every record when
-// want is nil. It returns the records to hand off: the changed ones, or with want nil (a bootstrap,
-// which may be re-running after a crash) every kept one, including on an error those so far. Entries
-// other than plain "<id>.json" files of at most 4 MiB are ignored.
-func (f *Feed) storeZip(ctx context.Context, b, path string, want map[string]bool) ([]recKey, error) {
+// want is nil. It returns the records to hand off: the changed and dropped ones (see put), or with
+// want nil (a bootstrap, which may be re-running after a crash) every cached one, including on an
+// error those so far. Entries other than plain "<id>.json" files of at most 4 MiB are ignored.
+func (f *Feed) storeZip(ctx context.Context, b, path string, want, gitCached map[string]bool) ([]recKey, error) {
 	zr, err := zip.OpenReader(path)
 	if err != nil {
 		return nil, fmt.Errorf("osv: %s all.zip: %w", b, err)
@@ -422,11 +471,11 @@ func (f *Feed) storeZip(ctx context.Context, b, path string, want map[string]boo
 		if err != nil {
 			return out, fmt.Errorf("osv: %s all.zip %s: %w", b, zf.Name, err)
 		}
-		kept, changed, err := f.put(ctx, b, id, raw)
+		res, err := f.put(ctx, b, id, raw, gitCached)
 		if err != nil {
 			return out, err
 		}
-		if changed || (want == nil && kept) {
+		if res == putChanged || res == putDropped || (want == nil && res == putUnchanged) {
 			out = append(out, recKey{b, id})
 		}
 	}
@@ -454,8 +503,9 @@ func readEntry(zf *zip.File) ([]byte, error) {
 }
 
 // bootstrap loads all of Go or GIT from all.zip (GIT filtered to GitRepos) and hands off every kept
-// record. The watermark is the newest modified_id.csv row read before the download, or now for an
-// empty listing, so polling resumes with nothing missed.
+// record, and, on a GIT reload, every cached one the filter now drops. The watermark is the newest
+// modified_id.csv row read before the download, or now for an empty listing, so polling resumes
+// with nothing missed.
 func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) error {
 	now := f.o.Now().UTC()
 	rd := newCSVReader(f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
@@ -467,12 +517,16 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 	if len(rows) > 0 {
 		wm = rows[0].ts
 	}
+	gitCached, err := f.gitCached(ctx, b)
+	if err != nil {
+		return err
+	}
 	path, err := f.downloadZip(ctx, b)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = os.Remove(path) }()
-	keys, err := f.storeZip(ctx, b, path, nil)
+	keys, err := f.storeZip(ctx, b, path, nil, gitCached)
 	if err != nil {
 		return err
 	}
@@ -507,7 +561,9 @@ func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) 
 }
 
 // deliverKeys hands the cached records of keys to the handler in chunks of 500, skipping records no
-// longer cached. With refreshNames it first rewrites each record's index names.
+// longer cached. With refreshNames it first rewrites each record's index names. A GIT record that
+// references no GitRepos repository is a drop (see put): once the handler has taken it, it is
+// deleted from the cache. Deciding this from the cached raw lets a redelivery finish a drop.
 func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool) error {
 	for chunk := range slices.Chunk(keys, handlerChunk) {
 		ids := make([]string, len(chunk))
@@ -526,13 +582,23 @@ func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool
 			}
 		}
 		recs := make([]Changed, 0, len(chunk))
+		var drops []string
 		for _, k := range chunk {
 			raw, ok := rawByID[k.id]
 			if !ok {
 				continue
 			}
+			info := byID[k.id]
+			drop := k.bucket == BucketGIT && !f.tracked(info)
+			if drop {
+				drops = append(drops, k.id)
+			}
 			if refreshNames {
-				if err := f.o.Store.PutOSVRecordNames(ctx, k.bucket, k.id, byID[k.id].names(k.bucket)); err != nil {
+				var names []string
+				if !drop {
+					names = info.names(k.bucket)
+				}
+				if err := f.o.Store.PutOSVRecordNames(ctx, k.bucket, k.id, names); err != nil {
 					return err
 				}
 			}
@@ -540,6 +606,11 @@ func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool
 		}
 		if err := f.deliver(ctx, recs); err != nil {
 			return err
+		}
+		if len(drops) > 0 {
+			if err := f.o.Store.DeleteOSVRecords(ctx, BucketGIT, drops); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

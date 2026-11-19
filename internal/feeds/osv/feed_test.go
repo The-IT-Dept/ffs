@@ -556,6 +556,122 @@ func TestOSVBootstrap_GoFullGITFiltered(t *testing.T) {
 	require.Equal(t, []string{"CVE-2026-1001", "CVE-2026-1002", "CVE-2026-1003"}, e.ids(t, "GIT"))
 }
 
+// lastDelivered returns the raw most recently delivered for id.
+func (s *sink) lastDelivered(t *testing.T, id string) osv.Changed {
+	t.Helper()
+	all := s.all()
+	for i := len(all) - 1; i >= 0; i-- {
+		if all[i].ID == id {
+			return all[i]
+		}
+	}
+	t.Fatalf("%s was never delivered", id)
+	return osv.Changed{}
+}
+
+func TestOSVSync_GITRecordLeavingGitReposDropped(t *testing.T) {
+	e := newEnv(t)
+	const php, k8s = "github.com/php/php-src", "github.com/kubernetes/kubernetes"
+	tBoot := now.Add(-time.Hour)
+	recs := map[string][]byte{
+		"CVE-2026-2001": gitRecord("CVE-2026-2001", "https://"+php, tBoot),
+		"CVE-2026-2002": gitRecord("CVE-2026-2002", "https://"+php, tBoot),
+		"CVE-2026-2003": gitRecord("CVE-2026-2003", "https://"+k8s, tBoot),
+	}
+	e.srv.set("GIT", &fakeBucket{csv: csvOf(row{tBoot, "CVE-2026-2001"}, row{tBoot, "CVE-2026-2002"},
+		row{tBoot, "CVE-2026-2003"}), records: maps.Clone(recs)})
+	e.putMeta(t, map[string]string{"setdiff": ts(now)})
+	feed := e.feed(func(o *osv.Options) { o.GitRepos = []string{php, k8s} })
+	phpIDs := func() []string {
+		ids, err := e.st.OSVRecordIDsByName(ctx, "GIT", []string{php})
+		require.NoError(t, err)
+		return ids
+	}
+
+	require.NoError(t, feed.Sync(ctx))
+	require.Equal(t, []string{"CVE-2026-2001", "CVE-2026-2002", "CVE-2026-2003"}, e.ids(t, "GIT"))
+	require.Equal(t, []string{"CVE-2026-2001", "CVE-2026-2002"}, phpIDs())
+	delivered := len(e.sink.all())
+
+	// The mapping of CVE-2026-2001 is corrected to a repository outside GitRepos: the new raw is
+	// delivered, so its php-src match goes, and the record leaves the GIT cache.
+	t1 := now.Add(-10 * time.Minute)
+	recs["CVE-2026-2001"] = gitRecord("CVE-2026-2001", "https://github.com/example/other", t1)
+	e.srv.set("GIT", &fakeBucket{csv: csvOf(row{t1, "CVE-2026-2001"}, row{tBoot, "CVE-2026-2002"},
+		row{tBoot, "CVE-2026-2003"}), records: maps.Clone(recs)})
+	require.NoError(t, feed.Sync(ctx))
+	got := e.sink.all()[delivered:]
+	require.Len(t, got, 1)
+	require.Equal(t, "GIT", got[0].Ecosystem)
+	require.Equal(t, "CVE-2026-2001", got[0].ID)
+	require.Contains(t, string(got[0].Raw), "github.com/example/other")
+	require.NotContains(t, string(got[0].Raw), "withdrawn")
+	require.Equal(t, []string{"CVE-2026-2002", "CVE-2026-2003"}, e.ids(t, "GIT"))
+	require.Equal(t, []string{"CVE-2026-2002"}, phpIDs())
+	require.Equal(t, ts(t1), e.meta(t)["wm.GIT"])
+	delivered = len(e.sink.all())
+
+	// The same for CVE-2026-2002 with the handler down: its php-src index entry goes at once, and the
+	// redelivery from the cache completes the drop.
+	t2 := now.Add(-5 * time.Minute)
+	recs["CVE-2026-2002"] = gitRecord("CVE-2026-2002", "https://github.com/example/other", t2)
+	e.srv.set("GIT", &fakeBucket{csv: csvOf(row{t2, "CVE-2026-2002"}, row{t1, "CVE-2026-2001"},
+		row{tBoot, "CVE-2026-2003"}), records: maps.Clone(recs)})
+	e.sink.fail = 1
+	require.ErrorContains(t, feed.Sync(ctx), "handler unavailable")
+	require.Equal(t, "GIT/CVE-2026-2002", e.meta(t)["pending"])
+	require.Empty(t, phpIDs())
+
+	require.NoError(t, feed.Sync(ctx))
+	got = e.sink.all()[delivered:]
+	require.Len(t, got, 1)
+	require.Equal(t, "CVE-2026-2002", got[0].ID)
+	require.Contains(t, string(got[0].Raw), "github.com/example/other")
+	require.Equal(t, []string{"CVE-2026-2003"}, e.ids(t, "GIT"))
+	meta := e.meta(t)
+	require.NotContains(t, meta, "pending")
+	require.Equal(t, ts(t2), meta["wm.GIT"])
+
+	// Once dropped, it is an ordinary GIT record outside GitRepos: a later change is not taken in.
+	t3 := now.Add(-time.Minute)
+	recs["CVE-2026-2001"] = gitRecord("CVE-2026-2001", "https://github.com/example/third", t3)
+	e.srv.set("GIT", &fakeBucket{csv: csvOf(row{t3, "CVE-2026-2001"}, row{t2, "CVE-2026-2002"},
+		row{tBoot, "CVE-2026-2003"}), records: maps.Clone(recs)})
+	require.NoError(t, feed.Sync(ctx))
+	require.Len(t, e.sink.all(), delivered+1)
+	require.Equal(t, []string{"CVE-2026-2003"}, e.ids(t, "GIT"))
+	require.Equal(t, ts(t3), e.meta(t)["wm.GIT"])
+}
+
+func TestOSVBootstrap_GITReloadDropsRemovedRepos(t *testing.T) {
+	e := newEnv(t)
+	const php, k8s = "github.com/php/php-src", "github.com/kubernetes/kubernetes"
+	tBoot := now.Add(-time.Hour)
+	e.srv.set("GIT", &fakeBucket{csv: csvOf(row{tBoot, "CVE-2026-3001"}), records: map[string][]byte{
+		"CVE-2026-3001": gitRecord("CVE-2026-3001", "https://"+php, tBoot),
+		"CVE-2026-3002": gitRecord("CVE-2026-3002", "https://"+k8s, tBoot),
+	}})
+	e.putMeta(t, map[string]string{"setdiff": ts(now)})
+	require.NoError(t, e.feed(func(o *osv.Options) { o.GitRepos = []string{php, k8s} }).Sync(ctx))
+	require.Equal(t, []string{"CVE-2026-3001", "CVE-2026-3002"}, e.ids(t, "GIT"))
+	delivered := len(e.sink.all())
+
+	// php-src leaves GitRepos: the reload hands its record off once more and drops it.
+	require.NoError(t, e.feed(func(o *osv.Options) { o.GitRepos = []string{k8s} }).Sync(ctx))
+	require.Equal(t, 2, e.srv.count("GIT/all.zip"))
+	var keys []string
+	for _, c := range e.sink.all()[delivered:] {
+		keys = append(keys, c.Ecosystem+"/"+c.ID)
+	}
+	slices.Sort(keys)
+	require.Equal(t, []string{"GIT/CVE-2026-3001", "GIT/CVE-2026-3002"}, keys)
+	require.Contains(t, string(e.sink.lastDelivered(t, "CVE-2026-3001").Raw), php)
+	require.Equal(t, []string{"CVE-2026-3002"}, e.ids(t, "GIT"))
+	ids, err := e.st.OSVRecordIDsByName(ctx, "GIT", []string{php})
+	require.NoError(t, err)
+	require.Empty(t, ids)
+}
+
 func TestOSVSync_PendingRedeliveredAfterHandlerError(t *testing.T) {
 	e := newEnv(t)
 	e.inUse(t, python)
