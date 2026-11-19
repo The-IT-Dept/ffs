@@ -143,11 +143,9 @@ func (e *Engine) OnMatchDelta(ctx context.Context, d match.Delta, trig model.Tri
 	if len(s.Digests) == 0 && len(s.PackageIDs) == 0 && len(s.AdvisoryIDs) == 0 {
 		return nil
 	}
-	ms, err := e.withObservedAt(ctx, d.Matches)
-	if err != nil {
-		return err
-	}
-	affected, err := e.o.Store.ReplaceMatches(ctx, s, ms)
+	// A match without an observation time is observed now; ReplaceMatches keeps the earlier of a
+	// surviving row's stored and incoming times, so nothing is re-read here.
+	affected, err := e.o.Store.ReplaceMatches(ctx, s, stampObserved(d.Matches, nil, e.now()))
 	if err != nil {
 		return fmt.Errorf("engine: replace %s matches: %w", s.Source, err)
 	}

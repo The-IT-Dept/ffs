@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
 	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
+	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -645,4 +647,58 @@ func TestEngine_StartDrainsOnWake(t *testing.T) {
 	require.NoError(t, <-done)
 	require.True(t, h.e.Idle())
 	require.Len(t, h.findings(apiKey), 1)
+}
+
+// TestEngine_GrypeOpinionStandsOnNewDigest is the F2 regression. The OSV record was observed three
+// days ago and the loaded grype DB was built a day ago, so grype has an opinion (spec §6.5). An image
+// catalogued now, a new digest after a rollout, must keep grype's verdict (won't fix, low) instead of
+// letting the OSV verdict stand as urgent and provisional because its match rows are new.
+func TestEngine_GrypeOpinionStandsOnNewDigest(t *testing.T) {
+	h := newHarness(t)
+	const cve5535 = "CVE-2024-5535"
+	raw, err := os.ReadFile(filepath.Join("..", "match", "osvfast", "testdata", "DEBIAN-CVE-2024-5535.json"))
+	require.NoError(t, err)
+	v, err := match.ParseOSV(raw)
+	require.NoError(t, err)
+	hash, err := osv.AffectedHash(raw)
+	require.NoError(t, err)
+	_, err = h.st.PutOSVRecordAt(ctx, "Debian", v.GetId(), v.GetModified().AsTime(), hash, raw, t0.Add(-72*time.Hour))
+	require.NoError(t, err)
+	require.NoError(t, h.st.PutOSVRecordNames(ctx, "Debian", v.GetId(), []string{osv.IndexName("Debian", "openssl")}))
+	canon, err := match.UpsertOSVAdvisory(ctx, h.st.Store, v)
+	require.NoError(t, err)
+	require.Equal(t, cve5535, canon)
+	require.NoError(t, h.st.UpsertAdvisory(ctx, model.Advisory{ID: cve5535, CNASeverity: model.SeverityCritical, CNASource: "openssl"}))
+	built := t0.Add(-24 * time.Hour)
+	require.NoError(t, h.st.RecordGrypeDBBuild(ctx, built))
+
+	o, _, err := h.st.GetOwner(ctx, apiKey)
+	require.NoError(t, err)
+	o.Context = model.WorkloadContext{Exposed: true, ExposurePaths: []string{"Ingress web/api"}}
+	require.NoError(t, h.st.UpsertOwner(ctx, o))
+	wontFix := model.Match{ImageDigest: d1, PackageID: h.libssl3.ID, AdvisoryID: cve5535, Source: model.SourceGrype,
+		FixState: model.FixWontFix, VendorSeverity: model.SeverityLow, VendorSeveritySource: "debian",
+		Namespace: "debian:distro:debian:12", DBBuilt: built}
+	h.grype.fn = matchOn(nil, d1, wontFix)
+	e := engine.New(engine.Options{Config: config.Default(), Store: h.st, Grype: h.grype,
+		Matchers: []match.Matcher{osvfast.New(h.st.Store)}, Now: h.clock.Now})
+
+	require.NoError(t, e.OnImageCatalogued(ctx, d1))
+	require.NoError(t, e.Drain(ctx))
+	f := h.finding(apiKey, cve5535)
+	require.False(t, f.Provisional, "grype's DB was built after ffs observed the OSV record")
+	require.Equal(t, model.FixWontFix, f.FixState)
+	require.Equal(t, model.PriorityLow, f.Priority)
+	require.Equal(t, "debian", f.SeveritySource)
+
+	osvMatches := advisories(h.grype.lastInput.Hints, model.SourceOSV)
+	require.Equal(t, []string{cve5535}, osvMatches, "the OSV fast path matched the new digest")
+	require.Equal(t, t0.Add(-72*time.Hour), h.grype.lastInput.Hints[0].ObservedAt)
+	got, err := e.MatchCandidate(ctx, d1)
+	require.NoError(t, err)
+	for _, m := range got {
+		if m.Source == model.SourceOSV {
+			require.Equal(t, t0.Add(-72*time.Hour), m.ObservedAt, "candidates are scored with the same observation")
+		}
+	}
 }

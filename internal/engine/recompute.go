@@ -332,29 +332,12 @@ func keyOf(m model.Match) matchKey {
 	return matchKey{m.ImageDigest, m.PackageID, m.AdvisoryID, m.Source}
 }
 
-// withObservedAt preserves the ObservedAt of the stored matches ms replace (see stampObserved).
-func (e *Engine) withObservedAt(ctx context.Context, ms []model.Match) ([]model.Match, error) {
-	if len(ms) == 0 {
-		return ms, nil
-	}
-	var digests []string
-	seen := map[string]bool{}
-	for _, m := range ms {
-		if !seen[m.ImageDigest] {
-			seen[m.ImageDigest] = true
-			digests = append(digests, m.ImageDigest)
-		}
-	}
-	stored, err := e.o.Store.MatchesForDigests(ctx, digests)
-	if err != nil {
-		return nil, fmt.Errorf("engine: stored matches: %w", err)
-	}
-	return stampObserved(ms, stored, e.now()), nil
-}
-
-// stampObserved returns a copy of ms in which each match takes the ObservedAt of the stored match
-// with the same key, and a match still without one is observed now. A re-match therefore never
-// moves the time ffs first saw a match, which provisional findings and precedence count from.
+// stampObserved returns a copy of ms in which each match takes the earlier of its own ObservedAt
+// (the OSV fast path stamps when ffs observed the record) and that of the stored match with the same
+// key, and a match still without one is observed now. It does in memory what ReplaceMatches does on
+// write, so the matches matchImage returns (hints, MatchCandidate) carry the stored times: a
+// re-match never moves the time ffs first saw a match, which provisional findings and precedence
+// count from.
 func stampObserved(ms, stored []model.Match, now time.Time) []model.Match {
 	if len(ms) == 0 {
 		return ms
@@ -365,7 +348,7 @@ func stampObserved(ms, stored []model.Match, now time.Time) []model.Match {
 	}
 	out := slices.Clone(ms)
 	for i := range out {
-		if t, ok := seen[keyOf(out[i])]; ok && !t.IsZero() {
+		if t, ok := seen[keyOf(out[i])]; ok && !t.IsZero() && (out[i].ObservedAt.IsZero() || t.Before(out[i].ObservedAt)) {
 			out[i].ObservedAt = t
 		}
 		if out[i].ObservedAt.IsZero() {

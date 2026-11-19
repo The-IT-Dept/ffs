@@ -13,6 +13,7 @@ import (
 	"maps"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/google/osv-scalibr/semantic"
@@ -52,7 +53,7 @@ func (m *Matcher) Source() model.MatchSource { return model.SourceOSV }
 
 // MatchImage implements match.Matcher. It looks up the cached records indexed under the image's
 // packages, bucket by bucket, and evaluates them against those packages. Synthetic digests get no
-// matches.
+// matches. Each match is observed when ffs first saw the record behind it (see evalRecord).
 func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
 	if match.IsSynthetic(in.Digest) {
 		return nil, nil
@@ -77,7 +78,7 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 		if err != nil {
 			return nil, err
 		}
-		recs, err := m.records(ctx, ids, nil)
+		recs, observed, err := m.records(ctx, ids, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -90,7 +91,7 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 				}
 				canon[v.GetId()] = adv
 			}
-			evalRecord(ctx, v, adv, idx, &ms)
+			evalRecord(ctx, v, adv, observed[v.GetId()], idx, &ms)
 		}
 	}
 	return ms.list, nil
@@ -156,7 +157,7 @@ func (m *Matcher) evalAdvisory(ctx context.Context, adv string, changed map[stri
 	if err != nil {
 		return nil, err
 	}
-	recs, err := m.records(ctx, ids, changed)
+	recs, observed, err := m.records(ctx, ids, changed)
 	if err != nil {
 		return nil, err
 	}
@@ -167,14 +168,34 @@ func (m *Matcher) evalAdvisory(ctx context.Context, adv string, changed map[stri
 	idx := indexPackages(pkgs)
 	var ms matchSet
 	for _, v := range recs {
-		evalRecord(ctx, v, adv, idx, &ms)
+		evalRecord(ctx, v, adv, observed[v.GetId()], idx, &ms)
 	}
 	return ms.list, nil
 }
 
 // records returns the cached records with ids, with override replacing (or adding) records by id,
+// sorted by id, and when ffs observed each cached one (store.OSVRecordsObserved). Cached records
+// that do not parse are skipped. The feed caches a changed record before handing it off, so an
+// override has its observation time too.
+func (m *Matcher) records(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, map[string]time.Time, error) {
+	recs, err := m.parsed(ctx, ids, override)
+	if err != nil {
+		return nil, nil, err
+	}
+	recIDs := make([]string, len(recs))
+	for i, v := range recs {
+		recIDs[i] = v.GetId()
+	}
+	observed, err := m.st.OSVRecordsObserved(ctx, recIDs)
+	if err != nil {
+		return nil, nil, err
+	}
+	return recs, observed, nil
+}
+
+// parsed returns the cached records with ids, with override replacing (or adding) records by id,
 // sorted by id. Cached records that do not parse are skipped.
-func (m *Matcher) records(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, error) {
+func (m *Matcher) parsed(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, error) {
 	raws, err := m.st.OSVRecordsByID(ctx, ids)
 	if err != nil {
 		return nil, err
@@ -294,8 +315,11 @@ func indexPackages(pkgs []model.Package) map[pkgKey][]model.Package {
 }
 
 // evalRecord adds to ms the matches of record v, whose canonical advisory is adv, against the
-// indexed packages. Withdrawn records, skipped ecosystems and notice records match nothing.
-func evalRecord(ctx context.Context, v *osvschema.Vulnerability, adv string, idx map[pkgKey][]model.Package, ms *matchSet) {
+// indexed packages. Withdrawn records, skipped ecosystems and notice records match nothing. Each
+// match is observed at observed, when ffs first saw the record's current content (zero when
+// unknown): grype has an opinion on it only through a DB built after that (spec §6.5), however
+// recently the image itself was catalogued.
+func evalRecord(ctx context.Context, v *osvschema.Vulnerability, adv string, observed time.Time, idx map[pkgKey][]model.Package, ms *matchSet) {
 	if v.GetWithdrawn() != nil {
 		return
 	}
@@ -338,14 +362,15 @@ func evalRecord(ctx context.Context, v *osvschema.Vulnerability, adv string, idx
 				VendorSeverity:       sev,
 				VendorSeveritySource: sevSource,
 				Namespace:            eco,
+				ObservedAt:           observed,
 			})
 		}
 	}
 }
 
 // matchSet collects matches, merging those for the same package and advisory: several records
-// (PYSEC and GHSA, say) or affected entries can name one package. Fixed versions are unioned and
-// the first vendor severity found is kept.
+// (PYSEC and GHSA, say) or affected entries can name one package. Fixed versions are unioned, the
+// first vendor severity found is kept and the earliest observation wins.
 type matchSet struct {
 	list []model.Match
 	at   map[[3]string]int
@@ -373,5 +398,8 @@ func (s *matchSet) add(m model.Match) {
 	}
 	if cur.VendorSeverity == model.SeverityUnknown {
 		cur.VendorSeverity, cur.VendorSeveritySource = m.VendorSeverity, m.VendorSeveritySource
+	}
+	if !m.ObservedAt.IsZero() && (cur.ObservedAt.IsZero() || m.ObservedAt.Before(cur.ObservedAt)) {
+		cur.ObservedAt = m.ObservedAt
 	}
 }

@@ -55,3 +55,25 @@ func TestOSVRecords(t *testing.T) {
 	all, _ = s.OSVRecords(ctx, "PyPI", time.Time{})
 	require.Len(t, all, 1)
 }
+
+// TestPutOSVRecordAt_Observed (F2): a record's observation time is when ffs first stored its current
+// affected content; a timestamp-only re-delivery keeps it and an affected change resets it.
+func TestPutOSVRecordAt_Observed(t *testing.T) {
+	s := newStore(t)
+	_, err := s.PutOSVRecordAt(ctx, "PyPI", "GHSA-1", t0, "h1", []byte(`{"id":"GHSA-1"}`), t0)
+	require.NoError(t, err)
+	_, err = s.PutOSVRecordAt(ctx, "Go", "GHSA-1", t0, "h1", []byte(`{"id":"GHSA-1"}`), t0.Add(30*time.Minute))
+	require.NoError(t, err)
+	_, err = s.PutOSVRecordAt(ctx, "PyPI", "GHSA-1", t0.Add(time.Hour), "h1", []byte(`{"id":"GHSA-1"}`), t0.Add(time.Hour))
+	require.NoError(t, err)
+	obs, err := s.OSVRecordsObserved(ctx, []string{"GHSA-1", "GHSA-9"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]time.Time{"GHSA-1": t0}, obs, "unchanged content keeps its time; the earliest bucket wins")
+
+	_, err = s.PutOSVRecordAt(ctx, "PyPI", "GHSA-1", t0.Add(2*time.Hour), "h2", []byte(`{"id":"GHSA-1"}`), t0.Add(2*time.Hour))
+	require.NoError(t, err)
+	require.NoError(t, s.DeleteOSVRecords(ctx, "Go", []string{"GHSA-1"}))
+	obs, err = s.OSVRecordsObserved(ctx, []string{"GHSA-1"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]time.Time{"GHSA-1": t0.Add(2 * time.Hour)}, obs, "changed content is observed anew")
+}

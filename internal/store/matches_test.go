@@ -49,3 +49,27 @@ func TestReplaceMatches_CanonicalisesAndKeepsObservedAt(t *testing.T) {
 	require.True(t, ms[0].ObservedAt.Equal(t0))
 	require.Equal(t, []string{"1.2.3"}, ms[0].FixedVersions)
 }
+
+// TestReplaceMatches_KeepsEarlierObservedAt (F2): a surviving row takes an earlier incoming
+// observation, such as the OSV record's observation time, but never a later one.
+func TestReplaceMatches_KeepsEarlierObservedAt(t *testing.T) {
+	s := newStore(t)
+	m := mt("sha256:d1", "p1", "CVE-1", model.SourceOSV)
+	m.ObservedAt = t0
+	scope := MatchScope{Source: model.SourceOSV, Digests: []string{"sha256:d1"}}
+	_, err := s.ReplaceMatches(ctx, scope, []model.Match{m})
+	require.NoError(t, err)
+	m.ObservedAt = t0.Add(-48 * time.Hour)
+	aff, err := s.ReplaceMatches(ctx, scope, []model.Match{m})
+	require.NoError(t, err)
+	require.Empty(t, aff, "observed_at alone is not a change")
+	ms, err := s.MatchesForDigests(ctx, []string{"sha256:d1"})
+	require.NoError(t, err)
+	require.True(t, ms[0].ObservedAt.Equal(t0.Add(-48*time.Hour)))
+	m.ObservedAt = time.Time{} // none: the stored time stands
+	_, err = s.ReplaceMatches(ctx, scope, []model.Match{m})
+	require.NoError(t, err)
+	ms, err = s.MatchesForDigests(ctx, []string{"sha256:d1"})
+	require.NoError(t, err)
+	require.True(t, ms[0].ObservedAt.Equal(t0.Add(-48*time.Hour)))
+}
