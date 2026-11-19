@@ -464,3 +464,50 @@ func TestCVEList_HandlerFailureKeepsPending(t *testing.T) {
 	require.Len(t, srv.requests(), 1)
 	require.Empty(t, feeds.Pending(feedState(t, st)))
 }
+
+// TestCVEList_RejectedClearsUpstreamRanges: when a CVE with stored CNA ranges is REJECTED, or its
+// record stops naming a mapped product, the stored ranges go, so the upstream matcher's ApplyCNA
+// drops the matches they made.
+func TestCVEList_RejectedClearsUpstreamRanges(t *testing.T) {
+	st := newStore(t)
+	setWatermark(t, st, "2026-11-18T00:00:00Z")
+	rejected := []byte(`{"dataType":"CVE_RECORD","cveMetadata":{"cveId":"CVE-2024-11236","state":"REJECTED",
+		"dateUpdated":"2026-11-18T15:00:00.000Z","dateRejected":"2026-11-18T15:00:00.000Z"},
+		"containers":{"cna":{"rejectedReasons":[{"lang":"en","value":"Rejected."}]}}}`)
+	srv := newReleaseServer(t, map[string][]byte{
+		hourly("2026-11-18", 1): deltaZip(t, [][]byte{
+			restamp(t, fixture(t, "CVE-2024-11236"), "2026-11-18T00:30:00.000Z"),
+			restamp(t, fixture(t, "CVE-2024-22019"), "2026-11-18T00:30:00.000Z"),
+		}),
+		endOfDay("2026-11-18"): deltaZip(t, [][]byte{rejected, record("CVE-2024-22019", "2026-11-18T16:00:00.000Z")}),
+	})
+	h := &handed{}
+	ranges := func(key string) map[string][]byte {
+		raw, err := st.UpstreamRanges(ctx, key)
+		require.NoError(t, err)
+		return raw
+	}
+
+	require.NoError(t, st.PutSBOM(ctx, "sha256:"+strings.Repeat("a", 64), []byte("{}"), []model.Package{{
+		Ecosystem: "binary", Classifier: "php-cli-binary", Name: "php-cli", Version: "8.3.13", Path: "/usr/local/bin/php"}}))
+	cnaMatches := func() []model.Match {
+		ds, err := upstream.New(st).ApplyCNA(ctx, []string{"CVE-2024-11236"})
+		require.NoError(t, err)
+		require.Len(t, ds, 1)
+		return ds[0].Matches
+	}
+
+	require.NoError(t, newFeed(st, srv, "2026-11-18T01:30:00Z", h).Sync(ctx))
+	require.Contains(t, ranges("php"), "CVE-2024-11236")
+	require.Contains(t, ranges("node"), "CVE-2024-22019")
+	require.Len(t, cnaMatches(), 1)
+
+	require.NoError(t, newFeed(st, srv, "2026-11-19T00:50:00Z", h).Sync(ctx))
+	require.NotContains(t, ranges("php"), "CVE-2024-11236", "a rejected CVE keeps no ranges")
+	require.NotContains(t, ranges("node"), "CVE-2024-22019", "a product the record no longer names keeps no ranges")
+	require.Empty(t, cnaMatches(), "ApplyCNA drops the rejected CVE's matches")
+	a, ok, err := st.GetAdvisory(ctx, "CVE-2024-11236")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, a.Withdrawn)
+}
