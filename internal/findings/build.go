@@ -34,14 +34,19 @@ var fixRank = map[model.FixState]int{model.FixFixed: 3, model.FixNotFixed: 2, mo
 
 // BuildInput is everything Build needs for one owner.
 type BuildInput struct {
-	Cluster        string
-	Owner          model.Owner
-	Matches        []model.Match             // every source, for the owner's digests
-	Packages       map[string]model.Package  // by Package.ID
-	Advisories     map[string]model.Advisory // by canonical ID
-	Exceptions     []ExceptionRule
-	GrypeDBBuilds  []time.Time       // build times of every Grype DB ffs has applied
-	ImageUsers     map[string]string // digest → Image.ConfigUser, catalogued images only (absent = unknown)
+	Cluster       string
+	Owner         model.Owner
+	Matches       []model.Match             // every source, for the owner's digests
+	Packages      map[string]model.Package  // by Package.ID
+	Advisories    map[string]model.Advisory // by canonical ID
+	Exceptions    []ExceptionRule
+	GrypeDBBuilds []time.Time       // build times of every Grype DB ffs has applied
+	ImageUsers    map[string]string // digest → Image.ConfigUser, catalogued images only (absent = unknown)
+	// Carry holds the owner's stored open or excepted findings on image repositories that run a
+	// digest not yet catalogued (pending, unresolvable or catalogFailed): what that digest holds is
+	// unknown, so a finding the matches do not build stands instead of resolving (spec §6.2: never
+	// clean when not catalogued). Its advisory must be in Advisories.
+	Carry          []model.Finding
 	Now            time.Time
 	PriorityConfig config.PriorityConfig
 }
@@ -94,9 +99,19 @@ func Build(in BuildInput) []model.Finding {
 	}
 
 	b := builder{in: in, ctx: ownerContext(in.Owner, in.ImageUsers), rules: sortRules(in.Exceptions)}
-	out := make([]model.Finding, 0, len(groups))
+	out := make([]model.Finding, 0, len(groups)+len(in.Carry))
+	built := make(map[string]bool, len(groups))
 	for k, vs := range groups {
-		out = append(out, b.finding(k.repo, k.advisoryID, vs))
+		f := b.finding(k.repo, k.advisoryID, vs)
+		built[f.Fingerprint] = true
+		out = append(out, f)
+	}
+	for _, c := range in.Carry {
+		if built[c.Fingerprint] || c.State == model.StateResolved || in.Advisories[c.AdvisoryID].Withdrawn {
+			continue
+		}
+		built[c.Fingerprint] = true
+		out = append(out, b.carried(c))
 	}
 	slices.SortFunc(out, func(a, b model.Finding) int { return strings.Compare(a.Fingerprint, b.Fingerprint) })
 	return out
@@ -260,7 +275,35 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 	f.Digests, fixed = sortedSet(digests), sortedSet(fixed)
 	f.FixAvailable = len(fixed) > 0 || f.FixState == model.FixFixed
 	f.Severity, f.SeveritySource = severity(vs, adv)
+	b.rank(&f, adv, fixed)
+	return f
+}
 
+// carried returns the stored finding c, which the matches did not build because its repository
+// runs a digest not yet catalogued, as it stands now: its packages, digests and fix state are kept,
+// and its priority and exception are re-evaluated with the current advisory and owner context, so a
+// KEV listing or an expired exception still applies to it.
+func (b builder) carried(c model.Finding) model.Finding {
+	adv := b.in.Advisories[c.AdvisoryID]
+	f := c
+	f.State, f.ExceptedBy, f.ResolvedAt, f.LastSeen = model.StateOpen, "", nil, b.in.Now
+	if !adv.Published.IsZero() {
+		f.Published = adv.Published
+	}
+	if f.Severity == model.SeverityUnknown && adv.CNASeverity != model.SeverityUnknown {
+		f.Severity, f.SeveritySource = adv.CNASeverity, cnaSource
+	}
+	var fixed []string
+	for _, p := range f.Packages {
+		fixed = append(fixed, p.Fixed...)
+	}
+	b.rank(&f, adv, sortedSet(fixed))
+	return f
+}
+
+// rank sets f's priority and reasons from its severity, fix and the owner's context, then applies
+// the first matching exception.
+func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
 	pin := priority.Input{
 		Severity:         f.Severity,
 		SeverityPending:  f.Severity == model.SeverityUnknown,
@@ -280,8 +323,7 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 		GoStdlib:         f.GoStdlib,
 	}
 	f.Priority, f.Reasons = priority.Evaluate(pin, b.in.PriorityConfig)
-	b.except(&f, adv.Aliases, pin)
-	return f
+	b.except(f, adv.Aliases, pin)
 }
 
 // except applies the first matching exception rule. A tenant rule cannot except an urgent finding:

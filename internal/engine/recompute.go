@@ -113,7 +113,7 @@ func (e *Engine) recomputeOwner(ctx context.Context, p *pass, key string) (ups [
 		}
 		rekeyed = true
 	}
-	built, err := e.build(ctx, p, key)
+	built, err := e.build(ctx, p, key, old)
 	if err != nil {
 		return nil, nil, rekeyed, err
 	}
@@ -167,8 +167,11 @@ func (p *pass) canonical(ctx context.Context, st Store, id string) (string, erro
 	return c, nil
 }
 
-// build returns the owner's findings from its current matches, or nil when the owner is gone.
-func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Finding, error) {
+// build returns the owner's findings from its current matches, or nil when the owner is gone. old
+// holds the owner's stored findings: those on an image repository that runs a digest not yet
+// catalogued (or with no digest) are carried, since that digest's matches are unknown; resolving
+// them would report every rollout as fixed and reopen everything once the new digest is catalogued.
+func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Finding) ([]model.Finding, error) {
 	o, ok, err := e.o.Store.GetOwner(ctx, key)
 	if err != nil {
 		return nil, fmt.Errorf("owner: %w", err)
@@ -177,8 +180,11 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 		return nil, nil
 	}
 	var digests []string
+	uncatalogued := map[string]bool{} // image repositories running a digest that is not catalogued
 	for _, c := range o.Containers {
-		if c.Digest != "" && !slices.Contains(digests, c.Digest) {
+		if c.Digest == "" {
+			uncatalogued[c.Repo] = true
+		} else if !slices.Contains(digests, c.Digest) {
 			digests = append(digests, c.Digest)
 		}
 	}
@@ -189,12 +195,15 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 	matched := map[string]bool{}
 	var ids []string
 	seen := map[string]bool{}
+	addID := func(id string) {
+		if !seen[id] {
+			seen[id] = true
+			ids = append(ids, id)
+		}
+	}
 	for _, m := range ms {
 		matched[m.ImageDigest] = true
-		if !seen[m.AdvisoryID] {
-			seen[m.AdvisoryID] = true
-			ids = append(ids, m.AdvisoryID)
-		}
+		addID(m.AdvisoryID)
 	}
 	pkgs := map[string]model.Package{}
 	users := map[string]string{}
@@ -205,6 +214,12 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 		}
 		if ok && img.Status == model.ImageCatalogued {
 			users[d] = img.ConfigUser
+		} else {
+			for _, c := range o.Containers {
+				if c.Digest == d {
+					uncatalogued[c.Repo] = true
+				}
+			}
 		}
 		if !matched[d] {
 			continue // Build reads the packages of matches only
@@ -215,6 +230,13 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 		}
 		for _, pk := range ps {
 			pkgs[pk.ID] = pk
+		}
+	}
+	var carry []model.Finding
+	for _, f := range old {
+		if f.State != model.StateResolved && uncatalogued[f.ImageRepo] {
+			carry = append(carry, f)
+			addID(f.AdvisoryID)
 		}
 	}
 	advs, err := e.o.Store.Advisories(ctx, ids)
@@ -230,6 +252,7 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 		Exceptions:     p.rules,
 		GrypeDBBuilds:  p.builds,
 		ImageUsers:     users,
+		Carry:          carry,
 		Now:            p.now,
 		PriorityConfig: e.o.Config.Priority,
 	}), nil

@@ -702,3 +702,51 @@ func TestEngine_GrypeOpinionStandsOnNewDigest(t *testing.T) {
 		}
 	}
 }
+
+// TestEngine_RolloutToUncataloguedDigestKeepsFindings is the F3 regression: while the digest an owner
+// rolled out to is pending or unresolvable its findings stand, with no transition, and they resolve
+// as an inventory change only once the new digest is catalogued without them.
+func TestEngine_RolloutToUncataloguedDigestKeepsFindings(t *testing.T) {
+	h := newHarness(t)
+	h.catalogueAPI()
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	n := len(h.transitions())
+
+	const d3 = "sha256:d3"
+	rollout := func(status model.ImageStatus) {
+		t.Helper()
+		require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64", Status: status}))
+		o, _, err := h.st.GetOwner(ctx, apiKey)
+		require.NoError(t, err)
+		o.Containers[0].Digest = d3
+		require.NoError(t, h.st.UpsertOwner(ctx, o))
+		require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+		require.NoError(t, h.e.Drain(ctx))
+	}
+	h.clock.now = t0.Add(time.Hour)
+	rollout(model.ImagePending)
+	f := h.finding(apiKey, cve)
+	require.Equal(t, model.StateOpen, f.State, "a pending digest is not clean")
+	require.Equal(t, model.PriorityHigh, f.Priority)
+	require.Len(t, h.transitions(), n, "no resolution while the new digest is unknown")
+
+	h.clock.now = t0.Add(2 * time.Hour)
+	rollout(model.ImageUnresolvable)
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State, "an unresolvable digest is never clean")
+	require.Len(t, h.transitions(), n)
+
+	// d3 is catalogued with the fixed libssl3: the finding resolves as an inventory change
+	h.clock.now = t0.Add(3 * time.Hour)
+	fixed := h.libssl3
+	fixed.ImageDigest, fixed.Version = d3, "3.0.15-1"
+	fixed.ID = model.PackageID(d3, fixed)
+	require.NoError(t, h.st.PutSBOM(ctx, d3, []byte(`{"artifacts":[]}`), []model.Package{fixed}))
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64",
+		Status: model.ImageCatalogued, CataloguedAt: h.clock.now}))
+	require.NoError(t, h.e.OnImageCatalogued(ctx, d3))
+	require.NoError(t, h.e.Drain(ctx))
+	require.Equal(t, model.StateResolved, h.finding(apiKey, cve).State)
+	ts := h.transitions()
+	require.Len(t, ts, n+1)
+	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
+}
