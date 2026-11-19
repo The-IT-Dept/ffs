@@ -17,8 +17,11 @@ import (
 	"strings"
 	"time"
 
+	// glebarez/go-sqlite is the modernc driver fork Grype's gorm adapter links; it runs the same
+	// modernc.org/sqlite/lib engine. modernc.org/sqlite itself must not be imported anywhere in the
+	// binary: both register "sqlite" in init and sql.Register panics on the second.
+	_ "github.com/glebarez/go-sqlite"
 	"github.com/klauspost/compress/zstd"
-	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
 
 //go:embed migrations/*.sql

@@ -5,6 +5,7 @@ go 1.27.0
 require (
 	github.com/anchore/stereoscope v0.4.2
 	github.com/anchore/syft v1.57.2
+	github.com/glebarez/go-sqlite v1.23.0
 	github.com/go-logr/logr v1.4.4
 	github.com/google/go-containerregistry v0.22.1
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20260904000721-8a72a424fdec
@@ -13,12 +14,12 @@ require (
 	github.com/stretchr/testify v1.12.1
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/mod v0.43.0
+	golang.org/x/sync v0.24.0
 	k8s.io/api v0.37.1
 	k8s.io/apiextensions-apiserver v0.37.1
 	k8s.io/apimachinery v0.37.1
 	k8s.io/client-go v0.37.1
 	k8s.io/utils v0.0.0-20260626114624-be93311217bd
-	modernc.org/sqlite v1.62.0
 	sigs.k8s.io/controller-runtime v0.25.3
 	sigs.k8s.io/gateway-api v1.7.0
 )
@@ -324,7 +325,6 @@ require (
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.62.0 // indirect
 	golang.org/x/oauth2 v0.37.0 // indirect
-	golang.org/x/sync v0.24.0
 	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/term v0.47.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
@@ -348,6 +348,7 @@ require (
 	modernc.org/libc v1.80.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.1 // indirect
+	modernc.org/sqlite v1.62.0 // indirect
 	sigs.k8s.io/json v0.0.0-20250730193827-2d320260d730 // indirect
 	sigs.k8s.io/randfill v1.0.0 // indirect
 	sigs.k8s.io/structured-merge-diff/v6 v6.4.2 // indirect

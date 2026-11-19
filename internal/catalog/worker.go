@@ -14,8 +14,8 @@ import (
 	"github.com/anchore/stereoscope/pkg/image"
 	"github.com/anchore/syft/syft"
 	"github.com/anchore/syft/syft/cataloging"
+	_ "github.com/glebarez/go-sqlite" // the "sqlite" driver Syft's RPM cataloger needs; without it every image fails (see internal/store for why not modernc.org/sqlite)
 	"github.com/google/go-containerregistry/pkg/authn"
-	_ "modernc.org/sqlite" // the "sqlite" driver Syft's RPM cataloger needs; without it every image fails
 
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
