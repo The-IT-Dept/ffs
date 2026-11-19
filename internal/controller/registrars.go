@@ -10,6 +10,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/output/events"
 	"github.com/the-it-dept/ffs/internal/output/openreports"
 	"github.com/the-it-dept/ffs/internal/upgrade"
+	"github.com/the-it-dept/ffs/internal/web"
 )
 
 // registrars add the output packages to the manager, in order, after the core components are wired.
@@ -19,4 +20,5 @@ var registrars = []deps.Registrar{
 	openreports.Register,
 	func(m manager.Manager, d deps.Deps) error { return notify.Register(m, d, sinks.New) },
 	upgrade.Register,
+	web.Register,
 }

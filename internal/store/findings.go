@@ -130,6 +130,13 @@ func (s *Store) OwnersWithAdvisories(ctx context.Context, ids []string) ([]strin
 
 // ListFindings returns the findings matching f.
 func (s *Store) ListFindings(ctx context.Context, f FindingFilter) ([]model.Finding, error) {
+	w := findingWhere(f)
+	return queryAll(ctx, s.rdb, scanFinding, `SELECT fingerprint, data FROM findings`+w.String()+
+		` ORDER BY priority DESC, advisory_id, owner_key, fingerprint`+limitOffset(f.Limit, f.Offset), w.args...)
+}
+
+// findingWhere builds the WHERE clause of f, ignoring Limit and Offset.
+func findingWhere(f FindingFilter) where {
 	var w where
 	if len(f.States) > 0 {
 		states := make([]string, len(f.States))
@@ -151,8 +158,7 @@ func (s *Store) ListFindings(ctx context.Context, f FindingFilter) ([]model.Find
 		list := idList(f.AdvisoryIDs)
 		w.add(sameAdvisory("advisory_id"), list, list)
 	}
-	return queryAll(ctx, s.rdb, scanFinding, `SELECT fingerprint, data FROM findings`+w.String()+
-		` ORDER BY priority DESC, advisory_id, owner_key, fingerprint`+limitOffset(f.Limit, f.Offset), w.args...)
+	return w
 }
 
 func scanFinding(r scanner) (model.Finding, error) {
