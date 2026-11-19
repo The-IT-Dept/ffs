@@ -15,9 +15,11 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/controller/deps"
 	"github.com/the-it-dept/ffs/internal/engine"
+	"github.com/the-it-dept/ffs/internal/eol"
 	"github.com/the-it-dept/ffs/internal/exposure"
 	"github.com/the-it-dept/ffs/internal/feeds"
 	"github.com/the-it-dept/ffs/internal/feeds/cvelist"
+	eolfeed "github.com/the-it-dept/ffs/internal/feeds/eol"
 	"github.com/the-it-dept/ffs/internal/feeds/epss"
 	"github.com/the-it-dept/ffs/internal/feeds/grypedb"
 	"github.com/the-it-dept/ffs/internal/feeds/kev"
@@ -39,7 +41,7 @@ import (
 const socketPoll = 2 * time.Second
 
 // wire builds the Phase 1 components, adds the leader-only ones to m and returns d with Registry,
-// Engine, Acquirer, Feeds and Ready filled in. d must carry Config, Namespace, Store, Hooks and Log.
+// Engine, Acquirer, Feeds, EOL and Ready filled in. d must carry Config, Namespace, Store, Hooks and Log.
 func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) (deps.Deps, error) {
 	cfg, st, log := d.Config, d.Store, d.Log
 
@@ -81,7 +83,11 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 		return d, err
 	}
 
-	fs, grypeFeed := newFeeds(cfg, st, eng)
+	ev := eol.New(st, time.Now)
+	if err := ev.Reload(ctx); err != nil {
+		log.Error(err, "loading the stored end-of-life cycles failed; end-of-life checks wait for the next feed update")
+	}
+	fs, grypeFeed := newFeeds(cfg, st, eng, ev)
 	var runner *feeds.Runner
 	runner = feeds.NewRunner(st, fs, feeds.RunnerOptions{OnStale: func(_ context.Context, f string, last time.Time) {
 		d.Hooks.FeedStale(f, last, runner.StaleAfter()[f])
@@ -112,14 +118,14 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 		}
 	}
 
-	d.Registry, d.Engine, d.Acquirer, d.Feeds = reg, eng, acq, runner
+	d.Registry, d.Engine, d.Acquirer, d.Feeds, d.EOL = reg, eng, acq, runner, ev
 	d.Ready = newReady(inv.Synced, acq.Stats, eng.Idle, grypeReady(cfg.Feeds.GrypeDB.Enabled, st))
 	return d, nil
 }
 
 // newFeeds builds the enabled feeds, sharing one HTTP client, each handing its output to eng. The
 // grypedb feed is also returned on its own, nil when disabled.
-func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine) (fs []feeds.Feed, grypeFeed *grypedb.Feed) {
+func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine, ev *eol.Evaluator) (fs []feeds.Feed, grypeFeed *grypedb.Feed) {
 	hc := feeds.NewHTTPClient(version.UserAgent())
 	if c := cfg.Feeds.GrypeDB; c.Enabled {
 		grypeFeed = grypedb.New(grypedb.Options{Config: c, DataDir: cfg.DataDir, Store: st, HTTP: hc, Handler: eng.OnGrypeDB})
@@ -138,6 +144,9 @@ func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine) (fs []feed
 	if c := cfg.Feeds.EPSS; c.Enabled {
 		fs = append(fs, epss.New(epss.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched,
 			DataDir: cfg.DataDir, Thresholds: []float64{cfg.Priority.EPSSBump, cfg.Priority.EPSSHigh}}))
+	}
+	if c := cfg.Feeds.EOL; c.Enabled {
+		fs = append(fs, eolfeed.New(c, st, hc, ev.Reload))
 	}
 	return fs, grypeFeed
 }

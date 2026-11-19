@@ -15,6 +15,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/engine"
+	"github.com/the-it-dept/ffs/internal/eol"
 	"github.com/the-it-dept/ffs/internal/feeds"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
@@ -59,6 +60,7 @@ type Deps struct {
 	Registry  *registry.Client
 	Acquirer  *sbom.Acquirer
 	Feeds     *feeds.Runner
+	EOL       *eol.Evaluator
 	Recorder  events.EventRecorder
 	Hooks     *Hooks
 	Log       logr.Logger
