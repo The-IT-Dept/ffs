@@ -131,7 +131,7 @@ func TestChart_DeploymentShape(t *testing.T) {
 }
 
 func TestChart_MountsFollowConfig(t *testing.T) {
-	ps := podSpec(t, "config.dataDir=/data", "config.catalog.socket=/sock/c.sock")
+	ps := podSpec(t, "config.dataDir=/data", "config.storePath=/data/ffs.db", "config.catalog.socket=/sock/c.sock")
 	ctl, cat := container(t, ps, "controller"), container(t, ps, "catalog")
 	require.Equal(t, "/data", mounts(ctl)["data"].MountPath)
 	require.Equal(t, "/sock", mounts(ctl)["run"].MountPath)
@@ -140,6 +140,15 @@ func TestChart_MountsFollowConfig(t *testing.T) {
 
 	ps = podSpec(t, "catalog.scratchLimit=1887436800")
 	require.Contains(t, container(t, ps, "catalog").Args, "--scratch-limit=1887436800")
+}
+
+func TestChart_StorePathMustBeUnderDataDir(t *testing.T) {
+	out, err := renderErr(t, "config.dataDir=/data")
+	require.Error(t, err)
+	require.Contains(t, out, "must be under config.dataDir")
+
+	_, err = renderErr(t, "config.dataDir=/data", "config.storePath=/database/ffs.db")
+	require.Error(t, err)
 }
 
 func TestChart_SecurityContext(t *testing.T) {

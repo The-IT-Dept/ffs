@@ -1,5 +1,9 @@
 {{- $name := include "ffs.fullname" . -}}
 {{- $sockDir := dir .Values.config.catalog.socket -}}
+{{- $dataDir := clean .Values.config.dataDir -}}
+{{- if not (hasPrefix (printf "%s/" (trimSuffix "/" $dataDir)) (clean .Values.config.storePath)) -}}
+{{- fail (printf "config.storePath (%s) must be under config.dataDir (%s): only dataDir is mounted on the persistent volume" .Values.config.storePath .Values.config.dataDir) -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -79,7 +83,7 @@ spec:
           volumeMounts:
             - {name: config, mountPath: /etc/ffs, readOnly: true}
             - {name: run, mountPath: {{ $sockDir }}}
-            - {name: data, mountPath: {{ .Values.config.dataDir }}}
+            - {name: data, mountPath: {{ $dataDir }}}
             - {name: tmp, mountPath: /tmp}
             - {name: kube-api-access, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
         - name: catalog

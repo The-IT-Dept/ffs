@@ -21,10 +21,15 @@ rbac:
 controller:
   # Controller container resources.
   resources:
+    # Guaranteed resources.
     requests:
+      # CPU request.
       cpu: 200m
+      # Memory limit.
       memory: 512Mi
+    # Resource ceilings.
     limits:
+      # Memory limit.
       memory: 1Gi
   # Size limit of the controller /tmp emptyDir.
   tmpSizeLimit: 1Gi
@@ -33,10 +38,15 @@ controller:
 catalog:
   # Catalog container resources.
   resources:
+    # Guaranteed resources.
     requests:
+      # CPU request.
       cpu: 100m
+      # Memory limit.
       memory: 256Mi
+    # Resource ceilings.
     limits:
+      # Memory limit.
       memory: 2Gi
   # Size limit of the catalog scratch emptyDir.
   scratchSizeLimit: 20Gi
@@ -106,6 +116,7 @@ grafanaDashboard:
   namespace: ""
   # Extra dashboard ConfigMap labels.
   labels:
+    # Label the Grafana sidecar selects dashboards by.
     grafana_dashboard: "1"
   # Extra dashboard ConfigMap annotations.
   annotations: {}
