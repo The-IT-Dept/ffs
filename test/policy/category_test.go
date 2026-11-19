@@ -11,7 +11,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestAnxietyOnlyInMarkers(t *testing.T) {
+// TestHiddenCategoryOnlyInMarkers checks that the hidden CRD category word appears in the tracked
+// tree only in the kubebuilder resource markers. The word is built by concatenation so this file
+// never contains it, and no line of this file is exempt.
+func TestHiddenCategoryOnlyInMarkers(t *testing.T) {
 	needle := "anx" + "iety"
 	root := moduleRoot(t)
 	skip := []string{".git", "bin", "docs/superpowers", "docs/research", "config/crd", "charts/ffs/crds"}
@@ -40,14 +43,11 @@ files:
 			if !strings.Contains(strings.ToLower(line), needle) {
 				continue
 			}
-			trimmed := strings.TrimSpace(line)
-			switch {
-			case strings.HasPrefix(rel, "api/v1alpha1/") && strings.HasPrefix(trimmed, "// +kubebuilder:resource:"):
+			if strings.HasPrefix(rel, "api/v1alpha1/") && strings.HasPrefix(strings.TrimSpace(line), "// +kubebuilder:resource:") {
 				allowed = append(allowed, rel)
-			case rel == "test/policy/category_test.go" && strings.HasPrefix(trimmed, "func Test") && strings.HasSuffix(trimmed, "(t *testing.T) {"):
-			default:
-				t.Errorf("%s:%d mentions the hidden category", rel, i+1)
+				continue
 			}
+			t.Errorf("%s:%d mentions the hidden category", rel, i+1)
 		}
 	}
 	require.ElementsMatch(t, []string{"api/v1alpha1/finding_types.go", "api/v1alpha1/vulnerability_types.go"}, allowed)
