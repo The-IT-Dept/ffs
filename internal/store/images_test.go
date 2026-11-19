@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"strings"
 	"testing"
 	"time"
 
@@ -110,6 +111,66 @@ func TestPackagesByName(t *testing.T) {
 	ecos, err := s.EcosystemsInUse(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []EcosystemKey{{"deb", "debian", "11"}, {"deb", "debian", "12"}, {"npm", "", ""}, {"npm", "debian", "12"}}, ecos)
+}
+
+func TestPackagesByFoldedName(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "sha256:a", pkg("python", nil, "Jinja2", ""), pkg("python", nil, "typing_extensions", ""),
+		pkg("python", nil, "zope.interface", ""), pkg("java-archive", nil, "Saxon-HE", ""), pkg("npm", nil, "Jinja2", ""))
+	put(t, s, "sha256:b", pkg("python", &model.Distro{ID: "debian", VersionID: "12"}, "jinja2", ""))
+
+	for _, tc := range []struct {
+		eco, name string
+		want      []string
+	}{
+		{"python", "jinja2", []string{"Jinja2", "jinja2"}},
+		{"python", "JINJA2", []string{"Jinja2", "jinja2"}},
+		{"python", "typing-extensions", []string{"typing_extensions"}},
+		{"python", "Typing.Extensions", []string{"typing_extensions"}},
+		{"python", "zope-interface", []string{"zope.interface"}},
+		{"python", "zope_-.interface", []string{"zope.interface"}},
+		{"python", "saxon-he", nil},
+		{"java-archive", "saxon-he", []string{"Saxon-HE"}},
+	} {
+		got, err := s.PackagesByFoldedName(ctx, tc.eco, tc.name)
+		require.NoError(t, err, tc.name)
+		require.Equal(t, tc.want, sliceOrNil(names(got)), tc.name)
+	}
+
+	_, err := s.PackagesByFoldedName(ctx, "npm", "jinja2")
+	require.Error(t, err)
+
+	// foldName and the folded_name column agree, including on long separator runs.
+	for _, n := range []string{"Jinja2", "typing_extensions", "zope.interface", "A__B..C-_-.D", "x" + strings.Repeat("_", 32) + "Y",
+		"x" + strings.Repeat(".", 40) + "y", "-lead.trail_", "Ünïcode_Name"} {
+		var folded string
+		put(t, s, "sha256:fold", pkg("python", nil, n, ""))
+		require.NoError(t, s.rdb.QueryRowContext(ctx, `SELECT folded_name FROM packages WHERE digest = 'sha256:fold'`).Scan(&folded))
+		require.Equal(t, foldName(n), folded, n)
+	}
+	require.Equal(t, "x-y", foldName("x"+strings.Repeat("_", 32)+"Y"))
+
+	// The lookup uses the partial index rather than scanning the ecosystem's packages.
+	var plan strings.Builder
+	rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT id FROM packages WHERE ecosystem = ? AND folded_name = ?`,
+		"python", "jinja2")
+	require.NoError(t, err)
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan.WriteString(detail + "\n")
+	}
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	require.Contains(t, plan.String(), "packages_by_folded_name")
+}
+
+func sliceOrNil(s []string) []string {
+	if len(s) == 0 {
+		return nil
+	}
+	return s
 }
 
 func TestTagDigest(t *testing.T) {

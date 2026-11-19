@@ -96,17 +96,19 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 	return ms.list, nil
 }
 
-// ApplyOSV implements match.RecordMatcher. It stores the advisory of every changed record outside
-// the skipped ecosystems, then re-evaluates each advisory touched from all of its cached records,
-// the changed ones taking the place of their cached copies, against the packages they name. Each
-// advisory gets one Delta scoped to the osv source and that advisory, so a withdrawn or narrowed
-// record drops the matches it no longer supports. An unreadable record is skipped; only store
-// failures are errors.
+// ApplyOSV implements match.RecordMatcher. It stores the advisory of every changed record except
+// GIT ones (the upstream and Kubernetes matchers' records), so the ids and aliases of records the
+// fast path does not evaluate (Linux, Android, Azure Linux, notices) are stored and searchable too.
+// It then re-evaluates each advisory touched from all of its cached records, the changed ones taking
+// the place of their cached copies, against the packages they name; records the fast path skips
+// match nothing. Each advisory gets one Delta scoped to the osv source and that advisory, so a
+// withdrawn or narrowed record drops the matches it no longer supports. An unreadable record is
+// skipped; only store failures are errors.
 func (m *Matcher) ApplyOSV(ctx context.Context, recs []osv.Changed) ([]match.Delta, error) {
 	log := logr.FromContextOrDiscard(ctx)
 	changed := map[string]*osvschema.Vulnerability{}
 	for _, r := range recs {
-		if skippedBuckets[r.Ecosystem] || osv.SkipID(r.Ecosystem, r.ID) {
+		if r.Ecosystem == osv.BucketGIT {
 			continue
 		}
 		v, err := match.ParseOSV(r.Raw)
@@ -198,14 +200,26 @@ func (m *Matcher) records(ctx context.Context, ids []string, override map[string
 	return out, nil
 }
 
-// candidates returns the stored packages the affected entries of recs can name, from the inverted
-// index: by source and by binary name in source-join buckets, by name, lowercase name and index name
-// for PyPI, by artifact ID for Maven (the group is checked against the PURL later) and by name
-// elsewhere. Withdrawn records and skipped ecosystems name none.
+// lookup is how candidates finds stored packages by name.
+type lookup uint8
+
+const (
+	byName       lookup = iota // the package name
+	bySource                   // the source package name, or the name when the source is empty
+	byFoldedName               // the PEP 503-folded package name
+)
+
+// candidates returns the stored packages the affected entries of recs can name: by source and by
+// binary name in source-join buckets, by folded name for PyPI (Syft keeps the metadata's "Jinja2"
+// or "typing_extensions" while records say "jinja2" or "typing-extensions"), by folded artifact ID
+// for Maven (the group is checked against the PURL later) and by name elsewhere. That is a superset
+// of the packages MatchImage would match against recs (for Maven, because Syft's PURL artifact is
+// the package name), so the two paths agree once indexPackages and evalRecord apply the exact index
+// names. Withdrawn records and skipped ecosystems name none.
 func (m *Matcher) candidates(ctx context.Context, recs []*osvschema.Vulnerability) ([]model.Package, error) {
 	type query struct {
 		typ, name string
-		bySource  bool
+		by        lookup
 	}
 	seen := map[query]bool{}
 	var out []model.Package
@@ -222,21 +236,27 @@ func (m *Matcher) candidates(ctx context.Context, recs []*osvschema.Vulnerabilit
 			var qs []query
 			switch {
 			case osv.SourceJoin(b):
-				qs = []query{{typ, name, true}, {typ, name, false}}
+				qs = []query{{typ, name, bySource}, {typ, name, byName}}
 			case b == bucketPyPI:
-				qs = []query{{typ, name, false}, {typ, strings.ToLower(name), false}, {typ, osv.IndexName(b, name), false}}
+				qs = []query{{typ, name, byFoldedName}}
 			case b == bucketMaven:
 				_, artifact, _ := strings.Cut(name, ":")
-				qs = []query{{typ, artifact, false}}
+				qs = []query{{typ, artifact, byFoldedName}}
 			default:
-				qs = []query{{typ, name, false}}
+				qs = []query{{typ, name, byName}}
 			}
 			for _, q := range qs {
 				if seen[q] || q.name == "" {
 					continue
 				}
 				seen[q] = true
-				pkgs, err := m.st.PackagesByName(ctx, q.typ, nil, q.name, q.bySource)
+				var pkgs []model.Package
+				var err error
+				if q.by == byFoldedName {
+					pkgs, err = m.st.PackagesByFoldedName(ctx, q.typ, q.name)
+				} else {
+					pkgs, err = m.st.PackagesByName(ctx, q.typ, nil, q.name, q.by == bySource)
+				}
 				if err != nil {
 					return nil, err
 				}

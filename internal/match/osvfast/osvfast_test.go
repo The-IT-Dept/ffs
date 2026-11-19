@@ -305,15 +305,75 @@ func TestOSVFast_SkippedEcosystems(t *testing.T) {
 		{Ecosystem: "GIT", ID: "CVE-2026-103", Raw: []byte(`{"id": "CVE-2026-103", "affected": [{
 			"ranges": [{"type": "GIT", "repo": "https://github.com/openssl/openssl", "events": [{"introduced": "0"}, {"fixed": "abc123"}]}],
 			"versions": ["openssl-3.0.11"]}]}`)},
+		// A Debian notice: its range would match libssl3 if the fast path evaluated it.
+		{Ecosystem: "Debian", ID: "DSA-5999-1", Raw: []byte(`{"id": "DSA-5999-1", "upstream": ["CVE-2026-104"], "affected": [{
+			"package": {"ecosystem": "Debian:12", "name": "openssl"},
+			"ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "3.0.15-1~deb12u1"}]}]}]}`)},
 	}
 	deltas, err := m.ApplyOSV(ctx, recs)
 	require.NoError(t, err)
-	require.Empty(t, deltas)
-	for _, id := range []string{"CVE-2026-100", "CVE-2026-101", "CVE-2026-102", "CVE-2026-103"} {
-		_, ok, err := st.GetAdvisory(ctx, id)
+	// Every advisory but the GIT record's is stored and re-evaluated; none has a match.
+	require.Equal(t, []match.Delta{{Scope: scope("CVE-2026-100")}, {Scope: scope("CVE-2026-101")},
+		{Scope: scope("CVE-2026-102")}, {Scope: scope("CVE-2026-104")}}, deltas)
+	for id, canonical := range map[string]string{"AZL-1": "CVE-2026-100", "CVE-2026-101": "CVE-2026-101",
+		"ASB-A-1": "CVE-2026-102", "DSA-5999-1": "CVE-2026-104"} {
+		a, ok, err := st.GetAdvisory(ctx, id)
 		require.NoError(t, err)
-		require.False(t, ok, id)
+		require.True(t, ok, id)
+		require.Equal(t, canonical, a.ID, id)
+		if id != canonical {
+			require.Contains(t, a.Aliases, id)
+		}
 	}
+	// GIT records belong to the upstream and Kubernetes matchers, which store their advisories.
+	_, ok, err := st.GetAdvisory(ctx, "CVE-2026-103")
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+// Syft keeps the case and separators of the package metadata, while records use the registry's
+// form. ApplyOSV must find the same packages MatchImage does, or each change to such a record would
+// replace the advisory's osv matches with none.
+func TestOSVFast_FoldedNamesAgree(t *testing.T) {
+	st := newStore(t)
+	m := osvfast.New(st)
+	pkgs := image(t, st, dPy,
+		model.Package{Ecosystem: "python", Name: "Jinja2", Version: "3.1.2", PURL: "pkg:pypi/jinja2@3.1.2",
+			Path: "/usr/lib/python3/site-packages/Jinja2-3.1.2.dist-info/METADATA"},
+		model.Package{Ecosystem: "python", Name: "typing_extensions", Version: "4.0.0", PURL: "pkg:pypi/typing-extensions@4.0.0",
+			Path: "/usr/lib/python3/site-packages/typing_extensions-4.0.0.dist-info/METADATA"},
+		model.Package{Ecosystem: "python", Name: "zope.interface", Version: "5.0.0", PURL: "pkg:pypi/zope-interface@5.0.0",
+			Path: "/usr/lib/python3/site-packages/zope.interface-5.0.0.dist-info/METADATA"},
+		model.Package{Ecosystem: "java-archive", Name: "Saxon-HE", Version: "12.3", PURL: "pkg:maven/net.sf.saxon/Saxon-HE@12.3",
+			Path: "/app/lib/Saxon-HE-12.3.jar"})
+	jinja2 := pkgs[0]
+	require.Equal(t, "Jinja2", jinja2.Name)
+	record := func(id, alias, eco, name, fixed string) []byte {
+		return []byte(`{"id": "` + id + `", "modified": "2026-11-01T00:00:00Z", "aliases": ["` + alias + `"],
+			"database_specific": {"severity": "MODERATE"}, "affected": [{"package": {"ecosystem": "` + eco + `", "name": "` + name + `"},
+			"ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "` + fixed + `"}]}]}]}`)
+	}
+	recs := []osv.Changed{
+		changed(t, "PyPI", record("GHSA-h5c8-rqwp-cp95", "CVE-2024-22195", "PyPI", "jinja2", "3.1.3")),
+		changed(t, "PyPI", record("PYSEC-2099-1", "CVE-2099-1", "PyPI", "typing-extensions", "4.5.0")),
+		changed(t, "PyPI", record("PYSEC-2099-2", "CVE-2099-2", "PyPI", "Zope-Interface", "5.4.0")),
+		changed(t, "Maven", record("GHSA-2099-0000-0003", "CVE-2099-3", "Maven", "net.sf.saxon:saxon-he", "12.4")),
+	}
+
+	deltas := apply(t, m, st, recs...)
+	require.Len(t, deltas, 4)
+	var fromRecords []model.Match
+	for _, d := range deltas {
+		fromRecords = append(fromRecords, d.Matches...)
+	}
+	require.Equal(t, model.Match{ImageDigest: dPy, PackageID: jinja2.ID, AdvisoryID: "CVE-2024-22195", Source: model.SourceOSV,
+		FixState: model.FixFixed, FixedVersions: []string{"3.1.3"}, VendorSeverity: model.SeverityMedium,
+		VendorSeveritySource: "ghsa", Namespace: "PyPI"}, byPackage(deltas)[jinja2.ID])
+	require.Len(t, fromRecords, 4)
+
+	fromImage, err := m.MatchImage(ctx, match.ImageInput{Digest: dPy, Packages: pkgs})
+	require.NoError(t, err)
+	require.ElementsMatch(t, fromImage, fromRecords)
 }
 
 func TestOSVFast_KernelHeadersSkipped(t *testing.T) {

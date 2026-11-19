@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -192,6 +193,37 @@ func (s *Store) PackagesByName(ctx context.Context, ecosystem string, distro *mo
 	}
 	return queryAll(ctx, s.rdb, scanPackage,
 		`SELECT `+packageCols+` FROM packages`+w.String()+` ORDER BY digest, name, version, id`, w.args...)
+}
+
+// foldedEcosystems are the package ecosystems whose packages have a folded name.
+var foldedEcosystems = map[string]bool{"python": true, "java-archive": true}
+
+// PackagesByFoldedName returns the stored packages of ecosystem, in any distro, whose folded name
+// equals the folded name. Folding lowercases a name, reads '_' and '.' as '-' and collapses runs of
+// '-': PEP 503 normalisation, the way PyPI compares names, so a record for "jinja2" finds a stored
+// "Jinja2". Only python and java-archive packages have folded names; other ecosystems are an error.
+func (s *Store) PackagesByFoldedName(ctx context.Context, ecosystem, name string) ([]model.Package, error) {
+	if !foldedEcosystems[ecosystem] {
+		return nil, fmt.Errorf("store: %q packages have no folded names", ecosystem)
+	}
+	return queryAll(ctx, s.rdb, scanPackage, `SELECT `+packageCols+` FROM packages
+		WHERE ecosystem = ? AND folded_name = ? ORDER BY digest, name, version, id`, ecosystem, foldName(name))
+}
+
+// foldName computes the folded_name column of 010_package_folded_names.sql for name: '_' and '.'
+// become '-', runs of '-' are halved five times (so runs of up to 32 collapse to one) and ASCII
+// letters are lowercased, as SQLite's replace and lower do.
+func foldName(name string) string {
+	s := strings.NewReplacer("_", "-", ".", "-").Replace(name)
+	for range 5 {
+		s = strings.ReplaceAll(s, "--", "-")
+	}
+	return strings.Map(func(r rune) rune {
+		if 'A' <= r && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 // EcosystemsInUse returns the sorted distinct (ecosystem, distro id, distro version) tuples over
