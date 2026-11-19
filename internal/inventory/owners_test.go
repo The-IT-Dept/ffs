@@ -132,7 +132,7 @@ func TestContainerUses_AllKinds(t *testing.T) {
 		return out
 	}
 
-	uses, err := h.inv.containerUses(ctx, pod, amd64)
+	uses, err := h.inv.containerUses(ctx, pod, amd64, nil)
 	require.NoError(t, err)
 	require.Equal(t, map[string]got{
 		"app":     {model.ContainerRegular, mA, true},
@@ -150,7 +150,7 @@ func TestContainerUses_AllKinds(t *testing.T) {
 
 	noStatus := pod.DeepCopy()
 	noStatus.Status.ContainerStatuses[0].VolumeMounts = nil
-	uses, err = h.inv.containerUses(ctx, noStatus, amd64)
+	uses, err = h.inv.containerUses(ctx, noStatus, amd64, nil)
 	require.NoError(t, err)
 	require.Equal(t, got{model.ContainerImageVolume, mB, false}, summarise(uses)["models"])
 	require.Equal(t, 1, h.res.resolveTagCalls)
@@ -161,7 +161,7 @@ func TestContainerUses_AllKinds(t *testing.T) {
 
 	nonRoot := pod.DeepCopy()
 	nonRoot.Spec.SecurityContext = &corev1.PodSecurityContext{RunAsNonRoot: ptr.To(true)}
-	uses, err = h.inv.containerUses(ctx, nonRoot, amd64)
+	uses, err = h.inv.containerUses(ctx, nonRoot, amd64, nil)
 	require.NoError(t, err)
 	for _, u := range uses {
 		require.False(t, u.RootUnlessImageUser, u.Name)

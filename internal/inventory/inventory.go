@@ -67,7 +67,10 @@ type Options struct {
 	Debounce    time.Duration // default 2s
 	TagTTL      time.Duration // default 6h
 	VersionPoll time.Duration // default 10m
-	Now         func() time.Time
+	// RetryPoll is how often the owners of images whose catalogFailed or unresolvable quarantine
+	// has ended are flushed again, so those images are retried; default 1h.
+	RetryPoll time.Duration
+	Now       func() time.Time
 }
 
 const (
@@ -86,6 +89,7 @@ type Inventory struct {
 	batch  *batcher
 	retry  *retrier    // backs off keys whose flush failed
 	cache  cache.Cache // set by Register
+	access *accessCache
 	synced atomic.Bool
 
 	// Only Flush, which holds flushMu, touches these.
@@ -113,10 +117,13 @@ func New(o Options) *Inventory {
 	if o.VersionPoll <= 0 {
 		o.VersionPoll = 10 * time.Minute
 	}
+	if o.RetryPoll <= 0 {
+		o.RetryPoll = time.Hour
+	}
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	inv := &Inventory{o: o, podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
+	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
 		enqueued: map[string]bool{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
 		known: map[string]bool{}, templateBacked: map[string]bool{}}
 	inv.batch = newBatcher(o.Debounce, func(ctx context.Context, keys []string) {
@@ -133,7 +140,11 @@ func (inv *Inventory) now() time.Time { return inv.o.Now() }
 // Register adds event handlers to the manager's informers. Each event queues the object key;
 // nodes and the kube-system/kube-proxy DaemonSet also queue "cluster".
 func (inv *Inventory) Register(ctx context.Context, mgr manager.Manager) error {
-	inv.cache = mgr.GetCache()
+	return inv.register(ctx, mgr.GetCache())
+}
+
+func (inv *Inventory) register(ctx context.Context, c cache.Cache) error {
+	inv.cache = c
 	rs := &metav1.PartialObjectMetadata{}
 	rs.SetGroupVersionKind(appsv1.SchemeGroupVersion.WithKind("ReplicaSet"))
 	for _, w := range []struct {
@@ -200,7 +211,8 @@ func (inv *Inventory) NeedLeaderElection() bool { return true }
 
 // Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
 // then flushes batches. Every TagTTL it re-resolves template-backed owners; every VersionPoll it
-// re-reads the control-plane version.
+// re-reads the control-plane version; every RetryPoll it flushes the owners of images whose
+// quarantine has ended, which hands those images back to the acquirer or the normaliser.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -231,10 +243,19 @@ func (inv *Inventory) Start(ctx context.Context) error {
 	defer tags.Stop()
 	versions := time.NewTicker(inv.o.VersionPoll)
 	defer versions.Stop()
+	retries := time.NewTicker(inv.o.RetryPoll)
+	defer retries.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
+		case <-retries.C:
+			keys, err := inv.o.Store.OwnersOfExpiredQuarantine(ctx, inv.now())
+			if err != nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images due a retry")
+				continue
+			}
+			inv.batch.Add(keys...)
 		case <-tags.C:
 			inv.mu.Lock()
 			keys := sortedKeys(inv.templateBacked)
@@ -298,7 +319,7 @@ func (inv *Inventory) SyncAll(ctx context.Context) error {
 		return err
 	}
 	for _, o := range owners {
-		if !synthetic(o.Ref.Kind) {
+		if !o.Ref.ClusterLevel() {
 			keys[o.Ref.Key()] = true
 		}
 	}
@@ -353,7 +374,7 @@ func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
 		switch {
 		case key == reportKey:
 			// report below retries the unreported owners.
-		case key == clusterKey || synthetic(kind):
+		case key == clusterKey || model.ClusterLevelKey(key):
 			cluster = true
 		case !ok:
 			log.Info("ignoring malformed inventory key", "key", key)
@@ -516,10 +537,16 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 	if len(pods) == 0 && tmpl == nil {
 		return inv.deleteOwner(ctx, f, key)
 	}
+	stored, _, err := inv.o.Store.GetOwner(ctx, key)
+	if err != nil {
+		return err
+	}
+	prev := prevUsesOf(stored)
 
 	var (
-		uses []use
-		live []*corev1.Pod // pods with a started container: the ones the uses come from
+		uses    []use
+		live    []*corev1.Pod // pods with a started container: the ones the uses come from
+		pending []error       // containers whose image is still to resolve: stored as placeholders, retried
 	)
 	archs := map[string]bool{}
 	for _, p := range pods {
@@ -531,9 +558,12 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 		if n, ok := f.nodes[p.Spec.NodeName]; ok {
 			platform = NodePlatform{OS: n.OS, Arch: n.Arch}
 		}
-		us, err := inv.containerUses(ctx, p, platform)
+		us, err := inv.containerUses(ctx, p, platform, prev)
 		if err != nil {
-			return fmt.Errorf("pod %s/%s: %w", p.Namespace, p.Name, err)
+			if us == nil {
+				return fmt.Errorf("pod %s/%s: %w", p.Namespace, p.Name, err)
+			}
+			pending = append(pending, fmt.Errorf("pod %s/%s: %w", p.Namespace, p.Name, err))
 		}
 		uses = append(uses, us...)
 		archs[platform.Arch] = true
@@ -541,8 +571,11 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 	running := len(archs) > 0
 	fromTemplate := !running && tmpl != nil
 	if fromTemplate {
-		if uses, err = inv.templateUses(ctx, tmpl, ns, f.platform); err != nil {
-			return err
+		if uses, err = inv.templateUses(ctx, tmpl, ns, f.platform, prev); err != nil {
+			if uses == nil {
+				return err
+			}
+			pending = append(pending, err)
 		}
 		archs[f.platform.Arch] = true
 	}
@@ -586,7 +619,8 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 		delete(inv.templateBacked, key)
 	}
 	inv.mu.Unlock()
-	return nil
+	// The owner is stored with every container it could resolve; the key is retried for the rest.
+	return errors.Join(pending...)
 }
 
 func (inv *Inventory) deleteOwner(ctx context.Context, f *flushState, key string) error {
@@ -648,5 +682,3 @@ func splitKey(key string) (kind, ns, name string, ok bool) {
 	}
 	return parts[0], parts[1], parts[2], true
 }
-
-func synthetic(kind string) bool { return kind == kindCluster || kind == kindRuntime }

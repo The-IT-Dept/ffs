@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -28,11 +29,21 @@ type fakeResolver struct {
 	configs       map[string]string
 	err           error
 	platformCalls int
+	headCalls     int
+	// allow, when set, decides whether cs may pull from repo; refused calls get ErrUnauthorized.
+	allow func(repo string, cs registry.CredSet) bool
 }
 
-func (f *fakeResolver) ResolveTag(_ context.Context, repo, tag string, _ registry.CredSet) (string, error) {
+func (f *fakeResolver) denied(repo string, cs registry.CredSet) bool {
+	return f.allow != nil && !f.allow(repo, cs)
+}
+
+func (f *fakeResolver) ResolveTag(_ context.Context, repo, tag string, cs registry.CredSet) (string, error) {
 	if f.err != nil {
 		return "", f.err
+	}
+	if f.denied(repo, cs) {
+		return "", registry.ErrUnauthorized
 	}
 	d, ok := f.tags[repo+":"+tag]
 	if !ok {
@@ -41,10 +52,13 @@ func (f *fakeResolver) ResolveTag(_ context.Context, repo, tag string, _ registr
 	return d, nil
 }
 
-func (f *fakeResolver) PlatformManifest(_ context.Context, repo, digest, platform string, _ registry.CredSet) (registry.Manifest, error) {
+func (f *fakeResolver) PlatformManifest(_ context.Context, repo, digest, platform string, cs registry.CredSet) (registry.Manifest, error) {
 	f.platformCalls++
 	if f.err != nil {
 		return registry.Manifest{}, f.err
+	}
+	if f.denied(repo, cs) {
+		return registry.Manifest{}, registry.ErrUnauthorized
 	}
 	m, ok := f.platforms[digest+"|"+platform]
 	if !ok {
@@ -55,6 +69,33 @@ func (f *fakeResolver) PlatformManifest(_ context.Context, repo, digest, platfor
 
 func (f *fakeResolver) ConfigDigest(_ context.Context, _, digest string, _ registry.CredSet) (string, error) {
 	return f.configs[digest], nil
+}
+
+// Head knows a digest that a tag points at or that has a platform manifest.
+func (f *fakeResolver) Head(_ context.Context, ref string, cs registry.CredSet) (*v1.Descriptor, error) {
+	f.headCalls++
+	if f.err != nil {
+		return nil, f.err
+	}
+	repo, digest, _ := strings.Cut(ref, "@")
+	if f.denied(repo, cs) {
+		return nil, registry.ErrUnauthorized
+	}
+	known := false
+	for k, d := range f.tags {
+		known = known || (d == digest && strings.HasPrefix(k, repo+":"))
+	}
+	for k := range f.platforms {
+		known = known || strings.HasPrefix(k, digest+"|")
+	}
+	if !known {
+		return nil, registry.ErrNotFound
+	}
+	h, err := v1.NewHash(digest)
+	if err != nil {
+		return nil, err
+	}
+	return &v1.Descriptor{Digest: h}, nil
 }
 
 type emptyLookup struct{}
