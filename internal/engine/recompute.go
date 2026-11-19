@@ -113,11 +113,11 @@ func (e *Engine) recomputeOwner(ctx context.Context, p *pass, key string) (ups [
 		}
 		rekeyed = true
 	}
-	built, err := e.build(ctx, p, key, old)
+	built, w, err := e.build(ctx, p, key, old)
 	if err != nil {
 		return nil, nil, rekeyed, err
 	}
-	ups, ts = findings.Diff(old, built, p.now, p.trig)
+	ups, ts = findings.Diff(old, built, w, p.now, p.trig)
 	return ups, ts, rekeyed, nil
 }
 
@@ -167,17 +167,19 @@ func (p *pass) canonical(ctx context.Context, st Store, id string) (string, erro
 	return c, nil
 }
 
-// build returns the owner's findings from its current matches, or nil when the owner is gone. old
-// holds the owner's stored findings: those on an image repository that runs a digest not yet
-// catalogued (or with no digest) are carried, since that digest's matches are unknown; resolving
-// them would report every rollout as fixed and reopen everything once the new digest is catalogued.
-func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Finding) ([]model.Finding, error) {
+// build returns the owner's findings from its current matches, or nil when the owner is gone, and
+// what Diff needs to tell a withdrawal from a fix. old holds the owner's stored findings: those on
+// an image repository that runs a digest not yet catalogued (or with no digest) are carried, since
+// that digest's matches are unknown; resolving them would report every rollout as fixed and reopen
+// everything once the new digest is catalogued.
+func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Finding) ([]model.Finding, findings.Withdrawals, error) {
+	var w findings.Withdrawals
 	o, ok, err := e.o.Store.GetOwner(ctx, key)
 	if err != nil {
-		return nil, fmt.Errorf("owner: %w", err)
+		return nil, w, fmt.Errorf("owner: %w", err)
 	}
 	if !ok {
-		return nil, nil
+		return nil, w, nil
 	}
 	var digests []string
 	uncatalogued := map[string]bool{} // image repositories running a digest that is not catalogued
@@ -188,9 +190,10 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 			digests = append(digests, c.Digest)
 		}
 	}
+	w.Digests = digests
 	ms, err := e.o.Store.MatchesForDigests(ctx, digests)
 	if err != nil {
-		return nil, fmt.Errorf("matches: %w", err)
+		return nil, w, fmt.Errorf("matches: %w", err)
 	}
 	matched := map[string]bool{}
 	var ids []string
@@ -210,7 +213,7 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 	for _, d := range digests {
 		img, ok, err := e.o.Store.GetImage(ctx, d)
 		if err != nil {
-			return nil, fmt.Errorf("image %s: %w", d, err)
+			return nil, w, fmt.Errorf("image %s: %w", d, err)
 		}
 		if ok && img.Status == model.ImageCatalogued {
 			users[d] = img.ConfigUser
@@ -226,7 +229,7 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		}
 		ps, err := e.o.Store.PackagesForImage(ctx, d)
 		if err != nil {
-			return nil, fmt.Errorf("packages of %s: %w", d, err)
+			return nil, w, fmt.Errorf("packages of %s: %w", d, err)
 		}
 		for _, pk := range ps {
 			pkgs[pk.ID] = pk
@@ -241,9 +244,9 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 	}
 	advs, err := e.o.Store.Advisories(ctx, ids)
 	if err != nil {
-		return nil, fmt.Errorf("advisories: %w", err)
+		return nil, w, fmt.Errorf("advisories: %w", err)
 	}
-	return findings.Build(findings.BuildInput{
+	r := findings.BuildResult(findings.BuildInput{
 		Cluster:        e.o.Config.ClusterName,
 		Owner:          o,
 		Matches:        ms,
@@ -255,7 +258,9 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		Carry:          carry,
 		Now:            p.now,
 		PriorityConfig: e.o.Config.Priority,
-	}), nil
+	})
+	w.NotAffected = r.NotAffected
+	return r.Findings, w, nil
 }
 
 // matchImage runs every matcher over a catalogued digest: the Matchers in order, then grype with

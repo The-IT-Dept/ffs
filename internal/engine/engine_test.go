@@ -750,3 +750,61 @@ func TestEngine_RolloutToUncataloguedDigestKeepsFindings(t *testing.T) {
 	require.Len(t, ts, n+1)
 	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
 }
+
+// TestEngine_ProvisionalResolutionTrigger is the F29 regression: a provisional finding resolves as
+// withdrawn only when the advisory went away for the image the owner still runs (a feed change, or
+// grype's not-affected verdict), never when the team shipped the fix.
+func TestEngine_ProvisionalResolutionTrigger(t *testing.T) {
+	provisional := func(t *testing.T) *harness {
+		t.Helper()
+		h := newHarness(t)
+		h.osv.fn = matchOn(nil, d1, newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1"))
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d1))
+		require.NoError(t, h.e.Drain(ctx))
+		require.True(t, h.finding(apiKey, cve).Provisional)
+		h.clock.now = t0.Add(time.Hour)
+		return h
+	}
+	lastTrigger := func(h *harness) model.Trigger {
+		ts := h.transitions()
+		require.Equal(h.t, model.StateResolved, ts[len(ts)-1].ToState)
+		return ts[len(ts)-1].Trigger
+	}
+
+	t.Run("the team shipped the fix", func(t *testing.T) {
+		h := provisional(t)
+		const d4 = "sha256:d4"
+		fixed := h.libssl3
+		fixed.ImageDigest, fixed.Version = d4, "3.0.15-1"
+		fixed.ID = model.PackageID(d4, fixed)
+		require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d4, Repo: apiRepo, Platform: "linux/amd64",
+			Status: model.ImageCatalogued, CataloguedAt: h.clock.now}))
+		require.NoError(t, h.st.PutSBOM(ctx, d4, []byte(`{"artifacts":[]}`), []model.Package{fixed}))
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d4))
+		o, _, err := h.st.GetOwner(ctx, apiKey)
+		require.NoError(t, err)
+		o.Containers[0].Digest = d4
+		require.NoError(t, h.st.UpsertOwner(ctx, o))
+		require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerInventoryChange, lastTrigger(h))
+	})
+
+	t.Run("the OSV record was withdrawn", func(t *testing.T) {
+		h := provisional(t)
+		require.NoError(t, h.e.OnMatchDelta(ctx, match.Delta{
+			Scope: store.MatchScope{Source: model.SourceOSV, AdvisoryIDs: []string{cve}}}, model.TriggerNewAdvisory))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerWithdrawn, lastTrigger(h))
+	})
+
+	t.Run("grype says not affected", func(t *testing.T) {
+		h := provisional(t)
+		na := newMatch(h.libssl3, cve, model.SourceGrype)
+		na.FixState, na.DBBuilt = model.FixNotAffected, t0.Add(30*time.Minute)
+		h.grype.fn = matchOn(nil, d1, na)
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d1))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerWithdrawn, lastTrigger(h), "even on an inventory-change recompute")
+	})
+}

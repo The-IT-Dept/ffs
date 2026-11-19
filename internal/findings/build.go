@@ -61,10 +61,21 @@ type verdict struct {
 	provisional bool
 }
 
+// Result is what BuildResult returns.
+type Result struct {
+	Findings []model.Finding
+	// NotAffected holds the fingerprints of the (repository, advisory) groups that grype's
+	// not-affected verdicts removed entirely: no finding was built for them.
+	NotAffected map[string]bool
+}
+
 // Build returns the owner's findings, one per (image repository, canonical advisory), sorted by
 // fingerprint. Matches on rejected CVEs (Advisory.Withdrawn), unknown packages and digests the owner
 // does not run are ignored. All findings are open or excepted; Diff decides what resolved.
-func Build(in BuildInput) []model.Finding {
+func Build(in BuildInput) []model.Finding { return BuildResult(in).Findings }
+
+// BuildResult is Build, also reporting which findings grype's not-affected verdict removed.
+func BuildResult(in BuildInput) Result {
 	repos := digestRepos(in.Owner.Containers)
 	byTriple := map[triple][]model.Match{}
 	for _, m := range in.Matches {
@@ -80,6 +91,7 @@ func Build(in BuildInput) []model.Finding {
 
 	type groupKey struct{ repo, advisoryID string }
 	groups := map[groupKey][]verdict{}
+	notAffected := map[groupKey]bool{}
 	// Sorted, so ties between equal vendor ratings resolve the same way every time.
 	keys := slices.SortedFunc(maps.Keys(byTriple), func(a, b triple) int {
 		return cmp.Or(strings.Compare(a.digest, b.digest), strings.Compare(a.pkgID, b.pkgID),
@@ -88,6 +100,9 @@ func Build(in BuildInput) []model.Finding {
 	for _, t := range keys {
 		m, ok := precedence(byTriple[t])
 		if !ok {
+			for _, repo := range repos[t.digest] {
+				notAffected[groupKey{repo, t.advisoryID}] = true
+			}
 			continue
 		}
 		p := in.Packages[t.pkgID]
@@ -114,7 +129,13 @@ func Build(in BuildInput) []model.Finding {
 		out = append(out, b.carried(c))
 	}
 	slices.SortFunc(out, func(a, b model.Finding) int { return strings.Compare(a.Fingerprint, b.Fingerprint) })
-	return out
+	gone := map[string]bool{}
+	for k := range notAffected {
+		if fp := model.FindingFingerprint(in.Cluster, in.Owner.Ref, k.repo, k.advisoryID); !built[fp] {
+			gone[fp] = true
+		}
+	}
+	return Result{Findings: out, NotAffected: gone}
 }
 
 // digestRepos maps each non-empty container digest to the sorted repositories it runs as.
