@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,8 @@ type Store interface {
 	Canonical(ctx context.Context, id string) (string, error)
 	RekeyFindings(ctx context.Context, rks []store.FindingRekey) error
 	DigestsInUse(ctx context.Context) ([]string, error)
+	LiveDigests(ctx context.Context) ([]string, error)
+	DigestsAwaitingGrype(ctx context.Context, built time.Time) ([]string, error)
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
 	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
@@ -62,8 +65,8 @@ type CNAMatcher interface {
 type GrypeMatcher interface {
 	match.Matcher
 	Load(path string, built time.Time) error
-	Rematch(ctx context.Context, changed []grypedb.PackageKey) (match.Delta, error)
-	RematchAll(ctx context.Context) (match.Delta, error)
+	// Affected returns the digests whose grype search keys include a changed package.
+	Affected(ctx context.Context, changed []grypedb.PackageKey) ([]string, error)
 }
 
 // Options configures an Engine.
@@ -85,6 +88,11 @@ type Engine struct {
 	o Options
 
 	mu sync.Mutex // serialises Recompute
+	// matchMu serialises every match computation with the write of its result: matchImage, record
+	// and CNA deltas, and each digest of a Grype DB re-match. A matcher reads the records, packages or
+	// stored matches it computes from, then replaces a whole scope; without it a concurrent writer's
+	// matches in that scope would be overwritten by a result computed before they existed.
+	matchMu sync.Mutex
 
 	qmu     sync.Mutex
 	pending map[string]model.Trigger // owner key → trigger of its queued recompute
@@ -116,7 +124,7 @@ func (e *Engine) now() time.Time { return e.o.Now().UTC() }
 // OnImageCatalogued re-matches a newly catalogued digest with every matcher and queues the owners
 // running it. The owners are queued even when a matcher failed; the error is returned afterwards.
 func (e *Engine) OnImageCatalogued(ctx context.Context, digest string) error {
-	_, err := e.matchImage(ctx, digest, true)
+	_, err := e.matchImage(ctx, digest, matchPersist)
 	// The owners are looked up now: a synthetic digest can be catalogued before its owner is stored,
 	// and the owner change then arrives through OnOwnersChanged.
 	owners, oerr := e.o.Store.OwnersForDigests(ctx, []string{digest})
@@ -139,6 +147,13 @@ func (e *Engine) OnOwnersChanged(_ context.Context, keys []string) error {
 // advisories (an alias merge can move matches between advisory keys without changing a digest's
 // rows). A delta with an empty scope is a no-op.
 func (e *Engine) OnMatchDelta(ctx context.Context, d match.Delta, trig model.Trigger) error {
+	e.matchMu.Lock()
+	defer e.matchMu.Unlock()
+	return e.applyDelta(ctx, d, trig)
+}
+
+// applyDelta is OnMatchDelta; the caller holds matchMu.
+func (e *Engine) applyDelta(ctx context.Context, d match.Delta, trig model.Trigger) error {
 	s := d.Scope
 	if len(s.Digests) == 0 && len(s.PackageIDs) == 0 && len(s.AdvisoryIDs) == 0 {
 		return nil
@@ -190,16 +205,29 @@ func (e *Engine) OnExceptionsChanged(ctx context.Context) error {
 func observe(h prometheus.Observer, start time.Time) { h.Observe(time.Since(start).Seconds()) }
 
 // OnOSVRecords hands changed OSV records to every record matcher and applies their deltas. A
-// failing matcher does not stop the others; the errors are returned together.
+// failing matcher does not stop the others; the errors are returned together. Each matcher's
+// evaluation and the write of its deltas hold matchMu, so an image catalogued meanwhile is matched
+// after the deltas land, against the records they came from.
 func (e *Engine) OnOSVRecords(ctx context.Context, recs []osv.Changed) error {
 	defer observe(metrics.RematchDuration.WithLabelValues("osv"), time.Now())
 	var errs []error
 	for _, m := range e.o.Records {
-		ds, err := m.ApplyOSV(ctx, recs)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("engine: apply OSV records: %w", err))
-		}
-		errs = append(errs, e.applyDeltas(ctx, ds, model.TriggerNewAdvisory))
+		errs = append(errs, e.applyRecords(ctx, func() ([]match.Delta, error) { return m.ApplyOSV(ctx, recs) }, "OSV records"))
+	}
+	return errors.Join(errs...)
+}
+
+// applyRecords computes record deltas with apply and writes them, under matchMu.
+func (e *Engine) applyRecords(ctx context.Context, apply func() ([]match.Delta, error), what string) error {
+	e.matchMu.Lock()
+	defer e.matchMu.Unlock()
+	var errs []error
+	ds, err := apply()
+	if err != nil {
+		errs = append(errs, fmt.Errorf("engine: apply %s: %w", what, err))
+	}
+	for _, d := range ds {
+		errs = append(errs, e.applyDelta(ctx, d, model.TriggerNewAdvisory))
 	}
 	return errors.Join(errs...)
 }
@@ -210,55 +238,98 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 	defer observe(metrics.RematchDuration.WithLabelValues("cna"), time.Now())
 	var errs []error
 	if e.o.CNA != nil {
-		ds, err := e.o.CNA.ApplyCNA(ctx, ids)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("engine: apply CNA records: %w", err))
-		}
-		errs = append(errs, e.applyDeltas(ctx, ds, model.TriggerNewAdvisory))
+		errs = append(errs, e.applyRecords(ctx, func() ([]match.Delta, error) { return e.o.CNA.ApplyCNA(ctx, ids) }, "CNA records"))
 	}
 	errs = append(errs, e.OnAdvisoriesEnriched(ctx, ids))
 	return errors.Join(errs...)
 }
 
-// OnGrypeDB loads a new Grype DB, records its build and re-matches the affected digests (every
-// digest when u.Full). Every owner is then queued, because the new build counts towards settling
-// provisional findings. A load failure is returned before the build is recorded, so the feed offers
-// the build again.
+// OnGrypeDB loads a new Grype DB and re-matches, one digest at a time, the live digests (those an
+// owner runs or a suggestion holds) it can change:
+//   - on a full update (the first DB, then weekly), every live digest with every matcher: the
+//     safety net for anything an incremental path missed, OSV and upstream included;
+//   - otherwise, with grype alone, the digests whose packages the diff changed plus those with OSV
+//     matches grype has not ruled on yet (store.DigestsAwaitingGrype).
+//
+// A digest that fails is logged, counted and left for the next DB; only when every digest fails, or
+// the re-match is cancelled, is the error returned, before the build is recorded, so the feed
+// offers it again. The build is recorded once the re-match is done, since it counts towards
+// settling provisional findings, and every owner is then queued.
 func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	defer observe(metrics.RematchDuration.WithLabelValues("grypedb"), time.Now())
 	if err := e.o.Grype.Load(u.Path, u.Built); err != nil {
 		return fmt.Errorf("engine: load grype database: %w", err)
 	}
+	digests, err := e.grypeTargets(ctx, u)
+	if err != nil {
+		return err
+	}
+	mode := matchGrype
+	if u.Full {
+		mode = matchPersist
+	}
+	var (
+		failed  int
+		lastErr error
+	)
+	for _, d := range digests {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("engine: grype re-match: %w", err)
+		}
+		if _, err := e.matchImage(ctx, d, mode); err != nil {
+			failed++
+			lastErr = err
+			e.o.Log.Error(err, "re-matching an image with the new Grype DB failed; it waits for the next one", "digest", d)
+		}
+	}
+	if failed > 0 {
+		if failed == len(digests) {
+			return fmt.Errorf("engine: grype re-match failed on all %d images: %w", failed, lastErr)
+		}
+		e.o.Log.Info("some images were not re-matched with the new Grype DB", "failed", failed, "images", len(digests))
+	}
 	if err := e.o.Store.RecordGrypeDBBuild(ctx, u.Built); err != nil {
 		return fmt.Errorf("engine: record grype database build: %w", err)
 	}
-	var (
-		d   match.Delta
-		err error
-	)
-	if u.Full {
-		d, err = e.o.Grype.RematchAll(ctx)
-	} else {
-		d, err = e.o.Grype.Rematch(ctx, u.Changed)
-	}
-	if err != nil {
-		return fmt.Errorf("engine: grype re-match: %w", err)
-	}
-	if err := e.OnMatchDelta(ctx, d, model.TriggerNewAdvisory); err != nil {
-		return err
-	}
 	return e.enqueueAll(ctx, model.TriggerNewAdvisory)
+}
+
+// grypeTargets returns the digests OnGrypeDB re-matches for u.
+func (e *Engine) grypeTargets(ctx context.Context, u grypedb.Update) ([]string, error) {
+	if u.Full {
+		ds, err := e.o.Store.LiveDigests(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("engine: live digests: %w", err)
+		}
+		return ds, nil
+	}
+	changed, err := e.o.Grype.Affected(ctx, u.Changed)
+	if err != nil {
+		return nil, fmt.Errorf("engine: digests the grype database changed: %w", err)
+	}
+	live, err := e.o.Store.LiveDigests(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("engine: live digests: %w", err)
+	}
+	waiting, err := e.o.Store.DigestsAwaitingGrype(ctx, u.Built)
+	if err != nil {
+		return nil, fmt.Errorf("engine: digests awaiting grype: %w", err)
+	}
+	out := slices.DeleteFunc(changed, func(d string) bool { _, ok := slices.BinarySearch(live, d); return !ok })
+	out = append(out, waiting...)
+	slices.Sort(out)
+	return slices.Compact(out), nil
 }
 
 // MatchCandidate runs every matcher over a catalogued digest and returns the matches without
 // storing them, with canonical advisory ids. A grype matcher with no DB loaded contributes no
 // matches; any other matcher failure is an error. An uncatalogued digest has no matches.
 func (e *Engine) MatchCandidate(ctx context.Context, digest string) ([]model.Match, error) {
-	ms, err := e.matchImage(ctx, digest, false)
+	r, err := e.matchImage(ctx, digest, matchCandidate)
 	if err != nil {
 		return nil, err
 	}
-	return e.canonicalise(ctx, ms)
+	return e.canonicalise(ctx, r.matches)
 }
 
 // Changed returns a new subscriber channel. It receives a value, coalesced, whenever a Recompute
@@ -288,15 +359,6 @@ func (e *Engine) Idle() bool {
 	e.qmu.Lock()
 	defer e.qmu.Unlock()
 	return len(e.pending) == 0 && e.running.Load() == 0
-}
-
-// applyDeltas applies each delta, continuing past failures.
-func (e *Engine) applyDeltas(ctx context.Context, ds []match.Delta, trig model.Trigger) error {
-	var errs []error
-	for _, d := range ds {
-		errs = append(errs, e.OnMatchDelta(ctx, d, trig))
-	}
-	return errors.Join(errs...)
 }
 
 // enqueueAll queues every stored owner.

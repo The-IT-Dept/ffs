@@ -102,25 +102,32 @@ func (f *fakeRecords) ApplyOSV(_ context.Context, recs []osv.Changed) ([]match.D
 	return f.deltas, nil
 }
 
-// fakeGrype is the grype matcher: MatchImage through fakeMatcher, Rematch and RematchAll return
-// delta. With notReady every call returns match.ErrNotReady.
+// fakeGrype is the grype matcher: MatchImage through fakeMatcher, storing a search key for the
+// digest as the real one does, and Affected returns affected. With notReady every call returns
+// match.ErrNotReady.
 type fakeGrype struct {
 	fakeMatcher
-	delta           match.Delta
-	loaded          []string
-	loadedBuilt     []time.Time
-	rematchArgs     [][]grypedb.PackageKey
-	rematchAllCalls int
-	notReady        bool
+	st           *store.Store
+	affected     []string
+	loaded       []string
+	loadedBuilt  []time.Time
+	affectedArgs [][]grypedb.PackageKey
+	matched      []string // digests MatchImage ran on
+	notReady     bool
 }
 
 func (g *fakeGrype) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
+	g.matched = append(g.matched, in.Digest)
 	if g.notReady {
 		g.calls++
 		g.lastInput = in
 		return nil, match.ErrNotReady
 	}
-	return g.fakeMatcher.MatchImage(ctx, in)
+	ms, err := g.fakeMatcher.MatchImage(ctx, in)
+	if err == nil && g.st != nil {
+		err = g.st.PutGrypeKeys(ctx, in.Digest, []string{"key"}, nil)
+	}
+	return ms, err
 }
 
 func (g *fakeGrype) Load(path string, built time.Time) error {
@@ -129,20 +136,12 @@ func (g *fakeGrype) Load(path string, built time.Time) error {
 	return nil
 }
 
-func (g *fakeGrype) Rematch(_ context.Context, changed []grypedb.PackageKey) (match.Delta, error) {
-	g.rematchArgs = append(g.rematchArgs, changed)
+func (g *fakeGrype) Affected(_ context.Context, changed []grypedb.PackageKey) ([]string, error) {
+	g.affectedArgs = append(g.affectedArgs, changed)
 	if g.notReady {
-		return match.Delta{}, match.ErrNotReady
+		return nil, match.ErrNotReady
 	}
-	return g.delta, nil
-}
-
-func (g *fakeGrype) RematchAll(context.Context) (match.Delta, error) {
-	g.rematchAllCalls++
-	if g.notReady {
-		return match.Delta{}, match.ErrNotReady
-	}
-	return g.delta, nil
+	return g.affected, nil
 }
 
 type harness struct {
@@ -171,7 +170,7 @@ func newHarness(t *testing.T) *harness {
 		st:         &spyStore{Store: st},
 		clock:      &clock{now: t0},
 		osv:        &fakeMatcher{src: model.SourceOSV},
-		grype:      &fakeGrype{fakeMatcher: fakeMatcher{src: model.SourceGrype}},
+		grype:      &fakeGrype{fakeMatcher: fakeMatcher{src: model.SourceGrype}, st: st},
 		records:    &fakeRecords{},
 		exceptions: &fakeExceptions{},
 	}
@@ -524,7 +523,9 @@ func TestEngine_GrypeDBRecordsBuildAndRematchesAffected(t *testing.T) {
 
 	rematched := h.grypeOn(h.libssl3)
 	rematched.DBBuilt = b
-	h.grype.delta = match.Delta{Scope: store.MatchScope{Source: model.SourceGrype, Digests: []string{d1}}, Matches: []model.Match{rematched}}
+	h.grype.fn = matchOn(h.grype.fn, d1, rematched)
+	h.grype.affected = []string{d1, "sha256:dead"} // a digest no owner runs is not re-matched
+	h.grype.matched, h.osv.calls = nil, 0
 	changed := []grypedb.PackageKey{{Ecosystem: "deb", Name: "libssl3"}}
 	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/b", Built: b, Changed: changed}))
 
@@ -533,8 +534,11 @@ func TestEngine_GrypeDBRecordsBuildAndRematchesAffected(t *testing.T) {
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []time.Time{b}, builds)
-	require.Equal(t, [][]grypedb.PackageKey{changed}, h.grype.rematchArgs)
-	require.Zero(t, h.grype.rematchAllCalls)
+	require.Equal(t, [][]grypedb.PackageKey{changed}, h.grype.affectedArgs)
+	require.Equal(t, []string{d1}, h.grype.matched, "only the live digest the diff touched")
+	require.Zero(t, h.osv.calls, "an incremental update re-matches with grype alone")
+	require.Equal(t, []model.Match{newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1")},
+		clearObserved(h.grype.lastInput.Hints), "the stored OSV matches are grype's hints")
 
 	ms, err := h.st.MatchesForDigests(ctx, []string{d1})
 	require.NoError(t, err)
@@ -559,7 +563,7 @@ func TestEngine_GrypeDBLoadFailureRecordsNothing(t *testing.T) {
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Empty(t, builds, "the build is recorded only once it loaded")
-	require.Zero(t, h.grype.rematchAllCalls)
+	require.Empty(t, h.grype.matched)
 	require.True(t, e.Idle())
 }
 
@@ -567,13 +571,21 @@ type failingLoad struct{ *fakeGrype }
 
 func (f *failingLoad) Load(string, time.Time) error { return errors.New("corrupt database") }
 
-func TestEngine_GrypeDBFullUsesRematchAll(t *testing.T) {
+// TestEngine_GrypeDBFullRematchesEveryMatcher is part of the F22 regression: the weekly full update
+// is the safety net for every matcher, so it re-runs the OSV fast path too, on every live digest.
+func TestEngine_GrypeDBFullRematchesEveryMatcher(t *testing.T) {
 	h := newHarness(t)
-	h.grype.delta = match.Delta{Scope: store.MatchScope{Source: model.SourceGrype}}
 	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/c", Built: t0, Full: true}))
-	require.Equal(t, 1, h.grype.rematchAllCalls)
-	require.Empty(t, h.grype.rematchArgs)
-	require.Empty(t, h.st.replaced, "a delta with an empty scope replaces nothing")
+	require.Empty(t, h.grype.affectedArgs)
+	require.Equal(t, []string{d1, d2}, h.grype.matched)
+	require.Equal(t, 2, h.osv.calls, "the OSV fast path re-matches every live digest too")
+	require.ElementsMatch(t, []store.MatchScope{
+		{Source: model.SourceOSV, Digests: []string{d1}}, {Source: model.SourceGrype, Digests: []string{d1}},
+		{Source: model.SourceOSV, Digests: []string{d2}}, {Source: model.SourceGrype, Digests: []string{d2}},
+	}, h.st.replaced, "one digest at a time")
+	builds, err := h.st.GrypeDBBuilds(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []time.Time{t0}, builds)
 }
 
 func TestEngine_AliasRekeyNoTransition(t *testing.T) {
@@ -854,4 +866,14 @@ func TestEngine_PruneUnusedImagesAfterAWeek(t *testing.T) {
 	_, ok, err = h.st.GetImage(ctx, d1)
 	require.NoError(t, err)
 	require.True(t, ok, "web/api still runs d1")
+}
+
+// clearObserved returns ms with ObservedAt cleared, for comparing match content.
+func clearObserved(ms []model.Match) []model.Match {
+	out := make([]model.Match, len(ms))
+	for i, m := range ms {
+		m.ObservedAt = time.Time{}
+		out[i] = m
+	}
+	return out
 }

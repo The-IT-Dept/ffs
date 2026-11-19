@@ -263,46 +263,69 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 	return r.Findings, w, nil
 }
 
-// matchImage runs every matcher over a catalogued digest: the Matchers in order, then grype with
-// the OSV matches as hints. With persist, each matcher's matches replace its stored matches on the
-// digest, and observers hear once that the digest's matches changed if any did. A grype matcher
-// with no DB loaded has no opinion: its stored matches stay and it is not an error. Any other
-// failure leaves that matcher's stored matches untouched and is returned, joined, after the other
-// matchers have run. It returns the matches of the matchers that succeeded.
-func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([]model.Match, error) {
+// matchMode is what matchImage runs and whether it stores the result.
+type matchMode int
+
+const (
+	matchPersist   matchMode = iota // every matcher; store each one's matches
+	matchGrype                      // grype alone, with the stored OSV matches as hints; store them
+	matchCandidate                  // every matcher; store nothing (upgrade candidates)
+)
+
+// matchResult is what matchImage returns.
+type matchResult struct {
+	matches       []model.Match // of the matchers that succeeded
+	grypeNotReady bool          // grype ran with no DB loaded
+}
+
+// matchImage runs the matchers of mode over a catalogued digest: the Matchers in order, then grype
+// with the OSV matches as hints. With matchPersist and matchGrype it holds matchMu throughout, each
+// matcher's matches replace its stored matches on the digest, and observers hear once that the
+// digest's matches changed if any did. A grype matcher with no DB loaded has no opinion: its stored
+// matches stay and it is not an error (MatchCandidate decides what that means for a candidate). Any
+// other failure leaves that matcher's stored matches untouched and is returned, joined, after the
+// other matchers have run.
+func (e *Engine) matchImage(ctx context.Context, digest string, mode matchMode) (matchResult, error) {
+	persist := mode != matchCandidate
+	if persist {
+		e.matchMu.Lock()
+		defer e.matchMu.Unlock()
+	}
+	var res matchResult
 	img, ok, err := e.o.Store.GetImage(ctx, digest)
 	if err != nil {
-		return nil, fmt.Errorf("engine: image %s: %w", digest, err)
+		return res, fmt.Errorf("engine: image %s: %w", digest, err)
 	}
 	if !ok || img.Status != model.ImageCatalogued {
-		return nil, nil
+		return res, nil
 	}
 	sbom, _, err := e.o.Store.GetSBOM(ctx, digest)
 	if err != nil {
-		return nil, fmt.Errorf("engine: SBOM of %s: %w", digest, err)
+		return res, fmt.Errorf("engine: SBOM of %s: %w", digest, err)
 	}
 	pkgs, err := e.o.Store.PackagesForImage(ctx, digest)
 	if err != nil {
-		return nil, fmt.Errorf("engine: packages of %s: %w", digest, err)
+		return res, fmt.Errorf("engine: packages of %s: %w", digest, err)
 	}
 	stored, err := e.o.Store.MatchesForDigests(ctx, []string{digest})
 	if err != nil {
-		return nil, fmt.Errorf("engine: matches of %s: %w", digest, err)
+		return res, fmt.Errorf("engine: matches of %s: %w", digest, err)
 	}
 	in := match.ImageInput{Digest: digest, SyftJSON: sbom, Packages: pkgs}
 	now := e.now()
 
 	var (
-		all       []model.Match
 		errs      []error
-		osvFailed bool
+		osvFailed = mode == matchGrype // grype alone: the OSV matches that stand are the stored ones
 		changed   bool
 	)
 	// run matches with m and, with persist, stores the result. It reports whether m had an opinion.
 	run := func(m match.Matcher, in match.ImageInput, grype bool) ([]model.Match, bool) {
 		ms, err := m.MatchImage(ctx, in)
 		if err != nil {
-			if !grype || !errors.Is(err, match.ErrNotReady) {
+			if grype && errors.Is(err, match.ErrNotReady) {
+				res.grypeNotReady = true
+			} else {
 				errs = append(errs, fmt.Errorf("engine: %s matcher on %s: %w", m.Source(), digest, err))
 			}
 			return nil, false
@@ -316,19 +339,20 @@ func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([
 			}
 			changed = changed || len(affected) > 0
 		}
-		all = append(all, ms...)
+		res.matches = append(res.matches, ms...)
 		return ms, true
 	}
 	var hints []model.Match
-	for _, m := range e.o.Matchers {
-		ms, ok := run(m, in, false)
-		if !ok && m.Source() == model.SourceOSV {
-			osvFailed = true
+	if mode != matchGrype {
+		for _, m := range e.o.Matchers {
+			ms, ok := run(m, in, false)
+			if !ok && m.Source() == model.SourceOSV {
+				osvFailed = true
+			}
+			hints = append(hints, sourced(ms, model.SourceOSV)...)
 		}
-		hints = append(hints, sourced(ms, model.SourceOSV)...)
 	}
 	if osvFailed {
-		// the OSV matches that stand are the stored ones
 		hints = append(hints, sourced(stored, model.SourceOSV)...)
 	}
 	in.Hints = hints
@@ -336,7 +360,7 @@ func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([
 	if changed {
 		e.matchesReplaced(ctx, []string{digest})
 	}
-	return all, errors.Join(errs...)
+	return res, errors.Join(errs...)
 }
 
 // sourced returns the matches of ms from source.
