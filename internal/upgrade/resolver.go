@@ -96,13 +96,16 @@ func NewResolver(o Options) *Resolver {
 func (r *Resolver) now() time.Time { return r.o.Now().UTC() }
 
 // clusterLevel reports whether kind is a cluster-level subject, whose advice is not an image upgrade.
-func clusterLevel(kind string) bool { return kind == "Cluster" || kind == "ContainerRuntime" }
+func clusterLevel(o model.OwnerRef) bool { return o.ClusterLevel() }
 
 // Run is the leader-only worker (a manager.Runnable). It runs the daily pass first when the last
 // one finished more than a day ago, then, until ctx is done, consumes the transitions outbox every
 // 30 seconds, runs the daily pass at Upgrades.DailyAt (UTC) and resolves queued owners one at a
 // time. Errors are logged, never returned, except an invalid DailyAt.
 func (r *Resolver) Run(ctx context.Context) error {
+	// Upgrade work is never more urgent than inventory resolution: it leaves a registry's last 20%
+	// of budget to the inventory (and candidate pulls run low-priority in the acquirer anyway).
+	ctx = registry.LowPriority(ctx)
 	at := r.o.Config.Upgrades.DailyAt
 	if _, err := nextDaily(r.now(), at); err != nil {
 		return fmt.Errorf("upgrade: dailyAt %q: %w", at, err)
@@ -236,7 +239,7 @@ func (r *Resolver) ConsumeTransitions(ctx context.Context) (int, error) {
 	var wanted []model.Transition
 	var fps []string
 	for _, t := range ts {
-		if qualifies(t) && !clusterLevel(t.Owner.Kind) {
+		if qualifies(t) && !clusterLevel(t.Owner) {
 			wanted = append(wanted, t)
 			fps = append(fps, t.Fingerprint)
 		}
@@ -293,7 +296,7 @@ func (r *Resolver) MatchesReplaced(ctx context.Context, digests []string) {
 // (a suggested upgrade was rolled out) is queued, so its suggestion says whether that helped.
 func (r *Resolver) OwnersRecomputed(ctx context.Context, keys []string) {
 	for _, key := range keys {
-		if kind, _, _ := strings.Cut(key, "/"); clusterLevel(kind) {
+		if model.ClusterLevelKey(key) {
 			continue
 		}
 		o, ok, err := r.o.Store.GetOwner(ctx, key)
@@ -396,7 +399,7 @@ func (r *Resolver) ResolveOwner(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("upgrade: findings of %s: %w", key, err)
 	}
-	if clusterLevel(o.Ref.Kind) {
+	if clusterLevel(o.Ref) {
 		return r.resolveClusterLevel(ctx, o, fs)
 	}
 

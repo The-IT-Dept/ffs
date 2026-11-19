@@ -867,7 +867,7 @@ func (s *Service) Cluster(ctx context.Context) (ClusterView, error) {
 	}
 	var versions []string
 	for _, o := range owners {
-		if o.Ref.Kind != "Cluster" {
+		if !o.Ref.ClusterLevel() || o.Ref.Kind != model.OwnerKindCluster {
 			continue
 		}
 		for _, c := range o.Containers {

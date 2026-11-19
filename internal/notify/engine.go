@@ -469,7 +469,7 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 	}
 	n := 0
 	for _, o := range owners {
-		if o.Ref.Kind != "Cluster" && o.Ref.Kind != "ContainerRuntime" && t.cfg.allows(o.Ref.Namespace) {
+		if !o.Ref.ClusterLevel() && t.cfg.allows(o.Ref.Namespace) {
 			n++
 		}
 	}
