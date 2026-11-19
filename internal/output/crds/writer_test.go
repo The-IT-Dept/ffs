@@ -279,3 +279,28 @@ func TestFindingStatus_Content(t *testing.T) {
 	f.Packages[0].Fixed, f.FixState, f.FixAvailable = nil, model.FixWontFix, false
 	require.Equal(t, "wont-fix", findingStatus("prod", f, owner, adv).Fix, "without a fixed version Fix is the fix state")
 }
+
+// TestCRWriter_ZeroMaxFindingsIsUnlimited pins the documented meaning of crd.maxFindings: 0 (F46):
+// every eligible finding is kept and none counts as dropped.
+func TestCRWriter_ZeroMaxFindingsIsUnlimited(t *testing.T) {
+	open := []model.Finding{
+		openFinding(deployment("web", "a"), debianRepo, cve, model.PriorityUrgent, t0),
+		openFinding(deployment("web", "b"), debianRepo, cve, model.PriorityHigh, t0),
+		openFinding(deployment("web", "c"), debianRepo, cve, model.PriorityMedium, t0),
+	}
+	for _, limit := range []int{0, -1} {
+		c := config.Default()
+		c.CRD.MaxFindings = limit
+		w := NewWriter(WriterOptions{Config: c, Namespace: "ffs"})
+		keep, dropped := w.selectFindings(open, model.PriorityHigh)
+		require.Len(t, keep, 2, "maxFindings %d", limit)
+		require.Zero(t, dropped, "maxFindings %d", limit)
+	}
+
+	c := config.Default()
+	c.CRD.MaxFindings = 1
+	keep, dropped := NewWriter(WriterOptions{Config: c, Namespace: "ffs"}).selectFindings(open, model.PriorityHigh)
+	require.Len(t, keep, 1)
+	require.Equal(t, model.PriorityUrgent, keep[0].Priority)
+	require.Equal(t, 1, dropped)
+}
