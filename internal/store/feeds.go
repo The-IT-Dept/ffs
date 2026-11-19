@@ -84,19 +84,12 @@ func (s *Store) OSVRecords(ctx context.Context, eco string, since time.Time) ([]
 	if !since.IsZero() {
 		w.add(`modified >= ?`, nanos(since))
 	}
-	return queryAll(ctx, s.rdb, func(r scanner) ([]byte, error) {
-		var zst []byte
-		if err := r.Scan(&zst); err != nil {
-			return nil, err
-		}
-		return zstdDecode(zst)
-	}, `SELECT raw_zst FROM osv_records`+w.String()+` ORDER BY id`, w.args...)
+	return queryAll(ctx, s.rdb, scanZstd, `SELECT raw_zst FROM osv_records`+w.String()+` ORDER BY id`, w.args...)
 }
 
-// DeleteOSVRecords removes the cached records of eco with the given ids.
+// DeleteOSVRecords removes the cached records of eco with the given ids, and their index names.
 func (s *Store) DeleteOSVRecords(ctx context.Context, eco string, ids []string) error {
-	_, err := s.wdb.ExecContext(ctx, `DELETE FROM osv_records WHERE ecosystem = ? AND id IN (SELECT value FROM json_each(?))`, eco, idList(ids))
-	return err
+	return s.inTx(ctx, func(tx *sql.Tx) error { return deleteOSVRecords(ctx, tx, eco, ids) })
 }
 
 // PutUpstreamRanges stores the affected ranges of an advisory for an upstream product.
