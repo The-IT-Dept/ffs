@@ -1,0 +1,248 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/the-it-dept/ffs/internal/model"
+)
+
+// ImageFilter selects images; empty fields match everything. Results are ordered by digest.
+type ImageFilter struct {
+	Statuses []model.ImageStatus
+	Repo     string
+	Limit    int // 0 = no limit
+}
+
+// EcosystemKey is a distinct (ecosystem, distro id, distro version) tuple present in stored packages.
+type EcosystemKey struct{ Ecosystem, DistroID, DistroVersion string }
+
+const imageCols = `digest, index_digest, repo, platform, status, status_reason, source, version_annotation,
+	config_user, coverage, catalogued_at, attempts, quarantined_until`
+
+// UpsertImage writes every column, except that an incoming pending status never overwrites a
+// stored non-pending one: the stored status and catalogue fields are kept and only non-empty
+// IndexDigest, Repo and Platform are updated.
+func (s *Store) UpsertImage(ctx context.Context, img model.Image) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if img.Status == model.ImagePending {
+			stored, ok, err := getImage(ctx, tx, img.Digest)
+			if err != nil {
+				return err
+			}
+			if ok && stored.Status != model.ImagePending {
+				if img.IndexDigest != "" {
+					stored.IndexDigest = img.IndexDigest
+				}
+				if img.Repo != "" {
+					stored.Repo = img.Repo
+				}
+				if img.Platform != "" {
+					stored.Platform = img.Platform
+				}
+				img = stored
+			}
+		}
+		coverage, err := jsonText(img.Coverage)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO images(`+imageCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			img.Digest, img.IndexDigest, img.Repo, img.Platform, string(img.Status), img.StatusReason, img.Source,
+			img.VersionAnnotation, img.ConfigUser, coverage, nanos(img.CataloguedAt), img.Attempts, nanos(img.QuarantinedUntil))
+		return err
+	})
+}
+
+// GetImage returns the image with the given platform-manifest digest.
+func (s *Store) GetImage(ctx context.Context, digest string) (model.Image, bool, error) {
+	return getImage(ctx, s.rdb, digest)
+}
+
+func getImage(ctx context.Context, q querier, digest string) (model.Image, bool, error) {
+	img, err := scanImage(q.QueryRowContext(ctx, `SELECT `+imageCols+` FROM images WHERE digest = ?`, digest))
+	if errors.Is(err, sql.ErrNoRows) {
+		return model.Image{}, false, nil
+	}
+	return img, err == nil, err
+}
+
+// ListImages returns the images matching f, ordered by digest.
+func (s *Store) ListImages(ctx context.Context, f ImageFilter) ([]model.Image, error) {
+	var w where
+	if len(f.Statuses) > 0 {
+		statuses := make([]string, len(f.Statuses))
+		for i, st := range f.Statuses {
+			statuses[i] = string(st)
+		}
+		w.add(`status IN (SELECT value FROM json_each(?))`, idList(statuses))
+	}
+	if f.Repo != "" {
+		w.add(`repo = ?`, f.Repo)
+	}
+	return queryAll(ctx, s.rdb, scanImage,
+		`SELECT `+imageCols+` FROM images`+w.String()+` ORDER BY digest`+limitOffset(f.Limit, 0), w.args...)
+}
+
+func scanImage(r scanner) (model.Image, error) {
+	var (
+		img                     model.Image
+		status, coverage        string
+		catalogued, quarantined sql.NullInt64
+	)
+	if err := r.Scan(&img.Digest, &img.IndexDigest, &img.Repo, &img.Platform, &status, &img.StatusReason, &img.Source,
+		&img.VersionAnnotation, &img.ConfigUser, &coverage, &catalogued, &img.Attempts, &quarantined); err != nil {
+		return model.Image{}, err
+	}
+	img.Status = model.ImageStatus(status)
+	img.CataloguedAt = fromNanos(catalogued)
+	img.QuarantinedUntil = fromNanos(quarantined)
+	if err := json.Unmarshal([]byte(coverage), &img.Coverage); err != nil {
+		return model.Image{}, fmt.Errorf("image %s coverage: %w", img.Digest, err)
+	}
+	return img, nil
+}
+
+const packageCols = `id, digest, ecosystem, distro_id, distro_version, distro_codename, name, version, epoch, arch,
+	source_name, source_version, purl, cpes, path, layer, classifier, go_stdlib, syft_id`
+
+// PutSBOM replaces every package of digest and stores the zstd-compressed syft JSON. Each package
+// gets ImageDigest = digest, and ID = model.PackageID(digest, p) when ID is empty. A nil syftJSON
+// (synthetic digests) deletes any stored SBOM.
+func (s *Store) PutSBOM(ctx context.Context, digest string, syftJSON []byte, pkgs []model.Package) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		var err error
+		if syftJSON == nil {
+			_, err = tx.ExecContext(ctx, `DELETE FROM sboms WHERE digest = ?`, digest)
+		} else {
+			_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO sboms(digest, syft_zst, raw_size) VALUES(?, ?, ?)`,
+				digest, zstdEncode(syftJSON), len(syftJSON))
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM packages WHERE digest = ?`, digest); err != nil {
+			return err
+		}
+		ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO packages(`+packageCols+`) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = ins.Close() }()
+		for _, p := range pkgs {
+			p.ImageDigest = digest
+			if p.ID == "" {
+				p.ID = model.PackageID(digest, p)
+			}
+			var d model.Distro
+			if p.Distro != nil {
+				d = *p.Distro
+			}
+			// OR IGNORE: an identical package listed twice (same PackageID) is stored once.
+			if _, err := ins.ExecContext(ctx, p.ID, p.ImageDigest, p.Ecosystem, d.ID, d.VersionID, d.Codename, p.Name, p.Version,
+				p.Epoch, p.Arch, p.SourceName, p.SourceVersion, p.PURL, stringsText(p.CPEs), p.Path, p.Layer, p.Classifier,
+				p.GoStdlib, p.SyftID); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// GetSBOM returns the decompressed syft JSON for digest.
+func (s *Store) GetSBOM(ctx context.Context, digest string) ([]byte, bool, error) {
+	var zst []byte
+	err := s.rdb.QueryRowContext(ctx, `SELECT syft_zst FROM sboms WHERE digest = ?`, digest).Scan(&zst)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	b, err := zstdDecode(zst)
+	if err != nil {
+		return nil, false, fmt.Errorf("store: sbom %s: %w", digest, err)
+	}
+	return b, true, nil
+}
+
+// PackagesForImage returns the packages stored for digest.
+func (s *Store) PackagesForImage(ctx context.Context, digest string) ([]model.Package, error) {
+	return queryAll(ctx, s.rdb, scanPackage,
+		`SELECT `+packageCols+` FROM packages WHERE digest = ? ORDER BY name, version, id`, digest)
+}
+
+// PackagesByName is the inverted index. A nil distro matches any distro; otherwise distro id and
+// version must match and the codename is ignored. With bySource it matches the source package
+// name, treating an empty source name as equal to the binary name (dpkg omits Source then).
+func (s *Store) PackagesByName(ctx context.Context, ecosystem string, distro *model.Distro, name string, bySource bool) ([]model.Package, error) {
+	var w where
+	w.add(`ecosystem = ?`, ecosystem)
+	if distro != nil {
+		w.add(`distro_id = ? AND distro_version = ?`, distro.ID, distro.VersionID)
+	}
+	if bySource {
+		w.add(`(source_name = ? OR (source_name = '' AND name = ?))`, name, name)
+	} else {
+		w.add(`name = ?`, name)
+	}
+	return queryAll(ctx, s.rdb, scanPackage,
+		`SELECT `+packageCols+` FROM packages`+w.String()+` ORDER BY digest, name, version, id`, w.args...)
+}
+
+// EcosystemsInUse returns the sorted distinct (ecosystem, distro id, distro version) tuples over
+// every stored package, upgrade candidates included.
+func (s *Store) EcosystemsInUse(ctx context.Context) ([]EcosystemKey, error) {
+	return queryAll(ctx, s.rdb, func(r scanner) (EcosystemKey, error) {
+		var k EcosystemKey
+		err := r.Scan(&k.Ecosystem, &k.DistroID, &k.DistroVersion)
+		return k, err
+	}, `SELECT DISTINCT ecosystem, distro_id, distro_version FROM packages ORDER BY 1, 2, 3`)
+}
+
+func scanPackage(r scanner) (model.Package, error) {
+	var (
+		p    model.Package
+		d    model.Distro
+		cpes string
+	)
+	if err := r.Scan(&p.ID, &p.ImageDigest, &p.Ecosystem, &d.ID, &d.VersionID, &d.Codename, &p.Name, &p.Version, &p.Epoch,
+		&p.Arch, &p.SourceName, &p.SourceVersion, &p.PURL, &cpes, &p.Path, &p.Layer, &p.Classifier, &p.GoStdlib, &p.SyftID); err != nil {
+		return model.Package{}, err
+	}
+	if d != (model.Distro{}) {
+		p.Distro = &d
+	}
+	var err error
+	if p.CPEs, err = textStrings(cpes); err != nil {
+		return model.Package{}, fmt.Errorf("package %s cpes: %w", p.ID, err)
+	}
+	return p, nil
+}
+
+// PutTagDigest records that repo:tag resolved to digest at the given time.
+func (s *Store) PutTagDigest(ctx context.Context, repo, tag, digest string, at time.Time) error {
+	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO image_tags(repo, tag, digest, resolved_at) VALUES(?, ?, ?, ?)`,
+		repo, tag, digest, nanos(orNow(at)))
+	return err
+}
+
+// TagDigest returns the last recorded resolution of repo:tag.
+func (s *Store) TagDigest(ctx context.Context, repo, tag string) (string, time.Time, bool, error) {
+	var (
+		digest string
+		at     sql.NullInt64
+	)
+	err := s.rdb.QueryRowContext(ctx, `SELECT digest, resolved_at FROM image_tags WHERE repo = ? AND tag = ?`, repo, tag).Scan(&digest, &at)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return digest, fromNanos(at), true, nil
+}

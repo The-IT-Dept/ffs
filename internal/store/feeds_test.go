@@ -1,0 +1,57 @@
+package store
+
+import (
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestFeedState(t *testing.T) {
+	s := newStore(t)
+	st, err := s.FeedState(ctx, "osv")
+	require.NoError(t, err)
+	require.Equal(t, FeedState{Name: "osv"}, st)
+
+	in := FeedState{Name: "osv", Watermark: "2026-11-19T00:55:00Z", LastSuccess: t0, LastAttempt: t0,
+		Meta: map[string]string{"PyPI": "2026-11-19T00:55:00Z"}}
+	require.NoError(t, s.PutFeedState(ctx, in))
+	got, err := s.FeedState(ctx, "osv")
+	require.NoError(t, err)
+	require.Equal(t, in.Meta, got.Meta)
+	require.Equal(t, in.Watermark, got.Watermark)
+	require.True(t, got.LastSuccess.Equal(t0))
+	require.True(t, got.LastAttempt.Equal(t0))
+}
+
+func TestUpstreamRanges(t *testing.T) {
+	s := newStore(t)
+	a, b, c := []byte(`{"r":"a"}`), []byte(`{"r":"b"}`), []byte(`{"r":"c"}`)
+	require.NoError(t, s.PutUpstreamRanges(ctx, "CVE-2026-0001", "php", a))
+	require.NoError(t, s.PutUpstreamRanges(ctx, "CVE-2026-0002", "php", b))
+	require.NoError(t, s.PutUpstreamRanges(ctx, "CVE-2026-0001", "php", c))
+
+	got, err := s.UpstreamRanges(ctx, "php")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	require.Equal(t, c, got["CVE-2026-0001"])
+}
+
+func TestOSVRecords(t *testing.T) {
+	s := newStore(t)
+	changed, err := s.PutOSVRecord(ctx, "PyPI", "GHSA-1", t0, "h1", []byte(`{"id":"GHSA-1"}`))
+	require.NoError(t, err)
+	require.True(t, changed)
+	changed, _ = s.PutOSVRecord(ctx, "PyPI", "GHSA-1", t0.Add(time.Hour), "h1", []byte(`{"id":"GHSA-1","summary":"y"}`))
+	require.False(t, changed) // timestamp-only churn
+	changed, _ = s.PutOSVRecord(ctx, "PyPI", "GHSA-1", t0.Add(2*time.Hour), "h2", []byte(`{"id":"GHSA-1"}`))
+	require.True(t, changed)
+	_, _ = s.PutOSVRecord(ctx, "PyPI", "GHSA-2", t0.Add(-time.Hour), "h", []byte(`{"id":"GHSA-2"}`))
+	recent, _ := s.OSVRecords(ctx, "PyPI", t0)
+	require.Equal(t, [][]byte{[]byte(`{"id":"GHSA-1"}`)}, recent)
+	all, _ := s.OSVRecords(ctx, "PyPI", time.Time{})
+	require.Len(t, all, 2)
+	require.NoError(t, s.DeleteOSVRecords(ctx, "PyPI", []string{"GHSA-2"}))
+	all, _ = s.OSVRecords(ctx, "PyPI", time.Time{})
+	require.Len(t, all, 1)
+}

@@ -1,0 +1,142 @@
+package store
+
+import (
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/the-it-dept/ffs/internal/model"
+)
+
+func TestTransitionsCursorDurable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	s, err := Open(ctx, path)
+	require.NoError(t, err)
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fd("fp-1", model.StateOpen, model.PriorityHigh)},
+		[]model.Transition{tr("fp-1", "", model.StateOpen), tr("fp-1", model.StateOpen, model.StateOpen), tr("fp-2", "", model.StateOpen)}))
+	all, _ := s.TransitionsAfter(ctx, 0, 100)
+	require.Len(t, all, 3)
+	require.Less(t, all[0].ID, all[1].ID)
+	require.NoError(t, s.SetCursor(ctx, "notify", all[1].ID))
+	require.NoError(t, s.Close())
+
+	s, err = Open(ctx, path)
+	require.NoError(t, err)
+	reopened := s
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	cur, _ := s.Cursor(ctx, "notify")
+	require.Equal(t, all[1].ID, cur)
+	rest, _ := s.TransitionsAfter(ctx, cur, 100)
+	require.Len(t, rest, 1)
+	require.Equal(t, all[2].ID, rest[0].ID)
+	require.Equal(t, "fp-2", rest[0].Fingerprint)
+	require.NoError(t, s.ApplyFindings(ctx, nil, []model.Transition{tr("fp-3", "", model.StateOpen)}))
+	rest, _ = s.TransitionsAfter(ctx, cur, 100)
+	require.Len(t, rest, 2)
+	require.Greater(t, rest[1].ID, all[2].ID)
+	other, _ := s.Cursor(ctx, "events")
+	require.Zero(t, other)
+}
+
+func TestApplyFindings_Atomic(t *testing.T) {
+	s := newStore(t)
+	bad := tr("", "", model.StateOpen) // violates CHECK(fingerprint <> '') after the finding row was written in the same tx
+	err := s.ApplyFindings(ctx, []model.Finding{fd("fp-1", model.StateOpen, model.PriorityUrgent)}, []model.Transition{tr("fp-1", "", model.StateOpen), bad})
+	require.Error(t, err)
+	fs, _ := s.ListFindings(ctx, FindingFilter{})
+	require.Empty(t, fs)
+	ts, _ := s.TransitionsAfter(ctx, 0, 0)
+	require.Empty(t, ts)
+}
+
+func TestFindings_Queries(t *testing.T) {
+	s := newStore(t)
+	web := fd("fp-4", model.StateOpen, model.PriorityLow)
+	web.Owner = model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "web"}
+	web.AdvisoryID = "CVE-2026-0002"
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{
+		fd("fp-1", model.StateOpen, model.PriorityHigh),
+		fd("fp-2", model.StateExcepted, model.PriorityUrgent),
+		fd("fp-3", model.StateResolved, model.PriorityMedium),
+		web,
+	}, nil))
+
+	open, _ := s.ListFindings(ctx, FindingFilter{States: []model.FindingState{model.StateOpen}, MinPriority: model.PriorityHigh})
+	require.Equal(t, []string{"fp-1"}, fps(open))
+	byNS, _ := s.ListFindings(ctx, FindingFilter{Namespace: "web"})
+	require.Equal(t, []string{"fp-4"}, fps(byNS))
+	ordered, _ := s.ListFindings(ctx, FindingFilter{})
+	require.Equal(t, []string{"fp-2", "fp-1", "fp-3", "fp-4"}, fps(ordered)) // priority DESC
+	page, _ := s.ListFindings(ctx, FindingFilter{Limit: 2, Offset: 1})
+	require.Equal(t, []string{"fp-1", "fp-3"}, fps(page))
+	mine, _ := s.FindingsForOwner(ctx, "Deployment/netbox/netbox")
+	require.Len(t, mine, 3) // every state, so Diff can see regressions
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0001", Aliases: []string{"GHSA-aaaa-bbbb-cccc"}}))
+	owners, _ := s.OwnersWithAdvisories(ctx, []string{"GHSA-aaaa-bbbb-cccc"})
+	require.Equal(t, []string{"Deployment/netbox/netbox"}, owners) // open+excepted, resolved via alias
+	byAlias, _ := s.ListFindings(ctx, FindingFilter{AdvisoryIDs: []string{"GHSA-aaaa-bbbb-cccc"}})
+	require.Equal(t, []string{"fp-2", "fp-1", "fp-3"}, fps(byAlias))
+	unknown, _ := s.OwnersWithAdvisories(ctx, []string{"CVE-2026-0002"})
+	require.Equal(t, []string{"Deployment/web/web"}, unknown) // an id with no alias row matches itself
+}
+
+func TestPruneResolved(t *testing.T) {
+	s := newStore(t)
+	recent := t0.Add(-24 * time.Hour)
+	fresh := fd("fp-new", model.StateResolved, model.PriorityLow)
+	fresh.ResolvedAt = &recent
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fresh, fd("fp-open", model.StateOpen, model.PriorityLow)},
+		[]model.Transition{tr("fp-new", model.StateOpen, model.StateResolved), tr("fp-open", "", model.StateOpen)}))
+	long := t0.Add(-100 * 24 * time.Hour)
+	stale := fd("fp-old", model.StateResolved, model.PriorityLow)
+	stale.ResolvedAt = &long
+	staleTr := tr("fp-old", model.StateOpen, model.StateResolved)
+	staleTr.At = long
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{stale}, []model.Transition{staleTr}))
+
+	all, _ := s.TransitionsAfter(ctx, 0, 0)
+	maxBefore := all[len(all)-1].ID
+	n, err := s.PruneResolved(ctx, t0.Add(-90*24*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	left, _ := s.ListFindings(ctx, FindingFilter{})
+	require.ElementsMatch(t, []string{"fp-new", "fp-open"}, fps(left))
+	kept, _ := s.TransitionsAfter(ctx, 0, 0)
+	require.Len(t, kept, len(all)-1) // only fp-old's history went
+	require.NoError(t, s.ApplyFindings(ctx, nil, []model.Transition{tr("fp-open", model.StateOpen, model.StateResolved)}))
+	next, _ := s.TransitionsAfter(ctx, 0, 0)
+	require.Greater(t, next[len(next)-1].ID, maxBefore) // AUTOINCREMENT: the pruned max id is never reused
+}
+
+func TestRekeyFindings(t *testing.T) {
+	s := newStore(t)
+	ghsa := fd("fp-ghsa", model.StateOpen, model.PriorityHigh)
+	ghsa.AdvisoryID = "GHSA-aaaa-bbbb-cccc"
+	ghsa.Matched = t0.Add(-time.Hour)
+	dupOld := fd("fp-dup-old", model.StateOpen, model.PriorityHigh)
+	dupOld.AdvisoryID = "GHSA-dddd-eeee-ffff"
+	dupNew := fd("fp-dup-new", model.StateOpen, model.PriorityHigh)
+	dupNew.AdvisoryID = "CVE-2026-0002"
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{ghsa, dupOld, dupNew}, []model.Transition{tr("fp-ghsa", "", model.StateOpen)}))
+
+	require.NoError(t, s.RekeyFindings(ctx, []FindingRekey{
+		{OldFingerprint: "fp-ghsa", NewFingerprint: "fp-cve", AdvisoryID: "CVE-2026-0001"},
+		{OldFingerprint: "fp-dup-old", NewFingerprint: "fp-dup-new", AdvisoryID: "CVE-2026-0002"},
+	}))
+
+	fs, err := s.ListFindings(ctx, FindingFilter{})
+	require.NoError(t, err)
+	require.ElementsMatch(t, []string{"fp-cve", "fp-dup-new"}, fps(fs))
+	byAdvisory, _ := s.ListFindings(ctx, FindingFilter{AdvisoryIDs: []string{"CVE-2026-0001"}})
+	require.Len(t, byAdvisory, 1) // the advisory_id column moved too
+	cve := byAdvisory[0]
+	require.Equal(t, "fp-cve", cve.Fingerprint)
+	require.Equal(t, "CVE-2026-0001", cve.AdvisoryID)
+	require.True(t, cve.Matched.Equal(ghsa.Matched))
+
+	ts, _ := s.TransitionsAfter(ctx, 0, 0)
+	require.Len(t, ts, 1)
+	require.Equal(t, "fp-ghsa", ts[0].Fingerprint) // history keeps the old fingerprint
+}
