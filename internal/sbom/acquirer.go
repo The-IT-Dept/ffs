@@ -13,6 +13,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -111,6 +112,7 @@ func (a *Acquirer) Enqueue(r Request) {
 	j := &job{req: r}
 	a.jobs[r.Digest] = j
 	a.high = append(a.high, j)
+	metrics.CatalogQueueDepth.Set(float64(len(a.high) + len(a.low)))
 	a.cond.Signal()
 }
 
@@ -201,6 +203,7 @@ func (a *Acquirer) next() *job {
 		j, a.low = a.low[0], a.low[1:]
 	}
 	a.inFlight++
+	metrics.CatalogQueueDepth.Set(float64(len(a.high) + len(a.low)))
 	return j
 }
 
@@ -421,6 +424,7 @@ func (a *Acquirer) fail(ctx context.Context, prev model.Image, r Request, err er
 		}
 	}
 	a.failed.Add(1)
+	metrics.CatalogFailures.Inc()
 	if uerr := a.o.Store.UpsertImage(ctx, img); uerr != nil {
 		a.o.Log.Error(uerr, "recording acquisition failure", "digest", r.Digest)
 	}

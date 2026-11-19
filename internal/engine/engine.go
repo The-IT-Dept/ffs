@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds/grypedb"
@@ -20,6 +21,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -181,9 +183,13 @@ func (e *Engine) OnExceptionsChanged(ctx context.Context) error {
 	return e.enqueueAll(ctx, model.TriggerPriorityChange)
 }
 
+// observe records the time since start in h.
+func observe(h prometheus.Observer, start time.Time) { h.Observe(time.Since(start).Seconds()) }
+
 // OnOSVRecords hands changed OSV records to every record matcher and applies their deltas. A
 // failing matcher does not stop the others; the errors are returned together.
 func (e *Engine) OnOSVRecords(ctx context.Context, recs []osv.Changed) error {
+	defer observe(metrics.RematchDuration.WithLabelValues("osv"), time.Now())
 	var errs []error
 	for _, m := range e.o.Records {
 		ds, err := m.ApplyOSV(ctx, recs)
@@ -198,6 +204,7 @@ func (e *Engine) OnOSVRecords(ctx context.Context, recs []osv.Changed) error {
 // OnCNARecords re-matches advisories whose cvelistV5 records changed, then queues the owners
 // holding them, since their CNA severity may have changed.
 func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
+	defer observe(metrics.RematchDuration.WithLabelValues("cna"), time.Now())
 	var errs []error
 	if e.o.CNA != nil {
 		ds, err := e.o.CNA.ApplyCNA(ctx, ids)
@@ -215,6 +222,7 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 // provisional findings. A load failure is returned before the build is recorded, so the feed offers
 // the build again.
 func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
+	defer observe(metrics.RematchDuration.WithLabelValues("grypedb"), time.Now())
 	if err := e.o.Grype.Load(u.Path, u.Built); err != nil {
 		return fmt.Errorf("engine: load grype database: %w", err)
 	}

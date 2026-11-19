@@ -1,0 +1,24 @@
+groups:
+  - name: ffs
+    rules:
+      - alert: FFSUrgentFindings
+        expr: sum by (namespace, owner_kind, owner_name) (ffs_findings_open{priority="urgent"}) > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "Urgent vulnerability findings on {{ $labels.owner_kind }} {{ $labels.namespace }}/{{ $labels.owner_name }}"
+          description: "ffs reports {{ $value }} open urgent findings for this workload. Run kubectl get findings -n {{ $labels.namespace }} for detail."
+      - alert: FFSFeedStale
+        expr: ffs_feed_lag_seconds > on (feed) ffs_feed_stale_after_seconds
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "ffs feed {{ $labels.feed }} is stale"
+          description: "The {{ $labels.feed }} feed has not synced successfully within its staleness threshold. Findings may be out of date."
+      - alert: FFSDeliveryFailing
+        expr: sum by (target) (increase(ffs_notify_deliveries_total{result=~"retry|failed"}[30m])) > 0 unless sum by (target) (increase(ffs_notify_deliveries_total{result="success"}[30m])) > 0
+        for: 15m
+        labels: {severity: warning}
+        annotations:
+          summary: "ffs notifications to {{ $labels.target }} are failing"
+          description: "No notification to AlertTarget {{ $labels.target }} has succeeded in the last 30 minutes. Check its status with kubectl get alerttarget {{ $labels.target }} -o yaml."

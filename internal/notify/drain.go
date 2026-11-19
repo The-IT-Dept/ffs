@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -132,6 +133,7 @@ func (e *Engine) drainTarget(ctx context.Context, t *target, ds []store.Delivery
 			return err // shutting down: the attempt is not recorded, so the delivery is sent again
 		}
 		a, retryAt := e.attempt(d, sendErr)
+		metrics.NotifyDeliveries.WithLabelValues(t.cfg.Name, deliveryResult(a)).Inc()
 		if err := e.st.RecordAttempt(ctx, a); err != nil {
 			return err
 		}
@@ -148,6 +150,18 @@ func (e *Engine) drainTarget(ctx context.Context, t *target, ds []store.Delivery
 		}
 	}
 	return nil
+}
+
+// deliveryResult names the outcome of attempt a for the delivery metric: success, failed (the
+// delivery will not be sent again) or retry.
+func deliveryResult(a store.DeliveryAttempt) string {
+	switch a.State {
+	case store.DeliverySent:
+		return "success"
+	case store.DeliveryFailed:
+		return "failed"
+	}
+	return "retry"
 }
 
 // attempt classifies the outcome of sending d. retryAt is set after a failure that is not

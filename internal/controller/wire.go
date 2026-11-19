@@ -10,6 +10,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/controller/deps"
@@ -27,6 +28,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/match/k8s"
 	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/match/upstream"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
 	"github.com/the-it-dept/ffs/internal/store"
@@ -84,6 +86,13 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 	runner = feeds.NewRunner(st, fs, feeds.RunnerOptions{OnStale: func(_ context.Context, f string, last time.Time) {
 		d.Hooks.FeedStale(f, last, runner.StaleAfter()[f])
 	}})
+	mc := metrics.NewCollector(st, metrics.CollectorOptions{FeedStaleAfter: runner.StaleAfter()})
+	if err := metrics.Register(ctrlmetrics.Registry, mc); err != nil {
+		return d, err
+	}
+	if err := m.Add(mc); err != nil {
+		return d, fmt.Errorf("add metrics collector: %w", err)
+	}
 	if grypeFeed != nil {
 		// Load the installed DB now, before anything matches, so a restart never waits for the next build.
 		loadGrypeDB(ctx, grypeFeed, grypeMatcher, log)

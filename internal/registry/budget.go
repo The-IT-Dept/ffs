@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 )
 
 // BudgetState is a registry's manifest-GET budget as last reported by its rate-limit headers.
@@ -167,6 +169,9 @@ func (t *budgetTransport) observe(host string, resp *http.Response) {
 	if limited {
 		b.tokens, b.last = 0, now
 		b.holdUntil = now.Add(b.retryAfter(resp.Header.Get("Retry-After"), now))
+	}
+	if b.known {
+		metrics.RegistryBudgetRemaining.WithLabelValues(host).Set(math.Max(0, b.tokens))
 	}
 }
 
