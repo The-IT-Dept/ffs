@@ -27,7 +27,7 @@ func moduleRoot(t *testing.T) string {
 
 func TestNoForbiddenDirectDeps(t *testing.T) {
 	path := filepath.Join(moduleRoot(t), "go.mod")
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(path) //nolint:gosec // path is derived from the module root, not user input
 	require.NoError(t, err)
 	f, err := modfile.Parse(path, data, nil)
 	require.NoError(t, err)
