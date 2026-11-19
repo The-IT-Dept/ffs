@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
+	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/inventory"
@@ -207,5 +208,37 @@ func TestExposure_GatewayCRDsAbsent(t *testing.T) {
 	}
 	if !got.Exposed || !slices.Equal(got.ExposurePaths, []string{"Service netbox/netbox type LoadBalancer"}) {
 		t.Fatalf("got %+v", got)
+	}
+}
+
+func TestRoutesIn_AlphaFallback(t *testing.T) {
+	s := runtime.NewScheme()
+	if err := clientgoscheme.AddToScheme(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := gatewayv1alpha2.Install(s); err != nil {
+		t.Fatal(err)
+	}
+	p := parent("gws", "edge")
+	b := gatewayv1alpha2.BackendRef{BackendObjectReference: gatewayv1alpha2.BackendObjectReference{Name: "netbox"}}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(
+		&gatewayv1alpha2.TLSRoute{ObjectMeta: objMeta("netbox", "t"), Spec: gatewayv1alpha2.TLSRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.TLSRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
+		&gatewayv1alpha2.TCPRoute{ObjectMeta: objMeta("netbox", "c"), Spec: gatewayv1alpha2.TCPRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.TCPRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
+		&gatewayv1alpha2.UDPRoute{ObjectMeta: objMeta("netbox", "u"), Spec: gatewayv1alpha2.UDPRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.UDPRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
+	).Build()
+	rs, err := routesIn(context.Background(), c, "netbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]bool{}
+	for _, r := range rs {
+		kinds[r.Kind] = true
+		if len(r.Parents) != 1 || r.Parents[0].Namespace != "gws" || r.Parents[0].Name != "edge" ||
+			len(r.Backends) != 1 || r.Backends[0].Namespace != "netbox" || r.Backends[0].Name != "netbox" {
+			t.Errorf("%s: bad extraction %+v", r.Kind, r)
+		}
+	}
+	if len(rs) != 3 || !kinds["TLSRoute"] || !kinds["TCPRoute"] || !kinds["UDPRoute"] {
+		t.Fatalf("want TLS/TCP/UDP alpha routes, got %+v", rs)
 	}
 }

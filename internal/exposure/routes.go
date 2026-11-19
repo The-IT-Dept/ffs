@@ -34,165 +34,157 @@ func absent(err error) bool {
 	return meta.IsNoMatchError(err) || runtime.IsNotRegisteredError(err)
 }
 
+// rawRoute is a route reduced to what extraction needs, whatever its API kind or version.
+type rawRoute struct {
+	Namespace, Name string
+	Parents         []gatewayv1.ParentReference
+	Backends        []gatewayv1.BackendObjectReference
+}
+
+// routeKind describes how to list and read one route kind at one API version.
+type routeKind struct {
+	name string
+	// list lists the kind in ns; it reports false when the kind is not served.
+	list func(ctx context.Context, c client.Reader, ns string) ([]rawRoute, bool, error)
+}
+
+// kindOf builds a routeKind from a list object constructor, an items accessor and a converter.
+func kindOf[L client.ObjectList, T any](name string, newList func() L, items func(L) []T, conv func(T) rawRoute) routeKind {
+	return routeKind{name: name, list: func(ctx context.Context, c client.Reader, ns string) ([]rawRoute, bool, error) {
+		l := newList()
+		if err := c.List(ctx, l, client.InNamespace(ns)); err != nil {
+			if absent(err) {
+				return nil, false, nil
+			}
+			return nil, false, fmt.Errorf("exposure: list %T: %w", l, err)
+		}
+		var out []rawRoute
+		for _, it := range items(l) {
+			out = append(out, conv(it))
+		}
+		return out, true, nil
+	}}
+}
+
+// backendsOf flattens the backend refs of every rule.
+func backendsOf[R, B any](rules []R, refs func(R) []B, obj func(B) gatewayv1.BackendObjectReference) []gatewayv1.BackendObjectReference {
+	var out []gatewayv1.BackendObjectReference
+	for _, r := range rules {
+		for _, b := range refs(r) {
+			out = append(out, obj(b))
+		}
+	}
+	return out
+}
+
+func plainRef(b gatewayv1.BackendRef) gatewayv1.BackendObjectReference {
+	return b.BackendObjectReference
+}
+
+// routeKinds lists, per route kind, the versions to try in order; the first served one wins.
+var routeKinds = [][]routeKind{
+	{kindOf("HTTPRoute", func() *gatewayv1.HTTPRouteList { return &gatewayv1.HTTPRouteList{} },
+		func(l *gatewayv1.HTTPRouteList) []gatewayv1.HTTPRoute { return l.Items },
+		func(o gatewayv1.HTTPRoute) rawRoute {
+			return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+				func(r gatewayv1.HTTPRouteRule) []gatewayv1.HTTPBackendRef { return r.BackendRefs },
+				func(b gatewayv1.HTTPBackendRef) gatewayv1.BackendObjectReference { return b.BackendObjectReference })}
+		})},
+	{kindOf("GRPCRoute", func() *gatewayv1.GRPCRouteList { return &gatewayv1.GRPCRouteList{} },
+		func(l *gatewayv1.GRPCRouteList) []gatewayv1.GRPCRoute { return l.Items },
+		func(o gatewayv1.GRPCRoute) rawRoute {
+			return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+				func(r gatewayv1.GRPCRouteRule) []gatewayv1.GRPCBackendRef { return r.BackendRefs },
+				func(b gatewayv1.GRPCBackendRef) gatewayv1.BackendObjectReference { return b.BackendObjectReference })}
+		})},
+	{
+		kindOf("TLSRoute", func() *gatewayv1.TLSRouteList { return &gatewayv1.TLSRouteList{} },
+			func(l *gatewayv1.TLSRouteList) []gatewayv1.TLSRoute { return l.Items },
+			func(o gatewayv1.TLSRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1.TLSRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+		kindOf("TLSRoute", func() *gatewayv1alpha2.TLSRouteList { return &gatewayv1alpha2.TLSRouteList{} },
+			func(l *gatewayv1alpha2.TLSRouteList) []gatewayv1alpha2.TLSRoute { return l.Items },
+			func(o gatewayv1alpha2.TLSRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1alpha2.TLSRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+	},
+	{
+		kindOf("TCPRoute", func() *gatewayv1.TCPRouteList { return &gatewayv1.TCPRouteList{} },
+			func(l *gatewayv1.TCPRouteList) []gatewayv1.TCPRoute { return l.Items },
+			func(o gatewayv1.TCPRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1.TCPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+		kindOf("TCPRoute", func() *gatewayv1alpha2.TCPRouteList { return &gatewayv1alpha2.TCPRouteList{} },
+			func(l *gatewayv1alpha2.TCPRouteList) []gatewayv1alpha2.TCPRoute { return l.Items },
+			func(o gatewayv1alpha2.TCPRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1alpha2.TCPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+	},
+	{
+		kindOf("UDPRoute", func() *gatewayv1.UDPRouteList { return &gatewayv1.UDPRouteList{} },
+			func(l *gatewayv1.UDPRouteList) []gatewayv1.UDPRoute { return l.Items },
+			func(o gatewayv1.UDPRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1.UDPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+		kindOf("UDPRoute", func() *gatewayv1alpha2.UDPRouteList { return &gatewayv1alpha2.UDPRouteList{} },
+			func(l *gatewayv1alpha2.UDPRouteList) []gatewayv1alpha2.UDPRoute { return l.Items },
+			func(o gatewayv1alpha2.UDPRoute) rawRoute {
+				return rawRoute{o.Namespace, o.Name, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
+					func(r gatewayv1alpha2.UDPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
+			}),
+	},
+}
+
 // routesIn lists the HTTP, GRPC, TLS, TCP and UDP routes in ns. A kind the cluster does not serve
 // is skipped; TLS, TCP and UDP routes fall back to v1alpha2 when v1 is not served.
 func routesIn(ctx context.Context, c client.Reader, ns string) ([]route, error) {
 	var out []route
-	add := func(kind string, objNS, name string, parents []gatewayv1.ParentReference, backends []gatewayv1.BackendObjectReference) {
-		r := route{Kind: kind, Namespace: objNS, Name: name}
-		for _, p := range parents {
-			if p.Group != nil && string(*p.Group) != gatewayGroup {
+	for _, versions := range routeKinds {
+		for _, k := range versions {
+			raws, ok, err := k.list(ctx, c, ns)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
 				continue
 			}
-			if p.Kind != nil && string(*p.Kind) != "Gateway" {
-				continue
+			for _, raw := range raws {
+				out = append(out, toRoute(k.name, raw))
 			}
-			r.Parents = append(r.Parents, types.NamespacedName{Namespace: refNamespace(p.Namespace, objNS), Name: string(p.Name)})
-		}
-		for _, b := range backends {
-			if b.Group != nil && string(*b.Group) != "" {
-				continue
-			}
-			if b.Kind != nil && string(*b.Kind) != "Service" {
-				continue
-			}
-			r.Backends = append(r.Backends, types.NamespacedName{Namespace: refNamespace(b.Namespace, objNS), Name: string(b.Name)})
-		}
-		out = append(out, r)
-	}
-	// list lists one kind; it reports false when the kind is not served.
-	list := func(l client.ObjectList) (bool, error) {
-		if err := c.List(ctx, l, client.InNamespace(ns)); err != nil {
-			if absent(err) {
-				return false, nil
-			}
-			return false, fmt.Errorf("exposure: list %T: %w", l, err)
-		}
-		return true, nil
-	}
-
-	hl := &gatewayv1.HTTPRouteList{}
-	if ok, err := list(hl); err != nil {
-		return nil, err
-	} else if ok {
-		for _, o := range hl.Items {
-			var bs []gatewayv1.BackendObjectReference
-			for _, rule := range o.Spec.Rules {
-				for _, b := range rule.BackendRefs {
-					bs = append(bs, b.BackendObjectReference)
-				}
-			}
-			add("HTTPRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-		}
-	}
-	gl := &gatewayv1.GRPCRouteList{}
-	if ok, err := list(gl); err != nil {
-		return nil, err
-	} else if ok {
-		for _, o := range gl.Items {
-			var bs []gatewayv1.BackendObjectReference
-			for _, rule := range o.Spec.Rules {
-				for _, b := range rule.BackendRefs {
-					bs = append(bs, b.BackendObjectReference)
-				}
-			}
-			add("GRPCRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-		}
-	}
-
-	// TLSRoute
-	tl := &gatewayv1.TLSRouteList{}
-	if ok, err := list(tl); err != nil {
-		return nil, err
-	} else if ok {
-		for _, o := range tl.Items {
-			var bs []gatewayv1.BackendObjectReference
-			for _, rule := range o.Spec.Rules {
-				for _, b := range rule.BackendRefs {
-					bs = append(bs, b.BackendObjectReference)
-				}
-			}
-			add("TLSRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-		}
-	} else {
-		al := &gatewayv1alpha2.TLSRouteList{}
-		if ok, err := list(al); err != nil {
-			return nil, err
-		} else if ok {
-			for _, o := range al.Items {
-				var bs []gatewayv1.BackendObjectReference
-				for _, rule := range o.Spec.Rules {
-					for _, b := range rule.BackendRefs {
-						bs = append(bs, b.BackendObjectReference)
-					}
-				}
-				add("TLSRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-			}
-		}
-	}
-
-	// TCPRoute
-	cl := &gatewayv1.TCPRouteList{}
-	if ok, err := list(cl); err != nil {
-		return nil, err
-	} else if ok {
-		for _, o := range cl.Items {
-			var bs []gatewayv1.BackendObjectReference
-			for _, rule := range o.Spec.Rules {
-				for _, b := range rule.BackendRefs {
-					bs = append(bs, b.BackendObjectReference)
-				}
-			}
-			add("TCPRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-		}
-	} else {
-		al := &gatewayv1alpha2.TCPRouteList{}
-		if ok, err := list(al); err != nil {
-			return nil, err
-		} else if ok {
-			for _, o := range al.Items {
-				var bs []gatewayv1.BackendObjectReference
-				for _, rule := range o.Spec.Rules {
-					for _, b := range rule.BackendRefs {
-						bs = append(bs, b.BackendObjectReference)
-					}
-				}
-				add("TCPRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-			}
-		}
-	}
-
-	// UDPRoute
-	ul := &gatewayv1.UDPRouteList{}
-	if ok, err := list(ul); err != nil {
-		return nil, err
-	} else if ok {
-		for _, o := range ul.Items {
-			var bs []gatewayv1.BackendObjectReference
-			for _, rule := range o.Spec.Rules {
-				for _, b := range rule.BackendRefs {
-					bs = append(bs, b.BackendObjectReference)
-				}
-			}
-			add("UDPRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-		}
-	} else {
-		al := &gatewayv1alpha2.UDPRouteList{}
-		if ok, err := list(al); err != nil {
-			return nil, err
-		} else if ok {
-			for _, o := range al.Items {
-				var bs []gatewayv1.BackendObjectReference
-				for _, rule := range o.Spec.Rules {
-					for _, b := range rule.BackendRefs {
-						bs = append(bs, b.BackendObjectReference)
-					}
-				}
-				add("UDPRoute", o.Namespace, o.Name, o.Spec.ParentRefs, bs)
-			}
+			break
 		}
 	}
 	return out, nil
+}
+
+// toRoute keeps only Gateway parents and core Service backends, defaulting namespaces.
+func toRoute(kind string, raw rawRoute) route {
+	r := route{Kind: kind, Namespace: raw.Namespace, Name: raw.Name}
+	for _, p := range raw.Parents {
+		if p.Group != nil && string(*p.Group) != gatewayGroup {
+			continue
+		}
+		if p.Kind != nil && string(*p.Kind) != "Gateway" {
+			continue
+		}
+		r.Parents = append(r.Parents, types.NamespacedName{Namespace: refNamespace(p.Namespace, raw.Namespace), Name: string(p.Name)})
+	}
+	for _, b := range raw.Backends {
+		if b.Group != nil && string(*b.Group) != "" {
+			continue
+		}
+		if b.Kind != nil && string(*b.Kind) != "Service" {
+			continue
+		}
+		r.Backends = append(r.Backends, types.NamespacedName{Namespace: refNamespace(b.Namespace, raw.Namespace), Name: string(b.Name)})
+	}
+	return r
 }
 
 func refNamespace(ns *gatewayv1.Namespace, def string) string {
