@@ -61,6 +61,9 @@ type Engine struct {
 	targets map[string]*target   // by UID
 	uids    map[string]string    // name → UID
 	backoff map[string]time.Time // by UID: after a failed send, nothing more goes to the target before this
+	// draining holds the UIDs of the targets with a drain running, so a target is never drained
+	// twice at once.
+	draining map[string]bool
 
 	// passMu serialises ProcessOnce with deleting a target's stored state, so a pass never
 	// writes state back for a target removed under it.
@@ -80,7 +83,7 @@ func New(st *store.Store, o Options) *Engine {
 		o.Ready = func(context.Context) bool { return true }
 	}
 	return &Engine{st: st, o: o, started: o.Now().UTC(), targets: map[string]*target{}, uids: map[string]string{},
-		backoff: map[string]time.Time{}, feedSent: map[string]bool{}}
+		backoff: map[string]time.Time{}, draining: map[string]bool{}, feedSent: map[string]bool{}}
 }
 
 // now is the engine clock in UTC, the zone of every stored and sent time.
@@ -221,11 +224,15 @@ func (e *Engine) snapshot() []*target {
 func (e *Engine) NeedLeaderElection() bool { return true }
 
 // Start processes transitions on every Changed signal and every 15s, drains the outbox every 2s,
-// and prunes old deliveries daily, until ctx is done. Errors are logged and the loops go on.
+// and prunes old deliveries daily, until ctx is done. Errors are logged and the loops go on. A
+// drain is not waited for before the next tick, so a target sending a long backlog never holds up
+// the other targets' drains.
 func (e *Engine) Start(ctx context.Context) error {
 	log := logr.FromContextOrDiscard(ctx).WithName("notify")
 	var wg sync.WaitGroup
 	wg.Go(func() {
+		var drains sync.WaitGroup
+		defer drains.Wait()
 		tick := time.NewTicker(drainInterval)
 		defer tick.Stop()
 		for {
@@ -234,9 +241,18 @@ func (e *Engine) Start(ctx context.Context) error {
 				return
 			case <-tick.C:
 			}
-			if err := e.DrainOnce(ctx); err != nil && ctx.Err() == nil {
-				log.Error(err, "delivering notifications failed")
+			wait, err := e.startDrains(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Error(err, "delivering notifications failed")
+				}
+				continue
 			}
+			drains.Go(func() {
+				if err := wait(); err != nil && ctx.Err() == nil {
+					log.Error(err, "delivering notifications failed")
+				}
+			})
 		}
 	})
 	defer wg.Wait()

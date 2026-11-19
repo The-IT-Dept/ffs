@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -224,4 +225,123 @@ func TestDrain_UnsendableBacklogTakesNoPlace(t *testing.T) {
 			assert.Zero(t, d.Attempts)
 		}
 	}
+}
+
+// queueBacklog queues n deliveries for uid, all created an hour before now.
+func (h *harness) queueBacklog(uid string, n int) {
+	h.t.Helper()
+	payload, err := json.Marshal(notify.Message{ID: "ffs_old", Kind: notify.KindImmediate, Title: "backlog"})
+	require.NoError(h.t, err)
+	ds := make([]store.Delivery, 0, n)
+	for i := range n {
+		ds = append(ds, store.Delivery{ID: fmt.Sprintf("ffs_%s_%04d", uid, i), Kind: "immediate", Payload: payload,
+			CreatedAt: h.now.Add(-time.Hour)})
+	}
+	require.NoError(h.t, h.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, Deliveries: ds}))
+}
+
+// TestDrain_BacklogDoesNotDelayOtherTargets pins per-target draining (F31): a healthy target with
+// a backlog older than everything else no longer fills the batch, so another target's urgent alert
+// goes out on the first drain.
+func TestDrain_BacklogDoesNotDelayOtherTargets(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	busy := &fakeSink{}
+	busyCfg := h.cfg("ops")
+	busyCfg.UID, busyCfg.Name = "uid-busy", "busy"
+	require.NoError(t, h.eng.Register(ctx, busyCfg, busy))
+	h.process() // baselines
+	h.queueBacklog("uid-busy", 400)
+	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	require.NoError(t, h.eng.ProcessOnce(ctx))
+
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	imm := h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 1, "the urgent alert goes out on the first drain")
+	assert.Equal(t, "CVE-2026-0001", imm[0].Items[0].AdvisoryID)
+	assert.Len(t, busy.ofKind(notify.KindImmediate), 200, "the busy target sends a batch of its own")
+}
+
+// blockingSink blocks every Send until release is closed, after signalling started once.
+type blockingSink struct {
+	fakeSink
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *blockingSink) Send(ctx context.Context, m notify.Message) error {
+	s.once.Do(func() { close(s.started) })
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return s.fakeSink.Send(ctx, m)
+}
+
+// TestDrain_SlowTargetDoesNotGateTheNextDrain pins the other half of F31: while one target is
+// still sending, the next drain sends the other targets' alerts instead of waiting for it, and
+// never drains the slow target twice at once.
+func TestDrain_SlowTargetDoesNotGateTheNextDrain(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	slow := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
+	slowCfg := h.cfg("ops")
+	slowCfg.UID, slowCfg.Name = "uid-slow", "slow"
+	require.NoError(t, h.eng.Register(ctx, slowCfg, slow))
+	require.NoError(t, h.eng.ProcessOnce(ctx)) // baselines, queued for both
+	h.queueBacklog("uid-slow", 3)
+
+	waitSlow, err := h.eng.StartDrains(ctx)
+	require.NoError(t, err)
+	<-slow.started
+
+	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	require.NoError(t, h.eng.ProcessOnce(ctx))
+	waitNext, err := h.eng.StartDrains(ctx)
+	require.NoError(t, err)
+	require.NoError(t, waitNext())
+	assert.Len(t, h.sink.ofKind(notify.KindImmediate), 1, "sent while the slow target is still sending")
+
+	close(slow.release)
+	require.NoError(t, waitSlow())
+	assert.Len(t, slow.ofKind(notify.KindBaseline), 1)
+	assert.Len(t, slow.ofKind(notify.KindImmediate), 3, "the backlog drained once, not twice")
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	assert.Len(t, slow.ofKind(notify.KindImmediate), 4, "its urgent alert follows on the next drain")
+}
+
+// TestDrain_PausedHoldsDeliveries pins spec.paused (F33): nothing is sent to a paused target, not
+// even an alert queued before the pause and released by the end of quiet hours, and no retry runs.
+// The queued alert waits until the pause is lifted.
+func TestDrain_PausedHoldsDeliveries(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops", func(c *notify.TargetConfig) {
+		c.AllowUrgentInQuietHours = false
+		c.QuietHours = []notify.TimeInterval{{Times: []notify.TimeRange{{StartTime: "00:00", EndTime: "12:00"}}}}
+	})
+	h.process() // baseline
+	h.at("2026-11-19T10:00Z")
+	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	require.NoError(t, h.eng.ProcessOnce(ctx)) // held until 12:00
+	h.target("ops", func(c *notify.TargetConfig) {
+		c.Paused = true
+		c.AllowUrgentInQuietHours = false
+		c.QuietHours = []notify.TimeInterval{{Times: []notify.TimeRange{{StartTime: "00:00", EndTime: "12:00"}}}}
+	})
+
+	h.at("2026-11-19T12:05Z")
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	assert.Empty(t, h.sink.ofKind(notify.KindImmediate), "nothing is sent while paused")
+	for _, d := range h.deliveries() {
+		if d.Kind == string(notify.KindImmediate) {
+			assert.Equal(t, store.DeliveryPending, d.State)
+			assert.Zero(t, d.Attempts)
+		}
+	}
+
+	h.target("ops")
+	require.NoError(t, h.eng.DrainOnce(ctx))
+	assert.Len(t, h.sink.ofKind(notify.KindImmediate), 1, "sent once the pause is lifted")
 }
