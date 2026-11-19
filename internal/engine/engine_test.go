@@ -463,7 +463,16 @@ func TestEngine_GrypeNotReadyStillRecomputes(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, advisories(ms, model.SourceGrype), stale, "stored grype matches are untouched")
 
-	got, err := h.e.MatchCandidate(ctx, d1)
+	// F42: an upgrade candidate is not scored without grype's OS package matches, or it would seem to
+	// fix everything the running image has
+	_, err = h.e.MatchCandidate(ctx, d1)
+	require.ErrorIs(t, err, match.ErrNotReady)
+
+	// with the grype feed disabled grype never has an opinion, for the running image or a candidate
+	cfg := config.Default()
+	cfg.Feeds.GrypeDB.Enabled = false
+	e := engine.New(engine.Options{Config: cfg, Store: h.st, Grype: h.grype, Matchers: []match.Matcher{h.osv}, Now: h.clock.Now})
+	got, err := e.MatchCandidate(ctx, d1)
 	require.NoError(t, err)
 	require.Equal(t, []string{cve}, advisories(got, model.SourceOSV))
 	require.Empty(t, advisories(got, model.SourceGrype))

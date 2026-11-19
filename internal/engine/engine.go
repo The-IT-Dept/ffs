@@ -322,12 +322,18 @@ func (e *Engine) grypeTargets(ctx context.Context, u grypedb.Update) ([]string, 
 }
 
 // MatchCandidate runs every matcher over a catalogued digest and returns the matches without
-// storing them, with canonical advisory ids. A grype matcher with no DB loaded contributes no
-// matches; any other matcher failure is an error. An uncatalogued digest has no matches.
+// storing them, with canonical advisory ids. An uncatalogued digest has no matches. While the
+// grype feed is enabled but no DB is loaded it returns match.ErrNotReady: without grype's OS
+// package matches every candidate would seem to fix everything the running image has. With the
+// feed disabled grype contributes nothing, as for the running image. Any other matcher failure is
+// an error.
 func (e *Engine) MatchCandidate(ctx context.Context, digest string) ([]model.Match, error) {
 	r, err := e.matchImage(ctx, digest, matchCandidate)
 	if err != nil {
 		return nil, err
+	}
+	if r.grypeNotReady && e.o.Config.Feeds.GrypeDB.Enabled {
+		return nil, fmt.Errorf("engine: scoring %s: %w", digest, match.ErrNotReady)
 	}
 	return e.canonicalise(ctx, r.matches)
 }
