@@ -37,8 +37,9 @@ const (
 // Options configures an Engine.
 type Options struct {
 	Cluster, DashboardURL string
-	// Ready reports that the initial inventory is catalogued and matched; nothing is processed
-	// before, so the first baseline covers the whole cluster. Nil means always ready.
+	// Ready reports that the initial inventory is catalogued and matched; nothing but feed-stale
+	// alerts is processed before, so the first baseline covers the whole cluster. Nil means always
+	// ready.
 	Ready   func(ctx context.Context) bool
 	Changed <-chan struct{}
 	// FeedStaleAfter is the staleness threshold of each registered feed, keyed by feed name.
@@ -272,16 +273,19 @@ func (e *Engine) prune(ctx context.Context, log logr.Logger) {
 
 // ProcessOnce runs one pass for every registered target: the baseline for a new target, otherwise
 // immediate alerts for the transitions since its cursor, then its digest when due and its
-// feed-stale alerts. It does nothing until Ready. Deliveries are queued for DrainOnce.
+// feed-stale alerts. Until Ready only the feed-stale alerts run: the alert that says ffs might be
+// wrong is never held back by the wait for the initial match. Deliveries are queued for DrainOnce.
 func (e *Engine) ProcessOnce(ctx context.Context) error {
-	if !e.o.Ready(ctx) {
-		return nil
-	}
+	ready := e.o.Ready(ctx)
 	e.passMu.Lock()
 	defer e.passMu.Unlock()
 	var errs []error
 	for _, t := range e.snapshot() {
-		if err := e.processTarget(ctx, t); err != nil {
+		pass := e.processTarget
+		if !ready {
+			pass = e.feedStaleOnly
+		}
+		if err := pass(ctx, t); err != nil {
 			errs = append(errs, fmt.Errorf("notify: target %s: %w", t.cfg.Name, err))
 		}
 		if ctx.Err() != nil {
@@ -331,6 +335,19 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 		return err
 	}
 	return e.feedStale(ctx, t, now)
+}
+
+// feedStaleOnly is the pass of a target before Ready: its feed-stale alerts, unless it is paused
+// or disabled.
+func (e *Engine) feedStaleOnly(ctx context.Context, t *target) error {
+	if t.cfg.Paused || !t.cfg.NotifyOnFeedStale {
+		return nil
+	}
+	st, ok, err := e.st.NotifyTarget(ctx, t.cfg.UID)
+	if err != nil || !ok || st.Disabled {
+		return err
+	}
+	return e.feedStale(ctx, t, e.now())
 }
 
 // transitionsAfter reads up to limit transitions after cursor, a page at a time, and returns them

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -119,7 +120,8 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 	}
 
 	d.Registry, d.Engine, d.Acquirer, d.Feeds, d.EOL = reg, eng, acq, runner, ev
-	d.Ready = newReady(inv.Synced, acq.Stats, eng.Idle, grypeReady(cfg.Feeds.GrypeDB.Enabled, st))
+	d.Ready = newReady(readyOptions{Synced: inv.Synced, Stats: acq.Stats, Idle: eng.Idle,
+		GrypeOK: grypeReady(cfg.Feeds.GrypeDB.Enabled, st, log), Wait: readyWait, Log: log.WithName("ready")})
 	return d, nil
 }
 
@@ -177,35 +179,95 @@ type feedStater interface {
 }
 
 // grypeReady reports whether the Grype DB condition of readiness holds: the grypedb feed is
-// disabled, or it has synced at least once.
-func grypeReady(enabled bool, st feedStater) func(ctx context.Context) bool {
+// disabled, or it has synced at least once. A store error is logged and counts as not yet.
+func grypeReady(enabled bool, st feedStater, log logr.Logger) func(ctx context.Context) bool {
 	return func(ctx context.Context) bool {
 		if !enabled {
 			return true
 		}
 		fs, err := st.FeedState(ctx, feeds.NameGrypeDB)
-		return err == nil && !fs.LastSuccess.IsZero()
+		if err != nil {
+			if ctx.Err() == nil {
+				log.Error(err, "reading the Grype DB feed state for notification readiness failed")
+			}
+			return false
+		}
+		return !fs.LastSuccess.IsZero()
 	}
 }
 
-// newReady returns the sticky readiness of Deps.Ready: once the inventory has synced, the acquirer
-// has nothing queued or in flight, the engine is idle and grypeOK holds, it returns true for good.
-func newReady(synced func() bool, stats func() sbom.AcquirerStats, idle func() bool, grypeOK func(ctx context.Context) bool) func(ctx context.Context) bool {
-	var ready atomic.Bool
+// readyWait bounds how long notifications wait, once the inventory has synced, for the initial
+// catalogue and match (the cataloguing queue, the engine and the first Grype DB sync). After it
+// they start with what is matched so far, and the reason is logged: a Grype DB that cannot be
+// downloaded, or work that never drains, must not hold back every alert for good.
+const readyWait = time.Hour
+
+// readyOptions are the conditions of Deps.Ready and the bound on waiting for them.
+type readyOptions struct {
+	Synced  func() bool
+	Stats   func() sbom.AcquirerStats
+	Idle    func() bool
+	GrypeOK func(ctx context.Context) bool
+	Wait    time.Duration
+	Now     func() time.Time // time.Now when nil
+	Log     logr.Logger
+}
+
+// newReady returns the sticky readiness of Deps.Ready. It never holds before the inventory has
+// synced. After that it holds, for good, once the acquirer has nothing queued or in flight, the
+// engine is idle and GrypeOK holds, or once Wait has passed since the inventory was first seen
+// synced, whichever comes first.
+func newReady(o readyOptions) func(ctx context.Context) bool {
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	var (
+		ready atomic.Bool
+		mu    sync.Mutex
+		since time.Time // when the inventory was first seen synced
+	)
 	return func(ctx context.Context) bool {
 		if ready.Load() {
 			return true
 		}
-		if !synced() {
+		if !o.Synced() {
 			return false
 		}
-		if s := stats(); s.Queued != 0 || s.InFlight != 0 {
-			return false
+		pending := o.pending(ctx)
+		mu.Lock()
+		defer mu.Unlock()
+		if ready.Load() {
+			return true
 		}
-		if !idle() || !grypeOK(ctx) {
+		now := o.Now()
+		if since.IsZero() {
+			since = now
+		}
+		switch {
+		case len(pending) == 0:
+			o.Log.Info("initial catalogue and match finished; notifications start")
+		case now.Sub(since) >= o.Wait:
+			o.Log.Info("notifications start before the initial catalogue and match finished",
+				"waited", o.Wait.String(), "waitingFor", pending)
+		default:
 			return false
 		}
 		ready.Store(true)
 		return true
 	}
+}
+
+// pending names the conditions of readiness that do not hold yet, besides the inventory sync.
+func (o readyOptions) pending(ctx context.Context) []string {
+	var out []string
+	if s := o.Stats(); s.Queued != 0 || s.InFlight != 0 {
+		out = append(out, fmt.Sprintf("image cataloguing (%d queued, %d in progress)", s.Queued, s.InFlight))
+	}
+	if !o.Idle() {
+		out = append(out, "finding recompute")
+	}
+	if !o.GrypeOK(ctx) {
+		out = append(out, "first Grype DB sync")
+	}
+	return out
 }
