@@ -1,0 +1,50 @@
+{{- $name := include "ffs.fullname" . -}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-view
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-view: "true"
+rules:
+  - apiGroups: [ffs.theitdept.au]
+    resources: [findings, exceptions]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-edit
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+    rbac.authorization.k8s.io/aggregate-to-edit: "true"
+    rbac.authorization.k8s.io/aggregate-to-admin: "true"
+rules:
+  - apiGroups: [ffs.theitdept.au]
+    resources: [exceptions]
+    verbs: [create, update, patch, delete, deletecollection]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-cluster-reader
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [ffs.theitdept.au]
+    resources: [findings, vulnerabilities, alerttargets, exceptions]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-admin
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [ffs.theitdept.au]
+    resources: [alerttargets, exceptions]
+    verbs: [get, list, watch, create, update, patch, delete, deletecollection]
+  - apiGroups: [ffs.theitdept.au]
+    resources: [findings, vulnerabilities]
+    verbs: [get, list, watch]

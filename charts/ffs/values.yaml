@@ -1,0 +1,276 @@
+# Container image.
+image:
+  # Image repository.
+  repository: ghcr.io/the-it-dept/ffs
+  # Image tag; defaults to the chart appVersion.
+  tag: ""
+  # Image digest (sha256:...); when set it replaces the tag.
+  digest: ""
+  # Image pull policy.
+  pullPolicy: IfNotPresent
+
+# Pull secrets for the ffs image itself.
+imagePullSecrets: []
+
+# RBAC options.
+rbac:
+  # Grant cluster-wide get on Secrets so pull secrets can be read for private images.
+  readPullSecrets: true
+
+# Controller container settings.
+controller:
+  # Controller container resources.
+  resources:
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      memory: 1Gi
+  # Size limit of the controller /tmp emptyDir.
+  tmpSizeLimit: 1Gi
+
+# Catalog container settings.
+catalog:
+  # Catalog container resources.
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 2Gi
+  # Size limit of the catalog scratch emptyDir.
+  scratchSizeLimit: 20Gi
+  # Scratch bytes a catalog job may use (18 GiB); keep below scratchSizeLimit.
+  scratchLimit: 19327352832
+
+# Persistent storage for the store and feed data.
+persistence:
+  # PVC size for the store and feed data.
+  size: 20Gi
+  # PVC storage class; empty uses the cluster default.
+  storageClass: ""
+  # Use an existing PVC instead of creating one.
+  existingClaim: ""
+
+# Extra pod annotations.
+podAnnotations: {}
+# Extra pod labels.
+podLabels: {}
+# Pod node selector.
+nodeSelector: {}
+# Pod tolerations.
+tolerations: []
+# Pod affinity.
+affinity: {}
+# Pod priority class.
+priorityClassName: ""
+
+# Dashboard exposure.
+web:
+  # Service settings.
+  service:
+    # Create a ClusterIP Service for the dashboard; needs config.listen bound beyond loopback.
+    enabled: false
+    # Service port for the dashboard.
+    port: 8080
+
+# Authenticated metrics endpoint.
+metrics:
+  # Metrics Service.
+  service:
+    # Create the metrics Service.
+    enabled: false
+    # Metrics Service port.
+    port: 8443
+  # Prometheus Operator ServiceMonitor.
+  serviceMonitor:
+    # Create a Prometheus Operator ServiceMonitor.
+    enabled: false
+    # Scrape interval.
+    interval: 60s
+    # Extra ServiceMonitor labels.
+    labels: {}
+
+# Prometheus alert rules.
+prometheusRule:
+  # Create a PrometheusRule with the ffs alerts.
+  enabled: false
+  # Extra PrometheusRule labels.
+  labels: {}
+
+# Grafana dashboard.
+grafanaDashboard:
+  # Create a ConfigMap carrying the Grafana dashboard.
+  enabled: false
+  # Namespace of the dashboard ConfigMap; defaults to the release namespace.
+  namespace: ""
+  # Extra dashboard ConfigMap labels.
+  labels:
+    grafana_dashboard: "1"
+  # Extra dashboard ConfigMap annotations.
+  annotations: {}
+
+# ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.
+config:
+  # Cluster name shown in findings and alerts.
+  clusterName: default
+  # Path of the SQLite store.
+  storePath: /var/lib/ffs/ffs.db
+  # Directory for feed data and the store.
+  dataDir: /var/lib/ffs
+  # Dashboard and API listen address.
+  listen: 127.0.0.1:8080
+  # External dashboard URL used in links.
+  dashboardURL: ""
+  # Cataloguer socket and limits.
+  catalog:
+    # Unix socket shared with the catalog container.
+    socket: /run/ffs/catalog.sock
+    # Per-image catalog timeout.
+    timeout: 10m
+    # Maximum image size in bytes to catalog.
+    maxImageBytes: 10737418240
+    # Concurrent catalog jobs.
+    concurrency: 2
+  # Registry access.
+  registry:
+    # Secret in the install namespace holding operator-level registry credentials.
+    operatorSecret: ""
+    # Registry mirror rewrite map.
+    mirrors: {}
+  # Vulnerability data feeds.
+  feeds:
+    # Grype database feed.
+    grypedb:
+      # Enable the Grype DB feed.
+      enabled: true
+      # Feed URL.
+      url: https://grype.anchore.io/databases/v6/latest.json
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 48h
+    # OSV feed.
+    osv:
+      # Enable the OSV feed.
+      enabled: true
+      # Feed URL.
+      url: https://osv-vulnerabilities.storage.googleapis.com
+      # Refresh interval.
+      interval: 5m
+      # Age after which the feed is stale.
+      staleAfter: 2h
+    # CVE list feed.
+    cvelist:
+      # Enable the CVE list feed.
+      enabled: true
+      # Feed URL.
+      url: https://github.com/CVEProject/cvelistV5/releases/download
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 6h
+    # CISA KEV feed.
+    kev:
+      # Enable the CISA KEV feed.
+      enabled: true
+      # Feed URL.
+      url: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 24h
+    # EPSS feed.
+    epss:
+      # Enable the EPSS feed.
+      enabled: true
+      # Feed URL.
+      url: https://epss.empiricalsecurity.com/epss_scores-current.csv.gz
+      # Refresh interval.
+      interval: 24h
+      # Age after which the feed is stale.
+      staleAfter: 72h
+    # End-of-life feed.
+    eol:
+      # Enable the end-of-life feed.
+      enabled: true
+      # Feed URL.
+      url: https://endoflife.date/api/v1
+      # Refresh interval.
+      interval: 24h
+      # Age after which the feed is stale.
+      staleAfter: 72h
+    # NVD feed (reserved).
+    nvd:
+      # Reserved; enabling is rejected in this release.
+      enabled: false
+      # Feed URL.
+      url: https://services.nvd.nist.gov/rest/json/cves/2.0
+      # Refresh interval.
+      interval: 0s
+      # Age after which the feed is stale.
+      staleAfter: 0s
+    # Chainguard OSV buckets.
+    chainguardOSV:
+      # Add the Wolfi/Chainguard buckets to the OSV feed.
+      enabled: false
+      # Feed URL.
+      url: https://packages.cgr.dev/chainguard/osv
+      # Refresh interval.
+      interval: 0s
+      # Age after which the feed is stale.
+      staleAfter: 0s
+  # Priority scoring thresholds.
+  priority:
+    # EPSS score at or above which a finding counts as likely exploited.
+    epssHigh: 0.5
+    # EPSS score at or above which priority is bumped one level.
+    epssBump: 0.1
+  # Exposure classification.
+  exposure:
+    # Ingress classes treated as internal.
+    internalIngressClasses: []
+    # Gateway classes treated as internal.
+    internalGatewayClasses: []
+    # Gateways treated as internal, as namespace/name.
+    internalGateways: []
+    # Load balancer annotations that mark a Service as internal.
+    internalLBAnnotations: {}
+  # Finding resource output.
+  crd:
+    # Lowest priority written as a Finding resource.
+    minPriority: high
+    # Maximum Finding resources; 0 is unlimited.
+    maxFindings: 2000
+  # Event output.
+  events:
+    # Lowest priority that emits Events.
+    minPriority: high
+  # OpenReports output.
+  openReports:
+    # Report publishing: auto, on or off.
+    mode: auto
+    # Maximum results per report.
+    maxResults: 100
+    # Also write wgpolicyk8s.io PolicyReports.
+    wgPolicy: false
+  # Exception limits.
+  exceptions:
+    # Longest allowed Exception duration.
+    maxDuration: 8760h
+  # Retention.
+  retention:
+    # How long resolved findings are kept.
+    resolved: 2160h
+  # Image upgrade candidates.
+  upgrades:
+    # Enable image upgrade candidates.
+    enabled: true
+    # Maximum upgrade candidates per repository.
+    maxCandidatesPerRepo: 4
+    # Daily upgrade scan time, HH:MM.
+    dailyAt: "03:00"
+    # Per-repository tag parsing overrides.
+    overrides: {}
+    # Kubernetes release URL; empty uses the default.
+    kubernetesReleaseURL: ""

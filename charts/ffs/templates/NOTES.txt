@@ -1,0 +1,14 @@
+ffs {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+Dashboard and read-only API (bound to {{ .Values.config.listen }} inside the pod):
+  kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "ffs.fullname" . }} 8080
+  then open http://127.0.0.1:8080
+
+Findings and advisories:
+  kubectl get ffs -A
+
+The first Grype database download takes several minutes. Feed status is on the Feeds page.
+{{- if not .Values.rbac.readPullSecrets }}
+
+Reading pull secrets is disabled. Private images that need them are shown as unresolvable.
+{{- end }}

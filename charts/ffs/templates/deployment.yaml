@@ -1,0 +1,150 @@
+{{- $name := include "ffs.fullname" . -}}
+{{- $sockDir := dir .Values.config.catalog.socket -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "ffs.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/config: {{ include "ffs.config" . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "ffs.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ $name }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: {{ include "ffs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - controller
+            - --config=/etc/ffs/config.yaml
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: controller
+                  resource: limits.memory
+          ports:
+            - {name: http, containerPort: 8080, protocol: TCP}
+            - {name: metrics, containerPort: 8443, protocol: TCP}
+            - {name: health, containerPort: 8081, protocol: TCP}
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8081}
+          readinessProbe:
+            httpGet: {path: /readyz, port: 8081}
+          resources:
+            {{- toYaml .Values.controller.resources | nindent 12 }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: config, mountPath: /etc/ffs, readOnly: true}
+            - {name: run, mountPath: {{ $sockDir }}}
+            - {name: data, mountPath: {{ .Values.config.dataDir }}}
+            - {name: tmp, mountPath: /tmp}
+            - {name: kube-api-access, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+        - name: catalog
+          image: {{ include "ffs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - catalog
+            - --socket={{ .Values.config.catalog.socket }}
+            - --scratch=/tmp
+            - --scratch-limit={{ int64 .Values.catalog.scratchLimit }}
+            - --max-concurrent={{ .Values.config.catalog.concurrency }}
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: catalog
+                  resource: limits.memory
+          resources:
+            {{- toYaml .Values.catalog.resources | nindent 12 }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: run, mountPath: {{ $sockDir }}}
+            - {name: scratch, mountPath: /tmp}
+      volumes:
+        - name: run
+          emptyDir: {}
+        - name: scratch
+          emptyDir:
+            sizeLimit: {{ .Values.catalog.scratchSizeLimit }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.controller.tmpSizeLimit }}
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ .Values.persistence.existingClaim | default $name }}
+        - name: config
+          configMap:
+            name: {{ $name }}
+        - name: kube-api-access
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3607
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - {key: ca.crt, path: ca.crt}
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef: {apiVersion: v1, fieldPath: metadata.namespace}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

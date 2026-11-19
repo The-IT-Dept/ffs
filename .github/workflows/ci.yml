@@ -26,10 +26,15 @@ jobs:
       - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
         with:
           go-version-file: go.mod
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.22.1
       - run: go build ./...
       - run: go vet ./...
-      - run: make generate && git diff --exit-code -- api config
+      - run: make generate && git diff --exit-code -- api config charts/ffs/crds
       - run: make test
+        env:
+          FFS_REQUIRE_HELM: "1"
 
   lint:
     runs-on: ubuntu-24.04

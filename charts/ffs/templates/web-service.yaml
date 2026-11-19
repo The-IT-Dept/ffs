@@ -1,0 +1,21 @@
+{{- if and .Values.web.service.enabled (hasPrefix "127." .Values.config.listen) }}
+{{- fail "web.service.enabled needs config.listen bound beyond loopback, e.g. 0.0.0.0:8080" }}
+{{- end }}
+{{- if .Values.web.service.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ffs.fullname" . }}-web
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ffs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.web.service.port }}
+      targetPort: http
+      protocol: TCP
+{{- end }}
