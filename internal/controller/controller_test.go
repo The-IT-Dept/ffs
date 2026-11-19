@@ -15,6 +15,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/leaderelection/resourcelock"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/the-it-dept/ffs/api/v1alpha1"
@@ -23,7 +25,9 @@ import (
 )
 
 func TestManagerOptions(t *testing.T) {
-	o := managerOptions(Options{Config: config.Default(), LeaderElect: true, MetricsAddr: ":8443", ProbeAddr: ":8081"}, "ffs")
+	o, err := managerOptions(Options{Config: config.Default(), LeaderElect: true, MetricsAddr: ":8443", ProbeAddr: ":8081"}, "ffs",
+		&rest.Config{Host: "https://127.0.0.1:6443"})
+	require.NoError(t, err)
 
 	require.Equal(t, "0", o.PprofBindAddress)
 	require.True(t, o.LeaderElection)
@@ -39,6 +43,18 @@ func TestManagerOptions(t *testing.T) {
 
 	require.NotNil(t, o.Client.Cache)
 	require.Contains(t, o.Client.Cache.DisableFor, client.Object(&corev1.Secret{}))
+
+	// Leader election records no core/v1 Events, which the RBAC does not grant (F47).
+	lock, ok := o.LeaderElectionResourceLockInterface.(*resourcelock.LeaseLock)
+	require.True(t, ok, "leader election uses a Lease lock built by ffs, got %T", o.LeaderElectionResourceLockInterface)
+	require.Nil(t, lock.LockConfig.EventRecorder)
+	require.Equal(t, "ffs", lock.LeaseMeta.Namespace)
+	require.Equal(t, "ffs.theitdept.au", lock.LeaseMeta.Name)
+	require.NotEmpty(t, lock.Identity())
+
+	off, err := managerOptions(Options{Config: config.Default()}, "ffs", &rest.Config{Host: "https://127.0.0.1:6443"})
+	require.NoError(t, err)
+	require.Nil(t, off.LeaderElectionResourceLockInterface)
 
 	require.NotNil(t, o.Cache.DefaultTransform)
 	transformed := map[string]bool{}
@@ -98,6 +114,14 @@ func TestController_StartStopFeedsDisabled(t *testing.T) {
 		}
 		return apimeta.IsStatusConditionTrue(got.Status.Conditions, "Ready")
 	}, 20*time.Second, 100*time.Millisecond)
+
+	// Leader election wrote no core/v1 Event about its Lease (F47): the chart grants only
+	// events.k8s.io, so such an Event would be refused with a "forbidden" error in production.
+	var evs corev1.EventList
+	require.NoError(t, env.Client.List(context.Background(), &evs, client.InNamespace("default")))
+	for _, ev := range evs.Items {
+		require.NotEqual(t, "Lease", ev.InvolvedObject.Kind, "core/v1 Event %q: %s", ev.Reason, ev.Message)
+	}
 
 	cancel()
 	select {
