@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -25,9 +26,10 @@ import (
 const DefaultURL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
 const (
-	maxBytes = 32 << 20
-	metaETag = "etag"
-	cacheRel = "feeds/kev.json"
+	maxBytes  = 32 << 20
+	metaETag  = "etag"
+	metaCount = "count" // entries in the last catalogue accepted
+	cacheRel  = "feeds/kev.json"
 )
 
 // Handler consumes the IDs of advisories whose KEV status changed; wiring passes
@@ -166,23 +168,31 @@ func (f *Feed) catalogue(ctx context.Context, st *store.FeedState, cache string)
 		if err != nil {
 			return nil, err
 		}
+		// An empty or broken catalogue would clear every KEV flag and de-escalate urgent findings.
+		prev, _ := strconv.Atoi(st.Meta[metaCount])
+		if err := feeds.CheckShrink("the KEV catalogue", prev, len(dates)); err != nil {
+			return nil, err
+		}
 		if err := feeds.WriteFile(cache, resp.Body); err != nil {
 			return nil, err
+		}
+		if st.Meta == nil {
+			st.Meta = map[string]string{}
 		}
 		if resp.ETag == "" {
 			delete(st.Meta, metaETag)
 		} else {
-			if st.Meta == nil {
-				st.Meta = map[string]string{}
-			}
 			st.Meta[metaETag] = resp.ETag
 		}
+		st.Meta[metaCount] = strconv.Itoa(len(dates))
 		return dates, nil
 	default:
 		return nil, fmt.Errorf("kev: GET %s: unexpected status %d", f.o.Config.URL, resp.Status)
 	}
 }
 
+// parse returns the catalogue's CVE ID to date-added map. A catalogue with no entries, or whose
+// entries are mostly unreadable (a reshaped body), is ErrImplausible.
 func parse(raw []byte) (map[string]time.Time, error) {
 	var c catalogue
 	if err := json.Unmarshal(raw, &c); err != nil {
@@ -195,6 +205,9 @@ func parse(raw []byte) (map[string]time.Time, error) {
 			continue
 		}
 		out[v.CVEID] = d
+	}
+	if len(out) == 0 || len(out) < len(c.Vulnerabilities)/2 {
+		return nil, fmt.Errorf("%w: the KEV catalogue has %d readable entries of %d", feeds.ErrImplausible, len(out), len(c.Vulnerabilities))
 	}
 	return out, nil
 }

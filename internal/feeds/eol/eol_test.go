@@ -149,3 +149,38 @@ func TestEOLFeed_RejectsOversizeBody(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, before, after)
 }
+
+// TestEOLFeed_RefusesEmptyOrReshapedList: a 200 whose list is empty, reshaped or far shorter than
+// the stored one fails the sync and keeps the stored cycles, instead of wiping them and reporting
+// success.
+func TestEOLFeed_RefusesEmptyOrReshapedList(t *testing.T) {
+	good, err := os.ReadFile("testdata/products-full.json")
+	require.NoError(t, err)
+	var body atomic.Value
+	body.Store(good)
+	fx := newFixture(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(body.Load().([]byte))
+	})
+	require.NoError(t, fx.feed.Sync(ctx))
+	before, err := fx.st.ListEOL(ctx)
+	require.NoError(t, err)
+	require.NotEmpty(t, before)
+
+	for name, bad := range map[string]string{
+		"empty result":  `{"schema_version":"1.2.1","total":0,"result":[]}`,
+		"no result":     `{"schema_version":"1.3.0","data":[{"name":"go","releases":[{"name":"1.25"}]}]}`,
+		"renamed names": `{"result":[{"id":"go","releases":[{"label":"1.25"},{"label":"1.24"}]}]}`,
+		"shrunk":        `{"result":[{"name":"go","releases":[{"name":"1.25","isEol":false}]}]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			body.Store([]byte(bad))
+			updates := fx.updates.Load()
+			err := fx.feed.Sync(ctx)
+			require.ErrorIs(t, err, feeds.ErrImplausible)
+			require.Equal(t, updates, fx.updates.Load(), "the evaluator is not reloaded")
+			after, err := fx.st.ListEOL(ctx)
+			require.NoError(t, err)
+			require.Equal(t, before, after)
+		})
+	}
+}

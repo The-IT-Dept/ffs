@@ -16,7 +16,19 @@ var (
 	ErrTooLarge = errors.New("feeds: size limit exceeded")
 	// ErrNotFound means the server answered 404.
 	ErrNotFound = errors.New("feeds: not found")
+	// ErrImplausible means a feed answered with a body that parses but cannot be right: empty,
+	// reshaped, or far smaller than the last one accepted. The stored data is kept.
+	ErrImplausible = errors.New("feeds: implausible response")
 )
+
+// CheckShrink returns an ErrImplausible error when a feed whose last accepted body had prev
+// entries now has fewer than half as many. A prev of zero (nothing accepted yet) passes.
+func CheckShrink(feed string, prev, now int) error {
+	if prev > 0 && now < prev/2 {
+		return fmt.Errorf("%w: %s has %d entries, down from %d; keeping the stored data", ErrImplausible, feed, now, prev)
+	}
+	return nil
+}
 
 // NewHTTPClient returns a client for feed downloads. It keeps the default transport's proxy
 // settings (HTTP_PROXY, HTTPS_PROXY, NO_PROXY), requires TLS 1.2 or later, sends userAgent when a
