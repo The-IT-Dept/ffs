@@ -164,4 +164,4 @@ type AlertTargetList struct {
 	Items           []AlertTarget `json:"items"`
 }
 
-func init() { SchemeBuilder.Register(&AlertTarget{}, &AlertTargetList{}) }
+func init() { register(&AlertTarget{}, &AlertTargetList{}) }

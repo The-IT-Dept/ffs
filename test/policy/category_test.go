@@ -15,7 +15,7 @@ func TestAnxietyOnlyInMarkers(t *testing.T) {
 	needle := "anx" + "iety"
 	root := moduleRoot(t)
 	skip := []string{".git", "bin", "docs/superpowers", "docs/research", "config/crd", "charts/ffs/crds"}
-	out, err := exec.Command("git", "-C", root, "ls-files", "-z").Output()
+	out, err := exec.CommandContext(t.Context(), "git", "-C", root, "ls-files", "-z").Output() //nolint:gosec // fixed git binary; root is the module root derived from the test file
 	require.NoError(t, err)
 	var allowed []string
 files:

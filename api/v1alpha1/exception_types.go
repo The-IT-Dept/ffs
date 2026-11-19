@@ -77,4 +77,4 @@ type ExceptionList struct {
 	Items           []Exception `json:"items"`
 }
 
-func init() { SchemeBuilder.Register(&Exception{}, &ExceptionList{}) }
+func init() { register(&Exception{}, &ExceptionList{}) }

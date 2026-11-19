@@ -128,7 +128,8 @@ func NewNormalizer(r IndexResolver, l ImageLookup, now func() time.Time) *Normal
 func (n *Normalizer) Normalize(ctx context.Context, in ContainerImage) (model.Image, error) {
 	repoID, digest, bare, err := ParseImageID(in.ImageID)
 	if err != nil {
-		return n.unresolvable("unknown:"+in.ImageID, "", "", fmt.Sprintf(ReasonUnparseable, in.ImageID)), nil
+		// An unparseable image ID is a permanent failure, recorded as an unresolvable image rather than retried.
+		return n.unresolvable("unknown:"+in.ImageID, "", "", fmt.Sprintf(ReasonUnparseable, in.ImageID)), nil //nolint:nilerr // parse error is permanent: reported as unresolvable, not returned
 	}
 	repo := repoID
 	imgRepo, tag, refDigest, refErr := SplitRef(in.Image)
@@ -141,7 +142,7 @@ func (n *Normalizer) Normalize(ctx context.Context, in ContainerImage) (model.Im
 	if err != nil {
 		return model.Image{}, err
 	}
-	if ok && !(stored.Status == model.ImageUnresolvable && !n.now().Before(stored.QuarantinedUntil)) {
+	if ok && (stored.Status != model.ImageUnresolvable || n.now().Before(stored.QuarantinedUntil)) {
 		if repo != "" {
 			stored.Repo = repo
 		}
@@ -154,7 +155,8 @@ func (n *Normalizer) Normalize(ctx context.Context, in ContainerImage) (model.Im
 		candidate := refDigest
 		if candidate == "" {
 			if refErr != nil || tag == "" {
-				return n.unresolvable(digest, repo, key, ReasonSideLoadedNoTag), nil
+				// refErr only means the reference carries no usable tag: permanent, so unresolvable.
+				return n.unresolvable(digest, repo, key, ReasonSideLoadedNoTag), nil //nolint:nilerr // unusable reference is permanent: reported as unresolvable, not returned
 			}
 			ref = repo + ":" + tag
 			if candidate, err = n.r.ResolveTag(ctx, repo, tag, in.Creds); err != nil {

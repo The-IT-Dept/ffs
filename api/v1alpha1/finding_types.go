@@ -158,4 +158,4 @@ type FindingList struct {
 	Items           []Finding `json:"items"`
 }
 
-func init() { SchemeBuilder.Register(&Finding{}, &FindingList{}) }
+func init() { register(&Finding{}, &FindingList{}) }
