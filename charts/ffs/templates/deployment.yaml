@@ -93,7 +93,7 @@ spec:
             - catalog
             - --socket={{ .Values.config.catalog.socket }}
             - --scratch=/tmp
-            - --scratch-limit={{ int64 .Values.catalog.scratchLimit }}
+            - --scratch-limit={{ include "ffs.scratchLimit" . }}
             - --max-concurrent={{ .Values.config.catalog.concurrency }}
           env:
             - name: GOMEMLIMIT

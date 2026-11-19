@@ -522,3 +522,41 @@ func TestChart_NotesAndHiddenCategory(t *testing.T) {
 		return nil
 	}))
 }
+
+// TestChart_ScratchLimitQuantities is the regression test for F16: a quantity such as 18Gi used to
+// render --scratch-limit=0, which the cataloguer reads as unlimited.
+func TestChart_ScratchLimitQuantities(t *testing.T) {
+	limit := func(sets ...string) string {
+		t.Helper()
+		for _, a := range container(t, podSpec(t, sets...), "catalog").Args {
+			if v, ok := strings.CutPrefix(a, "--scratch-limit="); ok {
+				return v
+			}
+		}
+		t.Fatal("no --scratch-limit argument")
+		return ""
+	}
+	require.Equal(t, "19327352832", limit(), "the default byte count")
+	require.Equal(t, "19327352832", limit("catalog.scratchLimit=18Gi"))
+	require.Equal(t, "19327352832", limit("catalog.scratchLimit=19327352832"))
+	require.Equal(t, "15000000000", limit("catalog.scratchLimit=15G"))
+	require.Equal(t, "1073741824", limit("catalog.scratchLimit=1Gi", "catalog.scratchSizeLimit=2Gi"))
+
+	values := filepath.Join(t.TempDir(), "values.yaml")
+	require.NoError(t, os.WriteFile(values, []byte("catalog:\n  scratchLimit: 18Gi\n"), 0o600))
+	args := []string{"template", "ffs", chartDir, "-n", "ffs", "--kube-version", kubeVersion, "-f", values}
+	out, err := exec.CommandContext(t.Context(), "helm", args...).CombinedOutput() //nolint:gosec // helm with a values file this test wrote
+	require.NoError(t, err, string(out))
+	require.Contains(t, string(out), "--scratch-limit=19327352832", "a quantity in a values file")
+
+	for _, c := range []struct{ set, want string }{
+		{"catalog.scratchLimit=0", "catalog.scratchLimit must be greater than 0"},
+		{"catalog.scratchLimit=20Gi", "catalog.scratchLimit (21474836480 bytes) must be below catalog.scratchSizeLimit (21474836480 bytes)"},
+		{"catalog.scratchLimit=25Gi", "must be below catalog.scratchSizeLimit"},
+		{"catalog.scratchLimit=18GB", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
+		{"catalog.scratchLimit=1.5Gi", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
+	} {
+		_, err := renderErr(t, c.set)
+		require.ErrorContains(t, err, c.want, c.set)
+	}
+}

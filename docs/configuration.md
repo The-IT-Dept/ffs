@@ -90,7 +90,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. |
 | `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |
-| `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch bytes one catalogue job may use. Keep it below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod. |
+| `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch space the catalogue jobs may use together, as a byte count or a quantity such as `18Gi`. It must be greater than 0 and below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod; the chart refuses to render otherwise. |
 | `persistence.size` | `20Gi` | Size of the volume for the store and feed data. |
 | `persistence.storageClass` | `""` | Storage class; empty uses the cluster default. |
 | `persistence.existingClaim` | `""` | Use an existing PersistentVolumeClaim instead of creating one. |
