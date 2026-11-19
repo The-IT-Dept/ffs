@@ -43,7 +43,8 @@ func LowPriority(ctx context.Context) context.Context {
 	return context.WithValue(ctx, lowPriorityKey{}, true)
 }
 
-func isLowPriority(ctx context.Context) bool {
+// IsLowPriority reports whether ctx was marked by LowPriority.
+func IsLowPriority(ctx context.Context) bool {
 	low, _ := ctx.Value(lowPriorityKey{}).(bool)
 	return low
 }
@@ -115,7 +116,7 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // take blocks until n tokens are available for host, then consumes them. It fails only with ctx.Err().
 func (t *budgetTransport) take(ctx context.Context, host string, n float64) error {
-	low := isLowPriority(ctx)
+	low := IsLowPriority(ctx)
 	for {
 		t.mu.Lock()
 		var wait time.Duration

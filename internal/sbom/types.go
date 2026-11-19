@@ -25,6 +25,11 @@ type Result struct {
 	ConfigUser        string // image config User; "" when the image sets none
 }
 
+// MaxSBOMBytes bounds an SBOM document the controller accepts, from the cataloguer or from an
+// attestation. Decoding one takes several times its size in memory, and the controller's memory is
+// small; an image whose SBOM is larger is quarantined instead.
+const MaxSBOMBytes = 64 << 20
+
 // ErrNotFound means a source has nothing for the digest; the next source is tried.
 var ErrNotFound = errors.New("sbom: not found")
 
