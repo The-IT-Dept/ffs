@@ -156,7 +156,7 @@ func (e *Engine) prune(ctx context.Context) {
 	n, err := e.Prune(ctx)
 	switch {
 	case err != nil:
-		e.o.Log.Error(err, "pruning resolved findings failed")
+		e.o.Log.Error(err, "pruning the store failed")
 	case n > 0:
 		e.o.Log.Info("pruned resolved findings", "count", n)
 	}

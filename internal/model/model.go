@@ -223,4 +223,6 @@ type Suggestion struct {
 	Alternatives                   []Suggestion
 	EOL                            string // e.g. "debian 10 reached end of life 2024-06-30"
 	ComputedAt                     time.Time
+	FixedIDs                       []string // sorted advisory ids the target fixes
+	Notes                          []string // e.g. "no upgrade path in this repository"
 }

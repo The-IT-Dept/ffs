@@ -89,6 +89,42 @@ func (s *Store) ListImages(ctx context.Context, f ImageFilter) ([]model.Image, e
 		`SELECT `+imageCols+` FROM images`+w.String()+` ORDER BY digest`+limitOffset(f.Limit, 0), w.args...)
 }
 
+// PruneImages deletes, in one transaction, the images catalogued before olderThan that no owner
+// runs and no upgrade suggestion holds as a candidate, with their packages, SBOMs, matches and
+// grype keys: superseded rollout digests and stale candidates. Synthetic digests and images never
+// catalogued (catalogued_at NULL, such as one inventory has just written) are kept. It returns the
+// number of images deleted.
+func (s *Store) PruneImages(ctx context.Context, olderThan time.Time) (int, error) {
+	if olderThan.IsZero() {
+		return 0, nil // nothing is older than the zero time
+	}
+	var n int
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		digests, err := queryAll(ctx, tx, scanString, `SELECT digest FROM images i WHERE catalogued_at < ?
+			AND digest NOT LIKE 'k8s:%' AND digest NOT LIKE 'runtime:%'
+			AND NOT EXISTS (SELECT 1 FROM owner_images o WHERE o.digest = i.digest)
+			AND NOT EXISTS (SELECT 1 FROM candidates c WHERE c.digest = i.digest)`, olderThan.UTC().UnixNano())
+		if err != nil || len(digests) == 0 {
+			return err
+		}
+		list := idList(digests)
+		for _, q := range []string{
+			`DELETE FROM packages WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM sboms WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM matches WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM grype_keys WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM images WHERE digest IN (SELECT value FROM json_each(?))`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, list); err != nil {
+				return fmt.Errorf("store: prune images: %w", err)
+			}
+		}
+		n = len(digests)
+		return nil
+	})
+	return n, err
+}
+
 func scanImage(r scanner) (model.Image, error) {
 	var (
 		img                     model.Image

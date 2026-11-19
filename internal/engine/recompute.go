@@ -32,8 +32,23 @@ type pass struct {
 	canon  map[string]string // advisory id → canonical, cached for the call
 }
 
-// recompute is Recompute, also returning the keys whose findings were not written.
+// recompute is Recompute, also returning the keys whose findings were not written. Observers hear
+// about the keys whose findings were, once the recompute lock is released.
 func (e *Engine) recompute(ctx context.Context, keys []string, trig model.Trigger) ([]string, error) {
+	failed, err := e.recomputeLocked(ctx, keys, trig)
+	var written []string
+	for _, k := range keys {
+		if !slices.Contains(failed, k) {
+			written = append(written, k)
+		}
+	}
+	e.ownersRecomputed(ctx, written)
+	return failed, err
+}
+
+// recomputeLocked rebuilds and writes the findings of keys under the recompute lock and returns the
+// keys whose findings were not written.
+func (e *Engine) recomputeLocked(ctx context.Context, keys []string, trig model.Trigger) ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	builds, err := e.o.Store.GrypeDBBuilds(ctx)
@@ -222,9 +237,10 @@ func (e *Engine) build(ctx context.Context, p *pass, key string) ([]model.Findin
 
 // matchImage runs every matcher over a catalogued digest: the Matchers in order, then grype with
 // the OSV matches as hints. With persist, each matcher's matches replace its stored matches on the
-// digest. A grype matcher with no DB loaded has no opinion: its stored matches stay and it is not an
-// error. Any other failure leaves that matcher's stored matches untouched and is returned, joined,
-// after the other matchers have run. It returns the matches of the matchers that succeeded.
+// digest, and observers hear once that the digest's matches changed if any did. A grype matcher
+// with no DB loaded has no opinion: its stored matches stay and it is not an error. Any other
+// failure leaves that matcher's stored matches untouched and is returned, joined, after the other
+// matchers have run. It returns the matches of the matchers that succeeded.
 func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([]model.Match, error) {
 	img, ok, err := e.o.Store.GetImage(ctx, digest)
 	if err != nil {
@@ -252,6 +268,7 @@ func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([
 		all       []model.Match
 		errs      []error
 		osvFailed bool
+		changed   bool
 	)
 	// run matches with m and, with persist, stores the result. It reports whether m had an opinion.
 	run := func(m match.Matcher, in match.ImageInput, grype bool) ([]model.Match, bool) {
@@ -265,9 +282,11 @@ func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([
 		ms = stampObserved(ms, stored, now)
 		if persist {
 			scope := store.MatchScope{Source: m.Source(), Digests: []string{digest}}
-			if _, err := e.o.Store.ReplaceMatches(ctx, scope, ms); err != nil {
+			affected, err := e.o.Store.ReplaceMatches(ctx, scope, ms)
+			if err != nil {
 				errs = append(errs, fmt.Errorf("engine: store %s matches of %s: %w", m.Source(), digest, err))
 			}
+			changed = changed || len(affected) > 0
 		}
 		all = append(all, ms...)
 		return ms, true
@@ -286,6 +305,9 @@ func (e *Engine) matchImage(ctx context.Context, digest string, persist bool) ([
 	}
 	in.Hints = hints
 	run(e.o.Grype, in, true)
+	if changed {
+		e.matchesReplaced(ctx, []string{digest})
+	}
 	return all, errors.Join(errs...)
 }
 

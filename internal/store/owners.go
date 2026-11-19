@@ -39,14 +39,21 @@ func (s *Store) UpsertOwner(ctx context.Context, o model.Owner) error {
 	})
 }
 
-// DeleteOwner removes the owner and its owner_images rows.
+// DeleteOwner removes the owner with its owner_images rows and its upgrade suggestions and
+// candidates.
 func (s *Store) DeleteOwner(ctx context.Context, key string) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM owner_images WHERE owner_key = ?`, key); err != nil {
-			return err
+		for _, q := range []string{
+			`DELETE FROM owner_images WHERE owner_key = ?`,
+			`DELETE FROM suggestions WHERE owner_key = ?`,
+			`DELETE FROM candidates WHERE owner_key = ?`,
+			`DELETE FROM owners WHERE key = ?`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, key); err != nil {
+				return err
+			}
 		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM owners WHERE key = ?`, key)
-		return err
+		return nil
 	})
 }
 

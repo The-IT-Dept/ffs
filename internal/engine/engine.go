@@ -43,6 +43,7 @@ type Store interface {
 	RekeyFindings(ctx context.Context, rks []store.FindingRekey) error
 	DigestsInUse(ctx context.Context) ([]string, error)
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
+	PruneImages(ctx context.Context, olderThan time.Time) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
 	GrypeDBBuilds(ctx context.Context) ([]time.Time, error)
 }
@@ -95,6 +96,9 @@ type Engine struct {
 
 	expiryMu  sync.Mutex
 	lastCheck time.Time // CheckExceptionExpiry has seen every expiry up to here
+
+	obsMu     sync.Mutex
+	observers []Observer
 }
 
 // New returns an engine with an empty queue.
@@ -147,6 +151,7 @@ func (e *Engine) OnMatchDelta(ctx context.Context, d match.Delta, trig model.Tri
 	if err != nil {
 		return fmt.Errorf("engine: replace %s matches: %w", s.Source, err)
 	}
+	e.matchesReplaced(ctx, affected)
 	if len(affected) > 0 {
 		owners, err := e.o.Store.OwnersForDigests(ctx, affected)
 		if err != nil {

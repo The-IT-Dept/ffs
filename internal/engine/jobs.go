@@ -31,12 +31,21 @@ func (e *Engine) CheckExceptionExpiry(ctx context.Context) error {
 	return nil
 }
 
-// Prune deletes resolved findings, and their history, older than the retention period. It returns
-// the number of findings deleted.
+// Prune deletes resolved findings, and their history, older than the retention period, then the
+// images catalogued before it that no owner runs and no upgrade suggestion holds (superseded
+// rollout digests and stale candidates). It returns the number of findings deleted.
 func (e *Engine) Prune(ctx context.Context) (int, error) {
-	n, err := e.o.Store.PruneResolved(ctx, e.now().Add(-e.o.Config.Retention.Resolved))
+	cutoff := e.now().Add(-e.o.Config.Retention.Resolved)
+	n, err := e.o.Store.PruneResolved(ctx, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("engine: prune resolved findings: %w", err)
+	}
+	images, err := e.o.Store.PruneImages(ctx, cutoff)
+	if err != nil {
+		return n, fmt.Errorf("engine: prune unused images: %w", err)
+	}
+	if images > 0 {
+		e.o.Log.Info("pruned unused images", "count", images)
 	}
 	return n, nil
 }
