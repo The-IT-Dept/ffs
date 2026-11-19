@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"io"
 	"runtime"
 	"strings"
 	"testing"
@@ -20,13 +19,17 @@ func TestVersionCommand(t *testing.T) {
 	require.Contains(t, out.String(), runtime.Version())
 }
 
-func TestStubCommandsFail(t *testing.T) {
-	for _, sub := range []string{"controller"} {
-		cmd := newRootCmd()
-		cmd.SetArgs([]string{sub})
-		cmd.SetOut(io.Discard)
-		cmd.SetErr(io.Discard)
-		require.EqualError(t, cmd.Execute(), "not implemented", sub)
+func TestControllerCmd_Flags(t *testing.T) {
+	cmd := newControllerCmd()
+	for flag, def := range map[string]string{
+		"config":                    "/etc/ffs/config.yaml",
+		"leader-elect":              "true",
+		"metrics-bind-address":      ":8443",
+		"health-probe-bind-address": ":8081",
+	} {
+		f := cmd.Flags().Lookup(flag)
+		require.NotNil(t, f, flag)
+		require.Equal(t, def, f.DefValue, flag)
 	}
 }
 
