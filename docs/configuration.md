@@ -87,11 +87,11 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `imagePullSecrets` | `[]` | Pull secrets for the ffs image itself. |
 | `rbac.readPullSecrets` | `true` | Grant cluster-wide `get` on Secrets so pull secrets of pods and ServiceAccounts can be read. When false, private images that need them show as `unresolvable`. |
 | `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. |
-| `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. |
+| `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. SQLite's temporary files do not use it: they go to `<dataDir>/tmp` on the persistent volume, or to `SQLITE_TMPDIR` when that is set. |
 | `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |
 | `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch bytes one catalogue job may use. Keep it below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod. |
-| `persistence.size` | `20Gi` | Size of the volume for the store and feed data. |
+| `persistence.size` | `20Gi` | Size of the volume for the store and feed data. While a Grype DB update runs, the volume holds two builds (the November 2026 database is 2.7 GB before indexing), and diffing them takes about 2.5 GB more of SQLite temporary files. Keep at least 10Gi. |
 | `persistence.storageClass` | `""` | Storage class; empty uses the cluster default. |
 | `persistence.existingClaim` | `""` | Use an existing PersistentVolumeClaim instead of creating one. |
 | `podAnnotations` | `{}` | Extra pod annotations. |

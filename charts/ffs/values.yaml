@@ -31,7 +31,7 @@ controller:
     limits:
       # Memory limit.
       memory: 1Gi
-  # Size limit of the controller /tmp emptyDir.
+  # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
   tmpSizeLimit: 1Gi
 
 # Catalog container settings.
@@ -55,7 +55,7 @@ catalog:
 
 # Persistent storage for the store and feed data.
 persistence:
-  # PVC size for the store and feed data.
+  # PVC size for the store and feed data. A Grype DB update holds two builds of a few GB each plus about 2.5 GB of SQLite temporary files; keep at least 10Gi.
   size: 20Gi
   # PVC storage class; empty uses the cluster default.
   storageClass: ""
