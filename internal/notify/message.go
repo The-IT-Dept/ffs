@@ -34,6 +34,9 @@ const (
 	EventReopened     Event = "reopened"
 	EventResolved     Event = "resolved"
 	EventFixAvailable Event = "fixAvailable"
+	// EventUpgradeAvailable lists, in a digest only, a finding already reported whose suggested
+	// upgrade arrived after it was sent (spec §6.10 message content; §6.6 UpgradeAvailable).
+	EventUpgradeAvailable Event = "upgradeAvailable"
 )
 
 // ProvisionalNote is shown on an item whose findings are provisional (spec §6.5).
@@ -139,9 +142,14 @@ func baselineTitle(n, urgent, high int) string {
 	return fmt.Sprintf("ffs is watching %s: %d urgent, %d high", workloads(n), urgent, high)
 }
 
-func digestTitle(cluster string, added, escalated, fixes, resolved int) string {
-	return fmt.Sprintf("ffs digest for %s: %d new, %d escalated, %s, %d resolved",
+// digestTitle counts the digest's sections; upgrades are named only when there are some.
+func digestTitle(cluster string, added, escalated, fixes, resolved, upgrades int) string {
+	t := fmt.Sprintf("ffs digest for %s: %d new, %d escalated, %s, %d resolved",
 		cluster, added, escalated, plural(fixes, "fix available", "fixes available"), resolved)
+	if upgrades > 0 {
+		t += ", " + plural(upgrades, "upgrade available", "upgrades available")
+	}
+	return t
 }
 
 func feedStaleTitle(name string, lastSuccess time.Time) string {
