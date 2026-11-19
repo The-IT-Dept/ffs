@@ -45,13 +45,14 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        name: Build and push the multi-arch image
+        name: Build and push the image
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         env:
           SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          # amd64 only for now; add linux/arm64 back here when arm64 images are wanted.
+          platforms: linux/amd64
           tags: |
             ghcr.io/the-it-dept/ffs:${{ env.VERSION }}
             ghcr.io/the-it-dept/ffs:sha-${{ env.SHORT }}
@@ -59,8 +60,8 @@ jobs:
             VERSION=${{ github.ref_name }}
             COMMIT=${{ env.SHORT }}
           annotations: |
-            index:org.opencontainers.image.version=${{ env.VERSION }}
-            index:org.opencontainers.image.source=https://github.com/The-IT-Dept/ffs
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.source=https://github.com/The-IT-Dept/ffs
           outputs: type=registry,rewrite-timestamp=true
           # No buildx in-index attestations: they add unknown/unknown entries to the index.
           # Signatures, SBOMs and provenance come from cosign and GitHub attestations below.
@@ -82,8 +83,13 @@ jobs:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          manifests="$(docker buildx imagetools inspect --raw "ghcr.io/the-it-dept/ffs@${DIGEST}" \
-            | jq -r '.manifests[] | "\(.platform.os)-\(.platform.architecture) \(.digest)"')"
+          raw="$(docker buildx imagetools inspect --raw "ghcr.io/the-it-dept/ffs@${DIGEST}")"
+          if jq -e '.manifests' <<<"${raw}" >/dev/null; then
+            manifests="$(jq -r '.manifests[] | "\(.platform.os)-\(.platform.architecture) \(.digest)"' <<<"${raw}")"
+          else
+            # Single-platform build: the pushed digest is the platform manifest itself.
+            manifests="linux-amd64 ${DIGEST}"
+          fi
           test -n "${manifests}"
           if grep -q unknown <<<"${manifests}"; then
             echo "unexpected attestation manifest in the index: ${manifests}" >&2
