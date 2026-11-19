@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"time"
 
+	orv1alpha1 "github.com/openreports/reports-api/apis/openreports.io/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -42,10 +43,10 @@ type Options struct {
 }
 
 // NewScheme returns the scheme the manager uses: the client-go types, the ffs API and the Gateway
-// API types exposure reads.
+// API types exposure reads, and the OpenReports types.
 func NewScheme() (*runtime.Scheme, error) {
 	s := runtime.NewScheme()
-	if err := errors.Join(clientgoscheme.AddToScheme(s), v1alpha1.AddToScheme(s), exposure.AddToScheme(s)); err != nil {
+	if err := errors.Join(clientgoscheme.AddToScheme(s), v1alpha1.AddToScheme(s), exposure.AddToScheme(s), orv1alpha1.Install(s)); err != nil {
 		return nil, fmt.Errorf("build scheme: %w", err)
 	}
 	return s, nil

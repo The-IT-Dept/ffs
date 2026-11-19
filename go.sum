@@ -886,6 +886,8 @@ github.com/opencontainers/runtime-spec v1.3.0 h1:YZupQUdctfhpZy3TM39nN9Ika5CBWT5
 github.com/opencontainers/runtime-spec v1.3.0/go.mod h1:jwyrGlmzljRJv/Fgzds9SsS/C5hL+LL3ko9hs6T5lQ0=
 github.com/opencontainers/selinux v1.15.1 h1:ERxeh5caJvCzNAKdI8WQbJmB1LDTn4BuaAg8wihLBpA=
 github.com/opencontainers/selinux v1.15.1/go.mod h1:LenyElirjUHszfxrjuFqC85HIeXZKumHcKMQtnaDlQQ=
+github.com/openreports/reports-api v0.2.1 h1:g9KS3yle9Y1elmww4TK9EkD1rl6inIaiIJPX6e+u680=
+github.com/openreports/reports-api v0.2.1/go.mod h1:Es52ppXibHHVWs8dEd322rEzCP6R6/7Wu+3rdwuRndU=
 github.com/openvex/go-vex v0.2.9 h1:InBYPjk5FQtDjnSQ12RUyQcnMlDO5QAg4QK848LIFm8=
 github.com/openvex/go-vex v0.2.9/go.mod h1:K7NfMaPzwZHZjg5xBvDzl4Wul4ojoNN4ICR5s4xbNHw=
 github.com/orisano/pixelmatch v0.0.0-20220722002657-fb0b55479cde/go.mod h1:nZgzbfBr3hhjoZnS66nKrHmduYNpc34ny7RK4z5/HM0=

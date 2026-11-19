@@ -12,6 +12,7 @@ require (
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20260904000721-8a72a424fdec
 	github.com/google/osv-scalibr v0.5.3
 	github.com/klauspost/compress v1.20.3
+	github.com/openreports/reports-api v0.2.1
 	github.com/ossf/osv-schema/bindings/go v0.0.0-20260424063704-83285ce2a866
 	github.com/prometheus/client_golang v1.24.1
 	github.com/robfig/cron/v3 v3.0.1
