@@ -109,6 +109,44 @@ func TestFloatingVersion(t *testing.T) {
 	require.False(t, ok)
 }
 
+// TestFloatingVersion_VariantTags is the regression test for F43: a floating variant tag keeps its
+// compatibility key, so redis:alpine is never offered the Debian-based 7.4.2.
+func TestFloatingVersion_VariantTags(t *testing.T) {
+	for _, c := range []struct {
+		tag, annotation string
+		release         []int
+		suffix          string
+	}{
+		{"alpine", "7.4.1", []int{7, 4, 1}, "alpine"},
+		{"alpine", "7.4.1-alpine", []int{7, 4, 1}, "alpine"},
+		{"slim", "3.12.7", []int{3, 12, 7}, "slim"},
+		{"alpine3.21", "17.2", []int{17, 2}, "alpine3.21"},
+		{"stable-alpine", "1.30.7-alpine", []int{1, 30, 7}, "alpine"},
+		{"latest", "1.27.4-bookworm", []int{1, 27, 4}, "bookworm"}, // the annotation's own key is kept
+		{"latest", "2.1.0", []int{2, 1, 0}, ""},
+		{"stable", "1.30.7", []int{1, 30, 7}, ""},
+		{"mainline", "1.29.3", []int{1, 29, 3}, ""},
+		{"lts", "22.11.0", []int{22, 11, 0}, ""},
+		{"current", "23.3.0", []int{23, 3, 0}, ""},
+		{"", "2.1.0", []int{2, 1, 0}, ""}, // digest-only reference
+	} {
+		v, ok := FloatingVersion(c.tag, c.annotation)
+		require.True(t, ok, c.tag)
+		require.Equal(t, c.release, v.Release, c.tag)
+		require.Equal(t, c.suffix, v.Suffix, "%s with annotation %s", c.tag, c.annotation)
+		require.Equal(t, c.tag, v.Tag)
+	}
+
+	tags := []string{"7.4.1", "7.4.2", "7.5.0", "7.4.1-alpine", "7.4.2-alpine", "7.5.0-alpine", "alpine", "latest"}
+	p, err := NewParser(nil)
+	require.NoError(t, err)
+	cur, ok := FloatingVersion("alpine", "7.4.1")
+	require.True(t, ok)
+	best := p.Best("docker.io/library/redis", cur, tags)
+	require.Equal(t, "7.4.2-alpine", best[model.TierPatch].Tag, "the patch stays on Alpine")
+	require.Equal(t, "7.5.0-alpine", best[model.TierMinor].Tag, "the minor stays on Alpine")
+}
+
 func fixture(t *testing.T, name string) []string {
 	t.Helper()
 	b, err := os.ReadFile("testdata/tags/" + name) //nolint:gosec // G304: name is a constant fixture filename from this test file
