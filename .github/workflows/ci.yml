@@ -28,6 +28,7 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
+      - run: make generate && git diff --exit-code -- api config
       - run: make test
 
   lint:

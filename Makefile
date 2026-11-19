@@ -9,7 +9,9 @@ PKGS ?= ./...
 RUN  ?=
 .PHONY: build test generate lint e2e
 build:    ; go build -trimpath -ldflags '$(LDFLAGS)' -o bin/ffs ./cmd/ffs
-test:     ; go test $(if $(RUN),-run '$(RUN)') $(PKGS)
+SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3
+ENVTEST_K8S_VERSION ?= 1.37.0
+test: ; KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(CURDIR)/bin/envtest -p path)" go test $(if $(RUN),-run '$(RUN)') $(PKGS)
 generate: ; $(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 lint:     ; $(GOLANGCI_LINT) run ./...
 e2e:      ; go test -tags e2e -count=1 -timeout 30m ./test/e2e/...

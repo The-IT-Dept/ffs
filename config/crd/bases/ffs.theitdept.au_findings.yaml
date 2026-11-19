@@ -1,0 +1,317 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: findings.ffs.theitdept.au
+spec:
+  group: ffs.theitdept.au
+  names:
+    categories:
+    - ffs
+    - anxiety
+    kind: Finding
+    listKind: FindingList
+    plural: findings
+    singular: finding
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.advisory.id
+      name: Advisory
+      type: string
+    - jsonPath: .status.advisory.severity
+      name: Severity
+      type: string
+    - jsonPath: .status.priority
+      name: Priority
+      type: string
+    - jsonPath: .status.packages[0].name
+      name: Package
+      type: string
+    - jsonPath: .status.packages[0].installed
+      name: Installed
+      type: string
+    - jsonPath: .status.fix
+      name: Fix
+      type: string
+    - jsonPath: .status.suggestion.target
+      name: Suggested
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Finding is a vulnerability affecting a workload.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          status:
+            description: FindingStatus is the observed state of a finding. ffs writes
+              status only.
+            properties:
+              advisory:
+                description: Advisory summarises the vulnerability advisory.
+                properties:
+                  aliases:
+                    description: Aliases lists other identifiers for the advisory.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  id:
+                    description: ID is the advisory identifier.
+                    type: string
+                  links:
+                    description: Links lists reference URLs.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  severity:
+                    description: Severity is the advisory severity.
+                    enum:
+                    - critical
+                    - high
+                    - medium
+                    - low
+                    - negligible
+                    - unknown
+                    type: string
+                  severitySource:
+                    description: SeveritySource names where the severity came from.
+                    type: string
+                  title:
+                    description: Title is the advisory title.
+                    type: string
+                type: object
+              cluster:
+                description: Cluster is the name of the cluster the finding belongs
+                  to.
+                type: string
+              exposure:
+                description: Exposure summarises how exposed the workload is.
+                properties:
+                  exposed:
+                    description: Exposed is true when the workload is reachable from
+                      outside the cluster.
+                    type: boolean
+                  exposurePaths:
+                    description: ExposurePaths describes how the workload is exposed.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  powerfulServiceAccount:
+                    description: PowerfulServiceAccount is true when the service account
+                      has broad permissions.
+                    type: boolean
+                  privilegeReasons:
+                    description: PrivilegeReasons explains why the workload is considered
+                      privileged.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  privileged:
+                    description: Privileged is true when the workload runs with elevated
+                      privileges.
+                    type: boolean
+                  serviceAccountReasons:
+                    description: ServiceAccountReasons explains why the service account
+                      is considered powerful.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
+              fingerprint:
+                description: Fingerprint is the stable identity of the finding.
+                type: string
+              fix:
+                description: Fix is the first available fixed version, or the fix
+                  state when none is available.
+                type: string
+              goStdlib:
+                description: GoStdlib is true when the affected package is the Go
+                  standard library.
+                type: boolean
+              lastSeen:
+                description: LastSeen is when the finding was last seen.
+                format: date-time
+                type: string
+              matched:
+                description: Matched is when the finding was first matched.
+                format: date-time
+                type: string
+              observed:
+                description: Observed is when the finding was first observed.
+                format: date-time
+                type: string
+              packages:
+                description: Packages lists the affected packages. The primary package
+                  is first.
+                items:
+                  description: AffectedPackage is a package affected by an advisory.
+                  properties:
+                    fixed:
+                      description: Fixed lists versions that fix the advisory.
+                      items:
+                        type: string
+                      type: array
+                      x-kubernetes-list-type: atomic
+                    installed:
+                      description: Installed is the installed version.
+                      type: string
+                    name:
+                      description: Name is the package name.
+                      type: string
+                    path:
+                      description: Path is where the package was found in the image.
+                      type: string
+                    type:
+                      description: Type is the package type.
+                      type: string
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              priority:
+                description: Priority is the computed priority.
+                enum:
+                - urgent
+                - high
+                - medium
+                - low
+                type: string
+              provisional:
+                description: Provisional is true while the finding rests on incomplete
+                  data.
+                type: boolean
+              published:
+                description: Published is when the advisory was published.
+                format: date-time
+                type: string
+              reasons:
+                description: Reasons explains the computed priority.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+              state:
+                description: State is the lifecycle state of the finding.
+                enum:
+                - open
+                - excepted
+                - resolved
+                type: string
+              subject:
+                description: Subject describes the affected workload and images.
+                properties:
+                  containers:
+                    description: Containers lists the affected container names.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  digests:
+                    description: Digests lists the affected image digests.
+                    items:
+                      type: string
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  imageRepository:
+                    description: ImageRepository is the normalised image repository.
+                    type: string
+                  managedBy:
+                    description: ManagedBy identifies the tool managing the workload.
+                    properties:
+                      name:
+                        description: Name is the name of the managing resource.
+                        type: string
+                      namespace:
+                        description: Namespace is the namespace of the managing resource.
+                        type: string
+                      tool:
+                        description: Tool is the managing tool.
+                        type: string
+                    type: object
+                  owner:
+                    description: Owner is the top-level workload.
+                    properties:
+                      kind:
+                        description: Kind is the workload kind, for example Deployment.
+                        type: string
+                      name:
+                        description: Name is the workload name.
+                        type: string
+                      namespace:
+                        description: Namespace is the workload namespace.
+                        type: string
+                      uid:
+                        description: UID is the workload UID.
+                        type: string
+                    type: object
+                type: object
+              suggestion:
+                description: Suggestion is the suggested image update, if any.
+                properties:
+                  digest:
+                    description: Digest is the digest of the suggested image.
+                    type: string
+                  fixes:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: Fixes counts findings fixed by the update, keyed
+                      by priority.
+                    type: object
+                  introduces:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: Introduces counts findings introduced by the update,
+                      keyed by priority.
+                    type: object
+                  remaining:
+                    additionalProperties:
+                      format: int32
+                      type: integer
+                    description: Remaining counts findings remaining after the update,
+                      keyed by priority.
+                    type: object
+                  target:
+                    description: Target is the suggested image as repository:tag.
+                    type: string
+                  tier:
+                    description: Tier is the update tier.
+                    type: string
+                type: object
+            required:
+            - advisory
+            - priority
+            - state
+            - subject
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

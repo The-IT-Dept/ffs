@@ -1,0 +1,167 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.23.0
+  name: vulnerabilities.ffs.theitdept.au
+spec:
+  group: ffs.theitdept.au
+  names:
+    categories:
+    - ffs
+    - anxiety
+    kind: Vulnerability
+    listKind: VulnerabilityList
+    plural: vulnerabilities
+    singular: vulnerability
+  scope: Cluster
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .status.severity
+      name: Severity
+      type: string
+    - jsonPath: .status.highestPriority
+      name: Priority
+      type: string
+    - jsonPath: .status.kev
+      name: KEV
+      type: boolean
+    - jsonPath: .status.epss
+      name: EPSS
+      type: string
+    - jsonPath: .status.affectedOwners
+      name: Workloads
+      type: integer
+    - jsonPath: .status.fixAvailable
+      name: Fix
+      type: boolean
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Vulnerability is a cluster-wide view of one advisory.
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          status:
+            description: VulnerabilityStatus is the observed state of a vulnerability.
+              ffs writes status only.
+            properties:
+              affectedOwners:
+                description: AffectedOwners is the number of affected workloads.
+                format: int32
+                type: integer
+              aliases:
+                description: Aliases lists other identifiers for the advisory.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+              cvss:
+                description: CVSS is the CVSS base score as a decimal string, for
+                  example "9.8".
+                type: string
+              epss:
+                description: EPSS is the EPSS score as a decimal string, for example
+                  "0.94321".
+                type: string
+              epssPercentile:
+                description: EPSSPercentile is the EPSS percentile as a decimal string.
+                type: string
+              fixAvailable:
+                description: FixAvailable is true when a fixed version exists.
+                type: boolean
+              highestPriority:
+                description: HighestPriority is the highest priority among affected
+                  workloads.
+                enum:
+                - urgent
+                - high
+                - medium
+                - low
+                type: string
+              id:
+                description: ID is the advisory identifier.
+                type: string
+              kev:
+                description: KEV is true when the advisory is in the CISA Known Exploited
+                  Vulnerabilities catalogue.
+                type: boolean
+              kevDateAdded:
+                description: KEVDateAdded is when the advisory was added to the KEV
+                  catalogue.
+                format: date-time
+                type: string
+              links:
+                description: Links lists reference URLs.
+                items:
+                  type: string
+                type: array
+                x-kubernetes-list-type: atomic
+              observed:
+                description: Observed is when the advisory was first observed.
+                format: date-time
+                type: string
+              published:
+                description: Published is when the advisory was published.
+                format: date-time
+                type: string
+              severity:
+                description: Severity is the advisory severity.
+                type: string
+              severitySource:
+                description: SeveritySource names where the severity came from.
+                type: string
+              title:
+                description: Title is the advisory title.
+                type: string
+              topOwners:
+                description: TopOwners lists affected workloads, highest priority
+                  first. The full list is available through the API.
+                items:
+                  description: AffectedOwner is a workload affected by a vulnerability.
+                  properties:
+                    kind:
+                      description: Kind is the workload kind.
+                      type: string
+                    name:
+                      description: Name is the workload name.
+                      type: string
+                    namespace:
+                      description: Namespace is the workload namespace.
+                      type: string
+                    priority:
+                      description: Priority is the finding priority for this workload.
+                      type: string
+                  type: object
+                maxItems: 50
+                type: array
+                x-kubernetes-list-type: atomic
+            required:
+            - affectedOwners
+            - fixAvailable
+            - kev
+            type: object
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
