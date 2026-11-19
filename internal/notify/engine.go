@@ -163,6 +163,16 @@ func (e *Engine) Unregister(ctx context.Context, name string) error {
 	return errors.Join(errs...)
 }
 
+// Detach stops processing and delivering for the target uid until it is registered again, as when
+// its Secret goes missing or its spec turns invalid: nothing more is sent to the endpoint it had.
+// Unlike Unregister, its stored state (baseline, ledger, cursors and queued deliveries) is kept, so
+// once it is registered again it resumes from its cursor. A send already under way finishes.
+func (e *Engine) Detach(uid string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.dropLocked(uid)
+}
+
 // Retain deletes the stored state of every target whose UID is not in liveUIDs, such as an
 // AlertTarget deleted while ffs was not running.
 func (e *Engine) Retain(ctx context.Context, liveUIDs []string) error {
