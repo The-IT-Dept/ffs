@@ -7,7 +7,7 @@ CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.23.0
 GOLANGCI_LINT  ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 PKGS ?= ./...
 RUN  ?=
-.PHONY: build test generate lint e2e
+.PHONY: build test generate lint e2e golden
 build:    ; go build -trimpath -ldflags '$(LDFLAGS)' -o bin/ffs ./cmd/ffs
 SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3
 ENVTEST_K8S_VERSION ?= 1.37.0
@@ -15,3 +15,4 @@ test: ; KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin
 generate: ; $(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 lint:     ; $(GOLANGCI_LINT) run ./...
 e2e:      ; go test -tags e2e -count=1 -timeout 30m ./test/e2e/...
+golden:   ; hack/golden.sh fetch && FFS_GOLDEN_DB=$(CURDIR)/.cache/golden-db/6 go test -tags golden ./internal/match/grype -run TestGolden -count=1
