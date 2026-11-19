@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -182,4 +183,19 @@ func TestCatalogSource_MapsErrors(t *testing.T) {
 			require.Equal(t, before+1, reg.reserves.Load(), "one Reserve per Acquire")
 		})
 	}
+}
+
+// TestCatalogSource_OversizedSBOMQuarantined (F20): a catalogue response whose SBOM is over the limit
+// is refused before the controller decodes it, as a quarantine rather than a counted failure.
+func TestCatalogSource_OversizedSBOMQuarantined(t *testing.T) {
+	reg := &countingRegistry{Client: registry.New(registry.Options{})}
+	fake := startFakeCatalog(t, reg)
+	cfg := config.Default().Catalog
+	cfg.Socket = fake.socket
+	src := NewCatalogSource(reg.Client, cfg)
+	fake.set(http.StatusOK, CatalogResponse{SyftJSON: json.RawMessage(`"` + strings.Repeat("a", MaxSBOMBytes) + `"`)}, false)
+
+	_, err := src.Acquire(ctx, Request{Repo: "docker.io/library/big", Digest: "sha256:" + strings.Repeat("3", 64), Platform: "linux/amd64"})
+	require.Error(t, err)
+	require.Equal(t, FailQuarantine, KindOf(err), err.Error())
 }
