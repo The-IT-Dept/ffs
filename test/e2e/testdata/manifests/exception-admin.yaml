@@ -1,0 +1,9 @@
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: Exception
+metadata:
+  name: e2e-admin
+  namespace: ffs
+spec:
+  advisories: [CVE-2026-90002]
+  reason: Cluster administrators accept the risk (end-to-end test).
+  expires: "${EXPIRES}"

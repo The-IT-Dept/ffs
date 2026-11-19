@@ -1,0 +1,9 @@
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: Exception
+metadata:
+  name: e2e-tenant
+  namespace: e2e
+spec:
+  advisories: [CVE-2026-90002]
+  reason: Workload team accepts the risk (end-to-end test).
+  expires: "${EXPIRES}"

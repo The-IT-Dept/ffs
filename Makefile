@@ -16,7 +16,6 @@ generate:
 	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 	rm -f charts/ffs/crds/*.yaml && cp config/crd/bases/*.yaml charts/ffs/crds/
 lint:     ; $(GOLANGCI_LINT) run ./...
-e2e:      ; go test -tags e2e -count=1 -timeout 30m ./test/e2e/...
 golden:   ; hack/golden.sh fetch && FFS_GOLDEN_DB=$(CURDIR)/.cache/golden-db/6 go test -tags golden ./internal/match/grype -run TestGolden -count=1
 chart-lint: ; helm lint --strict --kube-version 1.37.0 charts/ffs
 image:   ; docker buildx build --platform linux/$(shell go env GOARCH) --build-arg VERSION=dev --build-arg COMMIT=$$(git rev-parse --short=7 HEAD) -t ghcr.io/the-it-dept/ffs:dev --load .
@@ -35,3 +34,24 @@ licenses:
 	  GOOS=linux GOARCH=$$arch $(CURDIR)/bin/go-licenses check ./cmd/ffs --disallowed_types=forbidden,restricted \
 	    $(addprefix --ignore ,$(LICENSE_EXCEPTIONS)) || exit 1; \
 	done
+
+# End-to-end suite. By default it runs on a kind cluster with a local registry (hack/e2e-kind.sh),
+# deleted afterwards unless E2E_KEEP is set; the cluster's credentials go to E2E_KUBECONFIG, never
+# ~/.kube/config. kind is pinned: releases before v0.27 cannot create Kubernetes 1.37 nodes. With
+# FFS_E2E_KUBECONFIG it runs on that cluster instead (k3s), which also needs FFS_E2E_REGISTRY,
+# FFS_E2E_IMAGE and FFS_E2E_HOST_ADDR (and FFS_E2E_REGISTRY_IN_CLUSTER when ffs must reach the
+# registry by another address).
+E2E_KUBECONFIG ?= $(CURDIR)/bin/e2e-kind.kubeconfig
+KIND_VERSION   := v0.33.0
+KIND           := $(CURDIR)/bin/kind
+e2e:
+ifeq ($(FFS_E2E_KUBECONFIG),)
+	GOBIN=$(CURDIR)/bin go install sigs.k8s.io/kind@$(KIND_VERSION)
+	mkdir -p $(dir $(E2E_KUBECONFIG))
+	KIND=$(KIND) KUBECONFIG=$(E2E_KUBECONFIG) hack/e2e-kind.sh up
+	docker build -t ghcr.io/the-it-dept/ffs:e2e --build-arg VERSION=e2e .
+	$(KIND) load docker-image ghcr.io/the-it-dept/ffs:e2e --name ffs-e2e
+	KUBECONFIG=$(E2E_KUBECONFIG) GOFLAGS=-p=4 go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/... ; s=$$?; [ -n "$$E2E_KEEP" ] || KIND=$(KIND) KUBECONFIG=$(E2E_KUBECONFIG) hack/e2e-kind.sh down; exit $$s
+else
+	KUBECONFIG=$(FFS_E2E_KUBECONFIG) GOFLAGS=-p=4 go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
+endif

@@ -1,0 +1,16 @@
+apiVersion: ffs.theitdept.au/v1alpha1
+kind: AlertTarget
+metadata:
+  name: e2e
+spec:
+  type: webhook
+  secretRef:
+    name: e2e-webhook
+  allowPrivate: true
+  immediate:
+    minPriority: urgent
+  digest:
+    schedule: "* * * * *"
+    timeZone: UTC
+    minPriority: medium
+    includeResolved: true
