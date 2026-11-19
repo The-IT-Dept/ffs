@@ -117,7 +117,8 @@ type UpgradesConfig struct {
 	Enabled              bool                   `yaml:"enabled"`
 	MaxCandidatesPerRepo int                    `yaml:"maxCandidatesPerRepo"`
 	DailyAt              string                 `yaml:"dailyAt"`
-	Overrides            map[string]TagOverride `yaml:"overrides"` // key: normalised repo, e.g. "docker.io/bitnami/postgresql"
+	Overrides            map[string]TagOverride `yaml:"overrides"`            // key: normalised repo, e.g. "docker.io/bitnami/postgresql"
+	KubernetesReleaseURL string                 `yaml:"kubernetesReleaseURL"` // "" = "https://dl.k8s.io/release"
 }
 
 // TagOverride customises tag parsing for one repo. Pattern is a regexp with a required named

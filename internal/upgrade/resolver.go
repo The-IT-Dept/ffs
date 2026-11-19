@@ -186,7 +186,7 @@ func (r *Resolver) resolveNext(ctx context.Context) {
 	}
 }
 
-// DailyPass resolves every workload owner, then records the pass time. An owner that fails is
+// DailyPass resolves every owner, then records the pass time. An owner that fails is
 // logged and the pass goes on; the count of failures is returned.
 func (r *Resolver) DailyPass(ctx context.Context) error {
 	owners, err := r.o.Store.ListOwners(ctx)
@@ -197,9 +197,6 @@ func (r *Resolver) DailyPass(ctx context.Context) error {
 	for _, o := range owners {
 		if err := ctx.Err(); err != nil {
 			return err
-		}
-		if clusterLevel(o.Ref.Kind) {
-			continue
 		}
 		key := o.Ref.Key()
 		r.dequeue(key)
@@ -383,7 +380,8 @@ func (r *Resolver) dequeue(key string) {
 
 // ResolveOwner recomputes the owner's suggestion on every image repository where it has an open,
 // fixable finding at or above medium, and deletes its suggestions on every other repository.
-// Cluster-level subjects and unknown owners are skipped.
+// Cluster and container-runtime owners get patch-release advice instead (AdviseCluster,
+// AdviseRuntime); unknown owners are skipped.
 func (r *Resolver) ResolveOwner(ctx context.Context, key string) error {
 	r.resolveMu.Lock()
 	defer r.resolveMu.Unlock()
@@ -391,12 +389,15 @@ func (r *Resolver) ResolveOwner(ctx context.Context, key string) error {
 	if err != nil {
 		return fmt.Errorf("upgrade: owner %s: %w", key, err)
 	}
-	if !ok || clusterLevel(o.Ref.Kind) {
+	if !ok {
 		return nil
 	}
 	fs, err := r.o.Store.FindingsForOwner(ctx, key)
 	if err != nil {
 		return fmt.Errorf("upgrade: findings of %s: %w", key, err)
+	}
+	if clusterLevel(o.Ref.Kind) {
+		return r.resolveClusterLevel(ctx, o, fs)
 	}
 
 	running := map[string]bool{}
