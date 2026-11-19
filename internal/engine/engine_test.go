@@ -643,10 +643,35 @@ func TestEngine_StartDrainsOnWake(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Start did not drain the queued owner")
 	}
+	require.Eventually(t, h.e.Idle, 10*time.Second, 10*time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
 	require.True(t, h.e.Idle())
 	require.Len(t, h.findings(apiKey), 1)
+}
+
+// TestEngine_StartCatchesUp is the F6 regression: matches stored before a restart, whose owners were
+// queued only in the previous process's memory, produce findings once Start runs, with no hook.
+func TestEngine_StartCatchesUp(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.st.Store.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceGrype, Digests: []string{d1}},
+		[]model.Match{h.grypeOn(h.libssl3)})
+	require.NoError(t, err)
+	ch := h.e.Changed()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- h.e.Start(runCtx) }()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not recompute the owners queued before the restart")
+	}
+	require.Eventually(t, h.e.Idle, 10*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	require.Equal(t, model.TriggerInventoryChange, h.transitions()[0].Trigger)
 }
 
 // TestEngine_GrypeOpinionStandsOnNewDigest is the F2 regression. The OSV record was observed three

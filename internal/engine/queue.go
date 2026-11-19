@@ -115,16 +115,25 @@ func (e *Engine) drainBatch(ctx context.Context, batch map[string]model.Trigger)
 	return errors.Join(errs...)
 }
 
-// Start is the leader-only worker (a manager.Runnable). It prunes once, then drains the queue
-// whenever owners are queued, checks exception expiry every minute and prunes daily, until ctx is
-// done. Errors are logged, never returned; a failed drain is retried after a pause.
+// Start is the leader-only worker (a manager.Runnable). It prunes once and queues every owner, then
+// drains the queue whenever owners are queued, checks exception expiry every minute and prunes
+// daily, until ctx is done. Errors are logged, never returned; a failed drain is retried after a
+// pause.
+//
+// The queue lives in memory, while the feeds advance their watermarks once their handler has
+// written matches or enrichment and queued owners. Queuing every owner at start redoes whatever a
+// restart cut short; Diff emits only real changes, so the pass is idempotent.
 func (e *Engine) Start(ctx context.Context) error {
 	e.prune(ctx)
+	caughtUp := e.catchUp(ctx)
 	expiry := time.NewTicker(expiryInterval)
 	defer expiry.Stop()
 	prune := time.NewTicker(pruneInterval)
 	defer prune.Stop()
 	var retry <-chan time.Time
+	if !caughtUp {
+		retry = time.After(drainRetry)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -141,14 +150,28 @@ func (e *Engine) Start(ctx context.Context) error {
 		case <-retry:
 		}
 		retry = nil
+		if !caughtUp {
+			caughtUp = e.catchUp(ctx)
+		}
 		if err := e.Drain(ctx); err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
 			e.o.Log.Error(err, "recomputing findings failed; retrying", "after", drainRetry)
 			retry = time.After(drainRetry)
+		} else if !caughtUp {
+			retry = time.After(drainRetry)
 		}
 	}
+}
+
+// catchUp queues every owner, reporting whether it could.
+func (e *Engine) catchUp(ctx context.Context) bool {
+	if err := e.enqueueAll(ctx, model.TriggerInventoryChange); err != nil {
+		e.o.Log.Error(err, "queuing every owner at start failed; retrying", "after", drainRetry)
+		return false
+	}
+	return true
 }
 
 // prune runs Prune and logs the outcome.
