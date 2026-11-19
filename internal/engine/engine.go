@@ -251,10 +251,10 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 //   - otherwise, with grype alone, the digests whose packages the diff changed plus those with OSV
 //     matches grype has not ruled on yet (store.DigestsAwaitingGrype).
 //
-// A digest that fails is logged, counted and left for the next DB; only when every digest fails, or
-// the re-match is cancelled, is the error returned, before the build is recorded, so the feed
-// offers it again. The build is recorded once the re-match is done, since it counts towards
-// settling provisional findings, and every owner is then queued.
+// A digest that fails is logged, counted and left for the next DB; only when grype failed on every
+// digest, or the re-match is cancelled, is the error returned, before the build is recorded, so
+// the feed offers it again. The build is recorded once the re-match is done, since it counts
+// towards settling provisional findings, and every owner is then queued.
 func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	defer observe(metrics.RematchDuration.WithLabelValues("grypedb"), time.Now())
 	if err := e.o.Grype.Load(u.Path, u.Built); err != nil {
@@ -269,23 +269,27 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 		mode = matchPersist
 	}
 	var (
-		failed  int
-		lastErr error
+		failed, grypeFailed int
+		lastErr             error
 	)
 	for _, d := range digests {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("engine: grype re-match: %w", err)
 		}
-		if _, err := e.matchImage(ctx, d, mode); err != nil {
+		r, err := e.matchImage(ctx, d, mode)
+		if err != nil {
 			failed++
 			lastErr = err
 			e.o.Log.Error(err, "re-matching an image with the new Grype DB failed; it waits for the next one", "digest", d)
 		}
+		if r.grypeFailed {
+			grypeFailed++
+		}
+	}
+	if grypeFailed > 0 && grypeFailed == len(digests) {
+		return fmt.Errorf("engine: grype re-match failed on all %d images: %w", grypeFailed, lastErr)
 	}
 	if failed > 0 {
-		if failed == len(digests) {
-			return fmt.Errorf("engine: grype re-match failed on all %d images: %w", failed, lastErr)
-		}
 		e.o.Log.Info("some images were not re-matched with the new Grype DB", "failed", failed, "images", len(digests))
 	}
 	if err := e.o.Store.RecordGrypeDBBuild(ctx, u.Built); err != nil {
