@@ -140,10 +140,19 @@ func (f *Feed) Sync(ctx context.Context) error {
 
 	reported, scoreDate, err := f.apply(ctx, body, zeroOnly)
 	if err != nil {
+		// Scores already written would show no difference next run: keep their crossings pending.
+		if len(reported) > 0 {
+			set := map[string]bool{}
+			for _, id := range append(feeds.Pending(st), reported...) {
+				set[id] = true
+			}
+			feeds.SetPending(&st, slices.Sorted(maps.Keys(set)))
+			err = errors.Join(err, f.o.Store.PutFeedState(ctx, st))
+		}
 		return err
 	}
 	if fresh {
-		if err := writeFile(cache, body); err != nil {
+		if err := feeds.WriteFile(cache, body); err != nil {
 			return err
 		}
 		if scoreDate != "" {
@@ -253,21 +262,4 @@ func (f *Feed) crossed(a model.Advisory, now float64) bool {
 		}
 	}
 	return false
-}
-
-// writeFile writes data to path through a temporary file and a rename.
-func writeFile(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".part"
-	//nolint:gosec // G703: path is built from the configured data directory and a fixed name
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
 }

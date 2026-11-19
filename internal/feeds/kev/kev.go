@@ -6,6 +6,7 @@ package kev
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -114,14 +115,14 @@ func (f *Feed) Sync(ctx context.Context) error {
 			v = &want
 		}
 		if err := f.o.Store.SetAdvisoryKEV(ctx, id, v); err != nil {
-			return err
+			// Earlier IDs are already updated in the store; keep them pending for the next run.
+			return errors.Join(err, f.savePending(ctx, st, set))
 		}
 		set[id] = true
 	}
 
 	pending := slices.Sorted(maps.Keys(set))
-	feeds.SetPending(&st, pending)
-	if err := f.o.Store.PutFeedState(ctx, st); err != nil {
+	if err := f.savePending(ctx, st, set); err != nil {
 		return err
 	}
 	if len(pending) == 0 {
@@ -131,6 +132,12 @@ func (f *Feed) Sync(ctx context.Context) error {
 		return fmt.Errorf("kev: handler: %w", err)
 	}
 	feeds.SetPending(&st, nil)
+	return f.o.Store.PutFeedState(ctx, st)
+}
+
+// savePending stores set as the feed's pending IDs.
+func (f *Feed) savePending(ctx context.Context, st store.FeedState, set map[string]bool) error {
+	feeds.SetPending(&st, slices.Sorted(maps.Keys(set)))
 	return f.o.Store.PutFeedState(ctx, st)
 }
 
@@ -159,7 +166,7 @@ func (f *Feed) catalogue(ctx context.Context, st *store.FeedState, cache string)
 		if err != nil {
 			return nil, err
 		}
-		if err := writeFile(cache, resp.Body); err != nil {
+		if err := feeds.WriteFile(cache, resp.Body); err != nil {
 			return nil, err
 		}
 		if resp.ETag == "" {
@@ -190,20 +197,4 @@ func parse(raw []byte) (map[string]time.Time, error) {
 		out[v.CVEID] = d
 	}
 	return out, nil
-}
-
-// writeFile writes data to path through a temporary file and a rename.
-func writeFile(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
-		return err
-	}
-	tmp := path + ".part"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
 }
