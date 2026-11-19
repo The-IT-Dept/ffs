@@ -1,0 +1,25 @@
+{{define "content"}}
+<p>{{if .NotRunning}}Not running. {{end}}{{if .ServiceAccount}}Service account {{.ServiceAccount}}.{{end}}</p>
+{{if .ExposurePaths}}<h2>Exposure</h2><ul>{{range .ExposurePaths}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{if .PrivilegeReasons}}<h2>Privileges</h2><ul>{{range .PrivilegeReasons}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{if .ServiceAccountReasons}}<h2>Service account</h2><ul>{{range .ServiceAccountReasons}}<li>{{.}}</li>{{end}}</ul>{{end}}
+<h2>Containers</h2>
+<table>
+<thead><tr><th>Container</th><th>Kind</th><th>Image</th><th>Digest</th></tr></thead>
+<tbody>
+{{range .Containers}}<tr><td>{{.Name}}</td><td>{{.Kind}}</td><td>{{.Image}}</td><td>{{if .Digest}}<a href="/images/{{.Digest}}">{{.Digest}}</a>{{end}}</td></tr>{{end}}
+</tbody>
+</table>
+<h2>Findings</h2>
+{{if or .Groups .Rest}}
+<table>
+{{template "findingHead"}}
+<tbody>
+{{template "stdlibRows" .Groups}}
+{{template "findingRows" .Rest}}
+</tbody>
+</table>
+{{else}}<p>No open findings. See Coverage for what was not inventoried.</p>{{end}}
+{{if .Suggestions}}<h2>Upgrade suggestions</h2>{{range .Suggestions}}{{template "suggestion" .}}{{end}}{{end}}
+{{template "coverage" .CoverageNotes}}
+{{end}}

@@ -10,6 +10,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/controller/deps"
 	"github.com/the-it-dept/ffs/internal/web/api"
+	"github.com/the-it-dept/ffs/internal/web/dashboard"
 )
 
 // Register adds the HTTP server to m. It is not leader-only: it only reads the store.
@@ -18,7 +19,11 @@ func Register(m manager.Manager, d deps.Deps) error {
 		Store: d.Store, Config: d.Config, Feeds: feedInfos(d.Feeds.StaleAfter()), EOL: d.EOL,
 		Kube: m.GetClient(), Now: time.Now, Log: d.Log.WithName("api"),
 	})
-	if err := m.Add(NewServer(d.Config, api.NewHandler(svc), nil)); err != nil {
+	dash, err := dashboard.New(svc)
+	if err != nil {
+		return fmt.Errorf("build dashboard: %w", err)
+	}
+	if err := m.Add(NewServer(d.Config, api.NewHandler(svc), dash)); err != nil {
 		return fmt.Errorf("add web server: %w", err)
 	}
 	return nil

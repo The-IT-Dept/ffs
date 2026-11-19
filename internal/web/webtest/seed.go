@@ -3,6 +3,7 @@ package webtest
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -202,4 +203,35 @@ func Seed(t testing.TB) (*api.Service, *store.Store) {
 	}
 	kube := fake.NewClientBuilder().WithScheme(scheme(t)).WithObjects(exc).Build()
 	return service(t, st, kube), st
+}
+
+// DigestGo is the image of the Go standard library fixture.
+const DigestGo = "sha256:" + "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+
+// SeedGoStdlib adds owner Deployment/tools/gotool running DigestGo, with three open medium
+// findings on the Go 1.22.3 standard library.
+func SeedGoStdlib(t testing.TB, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	must := func(err error) { t.Helper(); require.NoError(t, err) }
+	const repo = "ghcr.io/example/gotool"
+	ref := model.OwnerRef{Kind: "Deployment", Namespace: "tools", Name: "gotool"}
+	must(st.UpsertOwner(ctx, model.Owner{Ref: ref, UpdatedAt: Now, Containers: []model.ContainerUse{
+		{Name: "gotool", Kind: model.ContainerRegular, ImageRef: repo + ":1.0", Repo: repo, Digest: DigestGo}}}))
+	must(st.UpsertImage(ctx, model.Image{Digest: DigestGo, Repo: repo, Platform: "linux/amd64", Status: model.ImageCatalogued,
+		Source: "registry", CataloguedAt: Now}))
+	must(st.PutSBOM(ctx, DigestGo, nil, []model.Package{
+		{Ecosystem: "go-module", Name: "stdlib", Version: "go1.22.3", GoStdlib: true, Path: "/usr/local/bin/gotool"}}))
+	var fs []model.Finding
+	for i, fix := range []string{"1.22.4", "1.22.12", "1.22.7"} {
+		id := fmt.Sprintf("GO-2024-000%d", i+1)
+		must(st.UpsertAdvisory(ctx, model.Advisory{ID: id, Title: "Standard library flaw " + fmt.Sprint(i+1), CNASeverity: model.SeverityMedium, Observed: Now}))
+		fs = append(fs, model.Finding{
+			Fingerprint: model.FindingFingerprint(clusterName, ref, repo, id), Owner: ref, ImageRepo: repo, AdvisoryID: id,
+			Packages: []model.FindingPackage{{Name: "stdlib", Ecosystem: "go-module", Installed: "go1.22.3", Fixed: []string{fix}}},
+			Severity: model.SeverityMedium, FixState: model.FixFixed, FixAvailable: true, Priority: model.PriorityMedium,
+			State: model.StateOpen, GoStdlib: true, Published: Now, Observed: Now, Matched: Now, LastSeen: Now,
+		})
+	}
+	must(st.ApplyFindings(ctx, fs, nil))
 }

@@ -1,0 +1,15 @@
+{{define "content"}}
+<p>{{.ID}}</p>
+<p>{{statusLabel .Status}}{{if .StatusReason}}: {{.StatusReason}}{{end}}{{if .PartialCoverage}} <span class="tag">Partial coverage</span>{{end}}</p>
+<p>{{.Platform}}{{if .VersionAnnotation}}, version {{.VersionAnnotation}}{{end}}{{if .Source}}, source {{.Source}}{{end}}{{if .CataloguedAt}}, catalogued {{date .CataloguedAt}}{{end}}</p>
+{{if .Owners}}<h2>Used by</h2><ul>{{range .Owners}}<li><a href="/owners/{{keyPath .}}">{{keyLabel .}}</a></li>{{end}}</ul>{{end}}
+{{if .EOL}}<h2>End of life</h2><ul>{{range .EOL}}<li>{{.Text}}</li>{{end}}</ul>{{end}}
+{{template "coverage" .Coverage.Notes}}
+<h2>Packages</h2>
+<table>
+<thead><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Path</th></tr></thead>
+<tbody>
+{{range .Packages}}<tr><td>{{.Name}}</td><td>{{.Version}}</td><td>{{.Ecosystem}}</td><td>{{.Path}}</td></tr>{{end}}
+</tbody>
+</table>
+{{end}}

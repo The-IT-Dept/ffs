@@ -1,0 +1,17 @@
+{{define "content"}}
+{{if not .}}<p>Nothing needs attention.</p>{{end}}
+{{range .}}
+<section class="group">
+<h2><span class="badge {{priorityClass .Highest}}">{{.Highest}}</span> <a href="/owners/{{keyPath .Owner.ID}}">{{keyLabel .Owner.ID}}</a></h2>
+{{if .Owner.Exposed}}<p class="sub">{{range .Owner.ExposurePaths}}Exposed via {{.}}. {{end}}</p>{{end}}
+<table>
+{{template "findingHead"}}
+<tbody>
+{{template "stdlibRows" .Stdlib}}
+{{template "findingRows" .Findings}}
+</tbody>
+</table>
+{{range .Suggestions}}{{template "suggestion" .}}{{end}}
+</section>
+{{end}}
+{{end}}

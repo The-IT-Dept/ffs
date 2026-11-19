@@ -1,0 +1,206 @@
+package dashboard_test
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/web"
+	"github.com/the-it-dept/ffs/internal/web/api"
+	"github.com/the-it-dept/ffs/internal/web/dashboard"
+	"github.com/the-it-dept/ffs/internal/web/webtest"
+)
+
+func serve(t *testing.T, svc *api.Service) *httptest.Server {
+	t.Helper()
+	d, err := dashboard.New(svc)
+	require.NoError(t, err)
+	srv := httptest.NewServer(d)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func seeded(t *testing.T) *httptest.Server {
+	t.Helper()
+	svc, _ := webtest.Seed(t)
+	return serve(t, svc)
+}
+
+func get(t *testing.T, srv *httptest.Server, path string, status int) string {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+path, nil)
+	require.NoError(t, err)
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = res.Body.Close() }()
+	b, err := io.ReadAll(res.Body)
+	require.NoError(t, err)
+	require.Equal(t, status, res.StatusCode, path)
+	return string(b)
+}
+
+func contains(t *testing.T, body string, want ...string) {
+	t.Helper()
+	for _, w := range want {
+		require.Contains(t, body, w)
+	}
+}
+
+func TestDashboard_NeedsAttention(t *testing.T) {
+	body := get(t, seeded(t), "/", 200)
+	shop, cluster := strings.Index(body, "Deployment shop/web"), strings.Index(body, "Cluster test")
+	require.GreaterOrEqual(t, shop, 0)
+	require.Greater(t, cluster, shop)
+	contains(t, body, "CVE-2026-0001", "actively exploited (CISA KEV, added 2026-11-02)",
+		"exposed via HTTPRoute shop/web on Gateway public/edge", "nginx:1.30.7", "fixes 1 urgent, 1 high; introduces none")
+	require.NotContains(t, body, "CVE-2026-0004")
+}
+
+func TestDashboard_NeedsAttentionEmpty(t *testing.T) {
+	contains(t, get(t, serve(t, webtest.Empty(t)), "/", 200), "Nothing needs attention.")
+}
+
+func TestDashboard_Workloads(t *testing.T) {
+	contains(t, get(t, seeded(t), "/workloads", 200), "shop/web", "shop/worker", "ops/backup", "Not running", "Cluster test")
+}
+
+func TestDashboard_Images(t *testing.T) {
+	body := get(t, seeded(t), "/images", 200)
+	contains(t, body, "Unresolvable", "bare config digest", "Catalogue failed", "catalogue timed out", "Partial coverage")
+}
+
+func TestDashboard_ImageDetail(t *testing.T) {
+	srv := seeded(t)
+	contains(t, get(t, srv, "/images/"+webtest.DigestWeb, 200), "openssl", "3.0.15-1~deb12u1", "php-cli", "8.3.14",
+		"2 executables not attributed to any package")
+	contains(t, get(t, srv, "/images/"+webtest.DigestWorker, 200), "daily, CPE-based coverage only: traefik")
+	contains(t, get(t, srv, "/images/sha256:nope", 404), "does not exist")
+}
+
+func TestDashboard_Owner(t *testing.T) {
+	srv := seeded(t)
+	contains(t, get(t, srv, "/owners/Deployment/shop/web", 200), "HTTPRoute shop/web on Gateway public/edge", "nginx",
+		"CVE-2026-0001", "CVE-2026-0002")
+	get(t, srv, "/owners/Cluster/-/test", 200)
+	contains(t, get(t, srv, "/owners/Deployment/shop/worker", 200), "daily, CPE-based coverage only: traefik", "catalogue timed out")
+	get(t, srv, "/owners/Deployment/shop/nope", 404)
+}
+
+func TestDashboard_GoStdlibGrouped(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.SeedGoStdlib(t, st)
+	body := get(t, serve(t, svc), "/owners/Deployment/tools/gotool", 200)
+	require.Equal(t, 1, strings.Count(body, "Go 1.22.3 standard library: 3 advisories, fixed in Go 1.22.12"))
+	start := strings.Index(body, "Go 1.22.3 standard library")
+	end := start + strings.Index(body[start:], "</tr>")
+	for _, id := range []string{"GO-2024-0001", "GO-2024-0002", "GO-2024-0003"} {
+		require.Equal(t, 1, strings.Count(body, id), id)
+		require.Contains(t, body[start:end], id)
+	}
+}
+
+func TestDashboard_Vulnerabilities(t *testing.T) {
+	srv := seeded(t)
+	contains(t, get(t, srv, "/vulnerabilities", 200), "CVE-2026-0001", "KEV")
+	contains(t, get(t, srv, "/vulnerabilities/GHSA-aaaa-bbbb-cccc", 200), "CVE-2026-0002", "shop/web")
+	contains(t, get(t, srv, "/advisories/CVE-2026-0001", 200), "CVE-2026-0001")
+	get(t, srv, "/vulnerabilities/CVE-0000-0000", 404)
+}
+
+func TestDashboard_Cluster(t *testing.T) {
+	body := get(t, seeded(t), "/cluster", 200)
+	contains(t, body, "1.34.2", "kubernetes 1.34 reached end of life 2026-10-27", "Ubuntu 24.04.4 LTS",
+		"containerd 2.2 reached end of life 2026-11-06",
+		"kernel, runc and other bundled components (flannel) are not inventoried", `href="/nodes/node-a"`)
+}
+
+func TestDashboard_NodeDetail(t *testing.T) {
+	srv := seeded(t)
+	contains(t, get(t, srv, "/nodes/node-a", 200), "6.8.0-88-generic", "v1.34.2", "containerd://2.2.1", "amd64")
+	get(t, srv, "/nodes/nope", 404)
+}
+
+func TestDashboard_Excepted(t *testing.T) {
+	contains(t, get(t, seeded(t), "/excepted", 200), "CVE-2026-0005", "shop/accept-risk", "Not reachable in our configuration")
+}
+
+func TestDashboard_Feeds(t *testing.T) {
+	body := get(t, seeded(t), "/feeds", 200)
+	rows := strings.Split(body, "<tr>")
+	var kev, osv string
+	for _, r := range rows {
+		switch {
+		case strings.HasPrefix(r, "<td>kev</td>"):
+			kev = r
+		case strings.HasPrefix(r, "<td>osv</td>"):
+			osv = r
+		}
+	}
+	require.Contains(t, kev, "Stale")
+	require.NotEmpty(t, osv)
+	require.NotContains(t, osv, "Stale")
+	for _, s := range api.Sources {
+		contains(t, body, strings.ReplaceAll(s.Name, "&", "&amp;"), s.URL)
+		require.Contains(t, body, escape(s.Licence))
+	}
+	contains(t, body, "ffs fetches these sources at runtime and does not redistribute them.")
+}
+
+func escape(s string) string {
+	return strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;").Replace(s)
+}
+
+func TestDashboard_Search(t *testing.T) {
+	contains(t, get(t, seeded(t), "/search?q=php", 200), "php-cli", "8.3.14", "shop/web",
+		"2 images are not catalogued, so this answer may be incomplete.")
+}
+
+func TestDashboard_EscapesFeedText(t *testing.T) {
+	contains(t, get(t, seeded(t), "/vulnerabilities/CVE-2026-0002", 200), "&lt;script&gt;alert(1)&lt;/script&gt;")
+}
+
+func TestDashboard_CopyRules(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.SeedGoStdlib(t, st)
+	srv := serve(t, svc)
+	needle := "anx" + "iety"
+	for _, p := range []string{"/", "/workloads", "/images", "/images/" + webtest.DigestWeb, "/owners/Deployment/shop/web",
+		"/owners/Deployment/tools/gotool", "/vulnerabilities", "/vulnerabilities/CVE-2026-0002", "/cluster", "/nodes/node-a",
+		"/excepted", "/feeds", "/search?q=php", "/nope"} {
+		status := 200
+		if p == "/nope" {
+			status = 404
+		}
+		body := get(t, srv, p, status)
+		lower := strings.ToLower(body)
+		for _, bad := range []string{needle, "clean", "<script"} {
+			require.NotContains(t, lower, bad, p)
+		}
+		contains(t, body, `<form action="/search" method="get">`, `name="q"`)
+	}
+}
+
+func TestDashboard_StaticAssetAndReadOnly(t *testing.T) {
+	svc, _ := webtest.Seed(t)
+	d, err := dashboard.New(svc)
+	require.NoError(t, err)
+	srv := httptest.NewServer(d)
+	defer srv.Close()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL+"/assets/style.css", nil)
+	require.NoError(t, err)
+	res, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	_ = res.Body.Close()
+	require.Equal(t, 200, res.StatusCode)
+	require.Equal(t, "text/css; charset=utf-8", res.Header.Get("Content-Type"))
+
+	rec := httptest.NewRecorder()
+	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec,
+		httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil))
+	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
