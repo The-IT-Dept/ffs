@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -45,11 +46,15 @@ type fakeHooks struct {
 	mu         sync.Mutex
 	owners     [][]string
 	catalogued []string
+	ownersErr  error // returned by OnOwnersChanged, which then records nothing
 }
 
 func (h *fakeHooks) OnOwnersChanged(_ context.Context, keys []string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.ownersErr != nil {
+		return h.ownersErr
+	}
 	h.owners = append(h.owners, append([]string(nil), keys...))
 	return nil
 }
@@ -105,6 +110,40 @@ type fakeContext struct{}
 
 func (fakeContext) Context(context.Context, *Workload) (model.WorkloadContext, error) {
 	return model.WorkloadContext{}, nil
+}
+
+// recordingContext records the last Workload it saw per owner key and fails the owners in err.
+type recordingContext struct {
+	mu   sync.Mutex
+	seen map[string]*Workload
+	err  map[string]error
+}
+
+func newRecordingContext() *recordingContext {
+	return &recordingContext{seen: map[string]*Workload{}, err: map[string]error{}}
+}
+
+func (r *recordingContext) Context(_ context.Context, w *Workload) (model.WorkloadContext, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen[w.Ref.Key()] = w
+	return model.WorkloadContext{}, r.err[w.Ref.Key()]
+}
+
+func (r *recordingContext) setErr(key string, err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err[key] = err
+}
+
+// backoffOf reports a key's backoff attempt and whether a retry is scheduled.
+func backoffOf(r *retrier, key string) (attempt int, scheduled bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if b := r.keys[key]; b != nil {
+		return b.attempt, b.timer != nil
+	}
+	return 0, false
 }
 
 type fakeVersion struct{ gitVersion string }
@@ -446,4 +485,175 @@ func TestBatcher_FlushesAfterDebounce(t *testing.T) {
 	require.Equal(t, []string{"Pod/a/3"}, next().keys)
 	close(release)
 	require.Equal(t, []string{"Pod/a/4"}, next().keys)
+}
+
+func TestSyncAll_ContextSeesLivePodsOnly(t *testing.T) {
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web-5d9",
+		OwnerReferences: ctrl("apps/v1", "Deployment", "web")}}
+	running := newPod("web-x", "n1", ctrl("apps/v1", "ReplicaSet", "web-5d9"), "nginx:1.27", nginx+"@"+idx)
+	pulling := newPod("web-z", "n1", ctrl("apps/v1", "ReplicaSet", "web-5d9"), "nginx:1.27", "")
+	cron := &batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "nightly", UID: "nightly-uid"},
+		Spec: batchv1.CronJobSpec{Schedule: "0 3 * * *", JobTemplate: batchv1.JobTemplateSpec{Spec: batchv1.JobSpec{
+			Template: corev1.PodTemplateSpec{Spec: podSpec("nginx:1.27")}}}}}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "nightly-1",
+		OwnerReferences: ctrl("batch/v1", "CronJob", "nightly")},
+		Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: podSpec("nginx:1.27")}}}
+	cronPod := newPod("nightly-1-abc", "n1", ctrl("batch/v1", "Job", "nightly-1"), "nginx:1.27", "")
+	bare := newPod("lonely", "n1", nil, "nginx:1.27", "")
+
+	h := newHarness(t, newNode("n1", "amd64"), newDeployment("web", 2, "nginx:1.27"), rs, running, pulling,
+		cron, job, cronPod, bare)
+	rc := newRecordingContext()
+	h.inv.o.Context = rc
+	h.res.tags[nginx+":1.27"] = idx
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	require.NoError(t, h.inv.SyncAll(ctx))
+
+	// A running owner's Workload holds its live pods only, not the one still pulling.
+	web := rc.seen["Deployment/apps/web"]
+	require.NotNil(t, web)
+	require.Len(t, web.Pods, 1)
+	require.Equal(t, "web-x", web.Pods[0].Name)
+	require.NotNil(t, web.Template)
+
+	// A not-running owner whose only pod is still pulling: Pods is empty, the template describes it.
+	require.True(t, h.owner(t, "CronJob/apps/nightly").NotRunning)
+	nightly := rc.seen["CronJob/apps/nightly"]
+	require.NotNil(t, nightly)
+	require.Empty(t, nightly.Pods)
+	require.NotNil(t, nightly.Template)
+
+	// A bare pod that has not started has nothing to describe: no context call and no containers.
+	require.NotContains(t, rc.seen, "Pod/apps/lonely")
+	require.Empty(t, h.owner(t, "Pod/apps/lonely").Containers)
+}
+
+func TestMarkNamespace(t *testing.T) {
+	other := newDeployment("tools", 0, "nginx:1.27")
+	other.Namespace = "ops"
+	h := newHarness(t, newNode("n1", "amd64"), newDeployment("web", 0, "nginx:1.27"), other)
+	h.res.tags[nginx+":1.27"] = idx
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	require.NoError(t, h.inv.SyncAll(ctx))
+	h.inv.batch.take()
+
+	h.inv.MarkNamespace("ops")
+	require.Equal(t, []string{"Deployment/ops/tools"}, h.inv.batch.take())
+	// "" marks every owner, and "cluster" for the synthetic ones.
+	h.inv.MarkNamespace("")
+	require.Equal(t, []string{"Deployment/apps/web", "Deployment/ops/tools", "cluster"}, h.inv.batch.take())
+}
+
+func TestFlush_FailedKeyBacksOff(t *testing.T) {
+	rs := &appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "web-5d9",
+		OwnerReferences: ctrl("apps/v1", "Deployment", "web")}}
+	h := newHarness(t, newNode("n1", "amd64"), newDeployment("web", 1, "nginx:1.27"), rs,
+		newPod("web-x", "n1", ctrl("apps/v1", "ReplicaSet", "web-5d9"), "nginx:1.27", nginx+"@"+idx),
+		newPod("orphan", "n1", ctrl("apps/v1", "ReplicaSet", "gone-1"), "nginx:1.27", nginx+"@"+idx))
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	rc := newRecordingContext()
+	rc.setErr("Deployment/apps/web", errors.New("rbac lookup failed"))
+	h.inv.o.Context = rc
+	h.inv.retry.min = time.Hour // keep the scheduled retry from firing during the test
+	t.Cleanup(h.inv.retry.stop)
+
+	require.NoError(t, h.inv.SyncAll(ctx))
+	_, ok, err := h.st.GetOwner(ctx, "Deployment/apps/web")
+	require.NoError(t, err)
+	require.False(t, ok)
+	// Only the pod whose ReplicaSet is not cached yet goes to the next batch; the failed owner backs off.
+	require.Equal(t, []string{"Pod/apps/orphan"}, h.inv.batch.take())
+	attempt, scheduled := backoffOf(h.inv.retry, "Deployment/apps/web")
+	require.Equal(t, 1, attempt)
+	require.True(t, scheduled)
+	attempt, _ = backoffOf(h.inv.retry, "Pod/apps/orphan")
+	require.Zero(t, attempt)
+
+	// An event-driven flush that fails again is absorbed by the scheduled retry.
+	require.NoError(t, h.inv.Flush(ctx, []string{"Pod/apps/web-x"}))
+	attempt, _ = backoffOf(h.inv.retry, "Deployment/apps/web")
+	require.Equal(t, 1, attempt)
+	require.Empty(t, h.inv.batch.take())
+
+	// Success clears the backoff.
+	rc.setErr("Deployment/apps/web", nil)
+	require.NoError(t, h.inv.Flush(ctx, []string{"Deployment/apps/web"}))
+	h.owner(t, "Deployment/apps/web")
+	attempt, scheduled = backoffOf(h.inv.retry, "Deployment/apps/web")
+	require.Zero(t, attempt)
+	require.False(t, scheduled)
+}
+
+func TestFlush_ReportFailureBacksOff(t *testing.T) {
+	h := newHarness(t, newNode("n1", "amd64"), newPod("solo", "n1", nil, "nginx:1.27", nginx+"@"+idx))
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	h.hooks.ownersErr = errors.New("engine unavailable")
+	h.inv.retry.min = time.Hour
+	t.Cleanup(h.inv.retry.stop)
+
+	require.Error(t, h.inv.SyncAll(ctx))
+	require.False(t, h.inv.Synced())
+	require.Empty(t, h.inv.batch.take(), "owners are not re-queued for the next batch")
+	attempt, scheduled := backoffOf(h.inv.retry, reportKey)
+	require.Equal(t, 1, attempt)
+	require.True(t, scheduled)
+
+	// The scheduled retry flushes reportKey, which reports what is still unreported.
+	h.hooks.ownersErr = nil
+	require.NoError(t, h.inv.Flush(ctx, []string{reportKey}))
+	require.Equal(t, [][]string{{"Pod/apps/solo"}}, h.hooks.workloadCalls())
+	attempt, _ = backoffOf(h.inv.retry, reportKey)
+	require.Zero(t, attempt)
+}
+
+func TestRetrier_BacksOffPerKey(t *testing.T) {
+	fired := make(chan string, 8)
+	r := newRetrier(10*time.Millisecond, 40*time.Millisecond, func(keys ...string) {
+		for _, k := range keys {
+			fired <- k
+		}
+	})
+	t.Cleanup(r.stop)
+	next := func() string {
+		t.Helper()
+		select {
+		case k := <-fired:
+			return k
+		case <-time.After(5 * time.Second):
+			t.Fatal("no retry")
+			return ""
+		}
+	}
+
+	// Each failure doubles the wait, capped at max; a failure while a retry waits is absorbed.
+	for i, want := range []time.Duration{10 * time.Millisecond, 20 * time.Millisecond, 40 * time.Millisecond,
+		40 * time.Millisecond} {
+		start := time.Now()
+		attempt, delay, scheduled := r.fail("k")
+		require.True(t, scheduled)
+		require.Equal(t, i+1, attempt)
+		require.Equal(t, want, delay)
+		_, _, again := r.fail("k")
+		require.False(t, again)
+		require.Equal(t, "k", next())
+		require.GreaterOrEqual(t, time.Since(start), want)
+	}
+
+	// Keys back off independently.
+	attempt, delay, _ := r.fail("other")
+	require.Equal(t, 1, attempt)
+	require.Equal(t, 10*time.Millisecond, delay)
+	require.Equal(t, "other", next())
+
+	// Success resets the backoff and cancels a waiting retry.
+	r.ok("k")
+	attempt, delay, _ = r.fail("k")
+	require.Equal(t, 1, attempt)
+	require.Equal(t, 10*time.Millisecond, delay)
+	r.ok("k")
+	select {
+	case k := <-fired:
+		t.Fatalf("cancelled retry fired for %s", k)
+	case <-time.After(50 * time.Millisecond):
+	}
 }

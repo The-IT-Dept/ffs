@@ -70,13 +70,21 @@ type Options struct {
 	Now         func() time.Time
 }
 
-const clusterKey = "cluster"
+const (
+	clusterKey = "cluster"
+	// reportKey is a batch key with no object behind it: it retries reporting the owners a failed
+	// OnOwnersChanged left unreported.
+	reportKey = "report"
+	// maxRetryBackoff caps the backoff of a key whose flush keeps failing.
+	maxRetryBackoff = 5 * time.Minute
+)
 
 // Inventory watches pods, workloads and nodes and keeps the stored owners, their images and the
 // synthetic cluster-level owners up to date.
 type Inventory struct {
 	o      Options
 	batch  *batcher
+	retry  *retrier    // backs off keys whose flush failed
 	cache  cache.Cache // set by Register
 	synced atomic.Bool
 
@@ -116,6 +124,7 @@ func New(o Options) *Inventory {
 			logf.FromContext(ctx).WithName("inventory").Error(err, "inventory flush failed")
 		}
 	})
+	inv.retry = newRetrier(o.Debounce, maxRetryBackoff, inv.batch.Add)
 	return inv
 }
 
@@ -189,8 +198,9 @@ func (inv *Inventory) nodeHandler() toolscache.ResourceEventHandler {
 // NeedLeaderElection makes the inventory run on the leader only.
 func (inv *Inventory) NeedLeaderElection() bool { return true }
 
-// Start waits for the caches, runs SyncAll until it succeeds, then flushes batches. Every TagTTL it
-// re-resolves template-backed owners; every VersionPoll it re-reads the control-plane version.
+// Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
+// then flushes batches. Every TagTTL it re-resolves template-backed owners; every VersionPoll it
+// re-reads the control-plane version.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -198,16 +208,17 @@ func (inv *Inventory) Start(ctx context.Context) error {
 		}
 		return errors.New("inventory: informer caches did not sync")
 	}
-	for {
+	defer inv.retry.stop()
+	for delay := inv.o.Debounce; ; delay = min(2*delay, maxRetryBackoff) {
 		err := inv.SyncAll(ctx)
 		if err == nil {
 			break
 		}
-		logf.FromContext(ctx).WithName("inventory").Error(err, "initial inventory sync failed; retrying")
+		logf.FromContext(ctx).WithName("inventory").Error(err, "initial inventory sync failed; retrying", "retryIn", delay)
 		select {
 		case <-ctx.Done():
 			return nil
-		case <-time.After(inv.o.Debounce):
+		case <-time.After(delay):
 		}
 	}
 	done := make(chan struct{})
@@ -236,13 +247,18 @@ func (inv *Inventory) Start(ctx context.Context) error {
 	}
 }
 
-// Synced reports whether a SyncAll has completed, which Start runs before anything else.
+// Synced reports whether a SyncAll has completed. SyncAll sets it (so a direct SyncAll counts);
+// Start runs SyncAll before anything else, so after Start it means the first SyncAll completed.
 func (inv *Inventory) Synced() bool { return inv.synced.Load() }
 
-// MarkNamespace queues every known owner in ns, or every known owner when ns is "".
+// MarkNamespace queues every known owner in ns. With ns "" it queues every known owner plus
+// "cluster", which rebuilds the synthetic Cluster and ContainerRuntime owners.
 func (inv *Inventory) MarkNamespace(ns string) {
 	inv.mu.Lock()
 	var keys []string
+	if ns == "" {
+		keys = append(keys, clusterKey)
+	}
 	for k := range inv.known {
 		if _, kns, _, _ := splitKey(k); ns == "" || kns == ns {
 			keys = append(keys, k)
@@ -304,31 +320,39 @@ type flushState struct {
 }
 
 // Flush brings the owners behind keys up to date. Keys are object keys ("Pod/ns/name",
-// "Deployment/ns/name", ...) or "cluster". A key that fails (an owner not yet cached, a registry
-// error) is logged and retried in the next batch. Flush returns an error only when the batch as a
-// whole could not be applied or reported; what it could not report is reported by the next Flush.
+// "Deployment/ns/name", ...) or "cluster". A pod whose intermediate owner is not cached yet is
+// retried in the next batch. Any other key that fails (a registry, store or context error) is
+// retried with a per-key exponential backoff, logged once per backoff step, until it succeeds.
+// Flush returns an error only when the batch as a whole could not be applied or reported; what it
+// could not report is reported by a later Flush.
 func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
 	inv.flushMu.Lock()
 	defer inv.flushMu.Unlock()
-	log := logf.FromContext(ctx).WithName("inventory")
 	f, err := inv.newFlush(ctx)
 	if err != nil {
 		inv.batch.Add(keys...)
 		return err
 	}
-	var retry []string
+	log := logf.FromContext(ctx).WithName("inventory")
+	done := map[string]bool{}    // every key this flush processed
+	failed := map[string]error{} // keys retried with backoff
+	pending := map[string]bool{} // keys whose owner is not cached yet, retried in the next batch
 	fail := func(key string, err error) {
-		if !errors.Is(err, errOwnerPending) {
-			log.Error(err, "inventory update failed; retrying in the next batch", "key", key)
+		if errors.Is(err, errOwnerPending) {
+			pending[key] = true
+		} else {
+			failed[key] = err
 		}
-		retry = append(retry, key)
 	}
 
 	dirty := map[string]bool{}
 	cluster := false
 	for _, key := range keys {
+		done[key] = true
 		kind, ns, name, ok := splitKey(key)
 		switch {
+		case key == reportKey:
+			// report below retries the unreported owners.
 		case key == clusterKey || synthetic(kind):
 			cluster = true
 		case !ok:
@@ -347,16 +371,29 @@ func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
 		}
 	}
 	if cluster {
+		done[clusterKey] = true
 		if err := inv.flushCluster(ctx, f); err != nil {
 			fail(clusterKey, err)
 		}
 	}
 	for _, key := range sortedKeys(dirty) {
+		done[key] = true
 		if err := inv.flushOwner(ctx, f, key); err != nil {
 			fail(key, err)
 		}
 	}
-	inv.batch.Add(retry...)
+	for _, key := range sortedKeys(done) {
+		switch {
+		case pending[key]:
+		case failed[key] != nil:
+			if attempt, delay, ok := inv.retry.fail(key); ok {
+				log.Error(failed[key], "inventory update failed; backing off", "key", key, "attempt", attempt, "retryIn", delay)
+			}
+		case key != reportKey:
+			inv.retry.ok(key)
+		}
+	}
+	inv.batch.Add(sortedKeys(pending)...)
 	return inv.report(ctx, f)
 }
 
@@ -377,7 +414,7 @@ func (inv *Inventory) newFlush(ctx context.Context) (*flushState, error) {
 }
 
 // report hands collected SBOM requests to the acquirer and reports changed owners, including any
-// a previous Flush failed to report.
+// a previous Flush failed to report. A failed report is retried with backoff through reportKey.
 func (inv *Inventory) report(ctx context.Context, f *flushState) error {
 	for _, r := range f.reqs {
 		inv.o.Acquirer.Enqueue(r)
@@ -397,10 +434,11 @@ func (inv *Inventory) report(ctx context.Context, f *flushState) error {
 		for _, k := range keys {
 			inv.unreported[k] = true
 		}
-		inv.batch.Add(keys...)
+		inv.retry.fail(reportKey)
 		return fmt.Errorf("inventory: report changed owners: %w", err)
 	}
 	clear(inv.unreported)
+	inv.retry.ok(reportKey)
 	return nil
 }
 
@@ -479,12 +517,16 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 		return inv.deleteOwner(ctx, f, key)
 	}
 
-	var uses []use
+	var (
+		uses []use
+		live []*corev1.Pod // pods with a started container: the ones the uses come from
+	)
 	archs := map[string]bool{}
 	for _, p := range pods {
 		if !hasImageID(p) {
 			continue
 		}
+		live = append(live, p)
 		platform := f.platform
 		if n, ok := f.nodes[p.Spec.NodeName]; ok {
 			platform = NodePlatform{OS: n.OS, Arch: n.Arch}
@@ -525,8 +567,10 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 	case len(pods) > 0:
 		o.ManagedBy = ManagedByFrom(pods[0].Labels, pods[0].Annotations)
 	}
-	if inv.o.Context != nil {
-		wl := &Workload{Ref: ref, ServiceAccount: o.ServiceAccount, Pods: pods, Template: tmpl}
+	// Workload.Pods holds only live pods, so it is empty whenever the owner is not running. A bare
+	// pod that has not started yet has neither pods nor a template to describe, and no uses either.
+	if inv.o.Context != nil && (len(live) > 0 || tmpl != nil) {
+		wl := &Workload{Ref: ref, ServiceAccount: o.ServiceAccount, Pods: live, Template: tmpl}
 		if o.Context, err = inv.o.Context.Context(ctx, wl); err != nil {
 			return fmt.Errorf("workload context: %w", err)
 		}
