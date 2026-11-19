@@ -127,6 +127,7 @@ func (a *Acquirer) AcquireNow(ctx context.Context, r Request) (*Result, error) {
 		j = &job{req: r}
 		a.jobs[r.Digest] = j
 		a.low = append(a.low, j)
+		metrics.CatalogQueueDepth.Set(float64(len(a.high) + len(a.low)))
 		a.cond.Signal()
 	}
 	j.waiters = append(j.waiters, ch)

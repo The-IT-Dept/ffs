@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -134,7 +135,7 @@ func (c *Collector) Refresh(ctx context.Context) error {
 // Start refreshes now and then every Interval until ctx ends. A failed refresh keeps the previous
 // snapshot and is tried again at the next tick.
 func (c *Collector) Start(ctx context.Context) error {
-	_ = c.Refresh(ctx)
+	c.refreshLogged(ctx)
 	t := time.NewTicker(c.o.Interval)
 	defer t.Stop()
 	for {
@@ -142,8 +143,15 @@ func (c *Collector) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-t.C:
-			_ = c.Refresh(ctx)
+			c.refreshLogged(ctx)
 		}
+	}
+}
+
+// refreshLogged runs Refresh and logs a failure, so a failing store is visible while the old snapshot is served.
+func (c *Collector) refreshLogged(ctx context.Context) {
+	if err := c.Refresh(ctx); err != nil && ctx.Err() == nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "metrics refresh failed; serving previous snapshot")
 	}
 }
 
