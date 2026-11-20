@@ -60,12 +60,14 @@ func (s *Store) OSVRecordIDs(ctx context.Context, bucket string) ([]string, erro
 
 // PruneOSVRecords removes the records of bucket last modified before olderThan, with their index
 // names, and returns how many it removed. A record whose canonical advisory still has matches from
-// the osv source is kept: dropping it would let those findings resolve without a real fix.
+// the osv source is kept: dropping it would let those findings resolve without a real fix. So is a
+// malicious-package record (MAL-): the Grype DB has none, so the cache is the only place a newly
+// catalogued image can find one, however old.
 func (s *Store) PruneOSVRecords(ctx context.Context, bucket string, olderThan time.Time) (int, error) {
 	var n int
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
 		ids, err := queryAll(ctx, tx, scanString, `SELECT r.id FROM osv_records r
-			WHERE r.ecosystem = ? AND r.modified < ?
+			WHERE r.ecosystem = ? AND r.modified < ? AND substr(r.id, 1, 4) != 'MAL-'
 			AND NOT EXISTS (SELECT 1 FROM matches m WHERE m.source = ? AND m.advisory_id =
 				COALESCE((SELECT a.canonical FROM advisory_aliases a WHERE a.alias = r.id), r.id))`,
 			bucket, nanos(olderThan), string(model.SourceOSV))

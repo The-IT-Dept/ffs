@@ -288,7 +288,8 @@ func (f *Feed) ingest(ctx context.Context, body []byte, since time.Time) ([]stri
 }
 
 // put stores the advisory of rec and, per mapped product, its affected ranges (entries naming the
-// same product merged).
+// same product merged). The ranges replace every range stored for the CVE, so a product the record
+// no longer names, or a REJECTED record, leaves none behind for the upstream matcher.
 func (f *Feed) put(ctx context.Context, rec Record) error {
 	if err := f.o.Store.UpsertAdvisory(ctx, model.Advisory{
 		ID:          rec.ID,
@@ -306,7 +307,7 @@ func (f *Feed) put(ctx context.Context, rec Record) error {
 	byKey := map[string]upstream.CNARanges{}
 	for _, a := range rec.Affected {
 		e, ok := upstream.ForCNA(a.Vendor, a.Product)
-		if !ok {
+		if !ok || rec.State == stateRejected {
 			continue
 		}
 		r := byKey[e.Key]
@@ -316,16 +317,15 @@ func (f *Feed) put(ctx context.Context, rec Record) error {
 		r.Versions = append(r.Versions, a.Ranges.Versions...)
 		byKey[e.Key] = r
 	}
-	for _, key := range slices.Sorted(maps.Keys(byKey)) {
-		raw, err := json.Marshal(byKey[key])
+	byProduct := make(map[string][]byte, len(byKey))
+	for key, r := range byKey {
+		raw, err := json.Marshal(r)
 		if err != nil {
 			return err
 		}
-		if err := f.o.Store.PutUpstreamRanges(ctx, rec.ID, key, raw); err != nil {
-			return err
-		}
+		byProduct[key] = raw
 	}
-	return nil
+	return f.o.Store.ReplaceUpstreamRanges(ctx, rec.ID, byProduct)
 }
 
 // readEntry reads a zip entry of at most maxRecordBytes.

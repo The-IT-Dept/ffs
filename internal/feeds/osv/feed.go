@@ -5,6 +5,8 @@
 // A cached GIT record that stops referencing the GitRepos repositories is handed off once more
 // and then dropped from the cache. A weekly set-diff withdraws records that left the bucket, and
 // records outside Go and GIT are pruned after 14 days unless the osv source still matches them.
+// Malicious-package records (MAL-) are the exception: the Grype DB carries none, so each language
+// bucket loads all of its MAL- records once and keeps them.
 package osv
 
 import (
@@ -22,6 +24,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -39,20 +42,25 @@ const DefaultURL = "https://osv-vulnerabilities.storage.googleapis.com"
 
 const (
 	maxRecordBytes   = 4 << 20
-	maxZipBytes      = 1 << 30
-	bulkThreshold    = 5000 // more changed IDs than this read all.zip instead of one GET each
 	handlerChunk     = 500
 	fetchConcurrency = 8
+	fetchChunk       = 32 // records fetched concurrently, then stored, to bound memory
 	firstPollWindow  = 72 * time.Hour
 	setDiffInterval  = 7 * 24 * time.Hour
 	retention        = 14 * 24 * time.Hour
 
-	metaWatermark  = "wm."   // + bucket: RFC 3339 time of the newest row handed off
-	metaGeneration = "gen."  // + bucket: x-goog-generation of modified_id.csv when last read
-	metaBootstrap  = "boot." // + bucket (Go, GIT): when all.zip was loaded
-	metaGitRepos   = "repos.GIT"
-	metaSetDiff    = "setdiff"
+	metaWatermark   = "wm."   // + bucket: RFC 3339 time of the newest row handed off
+	metaGeneration  = "gen."  // + bucket: x-goog-generation of modified_id.csv when last read
+	metaBootstrap   = "boot." // + bucket (Go, GIT): when all.zip was loaded
+	metaRecordBytes = "size." // + bucket: average uncompressed size of its records, measured
+	metaMalicious   = "mal."  // + language bucket: when all of its MAL- records were loaded
+	metaGitRepos    = "repos.GIT"
+	metaSetDiff     = "setdiff"
 )
+
+// maxZipBytes bounds a download of all of all.zip. A bigger one is read with Range requests or one
+// GET per record instead. A variable so tests can lower it.
+var maxZipBytes int64 = 1 << 30
 
 // Changed is a new or changed OSV record. Ecosystem is the bucket it came from ("Debian", "PyPI",
 // "Go", "GIT", ...).
@@ -151,6 +159,9 @@ func (f *Feed) Sync(ctx context.Context) error {
 		} else {
 			err = f.poll(ctx, &st, b)
 		}
+		if err == nil && needsMalicious(st, b) {
+			err = f.loadMalicious(ctx, &st, b)
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("osv: bucket %s: %w", b, err))
 			if len(feeds.Pending(st)) > 0 {
@@ -188,6 +199,47 @@ func (f *Feed) needsBootstrap(st store.FeedState, b string) bool {
 		return st.Meta[metaBootstrap+b] == "" || st.Meta[metaGitRepos] != f.reposKey
 	}
 	return false
+}
+
+// needsMalicious reports whether b is a language bucket whose MAL- records have not been loaded.
+// Go is loaded whole by its bootstrap.
+func needsMalicious(st store.FeedState, b string) bool {
+	return b != BucketGo && languageBuckets[bucketSyftTypes[b]] == b && st.Meta[metaMalicious+b] == ""
+}
+
+// loadMalicious caches every MAL- record that b's modified_id.csv lists and the cache lacks, and
+// hands them off. Polls only reach back to the first poll's window and other records are pruned, but
+// a known-malicious package version stays dangerous however old its record is (spec §6.4), and the
+// Grype DB has no MAL- records. It runs once per bucket; pruning keeps MAL- records.
+func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string) error {
+	listed, err := listIDs(ctx, f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
+	if err != nil {
+		return err
+	}
+	cached, err := f.o.Store.OSVRecordIDs(ctx, b)
+	if err != nil {
+		return err
+	}
+	have := make(map[string]bool, len(cached))
+	for _, id := range cached {
+		have[id] = true
+	}
+	var ids []string
+	for id := range listed {
+		if strings.HasPrefix(id, "MAL-") && !have[id] {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	changed, takeErr := f.take(ctx, st, b, ids)
+	if err := f.handOff(ctx, st, changed); err != nil {
+		return errors.Join(takeErr, err)
+	}
+	if takeErr != nil { // not marked loaded: the next Sync takes the rest
+		return errors.Join(takeErr, f.save(ctx, st))
+	}
+	st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
+	return f.save(ctx, st)
 }
 
 func (f *Feed) save(ctx context.Context, st *store.FeedState) error {
@@ -277,9 +329,9 @@ func (f *Feed) watermark(st store.FeedState, b string) time.Time {
 
 // take fetches and caches the records ids of b, returning the ones to hand off: those whose
 // affected hash changed and dropped GIT records (see put); on an error, those so far, which the
-// caller still hands off. Above the bulk threshold it reads them from all.zip. Every candidate is
-// pending while the cache is written, so a crash between a record's write and its hand-off cannot
-// lose it.
+// caller still hands off. It reads them the cheapest way (see choose): one GET each, Range reads of
+// their entries in all.zip, or all of all.zip. Every candidate is pending while the cache is
+// written, so a crash between a record's write and its hand-off cannot lose it.
 func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []string) ([]recKey, error) {
 	if len(ids) == 0 {
 		return nil, nil
@@ -288,51 +340,173 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []st
 	if err != nil {
 		return nil, err
 	}
-	setPendingKeys := func() error {
-		keys := make([]recKey, len(ids))
-		for i, id := range ids {
-			keys[i] = recKey{b, id}
-		}
-		setPending(st, keys)
-		return f.save(ctx, st)
-	}
-	if len(ids) > bulkThreshold {
-		path, err := f.downloadZip(ctx, b)
-		if err != nil {
-			return nil, err
-		}
-		defer func() { _ = os.Remove(path) }()
-		if err := setPendingKeys(); err != nil {
-			return nil, err
-		}
-		want := make(map[string]bool, len(ids))
-		for _, id := range ids {
-			want[id] = true
-		}
-		return f.storeZip(ctx, b, path, want, gitCached)
-	}
-
-	raws, err := f.fetchRecords(ctx, b, ids)
+	how, probe, err := f.plan(ctx, *st, b, len(ids))
 	if err != nil {
 		return nil, err
 	}
-	if err := setPendingKeys(); err != nil {
+	keys := make([]recKey, len(ids))
+	for i, id := range ids {
+		keys[i] = recKey{b, id}
+	}
+	setPending(st, keys)
+	if err := f.save(ctx, st); err != nil {
 		return nil, err
 	}
-	var out []recKey
-	for i, raw := range raws {
-		if raw == nil {
-			continue
+
+	want := func() map[string]bool {
+		m := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			m[id] = true
 		}
-		res, err := f.put(ctx, b, ids[i], raw, gitCached)
+		return m
+	}
+	var (
+		out   []recKey
+		sizes sizeStats
+	)
+	switch how {
+	case wholeZip:
+		var path string
+		if path, err = f.downloadZip(ctx, b); err != nil {
+			return nil, err
+		}
+		defer func() { _ = os.Remove(path) }()
+		out, sizes, err = f.storeZip(ctx, b, path, want(), gitCached)
+	case rangedZip:
+		out, sizes, err = f.storeRanged(ctx, b, probe, want(), gitCached)
+	default:
+		out, sizes, err = f.storeRecords(ctx, b, ids, gitCached)
+	}
+	learnRecordBytes(st, b, sizes)
+	return out, err
+}
+
+// plan picks how take reads n records of b. all.zip is probed only when one GET per record looks
+// expensive; a bucket without all.zip is read one GET per record.
+func (f *Feed) plan(ctx context.Context, st store.FeedState, b string, n int) (transport, zipProbe, error) {
+	recordBytes := recordBytesOf(st, b)
+	if int64(n)*(recordBytes+requestOverhead) <= probeAbove {
+		return perRecord, zipProbe{}, nil
+	}
+	p, err := probeZip(ctx, f.o.HTTP, f.bucketURL(b, "all.zip"))
+	switch {
+	case errors.Is(err, feeds.ErrNotFound):
+		return perRecord, p, nil
+	case err != nil:
+		return perRecord, p, err
+	}
+	how := choose(n, recordBytes, p)
+	logr.FromContextOrDiscard(ctx).V(1).Info("reading OSV records", "bucket", b, "records", n, "transport", how.String(),
+		"recordBytes", recordBytes, "zipBytes", p.size, "rangeReads", p.ranged)
+	return how, p, nil
+}
+
+// sizeStats sums the uncompressed sizes of the records a take read.
+type sizeStats struct{ n, bytes int64 }
+
+func (s *sizeStats) add(n int) { s.n, s.bytes = s.n+1, s.bytes+int64(n) }
+
+// recordBytesOf returns the measured average record size of b, or defaultRecordBytes.
+func recordBytesOf(st store.FeedState, b string) int64 {
+	if v, err := strconv.ParseInt(st.Meta[metaRecordBytes+b], 10, 64); err == nil && v > 0 {
+		return v
+	}
+	return defaultRecordBytes
+}
+
+// learnRecordBytes folds the sizes a take read into b's average, weighting a read of 100 records or
+// more fully. The caller saves st.
+func learnRecordBytes(st *store.FeedState, b string, s sizeStats) {
+	if s.n == 0 {
+		return
+	}
+	mean := s.bytes / s.n
+	if v, err := strconv.ParseInt(st.Meta[metaRecordBytes+b], 10, 64); err == nil && v > 0 {
+		w := min(s.n, 100)
+		mean = (v*(100-w) + mean*w) / 100
+	}
+	st.Meta[metaRecordBytes+b] = strconv.FormatInt(max(mean, 1), 10)
+}
+
+// storeRecords GETs the records ids of b, fetchChunk at a time, and caches each (see put).
+func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCached map[string]bool) ([]recKey, sizeStats, error) {
+	var (
+		out   []recKey
+		sizes sizeStats
+	)
+	for chunk := range slices.Chunk(ids, fetchChunk) {
+		raws, err := f.fetchRecords(ctx, b, chunk)
 		if err != nil {
-			return out, err
+			return out, sizes, err
 		}
-		if res == putChanged || res == putDropped {
-			out = append(out, recKey{b, ids[i]})
+		for i, raw := range raws {
+			if raw == nil {
+				continue
+			}
+			sizes.add(len(raw))
+			res, err := f.put(ctx, b, chunk[i], raw, gitCached)
+			if err != nil {
+				return out, sizes, err
+			}
+			if res == putChanged || res == putDropped {
+				out = append(out, recKey{b, chunk[i]})
+			}
 		}
 	}
-	return out, nil
+	return out, sizes, nil
+}
+
+// storeRanged reads the entries of the probed all.zip of b that want names with Range requests,
+// rangedChunk at a time, and caches each (see put).
+func (f *Feed) storeRanged(ctx context.Context, b string, p zipProbe, want, gitCached map[string]bool) ([]recKey, sizeStats, error) {
+	log := logr.FromContextOrDiscard(ctx)
+	var sizes sizeStats
+	z, err := openRemoteZip(ctx, f.o.HTTP, f.bucketURL(b, "all.zip"), p)
+	if err != nil {
+		return nil, sizes, err
+	}
+	var files []*zip.File
+	for _, zf := range z.zr.File {
+		id := zipEntryID(b, zf, want)
+		switch {
+		case id == "":
+		case zf.UncompressedSize64 > maxRecordBytes:
+			log.Info("skipping an oversized OSV record", "bucket", b, "id", id)
+		default:
+			files = append(files, zf)
+		}
+	}
+	var out []recKey
+	for chunk := range slices.Chunk(files, rangedChunk) {
+		raws := make([][]byte, len(chunk))
+		g, gctx := errgroup.WithContext(ctx)
+		g.SetLimit(rangedConcurrency)
+		for i, zf := range chunk {
+			g.Go(func() error {
+				if err := gctx.Err(); err != nil {
+					return err
+				}
+				raw, err := z.read(zf)
+				raws[i] = raw
+				return err
+			})
+		}
+		if err := g.Wait(); err != nil {
+			return out, sizes, fmt.Errorf("osv: %s all.zip: %w", b, err)
+		}
+		for i, raw := range raws {
+			sizes.add(len(raw))
+			id := strings.TrimSuffix(chunk[i].Name, ".json")
+			res, err := f.put(ctx, b, id, raw, gitCached)
+			if err != nil {
+				return out, sizes, err
+			}
+			if res == putChanged || res == putDropped {
+				out = append(out, recKey{b, id})
+			}
+		}
+	}
+	return out, sizes, nil
 }
 
 // gitCached returns the IDs held in the GIT cache when b is GIT, else nil. put needs them to notice
@@ -443,24 +617,35 @@ func (f *Feed) downloadZip(ctx context.Context, b string) (string, error) {
 	return path, nil
 }
 
+// zipEntryID returns the record ID of zf, an entry of b's all.zip, when it is a plain "<id>.json"
+// file that want names (every one when want is nil) and not a notice; else "".
+func zipEntryID(b string, zf *zip.File, want map[string]bool) string {
+	id, ok := strings.CutSuffix(zf.Name, ".json")
+	if !ok || id == "" || strings.ContainsAny(zf.Name, `/\`) || !zf.Mode().IsRegular() ||
+		(want != nil && !want[id]) || SkipID(b, id) {
+		return ""
+	}
+	return id
+}
+
 // storeZip caches the records in the all.zip at path: those named in want, or every record when
 // want is nil. It returns the records to hand off: the changed and dropped ones (see put), or with
 // want nil (a bootstrap, which may be re-running after a crash) every cached one, including on an
 // error those so far. Entries other than plain "<id>.json" files of at most 4 MiB are ignored.
-func (f *Feed) storeZip(ctx context.Context, b, path string, want, gitCached map[string]bool) ([]recKey, error) {
+func (f *Feed) storeZip(ctx context.Context, b, path string, want, gitCached map[string]bool) ([]recKey, sizeStats, error) {
+	var sizes sizeStats
 	zr, err := zip.OpenReader(path)
 	if err != nil {
-		return nil, fmt.Errorf("osv: %s all.zip: %w", b, err)
+		return nil, sizes, fmt.Errorf("osv: %s all.zip: %w", b, err)
 	}
 	defer func() { _ = zr.Close() }()
 	var out []recKey
 	for _, zf := range zr.File {
 		if err := ctx.Err(); err != nil {
-			return out, err
+			return out, sizes, err
 		}
-		id, ok := strings.CutSuffix(zf.Name, ".json")
-		if !ok || id == "" || strings.ContainsAny(zf.Name, `/\`) || !zf.Mode().IsRegular() ||
-			(want != nil && !want[id]) || SkipID(b, id) {
+		id := zipEntryID(b, zf, want)
+		if id == "" {
 			continue
 		}
 		raw, err := readEntry(zf)
@@ -469,17 +654,18 @@ func (f *Feed) storeZip(ctx context.Context, b, path string, want, gitCached map
 			continue
 		}
 		if err != nil {
-			return out, fmt.Errorf("osv: %s all.zip %s: %w", b, zf.Name, err)
+			return out, sizes, fmt.Errorf("osv: %s all.zip %s: %w", b, zf.Name, err)
 		}
+		sizes.add(len(raw))
 		res, err := f.put(ctx, b, id, raw, gitCached)
 		if err != nil {
-			return out, err
+			return out, sizes, err
 		}
 		if res == putChanged || res == putDropped || (want == nil && res == putUnchanged) {
 			out = append(out, recKey{b, id})
 		}
 	}
-	return out, nil
+	return out, sizes, nil
 }
 
 // readEntry reads a zip entry of at most maxRecordBytes.
@@ -526,7 +712,7 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 		return err
 	}
 	defer func() { _ = os.Remove(path) }()
-	keys, err := f.storeZip(ctx, b, path, nil, gitCached)
+	keys, _, err := f.storeZip(ctx, b, path, nil, gitCached)
 	if err != nil {
 		return err
 	}
@@ -725,7 +911,7 @@ func withdraw(raw []byte, now time.Time) ([]byte, error) {
 }
 
 // prune drops records older than the retention from every bucket except Go and GIT, whose cache is
-// loaded whole and kept.
+// loaded whole and kept. The store keeps MAL- records (see loadMalicious).
 func (f *Feed) prune(ctx context.Context) error {
 	cutoff := f.o.Now().UTC().Add(-retention)
 	for _, b := range knownBuckets() {

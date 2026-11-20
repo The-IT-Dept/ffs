@@ -78,6 +78,14 @@ func (f *Feed) Sync(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// ReplaceEOL drops every stored cycle: an empty or broken list would wipe EOL status.
+		stored, err := f.st.ListEOL(ctx)
+		if err != nil {
+			return err
+		}
+		if err := feeds.CheckShrink("the endoflife.date product list", len(stored), len(cycles)); err != nil {
+			return err
+		}
 		if err := f.st.ReplaceEOL(ctx, cycles); err != nil {
 			return err
 		}
@@ -101,14 +109,24 @@ func (f *Feed) Sync(ctx context.Context) error {
 	return nil
 }
 
+// parse returns the cycles of every product, skipping releases with no product or cycle name. A
+// list with no cycles, or with more unnamed releases than named ones (a reshaped body), is
+// ErrImplausible.
 func parse(body []byte) ([]store.EOLCycle, error) {
 	var p payload
 	if err := json.Unmarshal(body, &p); err != nil {
 		return nil, fmt.Errorf("eol: decode products: %w", err)
 	}
-	var out []store.EOLCycle
+	var (
+		out     []store.EOLCycle
+		unnamed int
+	)
 	for _, prod := range p.Result {
 		for _, r := range prod.Releases {
+			if prod.Name == "" || r.Name == "" {
+				unnamed++
+				continue
+			}
 			c := store.EOLCycle{Product: prod.Name, Cycle: r.Name, IsEOL: r.IsEOL}
 			if r.Codename != nil {
 				c.Codename = *r.Codename
@@ -132,6 +150,10 @@ func parse(body []byte) ([]store.EOLCycle, error) {
 			}
 			out = append(out, c)
 		}
+	}
+	if len(out) == 0 || unnamed > len(out) {
+		return nil, fmt.Errorf("%w: the endoflife.date product list has %d products, %d named release cycles and %d unnamed",
+			feeds.ErrImplausible, len(p.Result), len(out), unnamed)
 	}
 	return out, nil
 }

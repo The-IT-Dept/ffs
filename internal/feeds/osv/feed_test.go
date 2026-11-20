@@ -36,24 +36,42 @@ type fakeBucket struct {
 	csv     []byte
 	gen     string            // x-goog-generation; "" sends none
 	records map[string][]byte // served as <id>.json and inside all.zip
+	noRange bool              // all.zip ignores Range headers
+	zip     []byte            // all.zip, built on first request
 }
 
 // bucketServer serves <bucket>/modified_id.csv (with Range support), <bucket>/<id>.json and
-// <bucket>/all.zip. A bucket it does not know has an empty listing and an empty all.zip.
+// <bucket>/all.zip (with Range support unless noRange). A bucket it does not know has an empty
+// listing and an empty all.zip.
 type bucketServer struct {
 	*httptest.Server
-	mu      sync.Mutex
-	buckets map[string]*fakeBucket
-	gets    map[string]int      // "<bucket>/<file>" → GETs
-	ranges  map[string][]string // bucket → Range headers sent for modified_id.csv
+	mu       sync.Mutex
+	buckets  map[string]*fakeBucket
+	gets     map[string]int      // "<bucket>/<file>" → GETs
+	ranges   map[string][]string // bucket → Range headers sent for modified_id.csv
+	zipWhole map[string]int      // bucket → all.zip GETs without a Range header
+	zipBytes map[string]int64    // bucket → all.zip body bytes sent
 }
 
 func newBucketServer(t *testing.T) *bucketServer {
 	t.Helper()
-	s := &bucketServer{buckets: map[string]*fakeBucket{}, gets: map[string]int{}, ranges: map[string][]string{}}
+	s := &bucketServer{buckets: map[string]*fakeBucket{}, gets: map[string]int{}, ranges: map[string][]string{},
+		zipWhole: map[string]int{}, zipBytes: map[string]int64{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.Close)
 	return s
+}
+
+// countingWriter counts the body bytes written.
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +88,17 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 	if rg := r.Header.Get("Range"); rg != "" && file == "modified_id.csv" {
 		s.ranges[b] = append(s.ranges[b], rg)
 	}
+	var zipped []byte
+	if file == "all.zip" {
+		if fb.zip == nil {
+			fb.zip = zipOf(records)
+		}
+		zipped = fb.zip
+		if r.Header.Get("Range") == "" || fb.noRange {
+			s.zipWhole[b]++
+		}
+	}
+	noRange := fb.noRange
 	s.mu.Unlock()
 
 	if gen != "" {
@@ -79,7 +108,16 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 	case "modified_id.csv":
 		http.ServeContent(w, r, file, time.Time{}, bytes.NewReader(csv)) // 416 for a Range read of an empty file
 	case "all.zip":
-		_, _ = w.Write(zipOf(records))
+		cw := &countingWriter{ResponseWriter: w}
+		if noRange {
+			w.Header().Set("Content-Length", fmt.Sprint(len(zipped)))
+			_, _ = cw.Write(zipped)
+		} else {
+			http.ServeContent(cw, r, file, time.Time{}, bytes.NewReader(zipped))
+		}
+		s.mu.Lock()
+		s.zipBytes[b] += cw.n
+		s.mu.Unlock()
 	default:
 		raw, ok := records[strings.TrimSuffix(file, ".json")]
 		if !ok {
@@ -100,6 +138,20 @@ func (s *bucketServer) count(path string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gets[path]
+}
+
+// wholeZips counts the downloads of all of b's all.zip.
+func (s *bucketServer) wholeZips(b string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zipWhole[b]
+}
+
+// zipSent returns the all.zip body bytes sent for b.
+func (s *bucketServer) zipSent(b string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zipBytes[b]
 }
 
 // rangesOf returns the Range headers sent for b's modified_id.csv.
@@ -496,7 +548,7 @@ func TestOSVSync_BulkPathAboveThreshold(t *testing.T) {
 	e.putMeta(t, map[string]string{"setdiff": ts(now)})
 
 	require.NoError(t, e.feed().Sync(ctx))
-	require.Equal(t, 1, e.srv.count("PyPI/all.zip"))
+	require.Equal(t, 1, e.srv.wholeZips("PyPI"), "nearly every record changed: all of all.zip is cheapest")
 	require.Zero(t, e.srv.recordGETs("PyPI"))
 	require.Len(t, e.sink.all(), n)
 	for _, c := range e.sink.calls {
@@ -815,4 +867,129 @@ func TestAffectedHash_IgnoresTimestamps(t *testing.T) {
 		"affected":[{"package":{"ecosystem":"PyPI","name":"x"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.3"}]}]}]}`))
 	_, err := osv.AffectedHash([]byte(`not json`))
 	require.Error(t, err)
+}
+
+// TestOSVSync_RangedZipReadsOnlyChangedEntries: when one GET per record looks expensive (Ubuntu's
+// records average about 500 KB) and only part of the bucket changed, the changed records are read
+// with Range requests from their compressed entries in all.zip: no per-record GETs and no download
+// of the whole zip.
+func TestOSVSync_RangedZipReadsOnlyChangedEntries(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-48*time.Hour), now.Add(-time.Minute)
+	const total, changed = 2000, 100
+	records := make(map[string][]byte, total)
+	var rows []row
+	for i := range total {
+		id := fmt.Sprintf("PYSEC-2026-%05d", i)
+		if i < changed {
+			records[id] = pypi(id, "2.0.0", t1)
+			rows = append(rows, row{t1, id})
+		} else {
+			records[id] = pypi(id, "1.0.0", t0)
+		}
+	}
+	for i := changed; i < total; i++ {
+		id := fmt.Sprintf("PYSEC-2026-%05d", i)
+		rows = append(rows, row{t0, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Zero(t, e.srv.recordGETs("PyPI"), "no per-record GETs")
+	require.Zero(t, e.srv.wholeZips("PyPI"), "no download of all of all.zip")
+	require.Less(t, e.srv.zipSent("PyPI"), int64(len(zipOf(records))/2), "only the directory and the changed entries")
+	require.Len(t, e.sink.all(), changed)
+	require.Len(t, e.ids(t, "PyPI"), changed)
+	require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+	require.Equal(t, fmt.Sprint(len(records["PYSEC-2026-00000"])), e.meta(t)["size.PyPI"], "the record size is measured")
+}
+
+// TestOSVSync_ZipOverCapDoesNotWedge: a burst of changes in a bucket whose all.zip is over the
+// download cap (Ubuntu's is at 80% of it) is read with Range requests, or one GET per record when the
+// server ignores Range, instead of failing every poll with the watermark stuck.
+func TestOSVSync_ZipOverCapDoesNotWedge(t *testing.T) {
+	for name, noRange := range map[string]bool{"ranged": false, "no Range support": true} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.inUse(t, python)
+			t1 := now.Add(-time.Minute)
+			const n = 5001
+			records := make(map[string][]byte, n)
+			var rows []row
+			for i := range n {
+				id := fmt.Sprintf("GHSA-2026-%05d", i)
+				records[id] = pypi(id, "2.0.0", t1)
+				rows = append(rows, row{t1, id})
+			}
+			e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records, noRange: noRange})
+			e.putMeta(t, map[string]string{"setdiff": ts(now), "mal.PyPI": ts(now)})
+			osv.SetMaxZipBytes(t, int64(len(zipOf(records))-1))
+
+			require.NoError(t, e.feed().Sync(ctx))
+			require.Zero(t, e.srv.wholeZips("PyPI")-map[bool]int{true: 1, false: 0}[noRange], "no download of the whole zip beyond the probe")
+			if noRange {
+				require.Equal(t, n, e.srv.recordGETs("PyPI"))
+			} else {
+				require.Zero(t, e.srv.recordGETs("PyPI"))
+			}
+			require.Len(t, e.ids(t, "PyPI"), n)
+			require.Len(t, e.sink.all(), n)
+			require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+		})
+	}
+}
+
+var npm = store.EcosystemKey{Ecosystem: "npm"}
+
+func npmRecord(id, name string, modified time.Time) []byte {
+	return fmt.Appendf(nil, `{"schema_version":"1.6.0","id":%q,"modified":%q,"published":"2025-09-08T13:00:00Z",`+
+		`"summary":"Malicious code in %s (npm)","affected":[{"package":{"ecosystem":"npm","name":%q},"versions":["4.1.1"]}]}`,
+		id, modified.UTC().Format(time.RFC3339Nano), name, name)
+}
+
+// TestOSVSync_LoadsMaliciousRecordsOnce: a language bucket's first poll only reaches back 72 hours,
+// but every MAL- record it lists is loaded once, however old, and handed off: the Grype DB has none,
+// and a compromised package version stays urgent. Later syncs do not load them again, and pruning
+// keeps them.
+func TestOSVSync_LoadsMaliciousRecordsOnce(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, npm)
+	old, recent := now.Add(-60*24*time.Hour), now.Add(-time.Hour)
+	records := map[string][]byte{
+		"MAL-2025-0001":       npmRecord("MAL-2025-0001", "debug", old),
+		"MAL-2026-0002":       npmRecord("MAL-2026-0002", "chalk", recent),
+		"GHSA-aaaa-bbbb-cccc": record("GHSA-aaaa-bbbb-cccc", "npm", "lodash", "4.17.21", old),
+	}
+	e.srv.set("npm", &fakeBucket{csv: csvOf(row{recent, "MAL-2026-0002"}, row{old, "MAL-2025-0001"}, row{old, "GHSA-aaaa-bbbb-cccc"}),
+		records: records})
+	e.putMeta(t, map[string]string{"setdiff": ts(now)})
+
+	f := e.feed()
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"npm/MAL-2025-0001", "npm/MAL-2026-0002"}, e.sink.keys())
+	require.Equal(t, []string{"MAL-2025-0001", "MAL-2026-0002"}, e.ids(t, "npm"), "kept, though older than the retention")
+	ids, err := e.st.OSVRecordIDsByName(ctx, "npm", []string{"debug"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"MAL-2025-0001"}, ids, "indexed for newly catalogued images")
+	require.Equal(t, ts(now)[:19]+"Z", e.meta(t)["mal.npm"])
+	require.Equal(t, 1, e.srv.count("npm/MAL-2025-0001.json"))
+
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, 1, e.srv.count("npm/MAL-2025-0001.json"), "loaded once")
+	require.Equal(t, []string{"MAL-2025-0001", "MAL-2026-0002"}, e.ids(t, "npm"))
+}
+
+// TestOSVRetention_KeepsMaliciousRecords: pruning skips MAL- records however old.
+func TestOSVRetention_KeepsMaliciousRecords(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, npm)
+	old := now.Add(-90 * 24 * time.Hour)
+	e.cache(t, "npm", "MAL-2025-0001", old, npmRecord("MAL-2025-0001", "debug", old))
+	e.cache(t, "npm", "GHSA-aaaa-bbbb-cccc", old, record("GHSA-aaaa-bbbb-cccc", "npm", "lodash", "4.17.21", old))
+	e.putMeta(t, map[string]string{"setdiff": ts(now), "mal.npm": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []string{"MAL-2025-0001"}, e.ids(t, "npm"))
 }

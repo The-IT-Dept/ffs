@@ -15,8 +15,10 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/engine"
 	"github.com/the-it-dept/ffs/internal/feeds"
 	"github.com/the-it-dept/ffs/internal/feeds/epss"
+	"github.com/the-it-dept/ffs/internal/match"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -169,4 +171,48 @@ func TestEPSS_SameFileScoresNewlyInUse(t *testing.T) {
 	require.Equal(t, 1, srv.files)
 	require.Equal(t, 0.3, score(t, s, "CVE-2026-0002"))
 	require.Equal(t, 0.2, score(t, s, "CVE-2026-0001"))
+}
+
+// TestEPSS_NewMatchTakesCachedScore: a CVE first matched after the daily sync gets its score while
+// the match is stored, before the engine queues its owners, instead of at the next daily sync, which
+// could escalate the finding and alert twice. After a restart the scores come from the cached file.
+func TestEPSS_NewMatchTakesCachedScore(t *testing.T) {
+	s := newStore(t)
+	dir := t.TempDir()
+	srv := newServer(t, csvGz(t, "CVE-2024-10441,0.62000,0.98000", "CVE-2024-20000,0.15000,0.90000", "CVE-2023-0001,0.00100,0.10000"))
+	feed := func() *epss.Feed {
+		return epss.New(epss.Options{Config: config.FeedConfig{URL: srv.URL + "/current"}, Store: s, DataDir: dir,
+			Thresholds: []float64{0.1, 0.5}, Handler: func(context.Context, []string) error { return nil }})
+	}
+	observer := func(f *epss.Feed) engine.Observer {
+		obs, ok := any(f).(engine.Observer)
+		require.True(t, ok, "the EPSS feed observes the engine")
+		return obs
+	}
+	first := feed()
+	require.NoError(t, first.Sync(ctx)) // nothing is in use yet
+	eng := engine.New(engine.Options{Store: s})
+	eng.AddObserver(observer(first))
+	newMatch := func(e *engine.Engine, id string) {
+		t.Helper()
+		require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: id, Observed: time.Now()}))
+		d := "sha256:" + id
+		require.NoError(t, e.OnMatchDelta(ctx, match.Delta{
+			Scope:   store.MatchScope{Source: model.SourceGrype, Digests: []string{d}},
+			Matches: []model.Match{{ImageDigest: d, PackageID: "p", AdvisoryID: id, Source: model.SourceGrype, FixState: model.FixFixed}},
+		}, model.TriggerInventoryChange))
+	}
+
+	newMatch(eng, "CVE-2024-10441")
+	a, _, _ := s.GetAdvisory(ctx, "CVE-2024-10441")
+	require.InDelta(t, 0.62, a.EPSS, 1e-9, "set when the match is stored")
+	require.InDelta(t, 0.98, a.EPSSPercentile, 1e-9)
+
+	restarted := engine.New(engine.Options{Store: s})
+	restarted.AddObserver(observer(feed()))
+	newMatch(restarted, "CVE-2023-0001")
+	require.InDelta(t, 0.001, score(t, s, "CVE-2023-0001"), 1e-9, "from the cached file after a restart")
+
+	newMatch(eng, "CVE-2024-30000")
+	require.Zero(t, score(t, s, "CVE-2024-30000"), "not in the file")
 }

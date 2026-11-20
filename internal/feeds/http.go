@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 )
 
 var (
@@ -16,7 +18,19 @@ var (
 	ErrTooLarge = errors.New("feeds: size limit exceeded")
 	// ErrNotFound means the server answered 404.
 	ErrNotFound = errors.New("feeds: not found")
+	// ErrImplausible means a feed answered with a body that parses but cannot be right: empty,
+	// reshaped, or far smaller than the last one accepted. The stored data is kept.
+	ErrImplausible = errors.New("feeds: implausible response")
 )
+
+// CheckShrink returns an ErrImplausible error when a feed whose last accepted body had prev
+// entries now has fewer than half as many. A prev of zero (nothing accepted yet) passes.
+func CheckShrink(feed string, prev, now int) error {
+	if prev > 0 && now < prev/2 {
+		return fmt.Errorf("%w: %s has %d entries, down from %d; keeping the stored data", ErrImplausible, feed, now, prev)
+	}
+	return nil
+}
 
 // NewHTTPClient returns a client for feed downloads. It keeps the default transport's proxy
 // settings (HTTP_PROXY, HTTPS_PROXY, NO_PROXY), requires TLS 1.2 or later, sends userAgent when a
@@ -60,6 +74,9 @@ type Response struct {
 	ETag       string
 	Generation string // x-goog-generation
 	Location   string
+	// Total is the size of the whole resource: from Content-Range for a 206, else Content-Length;
+	// -1 when the server did not say.
+	Total int64
 }
 
 // Fetch performs r. A 2xx body is read whole, up to MaxBytes. 304, 416 and (with NoRedirect) 3xx
@@ -95,6 +112,10 @@ func Fetch(ctx context.Context, c *http.Client, r Request) (Response, error) {
 		ETag:       resp.Header.Get("ETag"),
 		Generation: resp.Header.Get("x-goog-generation"),
 		Location:   resp.Header.Get("Location"),
+		Total:      resp.ContentLength,
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		out.Total = rangeTotal(resp.Header.Get("Content-Range"))
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -115,6 +136,19 @@ func Fetch(ctx context.Context, c *http.Client, r Request) (Response, error) {
 	default:
 		return out, fmt.Errorf("feeds: GET %s: %s", r.URL, resp.Status)
 	}
+}
+
+// rangeTotal returns the complete length of a "bytes first-last/complete" Content-Range, or -1.
+func rangeTotal(v string) int64 {
+	_, total, ok := strings.Cut(v, "/")
+	if !ok || !strings.HasPrefix(v, "bytes ") {
+		return -1
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // Download streams url into dst, writing dst+".part" first (hashed into h when h is non-nil) and

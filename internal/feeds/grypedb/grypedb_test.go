@@ -311,3 +311,30 @@ func TestGrypeDB_KeepsCurrentAndPrevious(t *testing.T) {
 	require.Len(t, fx.h.updates, 3)
 	require.ElementsMatch(t, []string{built2.Format("20060102T150405Z"), built3.Format("20060102T150405Z")}, fx.dbDirs(t))
 }
+
+// TestGrypeDB_NoDiffWhenFull: when the weekly full re-match is due, Changed is unused, so the diff
+// (minutes and gigabytes of SQLite temp space on a production DB) is not run.
+func TestGrypeDB_NoDiffWhenFull(t *testing.T) {
+	fx := newFixture(t)
+	clock := now
+	fx.feed = grypedb.New(grypedb.Options{
+		Config:  config.FeedConfig{Enabled: true, URL: fx.srv.listingURL(), Interval: time.Hour, StaleAfter: 48 * time.Hour},
+		DataDir: fx.dataDir,
+		Store:   fx.st,
+		HTTP:    fx.srv.Client(),
+		Handler: fx.h.handle,
+		Now:     func() time.Time { return clock },
+	})
+	fx.srv.publish(t, grypedbtest.BuildDB(t, built1, "**/debian-12/cve-2022-38178.json"), built1)
+	require.NoError(t, fx.feed.Sync(ctx))
+
+	clock = clock.Add(8 * 24 * time.Hour) // the last full re-match is over 7 days old
+	fx.srv.publish(t, grypedbtest.BuildDB(t, built2), built2)
+	require.NoError(t, fx.feed.Sync(ctx))
+
+	require.Len(t, fx.h.updates, 2)
+	u := fx.h.updates[1]
+	require.True(t, u.Full)
+	require.Empty(t, u.Changed, "no diff for a full re-match")
+	require.Equal(t, clock.UTC().Format(time.RFC3339), fx.state(t).Meta["lastFull"])
+}

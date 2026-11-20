@@ -1,11 +1,13 @@
 // Package epss reads the daily FIRST EPSS scores (spec §6.4). Each advisory in use gets its EPSS
 // score and percentile; a score that crosses a priority threshold (spec §6.6) is handed to the
-// handler so the engine re-ranks the affected findings.
+// handler so the engine re-ranks the affected findings. An advisory first matched between syncs gets
+// its score through the engine observer hook, as soon as the match is stored.
 package epss
 
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"encoding/csv"
@@ -20,7 +22,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/go-logr/logr"
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds"
@@ -57,8 +62,13 @@ type Options struct {
 	Now        func() time.Time // nil = time.Now
 }
 
-// Feed is the EPSS feed. It implements feeds.Feed.
-type Feed struct{ o Options }
+// Feed is the EPSS feed. It implements feeds.Feed and engine.Observer.
+type Feed struct {
+	o Options
+
+	mu     sync.Mutex
+	scores scoreTable // every score of the file last applied; nil until read
+}
 
 // New returns the EPSS feed.
 func New(o Options) *Feed {
@@ -190,10 +200,25 @@ func (f *Feed) Sync(ctx context.Context) error {
 	return f.o.Store.PutFeedState(ctx, st)
 }
 
-// apply reads the gzipped CSV in gz and stores the score of every advisory in use whose stored
-// score or percentile differs (with zeroOnly: whose stored score is zero). It returns the IDs whose
-// score crossed a threshold and the file's score date.
+// apply reads the gzipped CSV in gz, makes it the table MatchesReplaced scores new matches from,
+// and stores the score of every advisory in use whose stored score or percentile differs (with
+// zeroOnly: whose stored score is zero). It returns the IDs whose score crossed a threshold and the
+// file's score date. The table is published before the advisories in use are read, so a match
+// stored from then on is covered by MatchesReplaced if this pass misses it.
 func (f *Feed) apply(ctx context.Context, gz []byte, zeroOnly bool) (reported []string, scoreDate string, err error) {
+	var table scoreTable
+	scoreDate, err = readScores(ctx, gz, func(cve string, score, pct float64) error {
+		table = table.add(cve, score, pct)
+		return nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	table = table.sorted()
+	f.mu.Lock()
+	f.scores = table
+	f.mu.Unlock()
+
 	inUse, err := f.o.Store.AdvisoryIDsInUse(ctx)
 	if err != nil {
 		return nil, "", err
@@ -202,9 +227,28 @@ func (f *Feed) apply(ctx context.Context, gz []byte, zeroOnly bool) (reported []
 	if err != nil {
 		return nil, "", err
 	}
+	for _, id := range slices.Sorted(maps.Keys(have)) {
+		a := have[id]
+		e, ok := table.lookup(id)
+		if !ok || (zeroOnly && a.EPSS != 0) || (e.epss == a.EPSS && e.pct == a.EPSSPercentile) {
+			continue
+		}
+		if err := f.o.Store.SetAdvisoryEPSS(ctx, id, e.epss, e.pct); err != nil {
+			return reported, scoreDate, err
+		}
+		if f.crossed(a, e.epss) {
+			reported = append(reported, id)
+		}
+	}
+	return reported, scoreDate, nil
+}
+
+// readScores calls fn with every row of the gzipped CSV in gz whose score and percentile parse, and
+// returns the file's score date.
+func readScores(ctx context.Context, gz []byte, fn func(cve string, score, pct float64) error) (scoreDate string, err error) {
 	zr, err := gzip.NewReader(bytes.NewReader(gz))
 	if err != nil {
-		return nil, "", fmt.Errorf("epss: scores: %w", err)
+		return "", fmt.Errorf("epss: scores: %w", err)
 	}
 	defer func() { _ = zr.Close() }()
 	br := bufio.NewReader(io.LimitReader(zr, maxCSVBytes))
@@ -223,35 +267,147 @@ func (f *Feed) apply(ctx context.Context, gz []byte, zeroOnly bool) (reported []
 	r.FieldsPerRecord = 3
 	head, err := r.Read()
 	if err != nil || head[0] != "cve" || head[1] != "epss" || head[2] != "percentile" {
-		return nil, "", fmt.Errorf("epss: scores: unexpected header %v", head)
+		return "", fmt.Errorf("epss: scores: unexpected header %v", head)
 	}
 	for {
 		if err := ctx.Err(); err != nil {
-			return reported, scoreDate, err
+			return scoreDate, err
 		}
 		rec, err := r.Read()
 		if errors.Is(err, io.EOF) {
-			return reported, scoreDate, nil
+			return scoreDate, nil
 		}
 		if err != nil {
-			return reported, scoreDate, fmt.Errorf("epss: scores: %w", err)
-		}
-		a, ok := have[rec[0]]
-		if !ok || (zeroOnly && a.EPSS != 0) {
-			continue
+			return scoreDate, fmt.Errorf("epss: scores: %w", err)
 		}
 		score, err1 := strconv.ParseFloat(rec[1], 64)
 		pct, err2 := strconv.ParseFloat(rec[2], 64)
-		if err1 != nil || err2 != nil || (score == a.EPSS && pct == a.EPSSPercentile) {
+		if err1 != nil || err2 != nil {
 			continue
 		}
-		if err := f.o.Store.SetAdvisoryEPSS(ctx, rec[0], score, pct); err != nil {
-			return reported, scoreDate, err
-		}
-		if f.crossed(a, score) {
-			reported = append(reported, rec[0])
+		if err := fn(rec[0], score, pct); err != nil {
+			return scoreDate, err
 		}
 	}
+}
+
+// MatchesReplaced is the engine.Observer hook. It gives the advisories now matched on digests that
+// have no score yet the score of the file last applied, so a new match is ranked with it from its
+// first recompute: the engine queues the owners after this returns. Without it the score would
+// arrive with the next daily sync and could escalate the finding, alerting twice. Errors are logged:
+// the next sync scores them anyway.
+func (f *Feed) MatchesReplaced(ctx context.Context, digests []string) {
+	if err := f.applyCached(ctx, digests); err != nil {
+		logr.FromContextOrDiscard(ctx).Error(err, "applying cached EPSS scores to new matches failed; the next sync applies them")
+	}
+}
+
+// OwnersRecomputed implements engine.Observer; the feed has nothing to do then.
+func (f *Feed) OwnersRecomputed(context.Context, []string) {}
+
+func (f *Feed) applyCached(ctx context.Context, digests []string) error {
+	scores := f.cached(ctx)
+	if len(scores) == 0 {
+		return nil
+	}
+	ids, err := f.o.Store.AdvisoryIDsOnDigests(ctx, digests)
+	if err != nil {
+		return err
+	}
+	ids = slices.DeleteFunc(ids, func(id string) bool { _, ok := scores.lookup(id); return !ok })
+	if len(ids) == 0 {
+		return nil
+	}
+	have, err := f.o.Store.Advisories(ctx, ids)
+	if err != nil {
+		return err
+	}
+	for _, id := range ids {
+		a, ok := have[id]
+		if !ok || a.EPSS != 0 || a.EPSSPercentile != 0 {
+			continue
+		}
+		e, _ := scores.lookup(id)
+		if err := f.o.Store.SetAdvisoryEPSS(ctx, id, e.epss, e.pct); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cached returns the scores of the file last applied, reading the cached copy on first use after a
+// restart; nil when there is none yet.
+func (f *Feed) cached(ctx context.Context) scoreTable {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.scores == nil {
+		gz, err := os.ReadFile(filepath.Join(f.o.DataDir, cacheRel)) //nolint:gosec // G304: the path is under the configured data directory
+		if err != nil {
+			return nil
+		}
+		var t scoreTable
+		if _, err := readScores(ctx, gz, func(cve string, score, pct float64) error {
+			t = t.add(cve, score, pct)
+			return nil
+		}); err != nil {
+			logr.FromContextOrDiscard(ctx).Info("the cached EPSS scores are unreadable; new matches wait for the next sync", "error", err.Error())
+		}
+		f.scores = t.sorted()
+		if f.scores == nil {
+			f.scores = scoreTable{} // read once; Sync replaces it
+		}
+	}
+	return f.scores
+}
+
+// scoreTable holds every score of a file in about 24 bytes each, sorted by CVE.
+type scoreTable []scoreEntry
+
+type scoreEntry struct {
+	key       uint64 // cveKey
+	epss, pct float64
+}
+
+// cveKey packs "CVE-<year>-<number>" into a sortable integer.
+func cveKey(id string) (uint64, bool) {
+	rest, ok := strings.CutPrefix(id, "CVE-")
+	if !ok {
+		return 0, false
+	}
+	y, n, ok := strings.Cut(rest, "-")
+	if !ok || len(y) != 4 || len(n) < 4 {
+		return 0, false
+	}
+	year, err1 := strconv.ParseUint(y, 10, 16)
+	num, err2 := strconv.ParseUint(n, 10, 32)
+	if err1 != nil || err2 != nil {
+		return 0, false
+	}
+	return year<<32 | num, true
+}
+
+func (t scoreTable) add(cve string, epss, pct float64) scoreTable {
+	if k, ok := cveKey(cve); ok {
+		t = append(t, scoreEntry{key: k, epss: epss, pct: pct})
+	}
+	return t
+}
+
+func (t scoreTable) sorted() scoreTable {
+	slices.SortFunc(t, func(a, b scoreEntry) int { return cmp.Compare(a.key, b.key) })
+	return slices.Clip(t)
+}
+
+func (t scoreTable) lookup(cve string) (scoreEntry, bool) {
+	k, ok := cveKey(cve)
+	if !ok {
+		return scoreEntry{}, false
+	}
+	i, found := slices.BinarySearchFunc(t, k, func(e scoreEntry, k uint64) int { return cmp.Compare(e.key, k) })
+	if !found {
+		return scoreEntry{}, false
+	}
+	return t[i], true
 }
 
 // crossed reports whether moving a's score to now crosses a threshold.

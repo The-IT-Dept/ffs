@@ -146,6 +146,26 @@ func (s *Store) PutUpstreamRanges(ctx context.Context, advisoryID, productKey st
 	return err
 }
 
+// ReplaceUpstreamRanges replaces every stored range of an advisory with byProduct (product key →
+// ranges), in one transaction. An empty byProduct removes them all, as for a rejected CVE.
+func (s *Store) ReplaceUpstreamRanges(ctx context.Context, advisoryID string, byProduct map[string][]byte) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM upstream_ranges WHERE advisory_id = ?`, advisoryID); err != nil {
+			return err
+		}
+		for key, ranges := range byProduct {
+			if ranges == nil {
+				ranges = []byte{}
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO upstream_ranges(advisory_id, product_key, ranges) VALUES(?, ?, ?)`,
+				advisoryID, key, ranges); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // UpstreamRanges returns the stored ranges for productKey, keyed by advisory id.
 func (s *Store) UpstreamRanges(ctx context.Context, productKey string) (map[string][]byte, error) {
 	type row struct {

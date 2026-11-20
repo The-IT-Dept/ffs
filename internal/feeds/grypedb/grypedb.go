@@ -60,7 +60,7 @@ type PackageKey struct{ Ecosystem, Name string }
 type Update struct {
 	Path    string // DB directory holding vulnerability.db
 	Built   time.Time
-	Changed []PackageKey // packages whose records changed since the previous build; empty on first install
+	Changed []PackageKey // packages whose records changed since the previous build; empty when Full
 	Full    bool         // re-match everything: first install, or the last full re-match is over 7 days old
 }
 
@@ -185,14 +185,15 @@ func (f *Feed) Sync(ctx context.Context) error {
 		}
 	}
 
-	u := Update{Path: newDir, Built: l.Built}
-	if current != "" && current != name {
+	lastFull, _ := time.Parse(time.RFC3339, st.Meta[metaLastFull])
+	u := Update{Path: newDir, Built: l.Built, Full: current == "" || f.o.Now().Sub(lastFull) > fullInterval}
+	// A full re-match ignores Changed, and the diff of two production builds takes minutes and
+	// gigabytes of SQLite temp space: run it only when its result is used.
+	if !u.Full && current != name {
 		if u.Changed, err = changedPackages(filepath.Join(f.root, current), newDir); err != nil {
 			return err
 		}
 	}
-	lastFull, _ := time.Parse(time.RFC3339, st.Meta[metaLastFull])
-	u.Full = current == "" || f.o.Now().Sub(lastFull) > fullInterval
 
 	feeds.SetPending(&st, []string{l.Built.Format(time.RFC3339)})
 	if err := f.o.Store.PutFeedState(ctx, st); err != nil {

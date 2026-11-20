@@ -31,6 +31,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/controller/deps"
 	"github.com/the-it-dept/ffs/internal/exposure"
+	"github.com/the-it-dept/ffs/internal/feeds/grypedb"
 	"github.com/the-it-dept/ffs/internal/inventory"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -124,6 +125,10 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 	}
 	log := logf.Log
 
+	// Before the first database is opened: the SQLite runtime reads the environment once.
+	if _, err := grypedb.UseSQLiteTempDir(cfg.DataDir); err != nil {
+		return err
+	}
 	st, err := store.Open(ctx, cfg.StorePath)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
