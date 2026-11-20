@@ -10,11 +10,11 @@ export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
   const f = copy.nodes.agentFields
   return (
     <div className="text-[12px]">
-      <dl className="grid max-w-2xl grid-cols-[10rem_1fr] gap-x-4 gap-y-1.5">
+      <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
         <dt className="text-muted-foreground">{f.state}</dt>
         <dd>{copy.agentState[agent.state]}</dd>
         <dt className="text-muted-foreground">{f.version}</dt>
-        <dd>{agent.agentVersion ? <Mono>{agent.agentVersion}</Mono> : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
+        <dd>{agent.agentVersion ? <Mono wrap>{agent.agentVersion}</Mono> : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
         <dt className="text-muted-foreground">{f.lastReport}</dt>
         <dd>
           <RelativeTime iso={agent.lastReport} />
@@ -24,7 +24,7 @@ export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
           <RelativeTime iso={agent.lastFullReport} />
         </dd>
         <dt className="text-muted-foreground">{f.kernel}</dt>
-        <dd>{agent.kernelRelease ? <Mono>{agent.kernelRelease}</Mono> : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
+        <dd>{agent.kernelRelease ? <Mono wrap>{agent.kernelRelease}</Mono> : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
         <dt className="text-muted-foreground">{copy.nodes.rebootPending}</dt>
         <dd>
           {agent.rebootPending ? copy.nodes.yes : copy.nodes.no}

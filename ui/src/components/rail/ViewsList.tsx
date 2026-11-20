@@ -20,13 +20,14 @@ export function ViewsList({ scope, views, active, from }: { scope: Scope; views:
               href={viewHref(scope, v.id, from)}
               aria-current={current ? 'page' : undefined}
               className={cn(
-                'flex items-center justify-between gap-2 rounded-md px-2 py-1 text-[12px]',
+                'flex items-center justify-between gap-2 rounded-md px-2 py-1 text-[12px] max-lg:min-h-10',
                 current ? 'bg-foreground font-medium text-background' : 'text-foreground hover:bg-muted',
               )}
             >
               <span className="truncate">{copy.view(v.id, scope.kind)}</span>
               {v.gap ? (
-                <CoverageMark>{copy.rail.gap}</CoverageMark>
+                // On the selected row the mark keeps its own ground and text, so it reads in both themes.
+                <CoverageMark className={current ? 'bg-background text-foreground' : undefined}>{copy.rail.gap}</CoverageMark>
               ) : v.count !== null ? (
                 <span className={cn('tabular-nums', current ? 'text-background/70' : 'text-muted-foreground')}>{formatCompact(v.count)}</span>
               ) : null}

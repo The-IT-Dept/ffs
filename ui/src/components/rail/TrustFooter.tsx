@@ -11,7 +11,7 @@ import type { Scope } from '@/lib/scope'
 export function TrustFooter({ trust }: { trust: S<'Trust'>; scope: Scope }) {
   return (
     <div className="flex flex-col gap-1 border-t pt-2 text-[11px] text-muted-foreground">
-      <AppLink href="/feeds" className="hover:text-foreground">
+      <AppLink href="/feeds" className="hover:text-foreground max-lg:flex max-lg:min-h-10 max-lg:items-center">
         {trust.feeds.fresh ? (
           <span>
             {copy.trust.feedsFresh}
@@ -33,11 +33,11 @@ export function TrustFooter({ trust }: { trust: S<'Trust'>; scope: Scope }) {
       {trust.settings ? (
         <div className="flex items-center gap-1.5">
           <span aria-hidden="true">⚙</span>
-          <AppLink href="/exceptions" className="hover:text-foreground hover:underline">
+          <AppLink href="/exceptions" className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
             {copy.trust.exceptions}
           </AppLink>
           <span aria-hidden="true">·</span>
-          <AppLink href="/settings" className="hover:text-foreground hover:underline">
+          <AppLink href="/settings" className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
             {copy.trust.settings}
           </AppLink>
         </div>

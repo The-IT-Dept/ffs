@@ -136,3 +136,40 @@
   border: 1px dashed var(--color-zinc-400);
   background-image: repeating-linear-gradient(45deg, transparent 0 4px, var(--muted) 4px 8px);
 }
+
+/* A wide table scrolls inside its own container (components/ui/table.tsx), and its first column,
+   the path or name, stays in view. That column is opaque so the scrolled columns pass under it,
+   and it keeps the row's tint: hover (as hover:bg-muted/50 does), an expanded group row, or a row
+   marked data-tinted (the exposure table's group rows, bg-muted/50). Below lg, where tables
+   usually scroll, a rule marks its edge; on a phone it takes at most 60% of the width, so the
+   rest of the row stays reachable. */
+:root {
+  --row-tint: color-mix(in oklab, var(--muted) 50%, transparent);
+}
+[data-slot="table"] > * > tr > :first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background-color: var(--background);
+}
+[data-slot="table-row"][data-tinted] > :first-child,
+[data-slot="table-row"]:has([aria-expanded="true"]) > :first-child {
+  background-image: linear-gradient(var(--row-tint), var(--row-tint));
+}
+@media (hover: hover) {
+  [data-slot="table-body"] > [data-slot="table-row"]:hover > :first-child {
+    background-image: linear-gradient(var(--row-tint), var(--row-tint));
+  }
+}
+@media (width < 64rem) {
+  [data-slot="table"] > * > tr > :first-child {
+    box-shadow: inset -1px 0 0 var(--border);
+  }
+}
+@media (width < 40rem) {
+  [data-slot="table"] > * > tr > :first-child {
+    max-width: 60vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+}

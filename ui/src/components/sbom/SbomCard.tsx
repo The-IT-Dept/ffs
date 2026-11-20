@@ -70,7 +70,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           <ul className="flex flex-wrap gap-x-3 gap-y-1">
             {image.usedBy.map((w) => (
               <li key={w.scope}>
-                <AppLink href={workloadPath(w.kind, w.namespace, w.name)} className="hover:underline">
+                <AppLink href={workloadPath(w.kind, w.namespace, w.name)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
                   {w.name}
                 </AppLink>{' '}
                 <span className="text-muted-foreground">{w.namespace}</span>

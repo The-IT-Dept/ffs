@@ -63,18 +63,18 @@ function KernelView({ d }: { d: Detail }) {
   const k = copy.nodes.kernelCols
   return (
     <div className="text-[12px]">
-      <dl className="grid max-w-2xl grid-cols-[10rem_1fr] gap-x-4 gap-y-1.5">
+      <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
         <dt className="text-muted-foreground">{f.kernel}</dt>
         <dd>
-          <Mono>{g.kernelRelease}</Mono>
+          <Mono wrap>{g.kernelRelease}</Mono>
         </dd>
         <dt className="text-muted-foreground">{f.runtime}</dt>
         <dd>
-          <Mono>{g.containerRuntimeVersion}</Mono>
+          <Mono wrap>{g.containerRuntimeVersion}</Mono>
         </dd>
         <dt className="text-muted-foreground">{f.kubelet}</dt>
         <dd>
-          <Mono>{g.kubeletVersion}</Mono>
+          <Mono wrap>{g.kubeletVersion}</Mono>
         </dd>
         <dt className="text-muted-foreground">{f.osImage}</dt>
         <dd>{g.osImage}</dd>
@@ -84,22 +84,22 @@ function KernelView({ d }: { d: Detail }) {
       <div className="mt-4">
         <AgentGate agentData={d.agentData}>
           {g.kernel ? (
-            <dl className="grid max-w-2xl grid-cols-[10rem_1fr] gap-x-4 gap-y-1.5">
+            <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
               <dt className="text-muted-foreground">{copy.nodes.kernelFields.release}</dt>
               <dd>
-                <Mono>{g.kernel.release}</Mono>
+                <Mono wrap>{g.kernel.release}</Mono>
               </dd>
               <dt className="text-muted-foreground">{copy.nodes.kernelFields.package}</dt>
               <dd>
-                <Mono>{g.kernel.package}</Mono>
+                <Mono wrap>{g.kernel.package}</Mono>
               </dd>
               <dt className="text-muted-foreground">{copy.nodes.kernelFields.version}</dt>
               <dd>
-                <Mono>{g.kernel.version}</Mono>
+                <Mono wrap>{g.kernel.version}</Mono>
               </dd>
               <dt className="text-muted-foreground">{copy.nodes.kernelFields.source}</dt>
               <dd>
-                <Mono>{g.kernel.sourceName}</Mono>
+                <Mono wrap>{g.kernel.sourceName}</Mono>
               </dd>
             </dl>
           ) : null}

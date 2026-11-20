@@ -61,16 +61,16 @@ export function Pager({
       {label ? <span className="tabular-nums">{label}</span> : null}
       <span className="ml-auto flex items-center gap-1.5">
         {info.page === null ? (
-          <Button variant="outline" size="xs" onClick={onFirst}>
+          <Button variant="outline" size="xs" className="max-lg:h-10 max-lg:px-3" onClick={onFirst}>
             {copy.explorer.first}
           </Button>
         ) : null}
         {info.prev ? (
-          <Button variant="outline" size="xs" onClick={onPrev}>
+          <Button variant="outline" size="xs" className="max-lg:h-10 max-lg:px-3" onClick={onPrev}>
             {copy.explorer.previous}
           </Button>
         ) : null}
-        <Button variant="outline" size="xs" disabled={!hasNext} onClick={onNext}>
+        <Button variant="outline" size="xs" className="max-lg:h-10 max-lg:px-3" disabled={!hasNext} onClick={onNext}>
           {copy.explorer.next}
         </Button>
       </span>

@@ -20,7 +20,7 @@ import { rootRoute } from './root'
 function Stat({ value, label, secondary, className }: { value: ReactNode; label: string; secondary?: string; className?: string }) {
   return (
     <div className="min-w-0">
-      <div className={cn('text-[22px] leading-tight font-semibold tabular-nums', className)}>{value}</div>
+      <div className={cn('text-[22px] leading-tight font-semibold whitespace-nowrap tabular-nums', className)}>{value}</div>
       <div className="text-[11px] text-muted-foreground">{label}</div>
       {secondary ? <div className="text-[11px] text-muted-foreground">{secondary}</div> : null}
     </div>
@@ -28,12 +28,12 @@ function Stat({ value, label, secondary, className }: { value: ReactNode; label:
 }
 
 // Headline is the four home figures: reachable workloads, how many of them carry urgent findings,
-// fixable findings, and how many images ffs sees in full detail.
+// fixable findings, and how many images ffs sees in full detail. Below sm they sit two by two.
 function Headline({ s }: { s: S<'Summary'> }) {
   const c = s.coverage
   const figure = `${formatCount(c.full)}/${formatCount(c.inUse)}`
   return (
-    <div className="mb-3 grid max-w-4xl grid-cols-4 gap-6">
+    <div className="mb-3 grid max-w-4xl grid-cols-2 gap-x-6 gap-y-4 sm:grid-cols-4 sm:gap-6">
       <Stat value={formatCount(s.reachable)} label={copy.headline.reachable} />
       <Stat value={formatCount(s.reachableUrgent)} label={copy.headline.reachableUrgent} className={s.reachableUrgent > 0 ? 'text-(--urgent)' : undefined} />
       <Stat value={formatCount(s.fixable)} label={copy.headline.fixable} />

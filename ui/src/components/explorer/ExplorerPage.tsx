@@ -1,14 +1,18 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef } from 'react'
+import { SlidersHorizontal } from 'lucide-react'
+import { type ReactNode, useEffect, useMemo, useRef } from 'react'
 import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { CoverageFigureText } from '@/components/signals/CoverageFigureText'
+import { Button } from '@/components/ui/button'
+import { Sheet, SheetContent, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { type CountNoun, copy, countsLine } from '@/lib/copy'
 import { plural } from '@/lib/format'
+import { useMediaQuery, WIDE } from '@/lib/hooks'
 import {
   chipsOf,
   EXPLORERS,
@@ -62,9 +66,30 @@ function TableSkeleton() {
   )
 }
 
+// FilterSheet holds the facets below the lg breakpoint, behind a "Filters (n)" button counting the
+// active filters (the chips). Toggling a facet keeps the sheet open, so several can be set at once.
+function FilterSheet({ count, children }: { count: number; children: ReactNode }) {
+  return (
+    <Sheet>
+      <SheetTrigger asChild>
+        <Button variant="outline" className="h-10 shrink-0 px-3 text-[12px] font-normal">
+          <SlidersHorizontal aria-hidden="true" />
+          {copy.explorer.filters(count)}
+        </Button>
+      </SheetTrigger>
+      <SheetContent side="right" aria-describedby={undefined} closeLabel={copy.shell.close} className="w-[300px] max-w-[85vw] gap-0 overflow-y-auto sm:max-w-[85vw]">
+        <SheetTitle className="flex h-12 shrink-0 items-center px-4 text-[13px]">{copy.explorer.filtersTitle}</SheetTitle>
+        <div className="px-4 pb-6">{children}</div>
+      </SheetContent>
+    </Sheet>
+  )
+}
+
 // ExplorerPage is one explorer: facets, chips, a group switch (findings only), a server-sorted
 // table and a cursor pager. The URL is the state: every change goes through onSearch, and every
 // filter change drops the cursor. A cursor the server rejects is dropped, and page one loads.
+// Below the lg breakpoint the results come first: the facets move into a filters sheet, and the
+// chips stay above the table.
 export function ExplorerPage<K extends ExplorerKind>({
   kind,
   title,
@@ -81,6 +106,7 @@ export function ExplorerPage<K extends ExplorerKind>({
   rowKey: (r: ExplorerRow<K>) => string
 }) {
   const spec = EXPLORERS[kind]
+  const wide = useMediaQuery(WIDE)
   // Only what this explorer's endpoint takes; every update below is built from it, so a stray key
   // in a shared URL never reaches the server and is dropped from the URL on the next change.
   const search = useMemo(() => revalidate(explorerSearchFor(kind), routeSearch), [kind, routeSearch])
@@ -142,34 +168,52 @@ export function ExplorerPage<K extends ExplorerKind>({
       />
     )
 
+  const facetColumn = (className?: string) => (
+    <FacetColumn
+      kind={kind}
+      facets={data?.facets ?? {}}
+      search={search}
+      epssBump={epssBump}
+      onToggle={(key, value, on) => onSearch(withFacet(search, key, value, on))}
+      className={className}
+    />
+  )
+  const filterChips = (
+    <FilterChips
+      chips={chips}
+      onRemove={(c) => onSearch(removeChip(search, c))}
+      onClear={() => onSearch({ scope: search.scope, group: search.group, sort: search.sort })}
+    />
+  )
+  const groupSwitch =
+    kind === 'findings' ? (
+      <GroupSwitch
+        label={copy.explorer.groupBy}
+        value={search.group ?? ''}
+        options={['', ...spec.groups].map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
+        onChange={(v) => onSearch({ ...search, group: v || undefined, cursor: undefined })}
+      />
+    ) : null
+
   return (
     <div className="flex gap-5">
-      <FacetColumn
-        kind={kind}
-        facets={data?.facets ?? {}}
-        search={search}
-        epssBump={epssBump}
-        onToggle={(key, value, on) => onSearch(withFacet(search, key, value, on))}
-      />
+      {wide ? facetColumn() : null}
       <div className="min-w-0 flex-1">
         <PageHeader title={title} sub={sub} />
-        <div className="mb-2 flex flex-wrap items-center gap-3">
-          <div className="min-w-0 flex-1">
-            <FilterChips
-              chips={chips}
-              onRemove={(c) => onSearch(removeChip(search, c))}
-              onClear={() => onSearch({ scope: search.scope, group: search.group, sort: search.sort })}
-            />
+        {wide ? (
+          <div className="mb-2 flex flex-wrap items-center gap-3">
+            <div className="min-w-0 flex-1">{filterChips}</div>
+            {groupSwitch}
           </div>
-          {kind === 'findings' ? (
-            <GroupSwitch
-              label={copy.explorer.groupBy}
-              value={search.group ?? ''}
-              options={['', ...spec.groups].map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
-              onChange={(v) => onSearch({ ...search, group: v || undefined, cursor: undefined })}
-            />
-          ) : null}
-        </div>
+        ) : (
+          <div className="mb-2 flex flex-col gap-2">
+            <div className="flex min-w-0 items-center gap-3">
+              <FilterSheet count={chips.length}>{facetColumn('w-full border-r-0 pr-0')}</FilterSheet>
+              {groupSwitch}
+            </div>
+            {filterChips}
+          </div>
+        )}
         {body}
         {data && data.total > 0 && !rejected ? (
           <Pager

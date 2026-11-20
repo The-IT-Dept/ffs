@@ -19,12 +19,21 @@ Element.prototype.releasePointerCapture ??= function releasePointerCapture() {}
 // The router restores scroll positions; jsdom reports window.scrollTo as not implemented.
 window.scrollTo = function scrollTo() {} as typeof window.scrollTo
 
+// Width queries are answered against window.innerWidth, which jsdom sets to 1024, so pages render
+// their wide layout unless a test says otherwise; every other query (the colour scheme) is false.
+function widthMatches(query: string): boolean {
+  const min = /\(min-width:\s*(\d+)px\)/.exec(query)
+  const max = /\(max-width:\s*(\d+(?:\.\d+)?)px\)/.exec(query)
+  if (!min && !max) return false
+  return (!min || window.innerWidth >= Number(min[1])) && (!max || window.innerWidth <= Number(max[1]))
+}
+
 if (typeof window.matchMedia !== 'function') {
   Object.defineProperty(window, 'matchMedia', {
     configurable: true,
     writable: true,
     value: (query: string): MediaQueryList => ({
-      matches: false,
+      matches: widthMatches(query),
       media: query,
       onchange: null,
       addEventListener() {},

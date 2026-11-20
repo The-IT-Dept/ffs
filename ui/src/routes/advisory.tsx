@@ -163,7 +163,12 @@ function AdvisoryPage() {
               <ul className="flex flex-col gap-0.5 text-[12px]">
                 {a.links.map((l) => (
                   <li key={l}>
-                    <a href={l} target="_blank" rel="noreferrer noopener" className="break-all underline underline-offset-2 hover:text-foreground">
+                    <a
+                      href={l}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="break-all underline underline-offset-2 hover:text-foreground max-lg:flex max-lg:min-h-10 max-lg:items-center"
+                    >
                       {l}
                     </a>
                   </li>

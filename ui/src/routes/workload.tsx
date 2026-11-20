@@ -185,10 +185,10 @@ function RbacView({ d }: { d: Detail }) {
       </ul>
     ) : null
   return (
-    <dl className="grid max-w-2xl grid-cols-[10rem_1fr] gap-x-4 gap-y-2 text-[12px]">
+    <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-2 text-[12px]">
       <dt className="text-muted-foreground">{w.serviceAccount}</dt>
       <dd>
-        <Mono>{d.serviceAccount}</Mono>
+        <Mono wrap>{d.serviceAccount}</Mono>
       </dd>
       <dt className="text-muted-foreground">{w.saPower}</dt>
       <dd>
@@ -291,7 +291,7 @@ function WorkloadPage() {
       <>
         {d.managedBy ? <span>{copy.workload.managedBy(copy.managedBy(d.managedBy))}</span> : null}
         {d.managedBy && first ? ' · ' : null}
-        {first ? <Mono>{first.image}</Mono> : null}
+        {first ? <Mono wrap>{first.image}</Mono> : null}
       </>
     ) : undefined
 

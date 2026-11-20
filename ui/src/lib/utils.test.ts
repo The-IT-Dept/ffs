@@ -8,7 +8,7 @@ describe('cn', () => {
 
   it('no component imports the cn package', () => {
     const files = import.meta.glob('../components/ui/*.tsx', { query: '?raw', import: 'default', eager: true }) as Record<string, string>
-    expect(Object.keys(files).length).toBe(19)
+    expect(Object.keys(files).length).toBe(20) // the shadcn set plus sheet (phones and tablets)
     for (const [name, src] of Object.entries(files)) expect(src, name).not.toMatch(/from ["']cn["']/)
   })
 })

@@ -10,9 +10,9 @@ import { ScopeCard } from './ScopeCard'
 import { TrustFooter } from './TrustFooter'
 import { ViewsList } from './ViewsList'
 
-// Rail is the contextual left rail. It has the same four parts at every depth (scope card, views,
-// inside or related, trust footer) and rebuilds around whatever page the router lands on.
-export function Rail() {
+// useRailScope is the scope the router has landed on and its rail payload. The rail and the
+// narrow-screen menu button share it, so the button's scope label costs no extra request.
+export function useRailScope() {
   // Only what the rail needs leaves the selector, all strings, so structural sharing keeps the
   // result stable across unrelated router updates.
   const leaf = useRouterState({
@@ -32,6 +32,13 @@ export function Rail() {
   })
   const rs = routeScope(leaf.routeId, leaf.params, { scope: leaf.scope, view: leaf.view, from: leaf.from })
   const q = useQuery(apiQuery('/scope', { query: { ...scopeParam(rs.scope), ...(rs.from ? { from: rs.from } : {}) } }))
+  return { rs, q }
+}
+
+// Rail is the contextual left rail. It has the same four parts at every depth (scope card, views,
+// inside or related, trust footer) and rebuilds around whatever page the router lands on.
+export function Rail() {
+  const { rs, q } = useRailScope()
 
   if (q.isPending) {
     return (
