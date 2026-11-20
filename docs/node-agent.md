@@ -65,7 +65,11 @@ The limits total 500m CPU and 768Mi memory per pod, and the steady-state target 
 - one small report every 5 minutes, and a full report with the host SBOM every 6 hours;
 - one image catalogued at a time, at nice 10.
 
-The collector holds each SBOM once. It decodes the cataloguer's answer in one pass and sends the report or SBOM result without a second copy. The cataloguer's answer is capped at 65 MiB (the controller's 64 MiB SBOM limit plus 1 MiB), so a forwarded image SBOM stays inside the collector's 128Mi limit. A full report over `nodeAgent.maxReportBytes` is sent without its host SBOM. Images larger than `nodeAgent.maxImageBytes` are not catalogued by the agent.
+The collector never holds an SBOM in memory. It streams the cataloguer's answer into a file on the scratch volume, checking on the way that it is JSON, and streams the report or SBOM result to the controller from that file, which it then deletes. Its memory use does not grow with the SBOM, which the cataloguer caps at 65 MiB (the controller's 64 MiB SBOM limit plus 1 MiB). `GOMEMLIMIT` is 90% of each container's memory limit, and the cataloguer's workers get its limit less 128Mi, which the catalog server keeps for itself. A full report over `nodeAgent.maxReportBytes` is sent without its host SBOM. Images larger than `nodeAgent.maxImageBytes` are not catalogued by the agent.
+
+Before each full report the collector checks that the controller answers, and stages and catalogues the host only when it does. When a full report is not stored (the controller is down, answers with an error, asks for the host again, or answers `429` with `Retry-After` because it is busy), the collector keeps the host inventory it collected and resends it, after a growing, jittered backoff or at least the `Retry-After` time, without staging or cataloguing the host again. Images reports have their own backoff. While the controller is starting (connection refused, `503`), these retries are logged at Info, and as errors only once a full report interval has passed without an answer.
+
+The liveness probe checks a heartbeat file the collector touches every minute while its loop is making progress: while it sleeps between reports, sends a report or runs a job, for as long as that step may take. A loop that stops making progress stops touching it, and the probe restarts the collector once the heartbeat is 15 minutes old. Jobs run one at a time, and the collector sends any images report that has fallen due between them.
 
 ## Turning it off
 
@@ -145,7 +149,7 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods. |
 | `nodeAgent.tolerations` | `[{operator: Exists}]` | Tolerations of the agent pods; the default runs on every node. |
 | `nodeAgent.priorityClassName` | `""` | Priority class of the agent pods. |
-| `nodeAgent.resources` | see [Footprint](#footprint) | Requests and limits of the `collector` and `catalog` containers. |
+| `nodeAgent.resources` | see [Footprint](#footprint) | Requests and limits of the `collector` and `catalog` containers. Memory limits are byte counts or whole quantities such as `640Mi`: `GOMEMLIMIT` is 90% of each, and the cataloguer's workers get its limit less 128Mi, so it must be at least 192Mi. |
 | `nodeAgent.scratchSizeLimit` | `4Gi` | Size limit of the scratch volume; at least 1Gi, and more than `nodeAgent.maxImageBytes` plus 256Mi. |
 | `nodeAgent.maxImageBytes` | `1Gi` | Largest image the agent catalogues. |
 | `nodeAgent.port` | `8444` | Port of the agent API on the controller; not 8080, 8081 or 8443. |
@@ -156,7 +160,7 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.runtimeGrace` | `2h` | How long nodes must lack fresh reports before container runtime findings move back to the node-status owner. |
 | `nodeAgent.maxReportBytes` | `33554432` | Largest agent report accepted (32 MiB); also a quantity such as `32Mi`. |
 | `nodeAgent.workPerReport` | `3` | Image SBOM requests handed out with each report, 0 to 10. |
-| `nodeAgent.workTimeout` | `30m` | How long a request stays with the node it was offered to. |
+| `nodeAgent.workTimeout` | `20m` | How long a request stays with the node it was offered to. With `nodeAgent.imageListInterval` it must be shorter than `nodeAgent.staleAfter`: the agent reports between jobs, not during one. |
 | `nodeAgent.tls.certManager.enabled` | `false` | Issue the agent API certificate with cert-manager instead of the chart. |
 | `nodeAgent.tls.certManager.issuerRef` | `{}` | The cert-manager issuer reference. |
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |

@@ -83,8 +83,35 @@ heap, and the kernel's own accounting. At 100% the container can be OOM-killed b
 collector has tried to stay under the limit.
 */ -}}
 {{- define "ffs.goMemLimit" -}}
-{{- $limit := include "ffs.bytes" (list "controller.resources.limits.memory" .) | int64 -}}
+{{- include "ffs.goMemLimitOf" (list "controller.resources.limits.memory" .) -}}
+{{- end -}}
+
+{{- /*
+ffs.goMemLimitOf is a GOMEMLIMIT of 90% of a memory limit, in bytes, from (list "<value path>" <limit>), for
+the same reason as ffs.goMemLimit: at 100% a container can be OOM-killed before the garbage collector has
+tried to stay under its limit.
+*/ -}}
+{{- define "ffs.goMemLimitOf" -}}
+{{- $limit := include "ffs.bytes" . | int64 -}}
 {{- div (mul $limit 9) 10 -}}
+{{- end -}}
+
+{{- /*
+ffs.workerMemLimit is a cataloguer's --worker-memory-limit in bytes, from (list "<value path>" <limit>
+<concurrent jobs>): the container's memory limit less 128Mi for the catalog server, shared by the workers
+that run at once. A worker inherits the server's GOMEMLIMIT otherwise, as if it had the container to itself.
+The server's 128Mi covers its own heap and the answer of a worker that is still running, which it buffers:
+up to the 64 MiB SBOM limit plus coverage.
+*/ -}}
+{{- define "ffs.workerMemLimit" -}}
+{{- $name := index . 0 -}}
+{{- $limit := include "ffs.bytes" (list $name (index . 1)) | int64 -}}
+{{- $jobs := max (index . 2 | int64) 1 -}}
+{{- $worker := div (sub $limit 134217728) $jobs -}}
+{{- if lt $worker 67108864 -}}
+{{- fail (printf "%s must be at least 128Mi plus 64Mi per concurrent catalog job (%d): the catalog server keeps 128Mi" $name $jobs) -}}
+{{- end -}}
+{{- $worker -}}
 {{- end -}}
 
 {{- /*

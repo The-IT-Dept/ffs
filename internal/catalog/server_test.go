@@ -550,3 +550,26 @@ echo '{}'
 		require.Equal(t, tc.want, string(got))
 	}
 }
+
+// TestExecRunner_MemoryLimitForWorker: WithMemoryLimit replaces the GOMEMLIMIT the worker would inherit.
+func TestExecRunner_MemoryLimitForWorker(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "worker.sh")
+	require.NoError(t, os.WriteFile(script, []byte("#!/bin/sh\nprintf '%s' \"$GOMEMLIMIT\" > \"$OUT\"\necho '{}'\n"), 0o700)) //nolint:gosec // G306: the test runs it
+	t.Setenv("GOMEMLIMIT", "671088640")
+	req := sbom.CatalogRequest{Ref: "r@sha256:" + strings.Repeat("a", 64)}
+	for _, tc := range []struct {
+		opts []catalog.ExecOption
+		want string
+	}{
+		{[]catalog.ExecOption{catalog.WithMemoryLimit(536870912)}, "536870912"},
+		{nil, "671088640"},
+	} {
+		out := filepath.Join(t.TempDir(), "limit")
+		t.Setenv("OUT", out)
+		_, err := catalog.ExecRunner(script, tc.opts...)(ctx, req, t.TempDir())
+		require.NoError(t, err)
+		got, err := os.ReadFile(out) //nolint:gosec // G304: the test's own file
+		require.NoError(t, err)
+		require.Equal(t, tc.want, string(got))
+	}
+}

@@ -95,10 +95,14 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: GOMEMLIMIT
+              {{- with (dig "resources" "collector" "limits" "memory" "" $na) }}
+              value: {{ include "ffs.goMemLimitOf" (list "nodeAgent.resources.collector.limits.memory" .) | quote }}
+              {{- else }}
               valueFrom:
                 resourceFieldRef:
                   containerName: collector
                   resource: limits.memory
+              {{- end }}
           livenessProbe:
             exec:
               command: [/ffs, agent, check, --heartbeat=/scratch/heartbeat, --max-age=15m]
@@ -140,12 +144,19 @@ spec:
             - --max-concurrent=1
             - --nice=10
             - --scratch-limit={{ $scratchLimit }}
+            {{- with (dig "resources" "catalog" "limits" "memory" "" $na) }}
+            - --worker-memory-limit={{ include "ffs.workerMemLimit" (list "nodeAgent.resources.catalog.limits.memory" . 1) }}
+            {{- end }}
           env:
             - name: GOMEMLIMIT
+              {{- with (dig "resources" "catalog" "limits" "memory" "" $na) }}
+              value: {{ include "ffs.goMemLimitOf" (list "nodeAgent.resources.catalog.limits.memory" .) | quote }}
+              {{- else }}
               valueFrom:
                 resourceFieldRef:
                   containerName: catalog
                   resource: limits.memory
+              {{- end }}
           resources:
             {{- toYaml $na.resources.catalog | nindent 12 }}
           securityContext:

@@ -67,7 +67,7 @@ func workDirs(t *testing.T, scratch string) []string {
 // newTestAgent builds the agent Run would, for driving jobs directly.
 func newTestAgent(t *testing.T, e *env) *agent {
 	t.Helper()
-	a, err := newAgent(context.Background(), e.opts)
+	a, err := newAgent(e.opts)
 	require.NoError(t, err)
 	return a
 }

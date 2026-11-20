@@ -202,17 +202,8 @@ func TestChart_AgentSecurityPosture(t *testing.T) {
 			env[e.Name] = e
 		}
 		require.Equal(t, "spec.nodeName", env["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
-		for _, c := range ps.Containers {
-			var limit *corev1.ResourceFieldSelector
-			for _, e := range c.Env {
-				if e.Name == "GOMEMLIMIT" {
-					limit = e.ValueFrom.ResourceFieldRef
-				}
-			}
-			require.NotNil(t, limit, c.Name)
-			require.Equal(t, c.Name, limit.ContainerName)
-			require.Equal(t, "limits.memory", limit.Resource)
-		}
+		require.Equal(t, "120795955", envOf(col)["GOMEMLIMIT"].Value, "90% of the collector's 128Mi")
+		require.Equal(t, "603979776", envOf(cat)["GOMEMLIMIT"].Value, "90% of the cataloguer's 640Mi")
 
 		for _, u := range o {
 			var subjects []rbacv1.Subject
@@ -245,7 +236,8 @@ func TestChart_AgentDaemonSetShape(t *testing.T) {
 		"--content-store=/host" + containerdStore, "--scratch=/scratch/stage", "--catalog-socket=/run/ffs/catalog.sock",
 		"--heartbeat=/scratch/heartbeat", "--max-image-bytes=1073741824"}, col.Args)
 	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/scratch/catalog", "--local-root=/scratch/stage",
-		"--max-concurrent=1", "--nice=10", "--scratch-limit=2952790016"}, cat.Args) // 4Gi − 1Gi − 256Mi
+		"--max-concurrent=1", "--nice=10", "--scratch-limit=2952790016", // 4Gi − 1Gi − 256Mi
+		"--worker-memory-limit=536870912"}, cat.Args) // 640Mi − 128Mi
 	require.Equal(t, col.Image, cat.Image)
 
 	res := func(c corev1.Container) []string {
@@ -567,4 +559,43 @@ func TestChart_AgentOptIns(t *testing.T) {
 	require.Equal(t, "ffs-agent", rb.Namespace)
 	require.Equal(t, rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "ffs-agent-scc"}, rb.RoleRef)
 	require.Equal(t, []rbacv1.Subject{{Kind: "ServiceAccount", Name: "ffs-agent", Namespace: "ffs-agent"}}, rb.Subjects)
+}
+
+// envOf maps a container's environment variables by name.
+func envOf(c corev1.Container) map[string]corev1.EnvVar {
+	out := map[string]corev1.EnvVar{}
+	for _, e := range c.Env {
+		out[e.Name] = e
+	}
+	return out
+}
+
+// TestChart_AgentMemoryLimits: GOMEMLIMIT is 90% of each agent container's memory limit, and the cataloguer's
+// workers get its limit less 128Mi for the catalog server; without limits both fall back to the container's
+// allocatable memory.
+func TestChart_AgentMemoryLimits(t *testing.T) {
+	ds := daemonSet(t, "nodeAgent.resources.collector.limits.memory=256Mi", "nodeAgent.resources.catalog.limits.memory=1Gi")
+	col, cat := agentContainer(t, ds, "collector"), agentContainer(t, ds, "catalog")
+	require.Equal(t, "241591910", envOf(col)["GOMEMLIMIT"].Value)
+	require.Equal(t, "966367641", envOf(cat)["GOMEMLIMIT"].Value)
+	require.Contains(t, cat.Args, "--worker-memory-limit=939524096") // 1Gi − 128Mi
+
+	ds = daemonSet(t, "nodeAgent.resources.collector.limits=null", "nodeAgent.resources.catalog.limits=null")
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		e := envOf(c)["GOMEMLIMIT"]
+		require.Empty(t, e.Value, c.Name)
+		require.Equal(t, corev1.ResourceFieldSelector{ContainerName: c.Name, Resource: "limits.memory"}, *e.ValueFrom.ResourceFieldRef, c.Name)
+		require.False(t, slices.ContainsFunc(c.Args, func(a string) bool { return strings.HasPrefix(a, "--worker-memory-limit") }), c.Name)
+	}
+
+	_, err := renderErr(t, "nodeAgent.resources.catalog.limits.memory=160Mi")
+	require.ErrorContains(t, err, "nodeAgent.resources.catalog.limits.memory must be at least 128Mi plus 64Mi per concurrent catalog job (1)")
+
+	// The controller's cataloguer runs config.catalog.concurrency workers at once, which share what the server leaves.
+	cc := container(t, podSpec(t, "config.catalog.concurrency=4"), "catalog")
+	require.Contains(t, cc.Args, "--worker-memory-limit=503316480") // (2Gi − 128Mi) / 4
+	require.Equal(t, "1932735283", envOf(cc)["GOMEMLIMIT"].Value)
+	cc = container(t, podSpec(t, "catalog.resources.limits=null"), "catalog")
+	require.Equal(t, "limits.memory", envOf(cc)["GOMEMLIMIT"].ValueFrom.ResourceFieldRef.Resource)
+	require.False(t, slices.ContainsFunc(cc.Args, func(a string) bool { return strings.HasPrefix(a, "--worker-memory-limit") }))
 }

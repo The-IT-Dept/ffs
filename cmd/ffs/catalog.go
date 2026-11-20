@@ -14,7 +14,7 @@ import (
 func newCatalogCmd() *cobra.Command {
 	var (
 		socket, scratch, localRoot string
-		scratchLimit               int64
+		scratchLimit, workerMemory int64
 		maxConcurrent, nice        int
 	)
 	cmd := &cobra.Command{
@@ -25,6 +25,9 @@ func newCatalogCmd() *cobra.Command {
 			if nice < 0 || nice > 19 {
 				return errors.New("--nice must be between 0 and 19")
 			}
+			if workerMemory < 0 {
+				return errors.New("--worker-memory-limit must not be negative")
+			}
 			self, err := os.Executable()
 			if err != nil {
 				return err
@@ -34,7 +37,7 @@ func newCatalogCmd() *cobra.Command {
 				ScratchLimit:  scratchLimit,
 				MaxConcurrent: maxConcurrent,
 				LocalRoot:     localRoot,
-				Run:           catalog.ExecRunner(self, catalog.WithNice(nice)),
+				Run:           catalog.ExecRunner(self, catalog.WithNice(nice), catalog.WithMemoryLimit(workerMemory)),
 				Log:           funcr.NewJSON(func(obj string) { fmt.Fprintln(os.Stderr, obj) }, funcr.Options{}),
 			}
 			return srv.ListenAndServe(cmd.Context(), socket)
@@ -47,6 +50,7 @@ func newCatalogCmd() *cobra.Command {
 	f.IntVar(&maxConcurrent, "max-concurrent", 2, "jobs run at once; further requests are refused as busy")
 	f.StringVar(&localRoot, "local-root", "", "local sources (oci-dir, host-dir) must resolve inside this directory; empty refuses them")
 	f.IntVar(&nice, "nice", 0, "nice value of catalog workers, 0 to 19")
+	f.Int64Var(&workerMemory, "worker-memory-limit", 0, "GOMEMLIMIT of each catalog worker in bytes; 0 keeps the server's")
 
 	cmd.AddCommand(&cobra.Command{
 		Use:    "worker",

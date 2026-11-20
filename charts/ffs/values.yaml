@@ -46,7 +46,7 @@ catalog:
       memory: 256Mi
     # Resource ceilings.
     limits:
-      # Memory limit.
+      # Memory limit, as a byte count or a whole quantity such as 2Gi. GOMEMLIMIT is set to 90% of it; the catalog workers share it less 128Mi.
       memory: 2Gi
   # Size limit of the catalog scratch emptyDir.
   scratchSizeLimit: 20Gi
@@ -147,7 +147,7 @@ nodeAgent:
     - operator: Exists
   # Priority class of the agent pods.
   priorityClassName: ""
-  # Agent container resources.
+  # Agent container resources. Memory limits are byte counts or whole quantities; GOMEMLIMIT is 90% of each, and the cataloguer's workers get its limit less 128Mi.
   resources:
     # Collector container.
     collector:
@@ -177,8 +177,8 @@ nodeAgent:
   maxReportBytes: 33554432
   # Image SBOM requests handed out with each report, 0 to 10; 0 turns them off.
   workPerReport: 3
-  # How long a request stays with the node it was offered to.
-  workTimeout: 30m
+  # How long a request stays with the node it was offered to; workTimeout plus imageListInterval must be shorter than staleAfter.
+  workTimeout: 20m
   # TLS of the agent API.
   tls:
     # Certificate issued by cert-manager; needs tls.caBundle.

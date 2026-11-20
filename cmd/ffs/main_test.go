@@ -44,12 +44,13 @@ func TestControllerCmd_Flags(t *testing.T) {
 func TestCatalogCmd_Flags(t *testing.T) {
 	cmd := newCatalogCmd()
 	for flag, def := range map[string]string{
-		"socket":         "/run/ffs/catalog.sock",
-		"scratch":        "/scratch",
-		"scratch-limit":  "19327352832",
-		"max-concurrent": "2",
-		"local-root":     "",
-		"nice":           "0",
+		"socket":              "/run/ffs/catalog.sock",
+		"scratch":             "/scratch",
+		"scratch-limit":       "19327352832",
+		"max-concurrent":      "2",
+		"local-root":          "",
+		"nice":                "0",
+		"worker-memory-limit": "0",
 	} {
 		f := cmd.Flags().Lookup(flag)
 		require.NotNil(t, f, flag)

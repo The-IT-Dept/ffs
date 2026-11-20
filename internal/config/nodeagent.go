@@ -30,7 +30,7 @@ func defaultNodeAgent() NodeAgentConfig {
 	return NodeAgentConfig{
 		Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent", ServiceAccount: "ffs-agent",
 		MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
-		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 30 * time.Minute,
+		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
 	}
 }
 
@@ -73,6 +73,11 @@ func (n NodeAgentConfig) validate(bad func(format string, a ...any)) {
 	}
 	if n.ImageListInterval > 0 && n.StaleAfter > 0 && n.StaleAfter < 2*n.ImageListInterval {
 		bad("nodeAgent.staleAfter: must be at least twice imageListInterval")
+	}
+	// An agent sends no report while a job runs, and reports again at most one image-list interval after it.
+	if n.WorkTimeout > 0 && n.ImageListInterval > 0 && n.StaleAfter > 0 && n.WorkTimeout+n.ImageListInterval >= n.StaleAfter {
+		bad("nodeAgent.workTimeout: workTimeout (%s) plus imageListInterval (%s) must be shorter than staleAfter (%s), "+
+			"or a node shows as not reporting while its agent catalogues an image", n.WorkTimeout, n.ImageListInterval, n.StaleAfter)
 	}
 	if n.WorkPerReport < 0 || n.WorkPerReport > 10 {
 		bad("nodeAgent.workPerReport: must be in 0..10")
