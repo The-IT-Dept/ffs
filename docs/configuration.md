@@ -120,6 +120,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `priorityClassName` | `""` | Pod priority class. |
 | `web.service.enabled` | `false` | Create a ClusterIP Service for the web UI. Requires `config.listen` bound beyond loopback. |
 | `web.service.port` | `8080` | Port of the web UI Service. |
+| `web.networkPolicy.from` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector` or `ipBlock` entries) admitted to the web UI port by the NetworkPolicy of `nodeAgent.networkPolicy.enabled`, for example your authenticating proxy's pods. Empty admits none. Required with `web.service.enabled` while that NetworkPolicy is created. |
 | `metrics.service.enabled` | `false` | Create the metrics Service. |
 | `metrics.service.port` | `8443` | Port of the metrics Service. |
 | `metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator ServiceMonitor (and the metrics Service). |
@@ -150,10 +151,20 @@ config:
 web:
   service:
     enabled: true
+  networkPolicy:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: oauth2-proxy
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: oauth2-proxy
 ```
 
 The web UI answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
 
-This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the web UI shows, so restrict it with a NetworkPolicy to the proxy alone, and do not expose the Service directly through an Ingress or Gateway.
+This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the web UI shows. The chart's NetworkPolicy, created while `nodeAgent.networkPolicy.enabled` is true (the default), admits the web UI port only from the peers in `web.networkPolicy.from`, so list your proxy's pods there and nothing else. With `web.service.enabled` and an empty `web.networkPolicy.from`, the chart refuses to render. If you set `nodeAgent.networkPolicy.enabled: false`, no NetworkPolicy selects the ffs pod, so restrict the port to the proxy with a NetworkPolicy of your own. Do not expose the Service directly through an Ingress or Gateway.
+
+**Upgrading from 0.0.1-rc.8 or earlier.** Earlier release candidates left the web UI port open to every pod: rc.5 to rc.8 admitted it from every source in the node agent's NetworkPolicy, and earlier ones created no NetworkPolicy for the ffs pod. Set `web.networkPolicy.from` before you upgrade if anything but `kubectl port-forward` reaches the web UI.
 
 The API itself is described in [api.md](api.md).

@@ -83,6 +83,10 @@ web:
     enabled: false
     # Service port for the web UI.
     port: 8080
+  # Who may reach the web UI port while nodeAgent.networkPolicy.enabled creates a NetworkPolicy for the ffs pod.
+  networkPolicy:
+    # NetworkPolicyPeers (podSelector, namespaceSelector or ipBlock) admitted to the web UI port, such as your authenticating proxy's pods; required with web.service.enabled. Empty admits none.
+    from: []
 
 # Authenticated metrics endpoint.
 metrics:
@@ -209,7 +213,7 @@ nodeAgent:
     scc: false
   # NetworkPolicy settings.
   networkPolicy:
-    # Create a NetworkPolicy limiting the agent API to the agent pods.
+    # Create a NetworkPolicy for the ffs pod: the agent API from the agent pods, metrics and health from anywhere, the web UI only from web.networkPolicy.from.
     enabled: true
 
 # ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.

@@ -146,12 +146,36 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{- /*
+ffs.httpPort is the port of config.listen, where the web UI and API listen.
+*/ -}}
+{{- define "ffs.httpPort" -}}
+{{- $listen := toString .Values.config.listen -}}
+{{- $port := regexFind "[0-9]+$" (regexFind ":[0-9]+$" $listen) -}}
+{{- if not $port -}}
+{{- fail (printf "config.listen must be an address with a port number, such as 0.0.0.0:8080, not %q" $listen) -}}
+{{- end -}}
+{{- $port -}}
+{{- end -}}
+
+{{- /*
+ffs.listenLoopback is "true" when config.listen binds a loopback address only, so the web UI and API are
+reachable only from inside the pod (kubectl port-forward), and "" otherwise.
+*/ -}}
+{{- define "ffs.listenLoopback" -}}
+{{- $host := regexReplaceAll ":[0-9]*$" (toString .Values.config.listen) "" -}}
+{{- if or (hasPrefix "127." $host) (eq $host "localhost" "[::1]") -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /*
 ffs.agentPort is nodeAgent.port, which must differ from the controller's other ports.
 */ -}}
 {{- define "ffs.agentPort" -}}
 {{- $port := int .Values.nodeAgent.port -}}
-{{- if has $port (list 8080 8081 8443) -}}
-{{- fail "nodeAgent.port must not be one of the controller's other ports (8080, 8081, 8443)" -}}
+{{- $http := include "ffs.httpPort" . | int -}}
+{{- if has $port (list $http 8081 8443) -}}
+{{- fail (printf "nodeAgent.port must not be one of the controller's other ports (%d, 8081, 8443)" $http) -}}
 {{- end -}}
 {{- $port -}}
 {{- end -}}

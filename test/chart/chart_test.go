@@ -24,6 +24,10 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 )
 
+// webPeer admits an authenticating proxy's pods to the web UI port, which a web UI Service needs while the agent
+// NetworkPolicy is rendered.
+const webPeer = "web.networkPolicy.from[0].podSelector.matchLabels.app=oauth2-proxy"
+
 func podSpec(t *testing.T, sets ...string) corev1.PodSpec {
 	t.Helper()
 	return as[appsv1.Deployment](t, render(t, sets...).get(t, "Deployment", "ffs")).Spec.Template.Spec
@@ -467,8 +471,30 @@ func TestChart_OptionalMonitoring(t *testing.T) {
 func TestChart_WebServiceNeedsNonLoopbackListen(t *testing.T) {
 	_, err := renderErr(t, "web.service.enabled=true")
 	require.ErrorContains(t, err, "web.service.enabled needs config.listen bound beyond loopback")
-	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
+	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", webPeer)
 	require.True(t, o.has("Service", "ffs-web"))
+}
+
+// TestChart_HTTPPortFollowsListen: the controller's http port is config.listen's, and the agent port must
+// differ from it.
+func TestChart_HTTPPortFollowsListen(t *testing.T) {
+	ports := func(sets ...string) map[string]int32 {
+		t.Helper()
+		out := map[string]int32{}
+		for _, p := range container(t, podSpec(t, sets...), "controller").Ports {
+			out[p.Name] = p.ContainerPort
+		}
+		return out
+	}
+	require.Equal(t, int32(8080), ports()["http"])
+	require.Equal(t, int32(9090), ports("config.listen=0.0.0.0:9090")["http"])
+	require.Equal(t, int32(9090), ports("config.listen=127.0.0.1:9090")["http"])
+	require.Equal(t, int32(8080), ports("config.listen=0.0.0.0:9090", "nodeAgent.port=8080")["agent-api"], "8080 is free then")
+
+	_, err := renderErr(t, "config.listen=0.0.0.0:9444", "nodeAgent.port=9444")
+	require.ErrorContains(t, err, "nodeAgent.port must not be one of the controller's other ports (9444, 8081, 8443)")
+	_, err = renderErr(t, "config.listen=0.0.0.0")
+	require.ErrorContains(t, err, `config.listen must be an address with a port number, such as 0.0.0.0:8080, not "0.0.0.0"`)
 }
 
 func TestChart_ImageDigestPinned(t *testing.T) {
@@ -610,7 +636,7 @@ func TestChart_WebServiceLoopbackGuardAndHosts(t *testing.T) {
 	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, render(t))), &c))
 	require.Empty(t, c.AllowedHosts)
 
-	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", "config.allowedHosts={ffs.example.com}")
+	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", "config.allowedHosts={ffs.example.com}", webPeer)
 	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, o)), &c))
 	require.Equal(t, []string{"ffs.example.com", "ffs-web", "ffs-web.ffs", "ffs-web.ffs.svc", "ffs-web.ffs.svc.cluster.local"}, c.AllowedHosts)
 	path := writeTemp(t, renderedConfig(t, o))

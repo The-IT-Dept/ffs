@@ -1,4 +1,8 @@
 {{- if and .Values.nodeAgent.enabled .Values.nodeAgent.networkPolicy.enabled }}
+{{- $webFrom := .Values.web.networkPolicy.from | default list }}
+{{- if and .Values.web.service.enabled (not $webFrom) (not (include "ffs.listenLoopback" .)) }}
+{{- fail "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled admits the web UI port only from the peers listed there, such as your authenticating proxy's pods. Set web.networkPolicy.from, or set nodeAgent.networkPolicy.enabled=false and restrict the port with your own NetworkPolicy" }}
+{{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -22,9 +26,16 @@ spec:
               app.kubernetes.io/name: ffs-agent
       ports:
         - {protocol: TCP, port: agent-api}
-    # The web UI, metrics and health ports, from anywhere as before.
+    # Metrics and health stay open to every source: metrics answers only requests that pass a
+    # TokenReview and a SubjectAccessReview, and health serves only the kubelet's probes.
     - ports:
-        - {protocol: TCP, port: http}
         - {protocol: TCP, port: metrics}
         - {protocol: TCP, port: health}
+    {{- if and $webFrom (not (include "ffs.listenLoopback" .)) }}
+    # The web UI and API have no authentication: only the peers in web.networkPolicy.from reach them.
+    - from:
+        {{- toYaml $webFrom | nindent 8 }}
+      ports:
+        - {protocol: TCP, port: {{ include "ffs.httpPort" . }}}
+    {{- end }}
 {{- end }}

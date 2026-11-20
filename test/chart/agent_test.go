@@ -23,6 +23,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -498,26 +499,59 @@ data:
 	require.ErrorContains(t, err, "nodeAgent.tls.caBundle is required when nodeAgent.tls.certManager.enabled is true")
 }
 
+// TestChart_AgentNetworkPolicy: the NetworkPolicy admits the agent API from the agent pods, metrics and health
+// from anywhere, and the web UI port only from web.networkPolicy.from on a listen address beyond loopback. A web
+// UI Service without those peers is refused, because the policy would close it.
 func TestChart_AgentNetworkPolicy(t *testing.T) {
-	np := as[networkingv1.NetworkPolicy](t, render(t).get(t, "NetworkPolicy", "ffs-agent-api"))
+	policy := func(sets ...string) networkingv1.NetworkPolicy {
+		t.Helper()
+		return as[networkingv1.NetworkPolicy](t, render(t, sets...).get(t, "NetworkPolicy", "ffs-agent-api"))
+	}
+	np := policy()
 	require.Equal(t, "ffs", np.Namespace)
 	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs"}, np.Spec.PodSelector.MatchLabels)
 	require.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
-	require.Len(t, np.Spec.Ingress, 2)
+	require.Len(t, np.Spec.Ingress, 2, "no web UI rule by default")
 	tcp := corev1.ProtocolTCP
-	port := func(name string) networkingv1.NetworkPolicyPort {
-		p := intstr.FromString(name)
+	port := func(p intstr.IntOrString) networkingv1.NetworkPolicyPort {
 		return networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &p}
 	}
 	in := np.Spec.Ingress[0]
 	require.Len(t, in.From, 1)
 	require.Equal(t, map[string]string{"kubernetes.io/metadata.name": "ffs-agent"}, in.From[0].NamespaceSelector.MatchLabels)
 	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs-agent"}, in.From[0].PodSelector.MatchLabels)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{port("agent-api")}, in.Ports)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromString("agent-api"))}, in.Ports)
 	require.Empty(t, np.Spec.Ingress[1].From)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{port("http"), port("metrics"), port("health")}, np.Spec.Ingress[1].Ports)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromString("metrics")), port(intstr.FromString("health"))},
+		np.Spec.Ingress[1].Ports)
 
-	require.False(t, render(t, "nodeAgent.networkPolicy.enabled=false").has("NetworkPolicy", "ffs-agent-api"))
+	for _, sets := range [][]string{
+		{"web.service.enabled=true", "config.listen=0.0.0.0:9090", webPeer},
+		{"config.listen=0.0.0.0:9090", webPeer}, // a Service of your own
+	} {
+		np = policy(sets...)
+		require.Len(t, np.Spec.Ingress, 3, sets)
+		web := np.Spec.Ingress[2]
+		require.Equal(t, []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "oauth2-proxy"}}}},
+			web.From, sets)
+		require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromInt32(9090))}, web.Ports, "the port of config.listen")
+	}
+	require.Len(t, policy(webPeer).Spec.Ingress, 2, "nothing outside the pod reaches a loopback listener")
+	for _, rule := range policy("config.listen=0.0.0.0:8080").Spec.Ingress {
+		for _, p := range rule.Ports {
+			require.NotEqual(t, intstr.FromInt32(8080), *p.Port, "no web UI rule without peers")
+			require.NotEqual(t, intstr.FromString("http"), *p.Port)
+		}
+	}
+
+	_, err := renderErr(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
+	require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled "+
+		"admits the web UI port only from the peers listed there")
+	for _, off := range []string{"nodeAgent.networkPolicy.enabled=false", "nodeAgent.enabled=false"} {
+		o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", off)
+		require.False(t, o.has("NetworkPolicy", "ffs-agent-api"), off)
+		require.True(t, o.has("Service", "ffs-web"), off)
+	}
 }
 
 func TestChart_AgentOptIns(t *testing.T) {
