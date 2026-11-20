@@ -21,6 +21,21 @@ test.each(['hostPackages', 'kernel', 'cachedImages'] as const)('the %s view show
   expect(api.calls('/images/{digest}/packages')).toHaveLength(0)
 })
 
+test('a node group without agent data says the agent is missing instead of nothing needs attention', async () => {
+  const api = mockApi().on('/nodegroups/{id}', nodeGroupDetail({ agentData: false })).on('/findings', findingsPage())
+  renderApp('/nodegroups/n1')
+  expect(await screen.findByText(copy.agentMissing)).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+  expect(api.calls('/findings')[0].searchParams.get('scope')).toBe('nodegroup:n1')
+})
+
+test('a node group with agent data and no findings says nothing needs attention', async () => {
+  mockApi().on('/nodegroups/{id}', nodeGroupDetail({ agentData: true })).on('/findings', findingsPage())
+  renderApp('/nodegroups/g1')
+  expect(await screen.findByText(copy.empty)).toBeInTheDocument()
+  expect(screen.queryByText(copy.agentMissing)).toBeNull()
+})
+
 test('host packages are searched through the node group digest when the agent reports', async () => {
   const api = mockApi().on('/nodegroups/{id}', nodeGroupDetail({ agentData: true })).on('/images/{digest}/packages', imagePackagesPage())
   renderApp('/nodegroups/g1?view=hostPackages')

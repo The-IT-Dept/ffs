@@ -3,8 +3,7 @@ import { createRoute } from '@tanstack/react-router'
 import { type ReactNode, useEffect, useState } from 'react'
 import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
-import { findingsQuery } from '@/components/explorer/params'
-import { FixGroupList } from '@/components/fix/FixGroupList'
+import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { AppLink } from '@/components/layout/AppLink'
 import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -50,13 +49,6 @@ function Subsection({ title, children }: { title: string; children: ReactNode })
       {children}
     </section>
   )
-}
-
-function FindingsView({ scope }: { scope: string }) {
-  const q = useQuery(findingsQuery({ scope, group: 'fix' }))
-  if (q.data) return q.data.groupRows.length === 0 ? <EmptyState /> : <FixGroupList rows={q.data.groupRows} group="fix" base={{ scope }} />
-  if (q.error) return <ProblemNotice error={q.error} />
-  return <Skeleton className="h-24" />
 }
 
 function HostPackagesView({ digest }: { digest: string }) {
@@ -316,6 +308,9 @@ function NodeGroupPage() {
   const d = q.data
   const g = d?.group
   const view = search.view ?? 'findings'
+  // Without agent data the group's host packages were never inventoried, so no findings is not
+  // proof that nothing needs attention.
+  const findingsEmpty = d && !d.agentData ? <EmptyState message={copy.agentMissing} /> : undefined
   const sub = g ? (
     <span className="inline-flex flex-wrap items-center gap-x-1.5">
       {[
@@ -343,7 +338,7 @@ function NodeGroupPage() {
             ))}
           </TabsList>
           <TabsContent value="findings">
-            <FindingsView scope={`nodegroup:${id}`} />
+            <FixGroupFindings scope={`nodegroup:${id}`} empty={findingsEmpty} />
           </TabsContent>
           <TabsContent value="hostPackages">
             <AgentGate agentData={d.agentData}>
