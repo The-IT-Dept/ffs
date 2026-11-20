@@ -93,6 +93,9 @@ type Ingester struct {
 	slots   *semaphore.Weighted
 	flight  singleflight.Group
 	prepare func(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error) // prepareHost; tests count calls
+	// stored, when set, is called once a report has started the store of its fingerprint's group SBOM or
+	// joined one in progress, before it waits for the outcome; tests use it.
+	stored func(node string)
 
 	mu   sync.Mutex
 	busy map[string]bool // nodes whose host inventory this process is processing
@@ -347,7 +350,7 @@ func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, g
 	}
 	prep := gate.prep
 	hk := hostKeyPrefix + node
-	v, err, _ := i.flight.Do(prep.Fingerprint, func() (ingested any, err error) {
+	flight := i.flight.DoChan(prep.Fingerprint, func() (ingested any, err error) {
 		// Detached from the request that leads: every report of this fingerprint waits on it, so a leader
 		// that disconnects must not fail them.
 		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostStoreTimeout)
@@ -372,6 +375,11 @@ func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, g
 		return true, i.o.Acquirer.Ingest(fctx, sbom.Request{Repo: model.HostRepo, Digest: digest, Platform: "linux/" + r.Arch},
 			&sbom.Result{SyftJSON: prep.SyftJSON, Source: sbom.SourceAgent})
 	})
+	if i.stored != nil {
+		i.stored(node)
+	}
+	res := <-flight
+	v, err := res.Val, res.Err
 	if err != nil {
 		if werr := st.SetAgentError(ctx, node, "host inventory not stored: "+err.Error()); werr != nil {
 			return false, werr

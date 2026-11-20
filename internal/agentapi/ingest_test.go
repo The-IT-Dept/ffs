@@ -832,7 +832,7 @@ func (g *gatedIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Resu
 
 // TestIngest_CancelledLeaderDoesNotFailFollowers: two nodes report the same host fingerprint; the first,
 // which leads the shared store, disconnects mid-store. The store is detached from its request, so the node
-// waiting on it gets its group.
+// waiting on it gets its group. The follower has joined the leader's store before the leader disconnects.
 func TestIngest_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	ctx := context.Background()
 	st := newStore(t)
@@ -840,13 +840,11 @@ func TestIngest_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	nodes := fakeNodes{"worker-1": testNode("worker-1", "Ubuntu 26.04 LTS"), "worker-2": testNode("worker-2", "Ubuntu 26.04 LTS")}
 	ing := NewIngester(IngesterOptions{Store: st, Acquirer: gate, Nodes: nodes, Config: config.Default().NodeAgent,
 		Now: newClock(t0).Now, Log: logr.Discard()})
-	followerPrepared := make(chan struct{})
-	ing.prepare = func(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error) {
-		p, err := prepareHost(r, n, now)
-		if r.Node == "worker-2" {
-			close(followerPrepared)
+	joined := make(chan struct{})
+	ing.stored = func(node string) {
+		if node == "worker-2" {
+			close(joined)
 		}
-		return p, err
 	}
 	host := ubuntuHost(t, "3.0.13-0ubuntu3.5")
 	type result struct {
@@ -866,8 +864,8 @@ func TestIngest_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 		resp, err := ing.Report(ctx, worker2, r)
 		follower <- result{resp, err}
 	}()
-	<-followerPrepared
-	time.Sleep(100 * time.Millisecond) // the follower joins the leader's store
+	// The leader's store is held at the gate, so the follower has joined it, not started its own.
+	<-joined
 	cancel()
 	close(gate.release)
 

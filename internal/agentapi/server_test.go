@@ -15,8 +15,10 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -326,9 +328,12 @@ func (b *blockingReports) Report(ctx context.Context, _ Identity, _ *wire.Report
 	return wire.ReportResponse{Applied: true}, nil
 }
 
+// inFlight is the ffs_agent_ingest_bytes_in_flight gauge.
+func inFlight() float64 { return testutil.ToFloat64(metrics.AgentIngestBytesInFlight) }
+
 // TestServer_IngestBudgetDefersFullReports: full reports beyond the ingest budget wait IngestWait and are
-// answered 429 with a Retry-After of 10 to 60 seconds, before their bodies are read; the bytes held never
-// exceed the budget, and a deferred report is counted as deferred, not rejected.
+// answered 429 with a Retry-After of 10 to 60 seconds, before their bodies are read; the bytes in flight
+// never exceed the budget, and a deferred report is counted as deferred, not rejected.
 func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
 	const size = 1 << 20
 	prefix, suffix := `{"node":"worker-1","kind":"full","agentVersion":"`, `"}`
@@ -341,7 +346,7 @@ func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
 	deferred := func() float64 {
 		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportDeferred, ""))
 	}
-	deferredBefore := deferred()
+	deferredBefore, held := deferred(), inFlight()
 	// post sends one full report and returns its status; it runs on other goroutines, so it asserts nothing.
 	post := func() int {
 		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, wire.PathReport, strings.NewReader(body))
@@ -359,7 +364,7 @@ func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
 	for range 3 {
 		<-reports.entered // three reports hold the whole budget
 	}
-	require.Equal(t, int64(3*size), srv.held.Load())
+	require.Equal(t, held+3*size, inFlight())
 
 	for range 4 {
 		a := serve(t, h, http.MethodPost, wire.PathReport, "tok", strings.NewReader(body), int64(len(body)))
@@ -373,17 +378,152 @@ func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
 	a := serve(t, h, http.MethodPost, wire.PathReport, "tok", strings.NewReader(body), -1)
 	require.Equal(t, http.StatusTooManyRequests, a.code)
 	require.Equal(t, deferredBefore+5, deferred())
+	require.Equal(t, held+3*size, inFlight(), "a deferred report takes none of the budget")
 
 	close(reports.release)
 	for range 3 {
 		require.Equal(t, http.StatusOK, <-answers)
 	}
-	require.Zero(t, srv.held.Load(), "every share is released")
-	require.LessOrEqual(t, srv.peak.Load(), int64(3*size), "the bytes held never exceed the budget")
+	require.Equal(t, held, inFlight(), "every share is released")
 
 	// With the budget free, a report goes through at once.
 	go func() { answers <- post() }()
 	<-reports.entered
 	require.Equal(t, http.StatusOK, <-answers)
-	require.LessOrEqual(t, srv.peak.Load(), int64(3*size))
+	require.Equal(t, held, inFlight())
+}
+
+// blockingSBOMs is an SBOMHandler that holds every result until release is closed. With wait set it is also
+// a ResultWindow whose results may wait that long, recording the nodes whose results waited too long.
+type blockingSBOMs struct {
+	entered chan struct{}
+	release chan struct{}
+
+	mu     sync.Mutex
+	wait   time.Duration
+	unread []string
+}
+
+func (b *blockingSBOMs) SBOM(ctx context.Context, _ Identity, _ *wire.SBOMResult) error {
+	b.entered <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return nil
+}
+
+func (b *blockingSBOMs) setWait(d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.wait = d
+}
+
+func (b *blockingSBOMs) unreadNodes() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.unread)
+}
+
+// windowedSBOMs is blockingSBOMs as a ResultWindow.
+type windowedSBOMs struct{ *blockingSBOMs }
+
+func (w windowedSBOMs) ResultWait(string) time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.wait
+}
+
+func (w windowedSBOMs) ResultUnread(node string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.unread = append(w.unread, node)
+}
+
+// sizedBody is a JSON body of exactly size bytes: prefix, padding and suffix.
+func sizedBody(t *testing.T, prefix, suffix string, size int) string {
+	t.Helper()
+	body := prefix + strings.Repeat("a", size-len(prefix)-len(suffix)) + suffix
+	require.Len(t, body, size)
+	return body
+}
+
+// postAsync sends body to path on another goroutine and returns its status on the channel; it asserts nothing.
+func postAsync(ctx context.Context, h http.Handler, path, body string) <-chan int {
+	answer := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, path, strings.NewReader(body))
+		req.ContentLength = int64(len(body))
+		req.Header.Set("Authorization", "Bearer tok")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		answer <- w.Code
+	}()
+	return answer
+}
+
+// TestServer_ReportsDoNotWaitBehindSBOMResults: SBOM results have a budget of their own, so a result holding
+// all of it, and another waiting for it, never defer a report.
+func TestServer_ReportsDoNotWaitBehindSBOMResults(t *testing.T) {
+	const size = 1 << 20
+	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{})}
+	rec := &reportRecorder{resp: wire.ReportResponse{Applied: true}}
+	srv := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: rec, SBOMs: sboms, MaxReportBytes: 2 * size, MaxSBOMBytes: 2 * size,
+		IngestBudget: size, SBOMBudget: size, IngestWait: 50 * time.Millisecond})
+	h := srv.Handler()
+	held := inFlight()
+	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+	first := postAsync(context.Background(), h, wire.PathSBOM, result)
+	<-sboms.entered // the first result holds the whole SBOM budget
+	waiting := postAsync(context.Background(), h, wire.PathSBOM, result)
+
+	report := sizedBody(t, `{"node":"worker-1","kind":"images","agentVersion":"`, `"}`, size)
+	for range 3 {
+		a := serve(t, h, http.MethodPost, wire.PathReport, "tok", strings.NewReader(report), int64(len(report)))
+		require.Equal(t, http.StatusOK, a.code, "a report of the whole report budget goes through: %s", a.body)
+	}
+	require.Len(t, rec.calls, 3)
+	require.Equal(t, held+size, inFlight(), "only the first result's share is held")
+
+	close(sboms.release)
+	require.Equal(t, http.StatusNoContent, <-first)
+	require.Equal(t, http.StatusNoContent, <-waiting, "the waiting result has its turn")
+	require.Equal(t, held, inFlight())
+}
+
+// TestServer_SBOMWaitEndsWithItsRequests: a result waits for the SBOM budget no longer than its node's requests
+// take a result (ResultWindow). It is then answered 503 and the node's requests are marked answered; a node
+// with no request taking a result is answered 403 before its body is read.
+func TestServer_SBOMWaitEndsWithItsRequests(t *testing.T) {
+	const size = 1 << 20
+	forbidden := func() float64 {
+		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected, metrics.AgentRejectForbidden))
+	}
+	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{})}
+	h := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
+		MaxSBOMBytes: 2 * size, SBOMBudget: size}).Handler()
+	held := inFlight()
+	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+
+	before := forbidden()
+	a := serve(t, h, http.MethodPost, wire.PathSBOM, "tok", strings.NewReader(result), int64(len(result)))
+	requireError(t, a, http.StatusForbidden, "no request to worker-1 takes a result")
+	require.Equal(t, before+1, forbidden())
+	require.Empty(t, sboms.entered, "the handler never sees it")
+
+	sboms.setWait(time.Hour)
+	first := postAsync(context.Background(), h, wire.PathSBOM, result)
+	<-sboms.entered // the first result holds the whole SBOM budget
+
+	sboms.setWait(50 * time.Millisecond)
+	start := time.Now()
+	a = serve(t, h, http.MethodPost, wire.PathSBOM, "tok", strings.NewReader(result), int64(len(result)))
+	requireError(t, a, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
+	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+	require.Equal(t, []string{"worker-1"}, sboms.unreadNodes(), "its requests are answered")
+	require.Equal(t, held+size, inFlight())
+
+	close(sboms.release)
+	require.Equal(t, http.StatusNoContent, <-first)
+	require.Equal(t, held, inFlight())
 }

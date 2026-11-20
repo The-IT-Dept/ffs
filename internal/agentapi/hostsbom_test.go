@@ -23,6 +23,10 @@ func TestIngest_CoverageOf(t *testing.T) {
 		return wire.Problem{Code: wire.ProblemPermissionDenied, Path: p, Detail: "permission denied"}
 	}
 	withStore := &wire.Images{ContentStore: true}
+	scanErr := wire.Problem{Code: wire.ProblemContentStore, Path: "/var/lib/containerd/io.containerd.content.v1.content",
+		Detail: "reading blobs/sha256: input/output error"}
+	scanFailed := model.NodeCoverageGap{Code: model.GapContentStoreUnreadable,
+		Detail: "the node agent could not scan the containerd content store: reading blobs/sha256: input/output error"}
 
 	for name, tc := range map[string]struct {
 		r         wire.Report
@@ -60,6 +64,12 @@ func TestIngest_CoverageOf(t *testing.T) {
 			stored: []model.NodeCoverageGap{blocked("/var/lib/rpm")}, want: []model.NodeCoverageGap{store, blocked("/var/lib/rpm")}},
 		"images-only clears the content-store gap": {r: wire.Report{Kind: wire.KindImages, Images: withStore},
 			stored: []model.NodeCoverageGap{store, noDB}, want: []model.NodeCoverageGap{noDB}},
+		"a failed scan says so, with its error": {r: wire.Report{Host: &wire.Host{PackageDB: "dpkg"}, Problems: []wire.Problem{scanErr}},
+			want: []model.NodeCoverageGap{scanFailed}},
+		"a failed scan replaces the stored content-store gap": {r: wire.Report{Problems: []wire.Problem{scanErr}},
+			stored: []model.NodeCoverageGap{store}, want: []model.NodeCoverageGap{scanFailed}},
+		"images-only, a failed scan keeps the host gaps": {r: wire.Report{Kind: wire.KindImages, Problems: []wire.Problem{scanErr}},
+			stored: []model.NodeCoverageGap{store, noDB}, want: []model.NodeCoverageGap{scanFailed, noDB}},
 	} {
 		if tc.r.Kind == "" {
 			tc.r.Kind = wire.KindFull

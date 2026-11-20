@@ -20,7 +20,7 @@ const agentHostJobPrefix = "nodehost:"
 type AgentReport struct {
 	Node, AgentVersion, BootID string
 	Instance                   string    // random per agent process start; with BootID and Seq it orders reports
-	StartedAt                  time.Time // when the reporting agent process started; shown only, never orders reports
+	StartedAt                  time.Time // when the reporting agent process started; orders only reports without an Instance
 	Seq                        uint64    // per-process report counter, starting at 1
 	At                         time.Time // when the report was received; zero means now
 	// Full is false for an images-only report, whose host fields below are ignored.
@@ -38,9 +38,19 @@ type AgentReport struct {
 // boot and the same agent process (Instance) as the stored report, with a sequence number no higher
 // than the stored one. A report of another boot, or of another process of the same boot (a newer
 // one: the older has exited), is never a duplicate and starts a new sequence. The wall clock, which
-// can step back, never orders reports.
+// can step back, never orders reports of agents that send an Instance.
+//
+// An agent older than the Instance field sends none. Its processes of the same boot are told apart by
+// StartedAt: a report from a process that started earlier than the stored one is stale, and one from
+// the same process is a duplicate unless its sequence number is higher.
 func (r AgentReport) DuplicateOf(n AgentNode) bool {
-	return n.BootID == r.BootID && n.Instance == r.Instance && r.Seq <= n.Seq
+	if n.BootID != r.BootID {
+		return false
+	}
+	if r.Instance == "" {
+		return r.StartedAt.Before(n.StartedAt) || r.StartedAt.Equal(n.StartedAt) && r.Seq <= n.Seq
+	}
+	return n.Instance == r.Instance && r.Seq <= n.Seq
 }
 
 // AgentNode is one nodes_agent row.

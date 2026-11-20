@@ -52,6 +52,13 @@ var (
 		Name: "ffs_agent_reports_total",
 		Help: "Node agent reports received, by result; rejected reports and SBOM results also by reason.",
 	}, []string{"result", "reason"})
+
+	// AgentIngestBytesInFlight is the bytes of node agent report and SBOM result bodies being read and
+	// handled now, out of the agent API's ingest budgets.
+	AgentIngestBytesInFlight = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "ffs_agent_ingest_bytes_in_flight",
+		Help: "Bytes of node agent report and SBOM result bodies being read and handled.",
+	})
 )
 
 // AgentReports results. Deferred is a report answered 429 because the controller's ingest budget was spent.
@@ -82,7 +89,7 @@ const crsDropped = "ffs_finding_crs_dropped"
 // its own gauge.
 func Register(reg prometheus.Registerer, c *Collector) error {
 	for _, col := range []prometheus.Collector{c, RematchDuration, CatalogQueueDepth, CatalogFailures, RegistryBudgetRemaining,
-		NotifyDeliveries, AgentReports} {
+		NotifyDeliveries, AgentReports, AgentIngestBytesInFlight} {
 		if err := reg.Register(col); err != nil {
 			return fmt.Errorf("metrics: register: %w", err)
 		}
@@ -112,6 +119,7 @@ func Names() []string {
 		"ffs_node_agent_nodes",
 		"ffs_node_groups",
 		"ffs_agent_reports_total",
+		"ffs_agent_ingest_bytes_in_flight",
 		crsDropped,
 	}
 }

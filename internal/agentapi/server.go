@@ -15,7 +15,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -40,10 +39,14 @@ const (
 	// jitterPercent spreads every agent's intervals.
 	jitterPercent = 10
 
-	// defaultIngestBudget caps the bytes of report and SBOM bodies being read and handled at once, the
-	// host part's preparation included: a rollout's herd of full reports waits or is deferred instead of
-	// taking the controller past its memory limit.
-	defaultIngestBudget = 256 << 20
+	// defaultIngestBudget caps the bytes of report bodies being read and handled at once, the host part's
+	// preparation included: a rollout's herd of full reports waits or is deferred instead of taking the
+	// controller past its memory limit. SBOM results have a budget of their own (ServerOptions.SBOMBudget),
+	// so a large result waiting for its share never holds up reports, nor reports results.
+	defaultIngestBudget = 192 << 20
+	// defaultSBOMBudget caps the bytes of SBOM result bodies being read and handled at once. A body's share
+	// is capped at the budget, so a result of the largest size takes all of it.
+	defaultSBOMBudget = 64 << 20
 	// defaultIngestWait is how long a report waits for its share of the budget before it is answered
 	// 429 with a Retry-After of retryAfterMin to retryAfterMax seconds.
 	defaultIngestWait = 2 * time.Second
@@ -80,17 +83,27 @@ type ServerOptions struct {
 	Config          func() wire.AgentConfig // nil: /agent/v1/config is not served
 	Log             logr.Logger
 	Now             func() time.Time // certificate reload and rate-limit clock; nil: time.Now
-	IngestBudget    int64            // bytes of bodies read and handled at once; 0: 256 MiB
+	IngestBudget    int64            // bytes of report bodies read and handled at once; 0: 192 MiB
+	SBOMBudget      int64            // bytes of SBOM result bodies read and handled at once; 0: 64 MiB
 	IngestWait      time.Duration    // a report's wait for budget before 429; 0: 2s
+}
+
+// ResultWindow is implemented by an SBOMHandler that knows how long a node's result may still be accepted
+// (*WorkQueue does). The server then bounds a result's wait for the SBOM budget by it.
+type ResultWindow interface {
+	// ResultWait is how long a result from node may wait before it is read; zero or less when none is
+	// expected from node.
+	ResultWait(node string) time.Duration
+	// ResultUnread is called when a result from node waited that long without being read.
+	ResultUnread(node string)
 }
 
 // Server serves /agent/v1 over TLS on the leader.
 type Server struct {
-	o      ServerOptions
-	fails  *failLimiter        // failed authentications per source IP
-	budget *semaphore.Weighted // the ingest budget, by body bytes
-	// held and peak are the budget bytes held now and at most, for tests.
-	held, peak atomic.Int64
+	o       ServerOptions
+	fails   *failLimiter        // failed authentications per source IP
+	reports *semaphore.Weighted // the report budget, by body bytes
+	sboms   *semaphore.Weighted // the SBOM result budget, by body bytes
 }
 
 // NewServer returns the agent API server.
@@ -107,44 +120,42 @@ func NewServer(o ServerOptions) *Server {
 	if o.IngestBudget <= 0 {
 		o.IngestBudget = defaultIngestBudget
 	}
+	if o.SBOMBudget <= 0 {
+		o.SBOMBudget = defaultSBOMBudget
+	}
 	if o.IngestWait <= 0 {
 		o.IngestWait = defaultIngestWait
 	}
-	return &Server{o: o, fails: newFailLimiter(), budget: semaphore.NewWeighted(o.IngestBudget)}
+	return &Server{o: o, fails: newFailLimiter(), reports: semaphore.NewWeighted(o.IngestBudget),
+		sboms: semaphore.NewWeighted(o.SBOMBudget)}
 }
 
-// acquire takes n bytes of the ingest budget, waiting at most wait (no limit when 0) and while ctx lasts.
-// It returns the release func, or false when the budget could not be had.
-func (s *Server) acquire(ctx context.Context, n int64, wait time.Duration) (func(), bool) {
+// acquire takes n bytes of budget, waiting at most wait (no limit when 0) and while ctx lasts. It returns the
+// release func, or false when the budget could not be had. The bytes held count in AgentIngestBytesInFlight.
+func acquire(ctx context.Context, budget *semaphore.Weighted, n int64, wait time.Duration) (func(), bool) {
 	if wait > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, wait)
 		defer cancel()
 	}
-	if err := s.budget.Acquire(ctx, n); err != nil {
+	if err := budget.Acquire(ctx, n); err != nil {
 		return nil, false
 	}
-	held := s.held.Add(n)
-	for {
-		peak := s.peak.Load()
-		if held <= peak || s.peak.CompareAndSwap(peak, held) {
-			break
-		}
-	}
+	metrics.AgentIngestBytesInFlight.Add(float64(n))
 	return func() {
-		s.held.Add(-n)
-		s.budget.Release(n)
+		metrics.AgentIngestBytesInFlight.Sub(float64(n))
+		budget.Release(n)
 	}, true
 }
 
 // bodyWeight is the budget a request body takes: its Content-Length, or limit when it has none, never more
 // than limit nor than the whole budget, and at least 1.
-func (s *Server) bodyWeight(r *http.Request, limit int64) int64 {
+func bodyWeight(r *http.Request, limit, budget int64) int64 {
 	n := r.ContentLength
 	if n < 0 || n > limit {
 		n = limit
 	}
-	return min(max(n, 1), s.o.IngestBudget)
+	return min(max(n, 1), budget)
 }
 
 // retryAfter is a Retry-After in seconds, spread between retryAfterMin and retryAfterMax so deferred agents
@@ -425,7 +436,7 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	if !ok || declaredTooLarge(w, r, s.o.MaxReportBytes, "report") {
 		return
 	}
-	release, ok := s.acquire(r.Context(), s.bodyWeight(r, s.o.MaxReportBytes), s.o.IngestWait)
+	release, ok := acquire(r.Context(), s.reports, bodyWeight(r, s.o.MaxReportBytes, s.o.IngestBudget), s.o.IngestWait)
 	if !ok {
 		if r.Context().Err() == nil {
 			w.deferred = true
@@ -447,8 +458,11 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// serveSBOM takes the result's share of the ingest budget, waiting for it as long as the request lasts: the
-// agent offers no back-pressure for results, and a result it gives up on expires and counts against the image.
+// serveSBOM takes the result's share of the SBOM budget before reading its body. The agent has no
+// back-pressure for results, so it waits for as long as the result could still be accepted: until the last
+// request open to the node stops taking a result (ResultWindow), or while the request lasts. A node with no
+// open request is answered 403 at once. A result that waited that long is answered 503, and its requests are
+// not counted against their images: the controller held them up.
 func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
 	defer countAnswer(w)
@@ -456,9 +470,22 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	if !ok || declaredTooLarge(w, r, s.o.MaxSBOMBytes, "SBOM result") {
 		return
 	}
-	release, ok := s.acquire(r.Context(), s.bodyWeight(r, s.o.MaxSBOMBytes), 0)
+	var wait time.Duration // as long as the request lasts
+	window, bounded := s.o.SBOMs.(ResultWindow)
+	if bounded {
+		if wait = window.ResultWait(id.Node); wait <= 0 {
+			writeError(w, http.StatusForbidden, "no request to "+id.Node+" takes a result")
+			return
+		}
+	}
+	release, ok := acquire(r.Context(), s.sboms, bodyWeight(r, s.o.MaxSBOMBytes, s.o.SBOMBudget), wait)
 	if !ok {
-		return // the agent went away
+		if bounded && r.Context().Err() == nil {
+			window.ResultUnread(id.Node)
+			s.o.Log.Info("an SBOM result waited for the ingest budget until its request expired", "node", id.Node)
+			writeError(w, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
+		}
+		return // or the agent went away
 	}
 	defer release()
 	var res wire.SBOMResult

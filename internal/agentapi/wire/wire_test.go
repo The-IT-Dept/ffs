@@ -100,4 +100,10 @@ func TestWire_JSONKeys(t *testing.T) {
 	require.Equal(t, []string{"id", "node", "agentVersion", "digest", "coverage"}, keysOf(t, SBOMResult{}),
 		"syftJSON, unavailable and failure are omitted when empty")
 	roundTrip(t, res)
+	skipped, err := json.Marshal(SBOMResult{ID: "w2", Node: "worker-1", Digest: "sha256:bb", Unavailable: UnavailableSkipped})
+	require.NoError(t, err)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal(skipped, &m))
+	require.Equal(t, "skipped", m["unavailable"])
+	require.NotContains(t, m, "failure")
 }

@@ -26,6 +26,7 @@ const (
 	detailNoPackageDatabase   = "no package database (image-based OS)"
 	detailPackageDBNotMounted = "package database not mounted; set nodeAgent.packageDatabases"
 	detailContentStore        = "no containerd content store on this node; side-loaded images cannot be catalogued from it"
+	detailScanFailedFmt       = "the node agent could not scan the containerd content store: %s"
 	detailBlockedFmt          = "node agent cannot read %s: permission denied"
 )
 
@@ -197,8 +198,9 @@ func mainModuleOf(meta any) (string, bool) {
 
 // coverageOf derives a report's coverage gaps, de-duplicated and sorted by code and detail. An images-only
 // report carries no host part, so it keeps the stored gaps but the content-store one, which its images
-// decide; a report without Images keeps the stored content-store gap. A missing package database is an
-// image-based OS only when imageBased says so (imageBasedOS); on any other OS the database was not mounted.
+// decide; a report without Images keeps the stored content-store gap, unless it says the scan failed, which
+// then replaces it with the scan's error. A missing package database is an image-based OS only when
+// imageBased says so (imageBasedOS); on any other OS the database was not mounted.
 func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool) []model.NodeCoverageGap {
 	noDB := model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: detailPackageDBNotMounted}
 	if imageBased {
@@ -212,7 +214,7 @@ func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool)
 			}
 		}
 	}
-	denied := false
+	denied, scanFailed := false, false
 	for _, p := range r.Problems {
 		switch p.Code {
 		case wire.ProblemPermissionDenied:
@@ -221,7 +223,12 @@ func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool)
 		case wire.ProblemNoPackageDB:
 			gaps = append(gaps, noDB)
 		case wire.ProblemContentStore:
-			gaps = append(gaps, model.NodeCoverageGap{Code: model.GapContentStoreUnreadable, Detail: detailContentStore})
+			detail := detailContentStore
+			if r.Images == nil { // the store is there, but the agent's scan of it failed: say so, with why
+				scanFailed = true
+				detail = fmt.Sprintf(detailScanFailedFmt, p.Detail)
+			}
+			gaps = append(gaps, model.NodeCoverageGap{Code: model.GapContentStoreUnreadable, Detail: detail})
 		}
 	}
 	if r.Host != nil && r.Host.PackageDB == "" && !denied {
@@ -231,7 +238,7 @@ func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool)
 	switch {
 	case r.Images != nil && !r.Images.ContentStore:
 		gaps = append(gaps, model.NodeCoverageGap{Code: model.GapContentStoreUnreadable, Detail: detailContentStore})
-	case r.Images == nil:
+	case r.Images == nil && !scanFailed:
 		for _, g := range stored {
 			if g.Code == model.GapContentStoreUnreadable {
 				gaps = append(gaps, g)
