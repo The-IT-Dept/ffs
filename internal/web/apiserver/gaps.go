@@ -81,6 +81,8 @@ var gapRemedy = map[apigen.GapCode]apigen.RemedyCode{
 	apigen.GapCodeNodeAgentBlocked:        apigen.RemedyCodeCheckHostPermissions,
 	apigen.GapCodeNoPackageDatabase:       apigen.RemedyCodeInformational,
 	apigen.GapCodeContentStoreUnreadable:  apigen.RemedyCodeInformational,
+	apigen.GapCodeHostNotInventoried:      apigen.RemedyCodeCheckNodeAgent,
+	apigen.GapCodeNodeAgentUnsupported:    apigen.RemedyCodeInformational,
 	apigen.GapCodeFeedStale:               apigen.RemedyCodeCheckFeedAccess,
 }
 

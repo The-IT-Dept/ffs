@@ -65,6 +65,8 @@ export const GAP_CODES = listOf<GapCode>({
   node_agent_blocked: true,
   no_package_database: true,
   content_store_unreadable: true,
+  host_not_inventoried: true,
+  node_agent_unsupported: true,
   feed_stale: true,
 })
 

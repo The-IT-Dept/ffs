@@ -465,12 +465,12 @@ export interface components {
          * @description What ffs cannot see.
          * @enum {string}
          */
-        GapCode: "pending" | "unresolvable_auth" | "unresolvable_sideloaded" | "unresolvable_notfound" | "unresolvable_unreachable" | "unresolvable_other" | "layers_discarded" | "catalog_failed" | "attestation_partial" | "unattributed_executables" | "rust_no_auditable" | "cpe_only_classifier" | "node_agent_missing" | "node_agent_blocked" | "no_package_database" | "content_store_unreadable" | "feed_stale";
+        GapCode: "pending" | "unresolvable_auth" | "unresolvable_sideloaded" | "unresolvable_notfound" | "unresolvable_unreachable" | "unresolvable_other" | "layers_discarded" | "catalog_failed" | "attestation_partial" | "unattributed_executables" | "rust_no_auditable" | "cpe_only_classifier" | "node_agent_missing" | "node_agent_blocked" | "no_package_database" | "content_store_unreadable" | "host_not_inventoried" | "node_agent_unsupported" | "feed_stale";
         /**
          * @description What to do about a gap.
          * @enum {string}
          */
-        RemedyCode: "wait" | "add_pull_secret" | "enable_node_agent" | "check_network" | "check_reference" | "repull_image" | "retry_later" | "build_with_auditable" | "check_host_permissions" | "check_feed_access" | "informational";
+        RemedyCode: "wait" | "add_pull_secret" | "enable_node_agent" | "check_network" | "check_reference" | "repull_image" | "retry_later" | "build_with_auditable" | "check_host_permissions" | "check_feed_access" | "check_node_agent" | "informational";
         /**
          * @description Kind of data that changed; all means every view may be stale.
          * @enum {string}
@@ -778,6 +778,20 @@ export interface components {
             matched?: string;
             /** Format: date-time */
             resolvedAt?: string;
+            /** @description Host findings (owner kind Nodes) only. The node groups the finding affects. */
+            nodeGroups?: components["schemas"]["FindingNodeGroup"][];
+        };
+        /** @description A node group a host finding affects, with the installed versions of the finding's packages there. */
+        FindingNodeGroup: {
+            /** @description The group's stable name, which /nodegroups/{id} resolves. */
+            id: string;
+            label: string;
+            /** @description Member nodes. */
+            nodes: number;
+            versions: {
+                package: string;
+                version: string;
+            }[];
         };
         /** @description A group of findings. distinct counts advisories, or workloads in advisory groups. fix is set on fix groups. */
         FindingGroupRow: {
@@ -828,6 +842,8 @@ export interface components {
             packages: components["schemas"]["AdvisoryPackage"][];
             /** @description Images in use that ffs has not seen into. */
             uncatalogued: number;
+            /** @description The node groups this advisory affects through host packages. */
+            nodeGroups?: components["schemas"]["FindingNodeGroup"][];
         };
         SourceSeverity: {
             source: string;

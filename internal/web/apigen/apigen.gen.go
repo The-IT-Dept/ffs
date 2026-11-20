@@ -352,10 +352,12 @@ const (
 	GapCodeContentStoreUnreadable  GapCode = "content_store_unreadable"
 	GapCodeCpeOnlyClassifier       GapCode = "cpe_only_classifier"
 	GapCodeFeedStale               GapCode = "feed_stale"
+	GapCodeHostNotInventoried      GapCode = "host_not_inventoried"
 	GapCodeLayersDiscarded         GapCode = "layers_discarded"
 	GapCodeNoPackageDatabase       GapCode = "no_package_database"
 	GapCodeNodeAgentBlocked        GapCode = "node_agent_blocked"
 	GapCodeNodeAgentMissing        GapCode = "node_agent_missing"
+	GapCodeNodeAgentUnsupported    GapCode = "node_agent_unsupported"
 	GapCodePending                 GapCode = "pending"
 	GapCodeRustNoAuditable         GapCode = "rust_no_auditable"
 	GapCodeUnattributedExecutables GapCode = "unattributed_executables"
@@ -379,6 +381,8 @@ func (e GapCode) Valid() bool {
 		return true
 	case GapCodeFeedStale:
 		return true
+	case GapCodeHostNotInventoried:
+		return true
 	case GapCodeLayersDiscarded:
 		return true
 	case GapCodeNoPackageDatabase:
@@ -386,6 +390,8 @@ func (e GapCode) Valid() bool {
 	case GapCodeNodeAgentBlocked:
 		return true
 	case GapCodeNodeAgentMissing:
+		return true
+	case GapCodeNodeAgentUnsupported:
 		return true
 	case GapCodePending:
 		return true
@@ -664,6 +670,7 @@ const (
 	RemedyCodeCheckFeedAccess      RemedyCode = "check_feed_access"
 	RemedyCodeCheckHostPermissions RemedyCode = "check_host_permissions"
 	RemedyCodeCheckNetwork         RemedyCode = "check_network"
+	RemedyCodeCheckNodeAgent       RemedyCode = "check_node_agent"
 	RemedyCodeCheckReference       RemedyCode = "check_reference"
 	RemedyCodeEnableNodeAgent      RemedyCode = "enable_node_agent"
 	RemedyCodeInformational        RemedyCode = "informational"
@@ -684,6 +691,8 @@ func (e RemedyCode) Valid() bool {
 	case RemedyCodeCheckHostPermissions:
 		return true
 	case RemedyCodeCheckNetwork:
+		return true
+	case RemedyCodeCheckNodeAgent:
 		return true
 	case RemedyCodeCheckReference:
 		return true
@@ -975,18 +984,21 @@ type AdvisoryDetail struct {
 	Cluster string `json:"cluster"`
 
 	// Counts Open findings by priority.
-	Counts      PriorityCounts    `json:"counts"`
-	Epss        *EpssInfo         `json:"epss"`
-	Findings    int               `json:"findings"`
-	GeneratedAt time.Time         `json:"generatedAt"`
-	Id          string            `json:"id"`
-	Kev         *KevInfo          `json:"kev"`
-	Links       []string          `json:"links"`
-	Malicious   bool              `json:"malicious"`
-	Packages    []AdvisoryPackage `json:"packages"`
-	Severities  []SourceSeverity  `json:"severities"`
-	Timeline    AdvisoryTimeline  `json:"timeline"`
-	Title       string            `json:"title"`
+	Counts      PriorityCounts `json:"counts"`
+	Epss        *EpssInfo      `json:"epss"`
+	Findings    int            `json:"findings"`
+	GeneratedAt time.Time      `json:"generatedAt"`
+	Id          string         `json:"id"`
+	Kev         *KevInfo       `json:"kev"`
+	Links       []string       `json:"links"`
+	Malicious   bool           `json:"malicious"`
+
+	// NodeGroups The node groups this advisory affects through host packages.
+	NodeGroups *[]FindingNodeGroup `json:"nodeGroups,omitempty"`
+	Packages   []AdvisoryPackage   `json:"packages"`
+	Severities []SourceSeverity    `json:"severities"`
+	Timeline   AdvisoryTimeline    `json:"timeline"`
+	Title      string              `json:"title"`
 
 	// Uncatalogued Images in use that ffs has not seen into.
 	Uncatalogued int  `json:"uncatalogued"`
@@ -1341,6 +1353,20 @@ type FindingGroupRow struct {
 	Worst Priority `json:"worst"`
 }
 
+// FindingNodeGroup A node group a host finding affects, with the installed versions of the finding's packages there.
+type FindingNodeGroup struct {
+	// Id The group's stable name, which /nodegroups/{id} resolves.
+	Id    string `json:"id"`
+	Label string `json:"label"`
+
+	// Nodes Member nodes.
+	Nodes    int `json:"nodes"`
+	Versions []struct {
+		Package string `json:"package"`
+		Version string `json:"version"`
+	} `json:"versions"`
+}
+
 // FindingPackage defines model for FindingPackage.
 type FindingPackage struct {
 	Ecosystem string   `json:"ecosystem"`
@@ -1356,13 +1382,16 @@ type FindingRow struct {
 	ExceptedBy *string         `json:"exceptedBy,omitempty"`
 
 	// Fix How a finding is cleared. introduces is set only on upgrade actions.
-	Fix          FixAction        `json:"fix"`
-	FixAvailable bool             `json:"fixAvailable"`
-	FixState     string           `json:"fixState"`
-	Id           string           `json:"id"`
-	Matched      *time.Time       `json:"matched,omitempty"`
-	Observed     *time.Time       `json:"observed,omitempty"`
-	Packages     []FindingPackage `json:"packages"`
+	Fix          FixAction  `json:"fix"`
+	FixAvailable bool       `json:"fixAvailable"`
+	FixState     string     `json:"fixState"`
+	Id           string     `json:"id"`
+	Matched      *time.Time `json:"matched,omitempty"`
+
+	// NodeGroups Host findings (owner kind Nodes) only. The node groups the finding affects.
+	NodeGroups *[]FindingNodeGroup `json:"nodeGroups,omitempty"`
+	Observed   *time.Time          `json:"observed,omitempty"`
+	Packages   []FindingPackage    `json:"packages"`
 
 	// Priority Priority of a finding; none means no open finding.
 	Priority       Priority     `json:"priority"`

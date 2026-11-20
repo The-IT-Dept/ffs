@@ -190,6 +190,14 @@ export const copy = {
       gap: 'no containerd content store',
       todo: 'Side-loaded images on this node cannot be catalogued from it.',
     },
+    host_not_inventoried: {
+      gap: 'agent reporting, host not inventoried',
+      todo: "Check the node agent's logs on these nodes; the last error is shown.",
+    },
+    node_agent_unsupported: {
+      gap: 'not scheduled by the node agent',
+      todo: 'Its architecture or node selector excludes this node from the node agent.',
+    },
     feed_stale: { gap: 'feed out of date', todo: 'Check that ffs can reach the {feed} feed; the last error is shown.' },
   } satisfies Record<GapCode, { gap: string; todo: string }>,
   theme: { light: 'Light', dark: 'Dark', system: 'System' },

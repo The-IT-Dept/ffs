@@ -691,6 +691,8 @@ components:
         - node_agent_blocked
         - no_package_database
         - content_store_unreadable
+        - host_not_inventoried
+        - node_agent_unsupported
         - feed_stale
     RemedyCode:
       type: string
@@ -706,6 +708,7 @@ components:
         - build_with_auditable
         - check_host_permissions
         - check_feed_access
+        - check_node_agent
         - informational
     ChangeKind:
       type: string
@@ -1096,6 +1099,27 @@ components:
         observed: {type: string, format: date-time}
         matched: {type: string, format: date-time}
         resolvedAt: {type: string, format: date-time}
+        nodeGroups:
+          type: array
+          description: Host findings (owner kind Nodes) only. The node groups the finding affects.
+          items: {$ref: '#/components/schemas/FindingNodeGroup'}
+
+    FindingNodeGroup:
+      type: object
+      description: A node group a host finding affects, with the installed versions of the finding's packages there.
+      required: [id, label, nodes, versions]
+      properties:
+        id: {type: string, description: "The group's stable name, which /nodegroups/{id} resolves."}
+        label: {type: string}
+        nodes: {type: integer, description: Member nodes.}
+        versions:
+          type: array
+          items:
+            type: object
+            required: [package, version]
+            properties:
+              package: {type: string}
+              version: {type: string}
 
     FindingGroupRow:
       type: object
@@ -1169,6 +1193,10 @@ components:
             byFix: {type: array, items: {$ref: '#/components/schemas/FindingGroupRow'}}
             packages: {type: array, items: {$ref: '#/components/schemas/AdvisoryPackage'}}
             uncatalogued: {type: integer, description: Images in use that ffs has not seen into.}
+            nodeGroups:
+              type: array
+              description: The node groups this advisory affects through host packages.
+              items: {$ref: '#/components/schemas/FindingNodeGroup'}
 
     SourceSeverity:
       type: object
