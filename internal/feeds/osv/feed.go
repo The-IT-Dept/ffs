@@ -241,13 +241,16 @@ func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string)
 		}
 	}
 	changed, takeErr := f.take(ctx, st, b, want, "")
+	if takeErr == nil {
+		// Every record is cached and the changed ones are pending (see handOff), in the same write.
+		st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
+	}
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
 	if takeErr != nil { // not marked loaded: the next Sync takes the rest
 		return errors.Join(takeErr, f.save(ctx, st))
 	}
-	st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
 	return f.save(ctx, st)
 }
 
@@ -268,7 +271,7 @@ func (f *Feed) redeliver(ctx context.Context, st *store.FeedState) error {
 		}
 	}
 	// A crash can separate a record's write from its index names: rewrite them from the record.
-	if err := f.deliverKeys(ctx, keys, true); err != nil {
+	if err := f.deliverKeys(ctx, st, keys, true); err != nil {
 		return err
 	}
 	feeds.SetPending(st, nil)
@@ -276,7 +279,9 @@ func (f *Feed) redeliver(ctx context.Context, st *store.FeedState) error {
 }
 
 // poll reads b's modified_id.csv down to the watermark and hands off the records whose affected
-// set changed. The watermark and generation advance only once the handler has taken them.
+// set changed. Once every listed record is cached, the watermark and generation advance in the same
+// write that records the changed ones as pending, before they are handed off: a hand-off cut short
+// resumes from pending (redeliver) instead of reading the backlog again.
 func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 	rd := newCSVReader(f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
 	rows, err := rd.next(ctx)
@@ -317,17 +322,19 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		logr.FromContextOrDiscard(ctx).V(1).Info("OSV all.zip is older than modified_id.csv; polling again next time", "bucket", b)
 		return f.save(ctx, st)
 	}
+	if takeErr == nil {
+		if newest.After(wm) {
+			st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
+		}
+		setMeta(st, metaGeneration+b, rd.gen)
+		delete(st.Meta, metaZipBehind+b)
+	}
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
 	if takeErr != nil { // the watermark stays, so the rest is read again next time
 		return errors.Join(takeErr, f.save(ctx, st))
 	}
-	if newest.After(wm) {
-		st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
-	}
-	setMeta(st, metaGeneration+b, rd.gen)
-	delete(st.Meta, metaZipBehind+b)
 	return f.save(ctx, st)
 }
 
@@ -833,15 +840,15 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 	return f.save(ctx, st)
 }
 
-// handOff records keys as pending and delivers them; on success it clears pending (the caller
-// saves). With no keys it only clears pending.
+// handOff records keys as pending, with whatever else st holds, and delivers them; on success it
+// clears pending (the caller saves). With no keys it only clears pending.
 func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) error {
 	if len(keys) > 0 {
 		setPending(st, keys)
 		if err := f.save(ctx, st); err != nil {
 			return err
 		}
-		if err := f.deliverKeys(ctx, keys, false); err != nil {
+		if err := f.deliverKeys(ctx, st, keys, false); err != nil {
 			return err
 		}
 	}
@@ -849,11 +856,14 @@ func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) 
 	return nil
 }
 
-// deliverKeys hands the cached records of keys to the handler in chunks of 500, skipping records no
-// longer cached. With refreshNames it first rewrites each record's index names. A GIT record that
-// references no GitRepos repository is a drop (see put): once the handler has taken it, it is
-// deleted from the cache. Deciding this from the cached raw lets a redelivery finish a drop.
-func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool) error {
+// deliverKeys hands the cached records of keys, which st holds as pending, to the handler in chunks
+// of 500, skipping records no longer cached. Once the handler has taken a chunk, pending is cut to
+// the keys after it and saved, so a failure part-way loses none of the progress before it. With
+// refreshNames it first rewrites each record's index names. A GIT record that references no
+// GitRepos repository is a drop (see put): once the handler has taken it, it is deleted from the
+// cache. Deciding this from the cached raw lets a redelivery finish a drop.
+func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recKey, refreshNames bool) error {
+	done := 0
 	for chunk := range slices.Chunk(keys, handlerChunk) {
 		ids := make([]string, len(chunk))
 		for i, k := range chunk {
@@ -900,6 +910,11 @@ func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool
 			if err := f.o.Store.DeleteOSVRecords(ctx, BucketGIT, drops); err != nil {
 				return err
 			}
+		}
+		done += len(chunk)
+		setPending(st, keys[done:])
+		if err := f.save(ctx, st); err != nil {
+			return err
 		}
 	}
 	return nil

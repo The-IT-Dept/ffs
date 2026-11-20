@@ -246,18 +246,21 @@ func gitRecord(id, repo string, modified time.Time) []byte {
 		`"events":[{"introduced":"0"},{"fixed":"abc123"}]}],"versions":["v1.0.0"]}]}`, id, modified.UTC().Format(time.RFC3339Nano), repo)
 }
 
-// sink records handler calls and fails the first fail calls.
+// sink records handler calls and fails the first fail calls, and the failAt-th call (1-based).
 type sink struct {
-	mu    sync.Mutex
-	calls [][]osv.Changed
-	fail  int
+	mu       sync.Mutex
+	calls    [][]osv.Changed
+	fail     int
+	failAt   int
+	attempts int
 }
 
 func (s *sink) handle(_ context.Context, recs []osv.Changed) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.fail > 0 {
-		s.fail--
+	s.attempts++
+	if s.fail > 0 || s.attempts == s.failAt {
+		s.fail = max(s.fail-1, 0)
 		return errors.New("handler unavailable")
 	}
 	s.calls = append(s.calls, slices.Clone(recs))
@@ -747,15 +750,51 @@ func TestOSVSync_PendingRedeliveredAfterHandlerError(t *testing.T) {
 	err := e.feed().Sync(ctx)
 	require.ErrorContains(t, err, "handler unavailable")
 	meta := e.meta(t)
-	require.Equal(t, ts(t0), meta["wm.PyPI"])
+	// the record is cached and pending, so the watermark already covers it
+	require.Equal(t, ts(t1), meta["wm.PyPI"])
 	require.Equal(t, "PyPI/PYSEC-2026-1", meta["pending"])
 	require.Empty(t, e.sink.all())
+	gets := e.srv.recordGETs("PyPI")
 
 	require.NoError(t, e.feed().Sync(ctx)) // the record is cached unchanged now, yet still delivered, once
 	require.Equal(t, []string{"PyPI/PYSEC-2026-1"}, e.sink.keys())
+	require.Equal(t, gets, e.srv.recordGETs("PyPI"), "a pending record is delivered from the cache")
 	meta = e.meta(t)
 	require.NotContains(t, meta, "pending")
 	require.Equal(t, ts(t1), meta["wm.PyPI"])
+}
+
+// TestOSVSync_BacklogResumesAfterFailedChunk guards the recovery of a large backlog whose hand-off
+// fails part-way, as when the sync timeout cuts it short: the chunks the handler took stay taken,
+// and the next Sync delivers only the rest, from the cache, without reading the bucket again.
+func TestOSVSync_BacklogResumesAfterFailedChunk(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-3*time.Hour), now.Add(-time.Minute)
+	const n = 1200
+	records := make(map[string][]byte, n)
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("GHSA-2026-%05d", i)
+		records[id] = pypi(id, "2.0.0", t1)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+	e.sink.failAt = 2 // the second chunk of 500 fails
+
+	require.ErrorContains(t, e.feed().Sync(ctx), "handler unavailable")
+	require.Len(t, e.sink.all(), 500)
+	meta := e.meta(t)
+	require.Equal(t, ts(t1), meta["wm.PyPI"], "every record is cached and pending: the backlog is not read again")
+	require.Len(t, strings.Split(meta["pending"], "\n"), n-500, "the first chunk is no longer pending")
+	reads := []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")}
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n, "each record is delivered once")
+	require.Len(t, slices.Compact(e.sink.keys()), n)
+	require.NotContains(t, e.meta(t), "pending")
+	require.Equal(t, reads, []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")})
 }
 
 func TestOSVSetDiff_VanishedMarkedWithdrawn(t *testing.T) {
