@@ -169,3 +169,38 @@ export function imagesPage(p?: Partial<S<'ImagesPage'>>): S<'ImagesPage'> {
 export function packagesPage(p?: Partial<S<'PackagesPage'>>): S<'PackagesPage'> {
   return { ...ENV, total: 0, rows: [], next: null, facets: {}, ...p }
 }
+
+export function exposureRow(p?: Partial<S<'ExposureRow'>>): S<'ExposureRow'> {
+  return {
+    id: 'row',
+    depth: 0,
+    kind: 'entry',
+    label: 'row',
+    internal: false,
+    workloads: [],
+    moreWorkloads: 0,
+    signals: rowSignals(),
+    expandable: false,
+    collapsed: false,
+    ...p,
+  }
+}
+
+export function exposureTable(p?: Partial<S<'ExposureTable'>>): S<'ExposureTable'> {
+  return { ...ENV, scope: { scope: 'cluster', kind: 'cluster', label: 'test' }, group: 'entry', maxUrgent: 0, rows: [], ...p }
+}
+
+export function gap(p?: Partial<S<'Gap'>>): S<'Gap'> {
+  return { code: 'pending', remedy: 'wait', what: 'ghcr.io/example/web', detail: '', affects: { workloads: 1, images: 1, nodes: 0 }, ...p }
+}
+
+export function coverageBody(p?: Partial<S<'Coverage'>>): S<'Coverage'> {
+  return {
+    ...ENV,
+    scope: { scope: 'cluster', kind: 'cluster', label: 'test' },
+    funnel: { pods: 3, images: 6, catalogued: 6, fullDetail: 6, feedsFresh: 3, feedsTotal: 3 },
+    gaps: [],
+    totalGaps: 0,
+    ...p,
+  }
+}

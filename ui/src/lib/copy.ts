@@ -282,6 +282,18 @@ export const copy = {
     images: 'Images',
     worst: 'Worst',
   },
+  funnel: { pods: 'Pods', images: 'Distinct images', catalogued: 'Catalogued', full: 'Full detail', feeds: 'Feeds fresh' },
+  gapsTable: { what: 'What', gap: 'Gap', affects: 'Affects', todo: 'What to do' },
+  // affects lists the non-zero parts: "2 workloads · 1 image"; nothing affected reads "—".
+  affects: (a: { workloads: number; images: number; nodes: number }) => {
+    const parts = [
+      a.workloads > 0 ? plural(a.workloads, 'workload', 'workloads') : '',
+      a.images > 0 ? plural(a.images, 'image', 'images') : '',
+      a.nodes > 0 ? plural(a.nodes, 'node', 'nodes') : '',
+    ].filter((p) => p !== '')
+    return parts.length ? parts.join(' · ') : '—'
+  },
+  moreGaps: (shown: number, total: number) => `Showing ${formatCount(shown)} of ${formatCount(total)} gaps`,
 }
 
 export type CountNoun = 'advisories' | 'workloads' | 'images' | 'packages' | 'namespaces' | 'fixes'
