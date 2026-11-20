@@ -3,6 +3,7 @@ package engine_test
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
 	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
+	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -100,25 +102,32 @@ func (f *fakeRecords) ApplyOSV(_ context.Context, recs []osv.Changed) ([]match.D
 	return f.deltas, nil
 }
 
-// fakeGrype is the grype matcher: MatchImage through fakeMatcher, Rematch and RematchAll return
-// delta. With notReady every call returns match.ErrNotReady.
+// fakeGrype is the grype matcher: MatchImage through fakeMatcher, storing a search key for the
+// digest as the real one does, and Affected returns affected. With notReady every call returns
+// match.ErrNotReady.
 type fakeGrype struct {
 	fakeMatcher
-	delta           match.Delta
-	loaded          []string
-	loadedBuilt     []time.Time
-	rematchArgs     [][]grypedb.PackageKey
-	rematchAllCalls int
-	notReady        bool
+	st           *store.Store
+	affected     []string
+	loaded       []string
+	loadedBuilt  []time.Time
+	affectedArgs [][]grypedb.PackageKey
+	matched      []string // digests MatchImage ran on
+	notReady     bool
 }
 
 func (g *fakeGrype) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
+	g.matched = append(g.matched, in.Digest)
 	if g.notReady {
 		g.calls++
 		g.lastInput = in
 		return nil, match.ErrNotReady
 	}
-	return g.fakeMatcher.MatchImage(ctx, in)
+	ms, err := g.fakeMatcher.MatchImage(ctx, in)
+	if err == nil && g.st != nil {
+		err = g.st.PutGrypeKeys(ctx, in.Digest, []string{"key"}, nil)
+	}
+	return ms, err
 }
 
 func (g *fakeGrype) Load(path string, built time.Time) error {
@@ -127,20 +136,12 @@ func (g *fakeGrype) Load(path string, built time.Time) error {
 	return nil
 }
 
-func (g *fakeGrype) Rematch(_ context.Context, changed []grypedb.PackageKey) (match.Delta, error) {
-	g.rematchArgs = append(g.rematchArgs, changed)
+func (g *fakeGrype) Affected(_ context.Context, changed []grypedb.PackageKey) ([]string, error) {
+	g.affectedArgs = append(g.affectedArgs, changed)
 	if g.notReady {
-		return match.Delta{}, match.ErrNotReady
+		return nil, match.ErrNotReady
 	}
-	return g.delta, nil
-}
-
-func (g *fakeGrype) RematchAll(context.Context) (match.Delta, error) {
-	g.rematchAllCalls++
-	if g.notReady {
-		return match.Delta{}, match.ErrNotReady
-	}
-	return g.delta, nil
+	return g.affected, nil
 }
 
 type harness struct {
@@ -169,7 +170,7 @@ func newHarness(t *testing.T) *harness {
 		st:         &spyStore{Store: st},
 		clock:      &clock{now: t0},
 		osv:        &fakeMatcher{src: model.SourceOSV},
-		grype:      &fakeGrype{fakeMatcher: fakeMatcher{src: model.SourceGrype}},
+		grype:      &fakeGrype{fakeMatcher: fakeMatcher{src: model.SourceGrype}, st: st},
 		records:    &fakeRecords{},
 		exceptions: &fakeExceptions{},
 	}
@@ -462,7 +463,16 @@ func TestEngine_GrypeNotReadyStillRecomputes(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, advisories(ms, model.SourceGrype), stale, "stored grype matches are untouched")
 
-	got, err := h.e.MatchCandidate(ctx, d1)
+	// F42: an upgrade candidate is not scored without grype's OS package matches, or it would seem to
+	// fix everything the running image has
+	_, err = h.e.MatchCandidate(ctx, d1)
+	require.ErrorIs(t, err, match.ErrNotReady)
+
+	// with the grype feed disabled grype never has an opinion, for the running image or a candidate
+	cfg := config.Default()
+	cfg.Feeds.GrypeDB.Enabled = false
+	e := engine.New(engine.Options{Config: cfg, Store: h.st, Grype: h.grype, Matchers: []match.Matcher{h.osv}, Now: h.clock.Now})
+	got, err := e.MatchCandidate(ctx, d1)
 	require.NoError(t, err)
 	require.Equal(t, []string{cve}, advisories(got, model.SourceOSV))
 	require.Empty(t, advisories(got, model.SourceGrype))
@@ -522,7 +532,9 @@ func TestEngine_GrypeDBRecordsBuildAndRematchesAffected(t *testing.T) {
 
 	rematched := h.grypeOn(h.libssl3)
 	rematched.DBBuilt = b
-	h.grype.delta = match.Delta{Scope: store.MatchScope{Source: model.SourceGrype, Digests: []string{d1}}, Matches: []model.Match{rematched}}
+	h.grype.fn = matchOn(h.grype.fn, d1, rematched)
+	h.grype.affected = []string{d1, "sha256:dead"} // a digest no owner runs is not re-matched
+	h.grype.matched, h.osv.calls = nil, 0
 	changed := []grypedb.PackageKey{{Ecosystem: "deb", Name: "libssl3"}}
 	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/b", Built: b, Changed: changed}))
 
@@ -531,8 +543,11 @@ func TestEngine_GrypeDBRecordsBuildAndRematchesAffected(t *testing.T) {
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []time.Time{b}, builds)
-	require.Equal(t, [][]grypedb.PackageKey{changed}, h.grype.rematchArgs)
-	require.Zero(t, h.grype.rematchAllCalls)
+	require.Equal(t, [][]grypedb.PackageKey{changed}, h.grype.affectedArgs)
+	require.Equal(t, []string{d1}, h.grype.matched, "only the live digest the diff touched")
+	require.Zero(t, h.osv.calls, "an incremental update re-matches with grype alone")
+	require.Equal(t, []model.Match{newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1")},
+		clearObserved(h.grype.lastInput.Hints), "the stored OSV matches are grype's hints")
 
 	ms, err := h.st.MatchesForDigests(ctx, []string{d1})
 	require.NoError(t, err)
@@ -557,7 +572,7 @@ func TestEngine_GrypeDBLoadFailureRecordsNothing(t *testing.T) {
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Empty(t, builds, "the build is recorded only once it loaded")
-	require.Zero(t, h.grype.rematchAllCalls)
+	require.Empty(t, h.grype.matched)
 	require.True(t, e.Idle())
 }
 
@@ -565,13 +580,21 @@ type failingLoad struct{ *fakeGrype }
 
 func (f *failingLoad) Load(string, time.Time) error { return errors.New("corrupt database") }
 
-func TestEngine_GrypeDBFullUsesRematchAll(t *testing.T) {
+// TestEngine_GrypeDBFullRematchesEveryMatcher is part of the F22 regression: the weekly full update
+// is the safety net for every matcher, so it re-runs the OSV fast path too, on every live digest.
+func TestEngine_GrypeDBFullRematchesEveryMatcher(t *testing.T) {
 	h := newHarness(t)
-	h.grype.delta = match.Delta{Scope: store.MatchScope{Source: model.SourceGrype}}
 	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/c", Built: t0, Full: true}))
-	require.Equal(t, 1, h.grype.rematchAllCalls)
-	require.Empty(t, h.grype.rematchArgs)
-	require.Empty(t, h.st.replaced, "a delta with an empty scope replaces nothing")
+	require.Empty(t, h.grype.affectedArgs)
+	require.Equal(t, []string{d1, d2}, h.grype.matched)
+	require.Equal(t, 2, h.osv.calls, "the OSV fast path re-matches every live digest too")
+	require.ElementsMatch(t, []store.MatchScope{
+		{Source: model.SourceOSV, Digests: []string{d1}}, {Source: model.SourceGrype, Digests: []string{d1}},
+		{Source: model.SourceOSV, Digests: []string{d2}}, {Source: model.SourceGrype, Digests: []string{d2}},
+	}, h.st.replaced, "one digest at a time")
+	builds, err := h.st.GrypeDBBuilds(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []time.Time{t0}, builds)
 }
 
 func TestEngine_AliasRekeyNoTransition(t *testing.T) {
@@ -641,8 +664,225 @@ func TestEngine_StartDrainsOnWake(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Start did not drain the queued owner")
 	}
+	require.Eventually(t, h.e.Idle, 10*time.Second, 10*time.Millisecond)
 	cancel()
 	require.NoError(t, <-done)
 	require.True(t, h.e.Idle())
 	require.Len(t, h.findings(apiKey), 1)
+}
+
+// TestEngine_StartCatchesUp is the F6 regression: matches stored before a restart, whose owners were
+// queued only in the previous process's memory, produce findings once Start runs, with no hook.
+func TestEngine_StartCatchesUp(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.st.Store.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceGrype, Digests: []string{d1}},
+		[]model.Match{h.grypeOn(h.libssl3)})
+	require.NoError(t, err)
+	ch := h.e.Changed()
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- h.e.Start(runCtx) }()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Start did not recompute the owners queued before the restart")
+	}
+	require.Eventually(t, h.e.Idle, 10*time.Second, 10*time.Millisecond)
+	cancel()
+	require.NoError(t, <-done)
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	require.Equal(t, model.TriggerInventoryChange, h.transitions()[0].Trigger)
+}
+
+// TestEngine_GrypeOpinionStandsOnNewDigest is the F2 regression. The OSV record was observed three
+// days ago and the loaded grype DB was built a day ago, so grype has an opinion (spec §6.5). An image
+// catalogued now, a new digest after a rollout, must keep grype's verdict (won't fix, low) instead of
+// letting the OSV verdict stand as urgent and provisional because its match rows are new.
+func TestEngine_GrypeOpinionStandsOnNewDigest(t *testing.T) {
+	h := newHarness(t)
+	const cve5535 = "CVE-2024-5535"
+	raw, err := os.ReadFile(filepath.Join("..", "match", "osvfast", "testdata", "DEBIAN-CVE-2024-5535.json"))
+	require.NoError(t, err)
+	v, err := match.ParseOSV(raw)
+	require.NoError(t, err)
+	hash, err := osv.AffectedHash(raw)
+	require.NoError(t, err)
+	_, err = h.st.PutOSVRecordAt(ctx, "Debian", v.GetId(), v.GetModified().AsTime(), hash, raw, t0.Add(-72*time.Hour))
+	require.NoError(t, err)
+	require.NoError(t, h.st.PutOSVRecordNames(ctx, "Debian", v.GetId(), []string{osv.IndexName("Debian", "openssl")}))
+	canon, err := match.UpsertOSVAdvisory(ctx, h.st.Store, v)
+	require.NoError(t, err)
+	require.Equal(t, cve5535, canon)
+	require.NoError(t, h.st.UpsertAdvisory(ctx, model.Advisory{ID: cve5535, CNASeverity: model.SeverityCritical, CNASource: "openssl"}))
+	built := t0.Add(-24 * time.Hour)
+	require.NoError(t, h.st.RecordGrypeDBBuild(ctx, built))
+
+	o, _, err := h.st.GetOwner(ctx, apiKey)
+	require.NoError(t, err)
+	o.Context = model.WorkloadContext{Exposed: true, ExposurePaths: []string{"Ingress web/api"}}
+	require.NoError(t, h.st.UpsertOwner(ctx, o))
+	wontFix := model.Match{ImageDigest: d1, PackageID: h.libssl3.ID, AdvisoryID: cve5535, Source: model.SourceGrype,
+		FixState: model.FixWontFix, VendorSeverity: model.SeverityLow, VendorSeveritySource: "debian",
+		Namespace: "debian:distro:debian:12", DBBuilt: built}
+	h.grype.fn = matchOn(nil, d1, wontFix)
+	e := engine.New(engine.Options{Config: config.Default(), Store: h.st, Grype: h.grype,
+		Matchers: []match.Matcher{osvfast.New(h.st.Store)}, Now: h.clock.Now})
+
+	require.NoError(t, e.OnImageCatalogued(ctx, d1))
+	require.NoError(t, e.Drain(ctx))
+	f := h.finding(apiKey, cve5535)
+	require.False(t, f.Provisional, "grype's DB was built after ffs observed the OSV record")
+	require.Equal(t, model.FixWontFix, f.FixState)
+	require.Equal(t, model.PriorityLow, f.Priority)
+	require.Equal(t, "debian", f.SeveritySource)
+
+	osvMatches := advisories(h.grype.lastInput.Hints, model.SourceOSV)
+	require.Equal(t, []string{cve5535}, osvMatches, "the OSV fast path matched the new digest")
+	require.Equal(t, t0.Add(-72*time.Hour), h.grype.lastInput.Hints[0].ObservedAt)
+	got, err := e.MatchCandidate(ctx, d1)
+	require.NoError(t, err)
+	for _, m := range got {
+		if m.Source == model.SourceOSV {
+			require.Equal(t, t0.Add(-72*time.Hour), m.ObservedAt, "candidates are scored with the same observation")
+		}
+	}
+}
+
+// TestEngine_RolloutToUncataloguedDigestKeepsFindings is the F3 regression: while the digest an owner
+// rolled out to is pending or unresolvable its findings stand, with no transition, and they resolve
+// as an inventory change only once the new digest is catalogued without them.
+func TestEngine_RolloutToUncataloguedDigestKeepsFindings(t *testing.T) {
+	h := newHarness(t)
+	h.catalogueAPI()
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	n := len(h.transitions())
+
+	const d3 = "sha256:d3"
+	rollout := func(status model.ImageStatus) {
+		t.Helper()
+		require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64", Status: status}))
+		o, _, err := h.st.GetOwner(ctx, apiKey)
+		require.NoError(t, err)
+		o.Containers[0].Digest = d3
+		require.NoError(t, h.st.UpsertOwner(ctx, o))
+		require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+		require.NoError(t, h.e.Drain(ctx))
+	}
+	h.clock.now = t0.Add(time.Hour)
+	rollout(model.ImagePending)
+	f := h.finding(apiKey, cve)
+	require.Equal(t, model.StateOpen, f.State, "a pending digest is not clean")
+	require.Equal(t, model.PriorityHigh, f.Priority)
+	require.Len(t, h.transitions(), n, "no resolution while the new digest is unknown")
+
+	h.clock.now = t0.Add(2 * time.Hour)
+	rollout(model.ImageUnresolvable)
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State, "an unresolvable digest is never clean")
+	require.Len(t, h.transitions(), n)
+
+	// d3 is catalogued with the fixed libssl3: the finding resolves as an inventory change
+	h.clock.now = t0.Add(3 * time.Hour)
+	fixed := h.libssl3
+	fixed.ImageDigest, fixed.Version = d3, "3.0.15-1"
+	fixed.ID = model.PackageID(d3, fixed)
+	require.NoError(t, h.st.PutSBOM(ctx, d3, []byte(`{"artifacts":[]}`), []model.Package{fixed}))
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64",
+		Status: model.ImageCatalogued, CataloguedAt: h.clock.now}))
+	require.NoError(t, h.e.OnImageCatalogued(ctx, d3))
+	require.NoError(t, h.e.Drain(ctx))
+	require.Equal(t, model.StateResolved, h.finding(apiKey, cve).State)
+	ts := h.transitions()
+	require.Len(t, ts, n+1)
+	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
+}
+
+// TestEngine_ProvisionalResolutionTrigger is the F29 regression: a provisional finding resolves as
+// withdrawn only when the advisory went away for the image the owner still runs (a feed change, or
+// grype's not-affected verdict), never when the team shipped the fix.
+func TestEngine_ProvisionalResolutionTrigger(t *testing.T) {
+	provisional := func(t *testing.T) *harness {
+		t.Helper()
+		h := newHarness(t)
+		h.osv.fn = matchOn(nil, d1, newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1"))
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d1))
+		require.NoError(t, h.e.Drain(ctx))
+		require.True(t, h.finding(apiKey, cve).Provisional)
+		h.clock.now = t0.Add(time.Hour)
+		return h
+	}
+	lastTrigger := func(h *harness) model.Trigger {
+		ts := h.transitions()
+		require.Equal(h.t, model.StateResolved, ts[len(ts)-1].ToState)
+		return ts[len(ts)-1].Trigger
+	}
+
+	t.Run("the team shipped the fix", func(t *testing.T) {
+		h := provisional(t)
+		const d4 = "sha256:d4"
+		fixed := h.libssl3
+		fixed.ImageDigest, fixed.Version = d4, "3.0.15-1"
+		fixed.ID = model.PackageID(d4, fixed)
+		require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d4, Repo: apiRepo, Platform: "linux/amd64",
+			Status: model.ImageCatalogued, CataloguedAt: h.clock.now}))
+		require.NoError(t, h.st.PutSBOM(ctx, d4, []byte(`{"artifacts":[]}`), []model.Package{fixed}))
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d4))
+		o, _, err := h.st.GetOwner(ctx, apiKey)
+		require.NoError(t, err)
+		o.Containers[0].Digest = d4
+		require.NoError(t, h.st.UpsertOwner(ctx, o))
+		require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerInventoryChange, lastTrigger(h))
+	})
+
+	t.Run("the OSV record was withdrawn", func(t *testing.T) {
+		h := provisional(t)
+		require.NoError(t, h.e.OnMatchDelta(ctx, match.Delta{
+			Scope: store.MatchScope{Source: model.SourceOSV, AdvisoryIDs: []string{cve}}}, model.TriggerNewAdvisory))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerWithdrawn, lastTrigger(h))
+	})
+
+	t.Run("grype says not affected", func(t *testing.T) {
+		h := provisional(t)
+		na := newMatch(h.libssl3, cve, model.SourceGrype)
+		na.FixState, na.DBBuilt = model.FixNotAffected, t0.Add(30*time.Minute)
+		h.grype.fn = matchOn(nil, d1, na)
+		require.NoError(t, h.e.OnImageCatalogued(ctx, d1))
+		require.NoError(t, h.e.Drain(ctx))
+		require.Equal(t, model.TriggerWithdrawn, lastTrigger(h), "even on an inventory-change recompute")
+	})
+}
+
+// TestEngine_PruneUnusedImagesAfterAWeek is the F30 regression: a superseded digest is pruned a week
+// after it is first found unused, not after resolved-finding retention (90 days).
+func TestEngine_PruneUnusedImagesAfterAWeek(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.DeleteOwner(ctx, cartKey))
+	_, err := h.e.Prune(ctx)
+	require.NoError(t, err)
+	_, ok, err := h.st.GetImage(ctx, d2)
+	require.NoError(t, err)
+	require.True(t, ok, "kept for a rollback")
+
+	h.clock.now = t0.Add(8 * 24 * time.Hour)
+	_, err = h.e.Prune(ctx)
+	require.NoError(t, err)
+	_, ok, err = h.st.GetImage(ctx, d2)
+	require.NoError(t, err)
+	require.False(t, ok, "unused for over a week")
+	_, ok, err = h.st.GetImage(ctx, d1)
+	require.NoError(t, err)
+	require.True(t, ok, "web/api still runs d1")
+}
+
+// clearObserved returns ms with ObservedAt cleared, for comparing match content.
+func clearObserved(ms []model.Match) []model.Match {
+	out := make([]model.Match, len(ms))
+	for i, m := range ms {
+		m.ObservedAt = time.Time{}
+		out[i] = m
+	}
+	return out
 }

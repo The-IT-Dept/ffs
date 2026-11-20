@@ -116,7 +116,7 @@ func TestUpsertOSVAdvisory(t *testing.T) {
 		require.True(t, a.Malicious)
 	})
 
-	t.Run("withdrawn", func(t *testing.T) {
+	t.Run("withdrawn record leaves the advisory live", func(t *testing.T) {
 		_, raw := record(t, "GHSA-grv7-fg5c-xmjg")
 		v, err := match.ParseOSV(bytes.Replace(raw, []byte("{"), []byte(`{"withdrawn": "2024-07-01T00:00:00Z",`), 1))
 		require.NoError(t, err)
@@ -125,7 +125,7 @@ func TestUpsertOSVAdvisory(t *testing.T) {
 		require.Equal(t, "CVE-2024-4068", canon)
 		a, _, err := st.GetAdvisory(ctx, canon)
 		require.NoError(t, err)
-		require.True(t, a.Withdrawn)
+		require.False(t, a.Withdrawn, "withdrawal is per record, never the advisory's")
 	})
 
 	t.Run("unknown fields and enum values", func(t *testing.T) {

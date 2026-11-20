@@ -54,13 +54,24 @@ func (s *Store) PutFeedState(ctx context.Context, st FeedState) error {
 	return err
 }
 
-// PutOSVRecord caches a raw OSV record. changed is true when there was no prior row or its
-// affected hash differs; the latest modified time and raw record are stored either way.
+// PutOSVRecord caches a raw OSV record, observed now. See PutOSVRecordAt.
 func (s *Store) PutOSVRecord(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte) (bool, error) {
+	return s.PutOSVRecordAt(ctx, eco, id, modified, affectedHash, raw, time.Now())
+}
+
+// PutOSVRecordAt caches a raw OSV record that ffs observed at observed. changed is true when there
+// was no prior row or its affected hash differs; the latest modified time and raw record are stored
+// either way. The record's observation time (OSVRecordsObserved) is observed when it changed, and
+// the stored one otherwise: it is when ffs first saw the record's current affected content.
+func (s *Store) PutOSVRecordAt(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte, observed time.Time) (bool, error) {
 	var changed bool
 	err := s.inTx(ctx, func(tx *sql.Tx) error {
-		var prev string
-		err := tx.QueryRowContext(ctx, `SELECT affected_hash FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).Scan(&prev)
+		var (
+			prev    string
+			prevObs sql.NullInt64
+		)
+		err := tx.QueryRowContext(ctx, `SELECT affected_hash, observed FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).
+			Scan(&prev, &prevObs)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
 			changed = true
@@ -69,11 +80,44 @@ func (s *Store) PutOSVRecord(ctx context.Context, eco, id string, modified time.
 		default:
 			changed = prev != affectedHash
 		}
-		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst) VALUES(?, ?, ?, ?, ?)`,
-			eco, id, nanos(modified), affectedHash, zstdEncode(raw))
+		obs := nanos(orNow(observed))
+		if !changed && prevObs.Valid {
+			obs = prevObs
+		}
+		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
+			VALUES(?, ?, ?, ?, ?, ?)`, eco, id, nanos(modified), affectedHash, zstdEncode(raw), obs)
 		return err
 	})
 	return changed, err
+}
+
+// OSVRecordsObserved returns, for each of ids cached in any bucket, the earliest time ffs observed
+// its current affected content. Ids not cached, or cached before observation times were kept and
+// never backfilled, are absent.
+func (s *Store) OSVRecordsObserved(ctx context.Context, ids []string) (map[string]time.Time, error) {
+	out := map[string]time.Time{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	type row struct {
+		id  string
+		obs sql.NullInt64
+	}
+	rows, err := queryAll(ctx, s.rdb, func(r scanner) (row, error) {
+		var v row
+		err := r.Scan(&v.id, &v.obs)
+		return v, err
+	}, `SELECT id, MIN(observed) FROM osv_records WHERE id IN (SELECT value FROM json_each(?)) AND observed IS NOT NULL
+		GROUP BY id`, idList(ids))
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range rows {
+		if r.obs.Valid {
+			out[r.id] = fromNanos(r.obs)
+		}
+	}
+	return out, nil
 }
 
 // OSVRecords returns the decompressed raw records of eco modified at or after since; a zero since

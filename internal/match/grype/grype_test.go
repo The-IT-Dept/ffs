@@ -248,9 +248,7 @@ func TestGrypeMatcher_NotReadyAndSynthetic(t *testing.T) {
 
 	_, err := m.MatchImage(ctx, match.ImageInput{Digest: d0, SyftJSON: sj, Packages: pkgs})
 	require.ErrorIs(t, err, match.ErrNotReady)
-	_, err = m.Rematch(ctx, []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}})
-	require.ErrorIs(t, err, match.ErrNotReady)
-	_, err = m.RematchAll(ctx)
+	_, err = m.Affected(ctx, []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}})
 	require.ErrorIs(t, err, match.ErrNotReady)
 	_, err = m.HasRecord(ctx, pkgs[0], []string{cve})
 	require.ErrorIs(t, err, match.ErrNotReady)
@@ -262,17 +260,16 @@ func TestGrypeMatcher_NotReadyAndSynthetic(t *testing.T) {
 
 	require.NoError(t, m.Load(grypedbtest.BuildDB(t, built, "**/debian-12/*.json"), built))
 	require.Equal(t, built, m.Built())
-	delta, err := m.RematchAll(ctx)
+	got, err := m.MatchImage(ctx, match.ImageInput{Digest: d0, SyftJSON: sj, Packages: pkgs})
 	require.NoError(t, err)
-	require.Equal(t, store.MatchScope{Source: model.SourceGrype, Digests: []string{d0}}, delta.Scope)
-	require.Len(t, delta.Matches, 1)
-	require.Equal(t, cve, delta.Matches[0].AdvisoryID)
+	require.Len(t, got, 1)
+	require.Equal(t, cve, got[0].AdvisoryID)
 	keyed, err := st.GrypeDigests(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []string{d0}, keyed)
 }
 
-func TestGrypeMatcher_RematchSelectsAffectedDigests(t *testing.T) {
+func TestGrypeMatcher_AffectedSelectsDigests(t *testing.T) {
 	m, st := loaded(t)
 	sj1, pkgs1 := debImage(t, d1, deb{"firefox-esr", "140.5.0esr-1~deb12u1", ""})
 	sj2, pkgs2 := debImage(t, d2, deb{"bind9", "1:9.18.0-1", ""})
@@ -285,19 +282,12 @@ func TestGrypeMatcher_RematchSelectsAffectedDigests(t *testing.T) {
 		_, err := m.MatchImage(ctx, match.ImageInput{Digest: img.digest, SyftJSON: img.sj, Packages: img.pkgs})
 		require.NoError(t, err)
 	}
-	// the OSV fast path matched d1; the re-match passes that on as a hint
-	_, err := st.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceOSV, Digests: []string{d1}}, []model.Match{
-		{ImageDigest: d1, PackageID: pkgs1[0].ID, AdvisoryID: cve, Source: model.SourceOSV, FixState: model.FixFixed}})
-	require.NoError(t, err)
 
-	delta, err := m.Rematch(ctx, []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}})
+	digests, err := m.Affected(ctx, []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}})
 	require.NoError(t, err)
-	require.Equal(t, store.MatchScope{Source: model.SourceGrype, Digests: []string{d1}}, delta.Scope)
-	require.Len(t, delta.Matches, 1)
-	require.Equal(t, model.FixNotAffected, delta.Matches[0].FixState)
-	require.Equal(t, d1, delta.Matches[0].ImageDigest)
+	require.Equal(t, []string{d1}, digests)
 
-	delta, err = m.Rematch(ctx, []grypedb.PackageKey{{Ecosystem: "cpe", Name: "firefox-esr"}})
+	digests, err = m.Affected(ctx, []grypedb.PackageKey{{Ecosystem: "cpe", Name: "firefox-esr"}})
 	require.NoError(t, err)
-	require.Empty(t, delta.Scope.Digests, "a deb package is not searched by CPE")
+	require.Empty(t, digests, "a deb package is not searched by CPE")
 }

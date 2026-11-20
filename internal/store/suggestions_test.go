@@ -152,8 +152,8 @@ func TestStore_PruneImages(t *testing.T) {
 	s := newStore(t)
 	now := t0
 	const (
-		used, cand, old, fresh = "sha256:d-used", "sha256:d-cand", "sha256:d-old", "sha256:d-new"
-		synthetic, pending     = "k8s:1.35.1", "sha256:d-pending"
+		used, cand, old, revived = "sha256:d-used", "sha256:d-cand", "sha256:d-old", "sha256:d-revived"
+		synthetic, pending       = "k8s:1.35.1", "sha256:d-pending"
 	)
 	seedImage := func(digest string, catalogued time.Time) {
 		t.Helper()
@@ -168,19 +168,29 @@ func TestStore_PruneImages(t *testing.T) {
 		seed(t, s, mt(digest, p.ID, "CVE-2026-0001", model.SourceGrype))
 		require.NoError(t, s.PutGrypeKeys(ctx, digest, []string{"openssl"}, nil))
 	}
-	for _, d := range []string{used, cand, old, synthetic} {
+	for _, d := range []string{used, cand, old, revived, synthetic} {
 		seedImage(d, now.AddDate(0, 0, -100))
 	}
-	seedImage(fresh, now.AddDate(0, 0, -1))
 	seedImage(pending, time.Time{})
-	require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "web"},
-		Containers: []model.ContainerUse{{Name: "web", Repo: "ghcr.io/x", Digest: used}}}))
+	owner := model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "web"},
+		Containers: []model.ContainerUse{{Name: "web", Repo: "ghcr.io/x", Digest: used}}}
+	require.NoError(t, s.UpsertOwner(ctx, owner))
 	require.NoError(t, s.PutSuggestion(ctx, "Deployment/shop/web", model.Suggestion{Repo: "ghcr.io/x", Tier: model.TierPatch, ComputedAt: now},
 		[]CandidateDigest{{Tag: "1.1", Tier: model.TierPatch, Platform: "linux/amd64", Digest: cand}}))
 
-	n, err := s.PruneImages(ctx, now.AddDate(0, 0, -90))
+	week := 7 * 24 * time.Hour
+	n, err := s.PruneImages(ctx, now, week)
 	require.NoError(t, err)
-	require.Equal(t, 1, n)
+	require.Zero(t, n, "an image is pruned a week after it is first seen unused, however old")
+	// revived is used again: its unused clock stops
+	owner.Containers = append(owner.Containers, model.ContainerUse{Name: "sidecar", Repo: "ghcr.io/x", Digest: revived})
+	require.NoError(t, s.UpsertOwner(ctx, owner))
+	n, err = s.PruneImages(ctx, now.Add(6*24*time.Hour), week)
+	require.NoError(t, err)
+	require.Zero(t, n)
+	n, err = s.PruneImages(ctx, now.Add(8*24*time.Hour), week)
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
 
 	present := func(digest string) (image, pkgs, sbom, matches bool) {
 		t.Helper()
@@ -194,17 +204,18 @@ func TestStore_PruneImages(t *testing.T) {
 		require.NoError(t, err)
 		return image, len(ps) > 0, sbom, len(ms) > 0
 	}
-	image, pkgs, sbom, matches := present(old)
-	require.False(t, image || pkgs || sbom || matches, "every row of the pruned image is gone")
-	for _, d := range []string{used, cand, fresh, synthetic, pending} {
+	for _, d := range []string{old, pending} {
+		image, pkgs, sbom, matches := present(d)
+		require.False(t, image || pkgs || sbom || matches, "every row of the pruned image %s is gone", d)
+	}
+	for _, d := range []string{used, cand, revived, synthetic} {
 		image, pkgs, sbom, matches := present(d)
 		require.True(t, image && pkgs && sbom && matches, d)
 	}
 	keyed, err := s.GrypeDigests(ctx)
 	require.NoError(t, err)
-	require.ElementsMatch(t, []string{used, cand, fresh, synthetic, pending}, keyed)
+	require.ElementsMatch(t, []string{used, cand, revived, synthetic}, keyed)
 
-	n, err = s.PruneImages(ctx, time.Time{})
-	require.NoError(t, err)
-	require.Zero(t, n)
+	_, err = s.PruneImages(ctx, time.Time{}, week)
+	require.Error(t, err)
 }

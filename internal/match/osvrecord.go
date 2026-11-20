@@ -33,6 +33,10 @@ func ParseOSV(raw []byte) (*osvschema.Vulnerability, error) {
 // candidate ids are its own id, its aliases and, when its upstream names exactly one CVE, that CVE;
 // the advisory is keyed by model.CanonicalID over them, with the rest as aliases. The id returned is
 // store.Canonical of the record id, because aliases stored earlier can make a different id canonical.
+//
+// A withdrawn record never marks the advisory withdrawn: withdrawal belongs to that one record, and
+// GitHub withdraws duplicate GHSAs that keep a live CVE as an alias. The record matchers drop the
+// matches a withdrawn record supported through their advisory-scoped deltas.
 func UpsertOSVAdvisory(ctx context.Context, st *store.Store, v *osvschema.Vulnerability) (string, error) {
 	cands := candidateIDs(v)
 	canon := model.CanonicalID(cands...)
@@ -43,7 +47,9 @@ func UpsertOSVAdvisory(ctx context.Context, st *store.Store, v *osvschema.Vulner
 		Published: osvTime(v.GetPublished()),
 		Modified:  osvTime(v.GetModified()),
 		Malicious: slices.ContainsFunc(cands, func(id string) bool { return strings.HasPrefix(id, "MAL-") }),
-		Withdrawn: v.GetWithdrawn() != nil,
+	}
+	if v.GetWithdrawn() == nil {
+		a.OSVSeverity = RecordSeverity(v)
 	}
 	for _, r := range v.GetReferences() {
 		if u := r.GetUrl(); u != "" && !slices.Contains(a.Links, u) {

@@ -476,6 +476,8 @@ func TestBuild_PriorityInputs(t *testing.T) {
 	})
 }
 
+// TestBuild_WithdrawnAdvisoryIgnored covers a REJECTED CVE (cvelistV5), the only source of
+// Advisory.Withdrawn.
 func TestBuild_WithdrawnAdvisoryIgnored(t *testing.T) {
 	gone := advisory("CVE-W")
 	gone.Withdrawn = true
@@ -484,4 +486,69 @@ func TestBuild_WithdrawnAdvisoryIgnored(t *testing.T) {
 		match(model.SourceGrype, libssl3Amd, "CVE-2026-0001"),
 	}, gone)
 	assert.Equal(t, "CVE-2026-0001", one(t, Build(in)).AdvisoryID)
+}
+
+// TestBuild_CarriedFindings (F3): a stored finding on a repository whose digest is not catalogued
+// stands, re-ranked with the current advisory and exceptions; a built finding wins over its carried
+// copy, and resolved findings and rejected CVEs are not carried.
+func TestBuild_CarriedFindings(t *testing.T) {
+	stored := one(t, Build(input([]model.Match{match(model.SourceGrype, libssl3Amd, "CVE-2026-0001", fixedIn("3.0.15-1"),
+		vendor(model.SeverityHigh, "debian"))})))
+	require.Equal(t, model.PriorityMedium, stored.Priority)
+	resolved := stored
+	resolved.Fingerprint, resolved.AdvisoryID, resolved.State = "fp-resolved", "CVE-2026-0002", model.StateResolved
+	rejected := stored
+	rejected.Fingerprint, rejected.AdvisoryID = "fp-rejected", "CVE-2026-0003"
+
+	in := input(nil, advisory("CVE-2026-0001", kev), advisory("CVE-2026-0002"),
+		advisory("CVE-2026-0003", func(a *model.Advisory) { a.Withdrawn = true }))
+	in.Carry = []model.Finding{stored, resolved, rejected}
+	f := one(t, Build(in))
+	assert.Equal(t, stored.Fingerprint, f.Fingerprint)
+	assert.Equal(t, model.StateOpen, f.State)
+	assert.Equal(t, model.PriorityUrgent, f.Priority, "a KEV listing applies to a carried finding")
+	assert.Equal(t, stored.Packages, f.Packages)
+	assert.Equal(t, stored.Digests, f.Digests)
+	assert.Equal(t, now, f.LastSeen)
+
+	in.Exceptions = []ExceptionRule{{Namespace: "ffs", Name: "accept", ClusterWide: true,
+		AdvisoryIDs: []string{"CVE-2026-0001"}, Expires: now.Add(time.Hour)}}
+	assert.Equal(t, model.StateExcepted, one(t, Build(in)).State, "exceptions apply to a carried finding")
+
+	// a match on the same fingerprint builds it afresh
+	in.Exceptions = nil
+	in.Matches = []model.Match{match(model.SourceGrype, libssl3Amd, "CVE-2026-0001", vendor(model.SeverityLow, "debian"))}
+	f = one(t, Build(in))
+	assert.Equal(t, model.FixNotFixed, f.FixState)
+	assert.Equal(t, model.SeverityLow, f.Severity)
+}
+
+// TestBuild_OSVSeverityFallback (F28): the CVSS rating of the advisory's OSV records is the last
+// resort, after the vendor, CNA and NVD ratings.
+func TestBuild_OSVSeverityFallback(t *testing.T) {
+	osvRated := func(a *model.Advisory) { a.OSVSeverity = model.SeverityHigh }
+	in := input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001", fixedIn("8.3.15"))}, advisory("CVE-2023-0001", osvRated))
+	f := one(t, Build(in))
+	assert.Equal(t, model.SeverityHigh, f.Severity)
+	assert.Equal(t, "osv", f.SeveritySource)
+	assert.NotContains(t, f.Reasons, "severity pending")
+
+	in = input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001", fixedIn("8.3.15"))},
+		advisory("CVE-2023-0001", osvRated, cna(model.SeverityMedium)))
+	f = one(t, Build(in))
+	assert.Equal(t, model.SeverityMedium, f.Severity, "the CNA rating comes first")
+	assert.Equal(t, "cna", f.SeveritySource)
+
+	in = input([]model.Match{match(model.SourceOSV, lodashAmd, "CVE-2023-0002", vendor(model.SeverityLow, "ghsa"))},
+		advisory("CVE-2023-0002", osvRated))
+	assert.Equal(t, model.SeverityLow, one(t, Build(in)).Severity, "a vendor rating comes first")
+
+	// a carried finding rated from OSV takes a CNA rating that arrives later
+	carried := one(t, Build(input([]model.Match{match(model.SourceUpstream, phpAmd, "CVE-2023-0001")},
+		advisory("CVE-2023-0001", osvRated))))
+	in = input(nil, advisory("CVE-2023-0001", osvRated, cna(model.SeverityCritical)))
+	in.Carry = []model.Finding{carried}
+	f = one(t, Build(in))
+	assert.Equal(t, model.SeverityCritical, f.Severity)
+	assert.Equal(t, "cna", f.SeveritySource)
 }

@@ -34,10 +34,11 @@ const matchColumns = `digest, package_id, advisory_id, source, fix_state, fixed_
 	vendor_severity_source, namespace, db_built, observed_at`
 
 // ReplaceMatches replaces every match in scope with ms in one transaction. Advisory ids in the
-// scope and in ms are canonicalised first, and a match outside the scope is an error. Rows whose
-// key survives keep their ObservedAt. It returns the sorted digests whose rows were added, removed
-// or changed in any column other than observed_at. Later entries of ms win over earlier ones with
-// the same key.
+// scope and in ms are canonicalised first, and a match outside the scope is an error. A new row is
+// observed at its ObservedAt, or now when it has none; a row whose key survives keeps the earlier of
+// its stored and incoming ObservedAt, so a re-match never moves the time ffs first saw a match. It
+// returns the sorted digests whose rows were added, removed or changed in any column other than
+// observed_at. Later entries of ms win over earlier ones with the same key.
 func (s *Store) ReplaceMatches(ctx context.Context, scope MatchScope, ms []model.Match) ([]string, error) {
 	if len(scope.Digests) == 0 && len(scope.PackageIDs) == 0 && len(scope.AdvisoryIDs) == 0 {
 		return nil, ErrEmptyScope
@@ -100,7 +101,7 @@ func (s *Store) ReplaceMatches(ctx context.Context, scope MatchScope, ms []model
 			cols := colsOf(m)
 			observedAt := orNow(m.ObservedAt).UTC().UnixNano()
 			if prev, ok := old[k]; ok {
-				observedAt = prev.observedAt
+				observedAt = min(observedAt, prev.observedAt)
 				if prev.cols != cols {
 					changed[k.digest] = true
 				}

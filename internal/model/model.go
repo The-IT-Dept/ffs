@@ -145,10 +145,15 @@ type Advisory struct {
 	CNASeverity                   Severity
 	CNACVSS                       float64
 	CNASource                     string
-	KEVAdded                      *time.Time
-	EPSS, EPSSPercentile          float64
-	Malicious                     bool // OSV MAL- record
-	Withdrawn                     bool
+	// OSVSeverity rates the CVSS vectors of the advisory's OSV records (the highest seen). Findings
+	// fall back to it, as source "osv", only when no vendor, CNA or NVD rating exists.
+	OSVSeverity          Severity
+	KEVAdded             *time.Time
+	EPSS, EPSSPercentile float64
+	Malicious            bool // OSV MAL- record
+	// Withdrawn means the CVE record is REJECTED in cvelistV5. A withdrawn OSV record never sets it:
+	// withdrawal is per record, and the record matchers drop that record's matches themselves.
+	Withdrawn bool
 }
 
 type Match struct {

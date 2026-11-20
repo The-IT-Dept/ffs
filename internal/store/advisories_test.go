@@ -59,3 +59,38 @@ func TestUpsertAdvisory_RekeysMatchesWhenCVEArrives(t *testing.T) {
 	ids, _ := s.AdvisoryIDsInUse(ctx)
 	require.Equal(t, []string{"CVE-2026-0001"}, ids)
 }
+
+// TestMigration011_ClearsWithdrawn is the store half of F1: flags ORed in from withdrawn OSV records
+// before the fix are cleared, and nothing else in the advisory changes.
+func TestMigration011_ClearsWithdrawn(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2024-24762", Aliases: []string{"GHSA-qf9m-vfgh-m389"},
+		Title: "ReDoS", Withdrawn: true, Malicious: false}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0002", Title: "live"}))
+	body, err := migrations.ReadFile("migrations/011_clear_advisory_withdrawn.sql")
+	require.NoError(t, err)
+	_, err = s.wdb.ExecContext(ctx, string(body))
+	require.NoError(t, err)
+
+	a, ok, err := s.GetAdvisory(ctx, "GHSA-qf9m-vfgh-m389")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, a.Withdrawn)
+	require.Equal(t, "ReDoS", a.Title)
+	require.Equal(t, []string{"GHSA-qf9m-vfgh-m389"}, a.Aliases)
+	b, _, err := s.GetAdvisory(ctx, "CVE-2026-0002")
+	require.NoError(t, err)
+	require.Equal(t, "live", b.Title)
+}
+
+// TestUpsertAdvisory_OSVSeverityKeepsHighest (F28): records of one advisory may carry different CVSS
+// vectors; the stored rating is the highest, whatever the delivery order.
+func TestUpsertAdvisory_OSVSeverityKeepsHighest(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", OSVSeverity: model.SeverityHigh}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", OSVSeverity: model.SeverityMedium}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0005", Title: "no rating"}))
+	a, _, err := s.GetAdvisory(ctx, "CVE-2026-0005")
+	require.NoError(t, err)
+	require.Equal(t, model.SeverityHigh, a.OSVSeverity)
+}

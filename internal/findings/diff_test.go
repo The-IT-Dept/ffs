@@ -24,8 +24,12 @@ func TestDiff_Transitions(t *testing.T) {
 	)
 	ref := api().Ref
 	f := func(s model.FindingState, p model.Priority) *model.Finding {
-		return &model.Finding{Fingerprint: "fp", Owner: ref, ImageRepo: phpRepo, AdvisoryID: "CVE-2026-0001", State: s, Priority: p}
+		return &model.Finding{Fingerprint: "fp", Owner: ref, ImageRepo: phpRepo, AdvisoryID: "CVE-2026-0001", State: s, Priority: p,
+			Digests: []string{amd}}
 	}
+	running := Withdrawals{Digests: []string{amd, arm}} // the owner still runs what the finding was found in
+	movedOn := Withdrawals{Digests: []string{"sha256:new"}}
+	notAffected := Withdrawals{NotAffected: map[string]bool{"fp": true}, Digests: []string{"sha256:new"}}
 	prov := func(x *model.Finding) *model.Finding { x.Provisional = true; return x }
 	fixed := func(x *model.Finding) *model.Finding { x.FixAvailable, x.FixState = true, model.FixFixed; return x }
 
@@ -36,25 +40,31 @@ func TestDiff_Transitions(t *testing.T) {
 		wantTo   model.FindingState
 		wantTrig model.Trigger
 		none     bool
+		w        *Withdrawals // nil = running
 	}{
-		{"create open", nil, f(open, high), newAdv, open, newAdv, false},
-		{"create excepted", nil, f(excepted, high), inv, excepted, inv, false},
-		{"create provisional", nil, prov(f(open, urgent)), newAdv, open, newAdv, false},
-		{"gone", f(open, high), nil, inv, resolved, inv, false},
-		{"gone provisional", prov(f(open, urgent)), nil, newAdv, resolved, model.TriggerWithdrawn, false},
-		{"excepted gone", f(excepted, high), nil, inv, resolved, inv, false},
-		{"regression", f(resolved, high), f(open, high), inv, open, inv, false},
-		{"regression excepted", f(resolved, high), f(excepted, high), inv, excepted, inv, false},
-		{"exception expired", f(excepted, high), f(open, high), prioCh, open, model.TriggerExceptionExpired, false},
-		{"excepted", f(open, high), f(excepted, high), prioCh, excepted, prioCh, false},
-		{"escalation", f(open, high), f(open, urgent), newAdv, open, prioCh, false},
-		{"de-escalation", f(open, urgent), f(open, medium), inv, open, prioCh, false},
-		{"fix appeared", f(open, medium), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false},
-		{"fix appeared, same priority", f(open, high), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false},
-		{"unchanged", f(open, high), f(open, high), newAdv, "", "", true},
-		{"fix still there", fixed(f(open, high)), fixed(f(open, high)), newAdv, "", "", true},
-		{"excepted, priority moved", f(excepted, high), f(excepted, medium), prioCh, "", "", true},
-		{"resolved stays gone", f(resolved, high), nil, inv, "", "", true},
+		{"create open", nil, f(open, high), newAdv, open, newAdv, false, nil},
+		{"create excepted", nil, f(excepted, high), inv, excepted, inv, false, nil},
+		{"create provisional", nil, prov(f(open, urgent)), newAdv, open, newAdv, false, nil},
+		{"gone", f(open, high), nil, inv, resolved, inv, false, nil},
+		{"gone provisional", prov(f(open, urgent)), nil, newAdv, resolved, model.TriggerWithdrawn, false, nil},
+		{"gone provisional after a rollout", prov(f(open, urgent)), nil, inv, resolved, inv, false, nil},
+		{"gone provisional, owner moved on", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &movedOn},
+		{"gone provisional with its owner", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &Withdrawals{}},
+		{"gone provisional, grype not affected", prov(f(open, urgent)), nil, inv, resolved, model.TriggerWithdrawn, false, &notAffected},
+		{"gone settled, grype not affected", f(open, urgent), nil, inv, resolved, inv, false, &notAffected},
+		{"excepted gone", f(excepted, high), nil, inv, resolved, inv, false, nil},
+		{"regression", f(resolved, high), f(open, high), inv, open, inv, false, nil},
+		{"regression excepted", f(resolved, high), f(excepted, high), inv, excepted, inv, false, nil},
+		{"exception expired", f(excepted, high), f(open, high), prioCh, open, model.TriggerExceptionExpired, false, nil},
+		{"excepted", f(open, high), f(excepted, high), prioCh, excepted, prioCh, false, nil},
+		{"escalation", f(open, high), f(open, urgent), newAdv, open, prioCh, false, nil},
+		{"de-escalation", f(open, urgent), f(open, medium), inv, open, prioCh, false, nil},
+		{"fix appeared", f(open, medium), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
+		{"fix appeared, same priority", f(open, high), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
+		{"unchanged", f(open, high), f(open, high), newAdv, "", "", true, nil},
+		{"fix still there", fixed(f(open, high)), fixed(f(open, high)), newAdv, "", "", true, nil},
+		{"excepted, priority moved", f(excepted, high), f(excepted, medium), prioCh, "", "", true, nil},
+		{"resolved stays gone", f(resolved, high), nil, inv, "", "", true, nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -66,7 +76,11 @@ func TestDiff_Transitions(t *testing.T) {
 			if c.new != nil {
 				built, to = []model.Finding{*c.new}, *c.new
 			}
-			_, ts := Diff(old, built, now, c.trig)
+			w := running
+			if c.w != nil {
+				w = *c.w
+			}
+			_, ts := Diff(old, built, w, now, c.trig)
 			if c.none {
 				assert.Empty(t, ts)
 				return
@@ -109,7 +123,7 @@ func TestDiff_Upserts(t *testing.T) {
 	ups, _ := Diff(
 		[]model.Finding{stored("d-unchanged", model.StateOpen), stored("c-gone", model.StateOpen), regressed, stillGone},
 		[]model.Finding{fresh("e-new"), fresh("d-unchanged"), fresh("b-regression")},
-		now, model.TriggerInventoryChange)
+		Withdrawals{}, now, model.TriggerInventoryChange)
 
 	fps := make([]string, 0, len(ups))
 	got := map[string]model.Finding{}

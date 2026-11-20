@@ -8,15 +8,42 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
+// Withdrawals tells Diff why stored findings that were not built disappeared.
+type Withdrawals struct {
+	// NotAffected holds the fingerprints grype's not-affected verdict removed (Result.NotAffected).
+	NotAffected map[string]bool
+	// Digests are the digests the owner runs now; nil when it is gone.
+	Digests []string
+}
+
+// withdrawn reports whether the stored finding o, which was not built, was withdrawn rather than
+// fixed or removed: grype says the package is not affected (spec §6.5), or a feed change, not an
+// inventory change, dropped it while the owner still runs every digest it was found in.
+func (w Withdrawals) withdrawn(o model.Finding, trig model.Trigger) bool {
+	if w.NotAffected[o.Fingerprint] {
+		return true
+	}
+	if trig == model.TriggerInventoryChange || len(o.Digests) == 0 {
+		return false
+	}
+	for _, d := range o.Digests {
+		if !slices.Contains(w.Digests, d) {
+			return false
+		}
+	}
+	return true
+}
+
 // Diff compares an owner's stored findings with the ones Build just produced. It returns the
 // findings to upsert, sorted by fingerprint, and at most one transition per fingerprint (spec §6.6).
 //
 // A built finding keeps Matched, Observed and Suggestion from its stored one and is seen now. A
-// stored finding that was not built resolves: it keeps everything else, and a provisional one
-// resolves as withdrawn. A finding that was resolved and is still absent is left alone. trig is
-// the transition trigger, except that an excepted finding reopening is an expired exception, and
-// an open finding staying open is a fix appearing or a priority change.
-func Diff(stored, built []model.Finding, now time.Time, trig model.Trigger) ([]model.Finding, []model.Transition) {
+// stored finding that was not built resolves: it keeps everything else, and a provisional one that
+// w says was withdrawn resolves as withdrawn; one the owner fixed by moving to another image, or
+// that went with its owner, keeps trig. A finding that was resolved and is still absent is left
+// alone. trig is the transition trigger, except that an excepted finding reopening is an expired
+// exception, and an open finding staying open is a fix appearing or a priority change.
+func Diff(stored, built []model.Finding, w Withdrawals, now time.Time, trig model.Trigger) ([]model.Finding, []model.Transition) {
 	olds, news := byFingerprint(stored), byFingerprint(built)
 	fps := slices.Collect(maps.Keys(olds))
 	for fp := range news {
@@ -47,7 +74,7 @@ func Diff(stored, built []model.Finding, now time.Time, trig model.Trigger) ([]m
 			r.State, r.ResolvedAt = model.StateResolved, &at
 			ups = append(ups, r)
 			t := trig
-			if o.Provisional {
+			if o.Provisional && w.withdrawn(o, trig) {
 				t = model.TriggerWithdrawn
 			}
 			ts = append(ts, transition(o, r, t, now))

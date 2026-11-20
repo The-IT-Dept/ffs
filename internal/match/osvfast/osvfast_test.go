@@ -8,12 +8,15 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/osv-scalibr/semantic"
 	"github.com/ossf/osv-schema/bindings/go/osvschema"
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
+	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
 	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/model"
@@ -69,14 +72,18 @@ func fixture(t *testing.T, id string) []byte {
 	return raw
 }
 
-// cache stores raw in the bucket's OSV cache under the index names the OSV feed writes.
+// observed is when the tests' OSV records were first cached.
+var observed = time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+
+// cache stores raw in the bucket's OSV cache, observed at observed, under the index names the OSV
+// feed writes.
 func cache(t *testing.T, st *store.Store, bucket string, raw []byte) {
 	t.Helper()
 	v, err := match.ParseOSV(raw)
 	require.NoError(t, err)
 	hash, err := osv.AffectedHash(raw)
 	require.NoError(t, err)
-	_, err = st.PutOSVRecord(ctx, bucket, v.GetId(), v.GetModified().AsTime(), hash, raw)
+	_, err = st.PutOSVRecordAt(ctx, bucket, v.GetId(), v.GetModified().AsTime(), hash, raw, observed)
 	require.NoError(t, err)
 	var names []string
 	for _, a := range v.GetAffected() {
@@ -141,7 +148,7 @@ func TestOSVFast_SourcePackageJoin(t *testing.T) {
 
 	deltas := apply(t, m, st, changed(t, "Debian", fixture(t, "DEBIAN-CVE-2024-5535")))
 	want := model.Match{ImageDigest: dDeb, PackageID: vulnerable[0].ID, AdvisoryID: cve5535, Source: model.SourceOSV,
-		FixState: model.FixFixed, FixedVersions: []string{"3.0.15-1~deb12u1"}, Namespace: "Debian:12"}
+		FixState: model.FixFixed, FixedVersions: []string{"3.0.15-1~deb12u1"}, Namespace: "Debian:12", ObservedAt: observed}
 	require.Equal(t, []match.Delta{{Scope: scope(cve5535), Matches: []model.Match{want}}}, deltas)
 
 	got, err := m.MatchImage(ctx, match.ImageInput{Digest: dDeb, Packages: vulnerable})
@@ -158,13 +165,13 @@ func TestOSVFast_UbuntuAndAlpineJoin(t *testing.T) {
 
 	deltas := apply(t, m, st, changed(t, "Ubuntu", ubuntuRaw), changed(t, "Alpine", fixture(t, "ALPINE-CVE-2024-5535")))
 	alpineMatch := model.Match{ImageDigest: dAlpine, PackageID: al[0].ID, AdvisoryID: cve5535, Source: model.SourceOSV,
-		FixState: model.FixFixed, FixedVersions: []string{"3.3.1-r1"}, Namespace: "Alpine:v3.20"}
+		FixState: model.FixFixed, FixedVersions: []string{"3.3.1-r1"}, Namespace: "Alpine:v3.20", ObservedAt: observed}
 	require.Len(t, deltas, 1)
 	require.Equal(t, scope(cve5535), deltas[0].Scope)
 	require.ElementsMatch(t, []model.Match{
 		{ImageDigest: dUbuntu, PackageID: ub[0].ID, AdvisoryID: cve5535, Source: model.SourceOSV, FixState: model.FixFixed,
 			FixedVersions: []string{"3.0.13-0ubuntu3.2"}, VendorSeverity: model.SeverityLow, VendorSeveritySource: "ubuntu",
-			Namespace: "Ubuntu:24.04"},
+			Namespace: "Ubuntu:24.04", ObservedAt: observed},
 		alpineMatch,
 	}, deltas[0].Matches)
 
@@ -233,7 +240,7 @@ func TestOSVFast_GoStdlib(t *testing.T) {
 	deltas := apply(t, m, st, changed(t, "Go", fixture(t, "GO-2024-2963")))
 	require.Equal(t, []match.Delta{{Scope: scope("CVE-2024-24791"), Matches: []model.Match{{
 		ImageDigest: dGo, PackageID: old[0].ID, AdvisoryID: "CVE-2024-24791", Source: model.SourceOSV,
-		FixState: model.FixFixed, FixedVersions: []string{"1.22.5"}, Namespace: "Go",
+		FixState: model.FixFixed, FixedVersions: []string{"1.22.5"}, Namespace: "Go", ObservedAt: observed,
 	}}}}, deltas)
 }
 
@@ -284,7 +291,7 @@ func TestOSVFast_RPMEpochMismatchSkipped(t *testing.T) {
 	deltas := apply(t, m, st, changed(t, "AlmaLinux", rec))
 	require.Equal(t, []match.Delta{{Scope: scope("ALSA-2026:0001"), Matches: []model.Match{{
 		ImageDigest: dAlma2, PackageID: withEpoch[0].ID, AdvisoryID: "ALSA-2026:0001", Source: model.SourceOSV,
-		FixState: model.FixFixed, FixedVersions: []string{"1:2.0-1"}, Namespace: "AlmaLinux:9",
+		FixState: model.FixFixed, FixedVersions: []string{"1:2.0-1"}, Namespace: "AlmaLinux:9", ObservedAt: observed,
 	}}}}, deltas)
 }
 
@@ -368,7 +375,7 @@ func TestOSVFast_FoldedNamesAgree(t *testing.T) {
 	}
 	require.Equal(t, model.Match{ImageDigest: dPy, PackageID: jinja2.ID, AdvisoryID: "CVE-2024-22195", Source: model.SourceOSV,
 		FixState: model.FixFixed, FixedVersions: []string{"3.1.3"}, VendorSeverity: model.SeverityMedium,
-		VendorSeveritySource: "ghsa", Namespace: "PyPI"}, byPackage(deltas)[jinja2.ID])
+		VendorSeveritySource: "ghsa", Namespace: "PyPI", ObservedAt: observed}, byPackage(deltas)[jinja2.ID])
 	require.Len(t, fromRecords, 4)
 
 	fromImage, err := m.MatchImage(ctx, match.ImageInput{Digest: dPy, Packages: pkgs})
@@ -387,7 +394,7 @@ func TestOSVFast_KernelHeadersSkipped(t *testing.T) {
 	kernel := pkgs[0]
 	require.Equal(t, "linux-image-6.1.0-17-amd64", kernel.Name)
 	want := []model.Match{{ImageDigest: dDeb, PackageID: kernel.ID, AdvisoryID: "CVE-2024-1086", Source: model.SourceOSV,
-		FixState: model.FixFixed, FixedVersions: []string{"6.1.76-1"}, Namespace: "Debian:12"}}
+		FixState: model.FixFixed, FixedVersions: []string{"6.1.76-1"}, Namespace: "Debian:12", ObservedAt: observed}}
 
 	deltas := apply(t, m, st, changed(t, "Debian", fixture(t, "DEBIAN-CVE-2024-1086")))
 	require.Equal(t, []match.Delta{{Scope: scope("CVE-2024-1086"), Matches: want}}, deltas)
@@ -471,7 +478,7 @@ func TestOSVFast_MatchImageUsesCache(t *testing.T) {
 	pkgs := image(t, st, dPy, requests)
 	want := []model.Match{{ImageDigest: dPy, PackageID: pkgs[0].ID, AdvisoryID: "CVE-2024-35195", Source: model.SourceOSV,
 		FixState: model.FixFixed, FixedVersions: []string{"2.32.0"}, VendorSeverity: model.SeverityMedium,
-		VendorSeveritySource: "ghsa", Namespace: "PyPI"}}
+		VendorSeveritySource: "ghsa", Namespace: "PyPI", ObservedAt: observed}}
 
 	got, err := m.MatchImage(ctx, match.ImageInput{Digest: dPy, Packages: pkgs})
 	require.NoError(t, err)
@@ -496,10 +503,54 @@ func TestOSVFast_MaliciousPackage(t *testing.T) {
 	deltas := apply(t, m, st, changed(t, "npm", fixture(t, "MAL-2024-1")))
 	require.Equal(t, []match.Delta{{Scope: scope("MAL-2024-1"), Matches: []model.Match{{
 		ImageDigest: dNode, PackageID: pkgs[0].ID, AdvisoryID: "MAL-2024-1", Source: model.SourceOSV,
-		FixState: model.FixNotFixed, Namespace: "npm",
+		FixState: model.FixNotFixed, Namespace: "npm", ObservedAt: observed,
 	}}}}, deltas)
 	a, ok, err := st.GetAdvisory(ctx, "MAL-2024-1")
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, a.Malicious)
+}
+
+// TestOSVFast_WithdrawnAliasKeepsLiveCVE is the F1 regression: GitHub withdrew GHSA-qf9m-vfgh-m389
+// as a duplicate but it still lists CVE-2024-24762, which is live. Delivering it (the PyPI bootstrap
+// does on every install) must not withdraw the CVE, and grype's match on another package must still
+// build a finding.
+func TestOSVFast_WithdrawnAliasKeepsLiveCVE(t *testing.T) {
+	const live = "CVE-2024-24762"
+	st := newStore(t)
+	m := osvfast.New(st)
+	multipart := model.Package{Ecosystem: "python", Name: "python-multipart", Version: "0.0.6",
+		PURL: "pkg:pypi/python-multipart@0.0.6", Path: "/usr/lib/python3/site-packages/python_multipart-0.0.6.dist-info/METADATA"}
+	pkgs := image(t, st, dPy, multipart)
+	require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: live, Title: "python-multipart ReDoS"}))
+	grypeMatch := model.Match{ImageDigest: dPy, PackageID: pkgs[0].ID, AdvisoryID: live, Source: model.SourceGrype,
+		FixState: model.FixFixed, FixedVersions: []string{"0.0.7"}, VendorSeverity: model.SeverityHigh,
+		VendorSeveritySource: "ghsa", Namespace: "github:language:python", DBBuilt: time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)}
+	_, err := st.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceGrype, Digests: []string{dPy}}, []model.Match{grypeMatch})
+	require.NoError(t, err)
+
+	withdrawn := changed(t, "PyPI", fixture(t, "GHSA-qf9m-vfgh-m389"))
+	deltas := apply(t, m, st, withdrawn)
+	require.Empty(t, byPackage(deltas), "a withdrawn record matches nothing")
+
+	canon, err := st.Canonical(ctx, "GHSA-qf9m-vfgh-m389")
+	require.NoError(t, err)
+	require.Equal(t, live, canon, "the withdrawn duplicate still aliases the live CVE")
+	a, ok, err := st.GetAdvisory(ctx, live)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, a.Withdrawn, "one withdrawn alias record does not withdraw the CVE")
+
+	advs, err := st.Advisories(ctx, []string{live})
+	require.NoError(t, err)
+	ms, err := st.MatchesForDigests(ctx, []string{dPy})
+	require.NoError(t, err)
+	const repo = "registry.example.com/web/api"
+	owner := model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"},
+		Containers: []model.ContainerUse{{Name: "api", Kind: model.ContainerRegular, Repo: repo, Digest: dPy}}}
+	fs := findings.Build(findings.BuildInput{Cluster: "prod", Owner: owner, Matches: ms,
+		Packages: map[string]model.Package{pkgs[0].ID: pkgs[0]}, Advisories: advs, Now: time.Now(),
+		PriorityConfig: config.Default().Priority})
+	require.Len(t, fs, 1, "grype's live match still builds a finding")
+	require.Equal(t, live, fs[0].AdvisoryID)
 }

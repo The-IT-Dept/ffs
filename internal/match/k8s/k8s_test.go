@@ -1,16 +1,20 @@
 package k8s_test
 
 import (
+	"bytes"
 	"context"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
+	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/match"
 	"github.com/the-it-dept/ffs/internal/match/k8s"
 	"github.com/the-it-dept/ffs/internal/model"
@@ -197,4 +201,32 @@ func TestK8s_ApplyOSVDelta(t *testing.T) {
 	_, ok, err := st.GetAdvisory(ctx, cveK8s)
 	require.NoError(t, err)
 	require.True(t, ok)
+}
+
+// TestK8s_OldCVEGetsOSVSeverity is the F28 regression: a Kubernetes CVE older than cvelist's 30-day
+// backfill has no CNA rating, so its cluster-level finding stayed "severity pending" (medium) for
+// good. The CVSS vector on its OSV record now rates it.
+func TestK8s_OldCVEGetsOSVSeverity(t *testing.T) {
+	st := newStore(t)
+	raw := bytes.Replace(fixture(t, cveK8s), []byte("{"),
+		[]byte(`{"severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H"}],`), 1)
+	const digest = "k8s:1.30.2"
+	p := synthetic(t, st, digest, "kubernetes", "1.30.2")
+	owner := model.Owner{Ref: model.OwnerRef{Kind: "Cluster", Name: "prod"},
+		Containers: []model.ContainerUse{{Name: "kubernetes", Repo: "kubernetes", Digest: digest}}}
+	require.NoError(t, st.UpsertOwner(ctx, owner))
+
+	deltas, err := k8s.New(st).ApplyOSV(ctx, []osv.Changed{{Ecosystem: osv.BucketGIT, ID: cveK8s, Raw: raw}})
+	require.NoError(t, err)
+	require.Len(t, deltas, 1)
+	advs, err := st.Advisories(ctx, []string{cveK8s})
+	require.NoError(t, err)
+	require.Equal(t, model.SeverityUnknown, advs[cveK8s].CNASeverity, "no cvelist record")
+
+	fs := findings.Build(findings.BuildInput{Cluster: "prod", Owner: owner, Matches: deltas[0].Matches,
+		Packages: map[string]model.Package{p.ID: p}, Advisories: advs, Now: time.Now(), PriorityConfig: config.Default().Priority})
+	require.Len(t, fs, 1)
+	require.Equal(t, model.SeverityHigh, fs[0].Severity, "CVSS 8.8 from the OSV record")
+	require.Equal(t, "osv", fs[0].SeveritySource)
+	require.NotContains(t, fs[0].Reasons, "severity pending")
 }

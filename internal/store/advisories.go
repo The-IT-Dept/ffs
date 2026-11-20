@@ -152,6 +152,8 @@ func mergeAdvisory(dst, src model.Advisory) model.Advisory {
 	if src.CNASource != "" {
 		dst.CNASource = src.CNASource
 	}
+	// the highest rating of any OSV record, so the result does not depend on delivery order
+	dst.OSVSeverity = max(dst.OSVSeverity, src.OSVSeverity)
 	if src.KEVAdded != nil {
 		dst.KEVAdded = src.KEVAdded
 	}
@@ -162,6 +164,7 @@ func mergeAdvisory(dst, src model.Advisory) model.Advisory {
 		dst.EPSSPercentile = src.EPSSPercentile
 	}
 	dst.Malicious = dst.Malicious || src.Malicious
+	// Only a REJECTED cvelistV5 record sets Withdrawn (see model.Advisory); OSV records never do.
 	dst.Withdrawn = dst.Withdrawn || src.Withdrawn
 	return dst
 }
