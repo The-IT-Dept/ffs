@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net"
@@ -103,8 +104,8 @@ type ServerOptions struct {
 type ResultWindow interface {
 	// ResultWait is how long a result from node answering the request id (wire.HeaderWorkID; "" when the
 	// agent sent none) may wait before it is read, zero or less when that request takes no result, and
-	// unread, which the server calls when the result was not read: it waited too long, or its HTTP request
-	// ended while it waited.
+	// unread, which the server calls when the result was not read: it waited too long, its HTTP request
+	// ended while it waited, or its body could not be read in full after the wait.
 	ResultWait(node, id string) (wait time.Duration, unread func())
 }
 
@@ -211,6 +212,11 @@ func (s *Server) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("agent API: %w", err)
 	}
+	return s.serve(ctx, ln)
+}
+
+// serve is Start on a listener it takes over, closing it when it returns.
+func (s *Server) serve(ctx context.Context, ln net.Listener) error {
 	reloader := newCertReloader(s.o.CertDir, s.o.Now)
 	reloader.log = s.o.Log
 	srv := s.httpServer(ctx, &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: reloader.GetCertificate})
@@ -223,7 +229,7 @@ func (s *Server) Start(ctx context.Context) error {
 		_ = srv.Shutdown(sctx)
 	}()
 	s.o.Log.Info("agent API listening", "address", ln.Addr().String())
-	err = srv.ServeTLS(ln, "", "")
+	err := srv.ServeTLS(ln, "", "")
 	if errors.Is(err, http.ErrServerClosed) {
 		<-stopped
 		return nil
@@ -382,26 +388,58 @@ func declaredTooLarge(w http.ResponseWriter, r *http.Request, max int64, what st
 	return true
 }
 
-// decode reads one JSON value of at most max bytes, answering the request itself when it fails.
-func decode(w http.ResponseWriter, r *http.Request, max int64, what string, v any) bool {
+// decode reads one JSON value of at most max bytes, then the rest of the body, answering the request itself
+// when it fails. unread is true when it failed because the body could not be read in full: the client went
+// away (its timeout passed, say) or the body stalled past the read deadline.
+//
+// Once the body is read to its end, the read deadline is lifted, so handling the request may take longer than
+// readTimeout: over HTTP/1.1 the server then watches the connection with a background read, which a deadline
+// still in force would end, cancelling the request's context.
+func decode(w http.ResponseWriter, r *http.Request, max int64, what string, v any) (ok, unread bool) {
 	tooLarge := fmt.Sprintf("%s larger than %d bytes", what, max)
 	if declaredTooLarge(w, r, max, what) {
-		return false
+		return false, false
 	}
 	// MaxBytesReader tells the server's own writer to close the connection once the limit is hit.
 	limited := w
 	if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
 		limited = u.Unwrap()
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(limited, r.Body, max)).Decode(v); err != nil {
-		if mbe := new(http.MaxBytesError); errors.As(err, &mbe) {
+	body := &readErrs{r: r.Body}
+	in := http.MaxBytesReader(limited, body, max)
+	if err := json.NewDecoder(in).Decode(v); err != nil {
+		switch mbe := new(http.MaxBytesError); {
+		case errors.As(err, &mbe):
 			writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
-			return false
+			return false, false
+		case body.err != nil:
+			writeError(w, http.StatusBadRequest, "request body could not be read: "+body.err.Error())
+			return false, true
 		}
 		writeError(w, http.StatusBadRequest, "request body is not valid JSON: "+err.Error())
-		return false
+		return false, false
 	}
-	return true
+	// Anything after the value is read under the deadline too, before it is lifted: the server would read it
+	// after the handler returns, with no deadline at all. It is not used, so a failure to read it is not one.
+	_, _ = io.Copy(io.Discard, in)
+	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	return true, false
+}
+
+// readErrs keeps the first error reading r returned, other than io.EOF.
+type readErrs struct {
+	r   io.ReadCloser
+	err error
+}
+
+func (e *readErrs) Close() error { return e.r.Close() }
+
+func (e *readErrs) Read(p []byte) (int, error) {
+	n, err := e.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) && e.err == nil {
+		e.err = err
+	}
+	return n, err
 }
 
 // handlerError answers a handler's error: ErrForbidden 403 and ErrBadRequest 400 with their text, else 500.
@@ -482,7 +520,7 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	var rep wire.Report
-	if !decode(w, r, s.o.MaxReportBytes, "report", &rep) || nodeMismatch(w, id, rep.Node) {
+	if ok, _ := decode(w, r, s.o.MaxReportBytes, "report", &rep); !ok || nodeMismatch(w, id, rep.Node) {
 		return
 	}
 	resp, err := s.o.Reports.Report(r.Context(), id, &rep)
@@ -498,8 +536,10 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 // it answers stops taking a result (ResultWindow), and at most MaxResultWait, which keeps the answer within
 // the agent's client timeout. A node whose request takes no result is answered 403 at once. A result that
 // waited that long is answered 503, which the agent answers by sending it again while its request takes one.
-// A result that was not read, because it waited that long or because its HTTP request ended while it waited,
-// leaves its request uncounted against the image: the controller held it up.
+// A result that was not read, because it waited that long, because its HTTP request ended while it waited, or
+// because its body could not be read in full once it had its share (after a wait close to MaxResultWait, the
+// agent's client timeout leaves about a minute for the body), leaves its request uncounted against the image:
+// the controller held it up.
 func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
 	defer countAnswer(w)
@@ -528,7 +568,11 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	}
 	defer release()
 	var res wire.SBOMResult
-	if !decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res) || nodeMismatch(w, id, res.Node) {
+	ok, failed := decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res)
+	if failed {
+		unread()
+	}
+	if !ok || nodeMismatch(w, id, res.Node) {
 		return
 	}
 	if err := s.o.SBOMs.SBOM(r.Context(), id, &res); err != nil {

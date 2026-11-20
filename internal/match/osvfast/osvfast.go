@@ -38,10 +38,20 @@ const (
 // compare them the way grype does, or (GIT) they are the upstream and Kubernetes matchers' records.
 var skippedBuckets = map[string]bool{osv.BucketGIT: true, "Linux": true, "Android": true, "Azure Linux": true}
 
-// recordChunk is how many cached records MatchImage reads, parses and evaluates at a time. A
-// host's Ubuntu linux source package alone indexes thousands of kernel records averaging over
-// 400 KB, so reading a bucket's records at once can take gigabytes. A var so tests can lower it.
-var recordChunk = 256
+// recordChunk is how many cached records MatchImage reads at a time: as many as recordChunkBytes holds
+// of the largest record the OSV feed caches (maxCachedRecordBytes), so one read holds at most
+// recordChunkBytes of records whatever their sizes. A host's Ubuntu linux source package alone indexes
+// thousands of kernel records averaging over 400 KB, so reading a bucket's records at once can take
+// gigabytes. A var so tests can lower it.
+var recordChunk = recordChunkBytes / maxCachedRecordBytes
+
+const (
+	// recordChunkBytes bounds the uncompressed records of one read.
+	recordChunkBytes = 64 << 20
+	// maxCachedRecordBytes is the largest record the OSV feed caches: it skips larger ones
+	// (internal/feeds/osv maxRecordBytes).
+	maxCachedRecordBytes = 4 << 20
+)
 
 // loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
 // the batches.
@@ -62,9 +72,10 @@ func New(st *store.Store) *Matcher { return &Matcher{st: st} }
 func (m *Matcher) Source() model.MatchSource { return model.SourceOSV }
 
 // MatchImage implements match.Matcher. It looks up the cached records indexed under the image's
-// packages, bucket by bucket, and evaluates them against those packages, recordChunk records at a
-// time in id order. Synthetic digests get no matches. Each match is observed when ffs first saw the
-// record behind it (see evalRecord).
+// packages, bucket by bucket, and evaluates them against those packages in id order, reading
+// recordChunk records at a time and parsing and evaluating them one by one (see eachRecord).
+// Synthetic digests get no matches. Each match is observed when ffs first saw the record behind it
+// (see evalRecord).
 func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
 	if match.IsSynthetic(in.Digest) {
 		return nil, nil
@@ -90,26 +101,69 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 			return nil, err
 		}
 		idx := indexPackages(pkgs)
-		// ids are sorted, so evaluating consecutive chunks visits the records in the same order as
-		// reading them all at once, and ms merges across chunks as before.
-		for chunk := range slices.Chunk(ids, recordChunk) {
-			recs, observed, err := m.records(ctx, chunk, nil)
-			if err != nil {
-				return nil, err
-			}
-			for _, v := range recs {
-				adv, ok := canon[v.GetId()]
-				if !ok {
-					if adv, err = m.st.Canonical(ctx, v.GetId()); err != nil {
-						return nil, err
-					}
-					canon[v.GetId()] = adv
+		err = m.eachRecord(ctx, ids, func(v *osvschema.Vulnerability, observed time.Time) error {
+			adv, ok := canon[v.GetId()]
+			if !ok {
+				var err error
+				if adv, err = m.st.Canonical(ctx, v.GetId()); err != nil {
+					return err
 				}
-				evalRecord(ctx, v, adv, observed[v.GetId()], idx, &ms)
+				canon[v.GetId()] = adv
 			}
+			evalRecord(ctx, v, adv, observed, idx, &ms)
+			return nil
+		})
+		if err != nil {
+			return nil, err
 		}
 	}
 	return ms.list, nil
+}
+
+// eachRecord calls fn with each cached record of ids that parses, and when ffs observed it, in the
+// order of the ids (sorted) they are cached under; a record id is passed once. It reads recordChunk
+// records at a time, and parses each record only once fn is done with the one before, dropping the
+// raw copy as it goes: a parsed record takes several times its raw size, and parsing a read's 256
+// records together held most of a gigabyte for a host's kernel records.
+func (m *Matcher) eachRecord(ctx context.Context, ids []string, fn func(*osvschema.Vulnerability, time.Time) error) error {
+	seen := make(map[string]bool, len(ids))
+	for chunk := range slices.Chunk(ids, recordChunk) {
+		raws, err := loadRecords(m.st, ctx, chunk)
+		if err != nil {
+			return err
+		}
+		observed, err := m.st.OSVRecordsObserved(ctx, chunk)
+		if err != nil {
+			return err
+		}
+		for i, raw := range raws {
+			raws[i] = nil
+			v, err := match.ParseOSV(raw)
+			if err != nil {
+				logr.FromContextOrDiscard(ctx).V(1).Info("skipping an unreadable cached OSV record", "error", err.Error())
+				continue
+			}
+			id := v.GetId()
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
+			at, ok := observed[id]
+			if _, asked := slices.BinarySearch(chunk, id); !ok && !asked {
+				// A record whose id is not the one it is cached under: look its observation up by its id,
+				// as records does.
+				o, err := m.st.OSVRecordsObserved(ctx, []string{id})
+				if err != nil {
+					return err
+				}
+				at = o[id]
+			}
+			if err := fn(v, at); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // ApplyOSV implements match.RecordMatcher. It stores the advisory of every changed record except
