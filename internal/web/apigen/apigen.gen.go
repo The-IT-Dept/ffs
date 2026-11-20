@@ -746,19 +746,23 @@ func (e ScopeKind) Valid() bool {
 
 // Defines values for SearchHitKind.
 const (
-	SearchHitKindAdvisory  SearchHitKind = "advisory"
-	SearchHitKindImage     SearchHitKind = "image"
-	SearchHitKindNamespace SearchHitKind = "namespace"
-	SearchHitKindNode      SearchHitKind = "node"
-	SearchHitKindNodegroup SearchHitKind = "nodegroup"
-	SearchHitKindPackage   SearchHitKind = "package"
-	SearchHitKindWorkload  SearchHitKind = "workload"
+	SearchHitKindAdvisory     SearchHitKind = "advisory"
+	SearchHitKindControlplane SearchHitKind = "controlplane"
+	SearchHitKindImage        SearchHitKind = "image"
+	SearchHitKindNamespace    SearchHitKind = "namespace"
+	SearchHitKindNode         SearchHitKind = "node"
+	SearchHitKindNodegroup    SearchHitKind = "nodegroup"
+	SearchHitKindNodes        SearchHitKind = "nodes"
+	SearchHitKindPackage      SearchHitKind = "package"
+	SearchHitKindWorkload     SearchHitKind = "workload"
 )
 
 // Valid indicates whether the value is a known member of the SearchHitKind enum.
 func (e SearchHitKind) Valid() bool {
 	switch e {
 	case SearchHitKindAdvisory:
+		return true
+	case SearchHitKindControlplane:
 		return true
 	case SearchHitKindImage:
 		return true
@@ -767,6 +771,8 @@ func (e SearchHitKind) Valid() bool {
 	case SearchHitKindNode:
 		return true
 	case SearchHitKindNodegroup:
+		return true
+	case SearchHitKindNodes:
 		return true
 	case SearchHitKindPackage:
 		return true
@@ -1987,17 +1993,19 @@ type ScopeRef struct {
 
 // SearchHit defines model for SearchHit.
 type SearchHit struct {
-	Detail *string       `json:"detail,omitempty"`
-	Id     string        `json:"id"`
-	Kind   SearchHitKind `json:"kind"`
-	Label  string        `json:"label"`
-	Scope  *string       `json:"scope,omitempty"`
+	Detail *string `json:"detail,omitempty"`
+	Id     string  `json:"id"`
+
+	// Kind The kind of object. controlplane is the Control plane page and nodes the Nodes page; the id of either is the cluster name.
+	Kind  SearchHitKind `json:"kind"`
+	Label string        `json:"label"`
+	Scope *string       `json:"scope,omitempty"`
 
 	// Worst Priority of a finding; none means no open finding.
 	Worst *Priority `json:"worst,omitempty"`
 }
 
-// SearchHitKind defines model for SearchHit.Kind.
+// SearchHitKind The kind of object. controlplane is the Control plane page and nodes the Nodes page; the id of either is the cluster name.
 type SearchHitKind string
 
 // SearchResult defines model for SearchResult.

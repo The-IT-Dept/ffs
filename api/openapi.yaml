@@ -1957,7 +1957,10 @@ components:
       properties:
         kind:
           type: string
-          enum: [workload, namespace, image, advisory, package, nodegroup, node]
+          description: >-
+            The kind of object. controlplane is the Control plane page and nodes the Nodes page; the
+            id of either is the cluster name.
+          enum: [workload, namespace, image, advisory, package, nodegroup, node, controlplane, nodes]
         id: {type: string}
         label: {type: string}
         detail: {type: string}

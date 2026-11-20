@@ -37,23 +37,21 @@ func (s *Server) scopeCoverage(ctx context.Context, sc model.Scope) (store.Cover
 			g, ok = gs.find(sc.Value)
 			members = g.Members
 		}
-		if !ok || g.Kind != model.NodeGroupAgent || g.Digest == "" {
-			return store.CoverageFigure{InUse: 1}, nil
+		if !ok || !hasHostImage(g) {
+			return hostCoverage(false, nil, nil), nil
 		}
 		img, found, err := s.imageRow(ctx, g.Digest)
-		if err != nil || !found || img.Status != model.ImageCatalogued {
-			return store.CoverageFigure{InUse: 1}, err
+		if err != nil {
+			return store.CoverageFigure{}, err
+		}
+		if !found || img.Status != model.ImageCatalogued {
+			return hostCoverage(false, nil, nil), nil
 		}
 		agents, err := s.agentView(ctx)
 		if err != nil {
 			return store.CoverageFigure{}, err
 		}
-		for _, m := range members {
-			if hostGap(agents.of(m)) {
-				return store.CoverageFigure{InUse: 1, SeenInto: 1}, nil
-			}
-		}
-		return store.CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}, nil
+		return hostCoverage(true, members, agents), nil
 	case model.ScopeControlPlane:
 		digests, err := s.controlPlaneDigests(ctx)
 		if err != nil {
@@ -77,6 +75,50 @@ func (s *Server) scopeCoverage(ctx context.Context, sc model.Scope) (store.Cover
 	case model.ScopeCluster, model.ScopeNamespace, model.ScopeWorkload, model.ScopeImage:
 	}
 	return s.o.Store.CoverageOf(ctx, sc)
+}
+
+// hasHostImage reports whether ffs may see into g's host image: g is an agent group with a host
+// image digest.
+func hasHostImage(g model.NodeGroup) bool { return g.Kind == model.NodeGroupAgent && g.Digest != "" }
+
+// hostCoverage is the coverage figure of one host image: in use; seen into when the image is (seen);
+// in full detail while none of members, the nodes it stands for, has a host coverage gap (hostGap).
+// agents may be nil when the image is not seen into.
+func hostCoverage(seen bool, members []string, agents *agentView) store.CoverageFigure {
+	switch {
+	case !seen:
+		return store.CoverageFigure{InUse: 1}
+	case slices.ContainsFunc(members, func(m string) bool { return hostGap(agents.of(m)) }):
+		return store.CoverageFigure{InUse: 1, SeenInto: 1}
+	}
+	return store.CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}
+}
+
+// groupCoverage is the coverage figure of every group in gs, in gs.groups order, as scopeCoverage
+// gives it for each group's scope, read in one pass: one query for which agent groups' host images
+// are seen into, and the agent statuses once, rather than an image lookup per group.
+func (s *Server) groupCoverage(ctx context.Context, gs *groupSet) ([]store.CoverageFigure, error) {
+	var digests []string
+	for _, g := range gs.groups {
+		if hasHostImage(g) {
+			digests = append(digests, g.Digest)
+		}
+	}
+	seen, err := s.o.Store.DigestsSeenInto(ctx, digests)
+	if err != nil {
+		return nil, err
+	}
+	var agents *agentView
+	if len(seen) > 0 {
+		if agents, err = s.agentView(ctx); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]store.CoverageFigure, len(gs.groups))
+	for i, g := range gs.groups {
+		out[i] = hostCoverage(hasHostImage(g) && seen[g.Digest], g.Members, agents)
+	}
+	return out, nil
 }
 
 // imageRow is digest's images row, if any, as the API reads it: a catalogued image whose first

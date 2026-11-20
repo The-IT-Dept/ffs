@@ -42,8 +42,8 @@ test('the Nodes and control plane hits open their pages and read by what they ho
     '/search',
     searchResult({
       hits: [
-        { kind: 'workload', id: 'Nodes//test', label: 'Nodes', detail: '3 nodes', worst: 'high' },
-        { kind: 'workload', id: 'Cluster//test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' },
+        { kind: 'nodes', id: 'test', label: 'Nodes', detail: '3 nodes', worst: 'high' },
+        { kind: 'controlplane', id: 'test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' },
       ],
     }),
   )
@@ -51,11 +51,23 @@ test('the Nodes and control plane hits open their pages and read by what they ho
   await user.keyboard('{Control>}k{/Control}')
   await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'no')
   const nodes = await screen.findByRole('option', { name: /3 nodes/ })
+  expect(nodes).toHaveAttribute('data-value', 'nodes:test')
   expect(nodes).toHaveTextContent(/^Nodes \(host packages\)Nodes/)
-  expect(screen.getByRole('option', { name: /Kubernetes 1\.35\.1/ })).toHaveTextContent(/^Control planeControl plane/)
+  const cp = screen.getByRole('option', { name: /Kubernetes 1\.35\.1/ })
+  expect(cp).toHaveAttribute('data-value', 'controlplane:test')
+  expect(cp).toHaveTextContent(/^Control planeControl plane/)
   expect(screen.queryByText(copy.command.kind.workload)).toBeNull()
   await user.click(nodes)
   expect(router.state.location.pathname).toBe('/nodes')
+})
+
+test('the control plane hit opens the Control plane page', async () => {
+  mockApi().on('/search', searchResult({ hits: [{ kind: 'controlplane', id: 'test', label: 'Control plane', scope: 'controlplane' }] }))
+  const { router, user } = renderApp('/')
+  await user.keyboard('{Control>}k{/Control}')
+  await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'control')
+  await user.click(await screen.findByRole('option', { name: /Control plane/ }))
+  expect(router.state.location.pathname).toBe('/controlplane')
 })
 
 test('says to refine the search when more objects matched than are listed', async () => {

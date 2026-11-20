@@ -24,7 +24,7 @@ export function namespacePath(ns: string): string {
 }
 
 // nodeGroupPath is a node group's page. id is the group's key as the API gives it (a stable name,
-// possibly qualified as <name>-<arch>, <name>-nodeinfo or <name>@<node>), used as it is.
+// possibly qualified as <name>-<arch>, <name>-nodeinfo@<node> or <name>@<node>), used as it is.
 export function nodeGroupPath(id: string): string {
   return `/nodegroups/${enc(id)}`
 }
@@ -96,10 +96,15 @@ export function explorerHref(kind: ExplorerKind, s: ExplorerSearch): string {
   return EXPLORERS[kind].path + stringifySearchParams(s)
 }
 
-// hitPath is where a command-menu hit goes. A workload hit is an owner key and goes where the owner
-// links, so the control plane and Nodes hits open their own pages.
+// hitPath is where a command-menu hit goes. The control plane and Nodes hits open their pages; a
+// workload hit is an owner key and opens the workload's page.
 export function hitPath(hit: SearchHit): string {
-  if (hit.kind === 'workload') return ownerPath(hit.id)
+  if (hit.kind === 'controlplane') return '/controlplane'
+  if (hit.kind === 'nodes') return '/nodes'
+  if (hit.kind === 'workload') {
+    const o = ownerOfKey(hit.id)
+    return workloadPath(o.kind, o.namespace, o.name)
+  }
   if (hit.kind === 'advisory') return advisoryPath(hit.id)
   if (hit.kind === 'package') {
     const i = hit.id.indexOf('/')
@@ -122,16 +127,6 @@ export function hitPath(hit: SearchHit): string {
     case 'node':
       return nodePath(hit.id)
   }
-}
-
-// hitKindLabel is how a command-menu hit's kind reads: a cluster-level owner (the control plane, the
-// Nodes page) by what it holds, every other hit by its kind.
-export function hitKindLabel(hit: SearchHit): string {
-  if (hit.kind === 'workload') {
-    const o = ownerOfKey(hit.id)
-    if (isClusterLevel(o)) return ownerLabel(o)
-  }
-  return copy.command.kind[hit.kind]
 }
 
 export type RelatedSectionId = S<'RelatedSection'>['id']

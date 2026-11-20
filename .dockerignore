@@ -16,3 +16,4 @@ ui/playwright-report
 ui/e2e/screenshots
 internal/web/ui/dist/*
 !internal/web/ui/dist/.keep
+internal/web/ui/bundle-packages.json

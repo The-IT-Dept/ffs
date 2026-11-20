@@ -76,7 +76,10 @@ func groupKindRank(k model.NodeGroupKind) int {
 // group when an agent group shares the name. Groups that still share a key (a rollout of package
 // updates, or two pools with the same OS, kernel and architecture) are each anchored to their first
 // member node, "<key>@<node>", which find follows into whichever group with that key holds the node
-// next. A key that is another group's ID, label or key falls back to the group's ID.
+// next. A "-nodeinfo" key is anchored to its group's first member too, "<name>-nodeinfo@<node>":
+// the group's nodes join an agent group of the name once their agents report, and find follows the
+// node into the one that holds it rather than the preferred group of the name. A key that is
+// another group's ID, label or key falls back to the group's ID.
 type groupSet struct {
 	groups []model.NodeGroup
 	keys   map[string]string // group ID → key
@@ -140,11 +143,12 @@ func newGroupSet(groups []model.NodeGroup) *groupSet {
 			shared[keys[i]]++
 		}
 		for _, i := range idx {
-			switch g := groups[i]; {
-			case shared[keys[i]] == 1:
-			case len(g.Members) > 0:
+			g := groups[i]
+			nodeInfo := withKind && g.Kind == model.NodeGroupNodeInfo // its key ends in nodeInfoSuffix
+			switch {
+			case (shared[keys[i]] > 1 || nodeInfo) && len(g.Members) > 0:
 				keys[i] += anchorSep + g.Members[0]
-			default:
+			case shared[keys[i]] > 1:
 				keys[i] = g.ID
 			}
 		}
@@ -184,9 +188,9 @@ func (gs *groupSet) key(g model.NodeGroup) string {
 // find resolves a group reference: a group ID, a current key or label, or a key built while other
 // groups shared the name (or none did). A stable form names the current groups it is a stable form
 // of (stableForms); "<form>-nodeinfo" with none of those names the groups of <form>, which the
-// nodeinfo group's nodes moved to once their agent reported. An anchored reference, "<form>@<node>",
-// is the one of those groups that holds the node; else, and for a bare form, it is the preferred one
-// (preferGroup).
+// nodeinfo group's nodes moved to once their agent reported. An anchored reference, "<form>@<node>"
+// or "<form>-nodeinfo@<node>", is the one of those groups that holds the node; else, and for a bare
+// form, it is the preferred one (preferGroup).
 func (gs *groupSet) find(ref string) (model.NodeGroup, bool) {
 	if ref == "" {
 		return model.NodeGroup{}, false

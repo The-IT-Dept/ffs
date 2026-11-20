@@ -265,6 +265,8 @@ export const copy = {
       package: 'Package',
       nodegroup: 'Node group',
       node: 'Node',
+      controlplane: 'Control plane',
+      nodes: 'Nodes (host packages)',
     } satisfies Record<S<'SearchHit'>['kind'], string>,
   },
   explorer: {

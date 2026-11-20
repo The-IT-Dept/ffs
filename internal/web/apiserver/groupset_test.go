@@ -63,8 +63,9 @@ func TestGroupSet_KeysSurvivePackageUpdates(t *testing.T) {
 		arm := testGroup("b1", name, "arm64", false, "a-1")
 		fresh := testGroup("c1", name, "amd64", true, "w-9")
 		gs := newGroupSet([]model.NodeGroup{amd, arm, fresh})
-		require.Equal(t, []string{name + "-amd64", name + "-arm64", name + "-amd64-nodeinfo"}, keysOf(t, gs))
+		require.Equal(t, []string{name + "-amd64", name + "-arm64", name + "-amd64-nodeinfo@w-9"}, keysOf(t, gs))
 		require.Equal(t, amd.ID, findID(gs, name), "the bare name opens the preferred group: an agent group, then the largest")
+		require.Equal(t, fresh.ID, findID(gs, name+"-amd64-nodeinfo"), "the key before it named a member")
 
 		// Package updates re-key both agent pools; the agentless node gets its agent and joins amd64.
 		amd2 := testGroup("a2", name, "amd64", false, "w-1", "w-2", "w-3", "w-9")
@@ -72,7 +73,8 @@ func TestGroupSet_KeysSurvivePackageUpdates(t *testing.T) {
 		gs = newGroupSet([]model.NodeGroup{amd2, arm2})
 		require.Equal(t, amd2.ID, findID(gs, name+"-amd64"))
 		require.Equal(t, arm2.ID, findID(gs, name+"-arm64"))
-		require.Equal(t, amd2.ID, findID(gs, name+"-amd64-nodeinfo"), "the agentless node's link follows it into its agent group")
+		require.Equal(t, amd2.ID, findID(gs, name+"-amd64-nodeinfo@w-9"), "the agentless node's link follows it into its agent group")
+		require.Equal(t, amd2.ID, findID(gs, name+"-amd64-nodeinfo"))
 		require.Empty(t, findID(gs, amd.ID), "a fingerprint does not survive")
 
 		// The arm64 pool leaves: the amd64 pool is its bare name again, and its qualified key still opens it.
@@ -85,8 +87,40 @@ func TestGroupSet_KeysSurvivePackageUpdates(t *testing.T) {
 	t.Run("agent and nodeinfo groups of one architecture", func(t *testing.T) {
 		agent, fresh := testGroup("a1", name, "amd64", false, "w-1"), testGroup("c1", name, "amd64", true, "w-8", "w-9")
 		gs := newGroupSet([]model.NodeGroup{agent, fresh})
-		require.Equal(t, []string{name, name + "-nodeinfo"}, keysOf(t, gs))
+		require.Equal(t, []string{name, name + "-nodeinfo@w-8"}, keysOf(t, gs))
 		require.Equal(t, agent.ID, findID(gs, name+"-amd64"), "an agent group is preferred over a larger nodeinfo group")
+		require.Equal(t, fresh.ID, findID(gs, name+"-nodeinfo"))
+	})
+
+	// #16: a nodeinfo group's link names a member node, so once the node's agent reports, the link
+	// opens the group that holds it rather than the preferred group of the name.
+	t.Run("a nodeinfo link follows its node into a smaller pool", func(t *testing.T) {
+		cpu := testGroup("a1", name, "amd64", false, "cpu-1", "cpu-2", "cpu-3")
+		gpu := testGroup("b1", name, "amd64", false, "gpu-1")
+		fresh := testGroup("c1", name, "amd64", true, "gpu-2", "gpu-3")
+		gs := newGroupSet([]model.NodeGroup{cpu, gpu, fresh})
+		key := name + "-nodeinfo@gpu-2"
+		require.Equal(t, []string{name + "@cpu-1", name + "@gpu-1", key}, keysOf(t, gs))
+
+		// The new GPU nodes' agents report and they join the GPU pool, re-keyed by a package update.
+		gpu2 := testGroup("b2", name, "amd64", false, "gpu-1", "gpu-2", "gpu-3")
+		gs = newGroupSet([]model.NodeGroup{cpu, gpu2})
+		require.Equal(t, gpu2.ID, findID(gs, key), "the link opens the pool that holds its node")
+		require.Equal(t, gpu2.ID, findID(gs, name+"-amd64-nodeinfo@gpu-3"), "with the architecture too")
+		require.Equal(t, cpu.ID, findID(gs, name+"-nodeinfo"), "a link without a member opens the preferred group, as before")
+		require.Equal(t, cpu.ID, findID(gs, name+"-nodeinfo@gpu-gone"), "without its node, the preferred group")
+
+		// One of them is still agentless: its nodeinfo group keeps the link while it holds the node.
+		left := testGroup("c2", name, "amd64", true, "gpu-2")
+		gpu3 := testGroup("b3", name, "amd64", false, "gpu-1", "gpu-3")
+		gs = newGroupSet([]model.NodeGroup{cpu, gpu3, left})
+		require.Equal(t, left.ID, findID(gs, key))
+		require.Equal(t, gpu3.ID, findID(gs, name+"-nodeinfo@gpu-3"), "a node that left the nodeinfo group is followed")
+	})
+
+	t.Run("a nodeinfo group alone keeps the bare name", func(t *testing.T) {
+		fresh := testGroup("c1", name, "amd64", true, "w-8")
+		require.Equal(t, []string{name}, keysOf(t, newGroupSet([]model.NodeGroup{fresh})))
 	})
 
 	t.Run("pools of one OS, kernel and architecture", func(t *testing.T) {

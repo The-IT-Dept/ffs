@@ -297,8 +297,10 @@ func TestNodeGroups_MultiArchAndAgentlessKeysSurvivePackageUpdates(t *testing.T)
 		webtest.AgentGroupID)
 	h := handlerOf(f)
 
-	amdKey, armKey, freshKey := name+"-amd64", name+"-arm64", name+"-amd64-nodeinfo"
+	// The agentless node's group is anchored to it (#16); v0.0.1 linked it without the anchor.
+	amdKey, armKey, freshKey, freshKeyV1 := name+"-amd64", name+"-arm64", name+"-amd64-nodeinfo@worker-3", name+"-amd64-nodeinfo"
 	require.ElementsMatch(t, []string{amdKey, armKey, freshKey, webtest.CP1GroupKey}, groupKeys(t, h))
+	require.Equal(t, freshKey, ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+freshKeyV1)).Group.Id)
 	for key, members := range map[string][]string{amdKey: {"worker-1", "worker-2"}, armKey: {"arm-1"}, freshKey: {"worker-3"}} {
 		d := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+key))
 		require.Equal(t, key, d.Group.Id)
@@ -335,7 +337,7 @@ func TestNodeGroups_MultiArchAndAgentlessKeysSurvivePackageUpdates(t *testing.T)
 		amdNext.ID)
 	h = handlerOf(f)
 	require.ElementsMatch(t, []string{amdKey, armKey, webtest.CP1GroupKey}, groupKeys(t, h))
-	for ref, want := range map[string]model.NodeGroup{amdKey: amdNext, armKey: armNext, freshKey: amdNext} {
+	for ref, want := range map[string]model.NodeGroup{amdKey: amdNext, armKey: armNext, freshKey: amdNext, freshKeyV1: amdNext} {
 		d := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+ref))
 		require.Equal(t, want.Digest, d.Group.Digest, ref)
 		require.Equal(t, want.Label, scopeCard(t, h, "?scope="+url.QueryEscape("nodegroup:"+ref)).Title, ref)

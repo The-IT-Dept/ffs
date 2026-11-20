@@ -8,6 +8,8 @@ COPY ui/package.json ui/package-lock.json ui/.npmrc ./
 RUN npm ci
 COPY ui/ ./
 COPY internal/web/ui/dist/.keep /src/internal/web/ui/dist/.keep
+# The build lists the npm packages the bundle contains, from Vite's module graph, next to dist
+# (ui/scripts/bundled.ts); manifests checks their licences and writes a package.json for each.
 RUN npm run build && node scripts/prodtree.mjs manifests /out/ui-sbom
 
 FROM --platform=$BUILDPLATFORM golang:1.27.1-trixie@sha256:8f58fd67ea075142d947a60e0caa4317746a55118d312f027793d382c7741734 AS build

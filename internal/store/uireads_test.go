@@ -533,3 +533,24 @@ func TestOwnerImageCoverage_DistinctContainerImages(t *testing.T) {
 		exReport.Key():               {{Digest: placeholderDigest}},
 	}, got)
 }
+
+// The node-group rail's batched read: a digest is seen into once it is catalogued and its first
+// match has run, whether or not an owner runs it; any other status, a missing row or a pending
+// first match is not.
+func TestDigestsSeenInto_CataloguedAndMatched(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	all := []string{"sha256:web", "sha256:api", "sha256:node-exporter", placeholderDigest, "sha256:norow", "sha256:unused"}
+	got, err := s.DigestsSeenInto(ctx, all)
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"sha256:web": true, "sha256:api": true, "sha256:unused": true}, got)
+
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:web", t0))
+	got, err = s.DigestsSeenInto(ctx, all)
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{"sha256:api": true, "sha256:unused": true}, got)
+
+	none, err := s.DigestsSeenInto(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, none)
+}
