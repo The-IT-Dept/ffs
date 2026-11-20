@@ -140,16 +140,20 @@ func (r *Resolver) clusterInfo(ctx context.Context) (model.ClusterInfo, error) {
 	return ci, nil
 }
 
-// eolOf is the end-of-life text of pv, empty when unknown or without an evaluator.
-func (r *Resolver) eolOf(pv eol.ProductVersion) string {
+// eolOf is the support text of pv (eol.Support), "unknown" when pv has no product (known is false)
+// or no known lifecycle, and empty without an evaluator.
+func (r *Resolver) eolOf(pv eol.ProductVersion, known bool) string {
 	if r.o.EOL == nil {
 		return ""
 	}
+	if !known {
+		return eol.Unknown
+	}
 	s, ok := r.o.EOL.Evaluate(pv.Product, pv.Version)
 	if !ok {
-		return ""
+		return eol.Unknown
 	}
-	return eol.Text(s, r.now())
+	return eol.Support(s, r.now())
 }
 
 // k8sMinor is the Kubernetes versions an owner runs in one minor line, and the patch to move to.
@@ -215,7 +219,7 @@ func (r *Resolver) AdviseCluster(ctx context.Context, o model.Owner) error {
 	}
 	slices.SortFunc(moving, func(a, b *k8sMinor) int { return compareVersions(b.current[0], a.current[0]) })
 
-	eolText := r.eolOf(eol.ClusterProduct(ci.Distribution, highest))
+	eolText := r.eolOf(eol.ClusterProduct(ci.Distribution, highest), true)
 	var notes adviceNotes
 	var scored []Scored
 	var rows []store.CandidateDigest
@@ -388,10 +392,7 @@ func (r *Resolver) AdviseRuntime(ctx context.Context, o model.Owner) error {
 		notes.always = append(notes.always, name+" >= "+target)
 	}
 	notes.withTarget = distributionNote(ci)
-	var eolText string
-	if pv, ok := eol.ContainerRuntimeProduct(name, cur); ok {
-		eolText = r.eolOf(pv)
-	}
+	eolText := r.eolOf(eol.ContainerRuntimeProduct(name, cur))
 	return r.storeAdvice(ctx, key, name, cur, scored, rows, notes, eolText)
 }
 

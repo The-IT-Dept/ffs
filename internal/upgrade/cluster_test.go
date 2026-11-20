@@ -201,7 +201,7 @@ func TestAdviseCluster_AlreadyLatest(t *testing.T) {
 	require.Equal(t, model.TierNone, got.Suggestion.Tier)
 	require.Empty(t, got.Suggestion.ToTag)
 	require.Empty(t, got.Candidates)
-	require.Equal(t, "", got.Suggestion.EOL) // cycle 1.35 ends 2027-02-28, outside the warning window
+	require.Equal(t, "Kubernetes 1.35 supported until 2027-02-28", got.Suggestion.EOL) // outside the warning window
 }
 
 func TestAdviseCluster_DistributionNoteOnlyWithTarget(t *testing.T) {

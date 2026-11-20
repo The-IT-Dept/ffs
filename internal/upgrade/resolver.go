@@ -755,16 +755,20 @@ func suggestionOf(repo, from string, s Scored, now time.Time) model.Suggestion {
 		Fixes: s.Fixes, Remaining: s.Remaining, Introduces: s.Introduces, FixedIDs: s.FixedIDs, ComputedAt: now}
 }
 
-// eolText is the end-of-life status of the distro and runtimes of the image the owner runs.
+// eolText is the support status of the distro and runtimes of the image the owner runs (eol.Support),
+// "unknown" when none is known, and empty without an evaluator.
 func (r *Resolver) eolText(ctx context.Context, repo string, cur repoState, now time.Time) (string, error) {
-	if r.o.EOL == nil || len(cur.digests) == 0 {
+	if r.o.EOL == nil {
 		return "", nil
+	}
+	if len(cur.digests) == 0 {
+		return eol.Unknown, nil
 	}
 	pkgs, err := r.o.Store.PackagesForImage(ctx, cur.digests[0])
 	if err != nil {
 		return "", fmt.Errorf("upgrade: packages of %s: %w", cur.digests[0], err)
 	}
-	return eol.JoinText(r.o.EOL.ImageEOL(repo, pkgs), now), nil
+	return eol.JoinSupport(r.o.EOL.ImageEOL(repo, pkgs), now), nil
 }
 
 // appliedUpgrade returns the upgrade the owner now runs, from its stored suggestion prev: the

@@ -16,4 +16,5 @@ var overrides = map[string]override{
 	"flatcar":      {note: "rolling release", rolling: true},
 	"bottlerocket": {note: "lifecycle follows the variant's Kubernetes version"},
 	"talos":        {note: "security updates for the two latest minor releases"},
+	"azure-linux":  {note: "lifecycle published by Microsoft"}, // endoflife.date has no Azure Linux product
 }

@@ -262,7 +262,7 @@ func TestResolver_RefreshRecommended(t *testing.T) {
 	require.Equal(t, []string{advA, advB}, sg.FixedIDs)
 	require.Empty(t, sg.Alternatives, "patch and minor fix nothing more")
 	require.Empty(t, sg.Notes)
-	require.Empty(t, sg.EOL, "debian 12 is supported")
+	require.Equal(t, "Debian 12 supported until 2028-06-30", sg.EOL)
 	require.Equal(t, rnow, sg.ComputedAt)
 	require.Contains(t, got.Candidates, store.CandidateDigest{Tag: "1.30.6", Tier: model.TierRefresh, Platform: "linux/amd64", Digest: "sha256:new-amd64"})
 	require.Equal(t, []string{"1.30.6", "1.30.7", "1.31.9"}, tags(got.Candidates))
@@ -351,9 +351,16 @@ func TestResolver_NoUpgradePath(t *testing.T) {
 	got := rg.suggestion()
 	require.Equal(t, model.TierNone, got.Suggestion.Tier)
 	require.Equal(t, []string{"no upgrade path in this repository"}, got.Suggestion.Notes)
-	require.Equal(t, "debian 11 reached end of life 2026-08-31", got.Suggestion.EOL)
+	require.Equal(t, "Debian 11 reached end of life 2026-08-31", got.Suggestion.EOL)
 	require.Empty(t, got.Candidates)
 	require.Empty(t, rg.acq.reqs)
+}
+
+func TestResolver_SupportUnknown(t *testing.T) {
+	rg := newRig(t)
+	rg.putImage(curAMD64, curIdx, "99") // a Debian release the lifecycle data does not know
+	rg.resolve()
+	require.Equal(t, "unknown", rg.suggestion().Suggestion.EOL)
 }
 
 func TestResolver_CandidateFailureSkipsCandidate(t *testing.T) {

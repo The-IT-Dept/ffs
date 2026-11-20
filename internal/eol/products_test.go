@@ -6,6 +6,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 func TestClusterProduct(t *testing.T) {
@@ -79,4 +80,38 @@ func TestContainerRuntimeProduct(t *testing.T) {
 	require.Equal(t, ProductVersion{"containerd", "2.2.1"}, got)
 	_, ok = ContainerRuntimeProduct("cri-o", "1.31.3")
 	require.False(t, ok)
+}
+
+func TestCentOSAndAzureLinux(t *testing.T) {
+	for in, want := range map[string]ProductVersion{
+		"CentOS Linux 7 (Core)":     {"centos", "7"},
+		"CentOS Linux 8":            {"centos", "8"},
+		"Microsoft Azure Linux 3.0": {"azure-linux", "3.0"},
+		"CBL-Mariner/Linux 2.0":     {"azure-linux", "2.0"},
+	} {
+		got, ok := NodeOSProduct(in)
+		require.True(t, ok, in)
+		require.Equal(t, want, got, in)
+	}
+	for _, tc := range []struct {
+		d    *model.Distro
+		want ProductVersion
+	}{
+		{&model.Distro{ID: "centos", VersionID: "7"}, ProductVersion{"centos", "7"}},
+		{&model.Distro{ID: "azurelinux", VersionID: "3.0"}, ProductVersion{"azure-linux", "3.0"}},
+		{&model.Distro{ID: "mariner", VersionID: "2.0"}, ProductVersion{"azure-linux", "2.0"}},
+	} {
+		got, ok := DistroProduct(tc.d, "docker.io/library/app")
+		require.True(t, ok, tc.d.ID)
+		require.Equal(t, tc.want, got, tc.d.ID)
+	}
+
+	// CentOS has endoflife.date cycles; Azure Linux, which endoflife.date does not track, has a note
+	e := newEvaluator(t, store.EOLCycle{Product: "centos", Cycle: "7", EOLDate: day(2024, 6, 30)})
+	s, ok := e.Evaluate("centos", "7")
+	require.True(t, ok)
+	require.Equal(t, "CentOS 7 reached end of life 2024-06-30", Text(s, now))
+	s, ok = e.Evaluate("azure-linux", "3.0")
+	require.True(t, ok)
+	require.Equal(t, "Azure Linux 3.0: lifecycle published by Microsoft", Support(s, now))
 }
