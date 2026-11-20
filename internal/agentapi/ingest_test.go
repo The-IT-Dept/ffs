@@ -12,6 +12,7 @@ import (
 	"github.com/anchore/syft/syft/linux"
 	"github.com/anchore/syft/syft/pkg"
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,6 +21,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/nodegroup"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/sbom"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -686,4 +688,18 @@ func TestIngest_TriggersAndOffers(t *testing.T) {
 	require.True(t, resp.Applied, "an offer failure does not fail the report")
 	require.Nil(t, resp.Work)
 	require.Equal(t, 2, h.triggers)
+}
+
+func TestIngest_CountsAppliedAndDuplicate(t *testing.T) {
+	count := func(result string) float64 { return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(result)) }
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	applied, duplicate := count(metrics.AgentReportApplied), count(metrics.AgentReportDuplicate)
+
+	require.True(t, h.report(t, imagesReport(1, nil)).Applied)
+	require.Equal(t, applied+1, count(metrics.AgentReportApplied))
+	require.Equal(t, duplicate, count(metrics.AgentReportDuplicate))
+
+	require.False(t, h.report(t, imagesReport(1, nil)).Applied)
+	require.Equal(t, applied+1, count(metrics.AgentReportApplied))
+	require.Equal(t, duplicate+1, count(metrics.AgentReportDuplicate))
 }

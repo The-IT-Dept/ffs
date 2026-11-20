@@ -100,7 +100,8 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 	runner = feeds.NewRunner(st, fs, feeds.RunnerOptions{OnStale: func(_ context.Context, f string, last time.Time) {
 		d.Hooks.FeedStale(f, last, runner.StaleAfter()[f])
 	}})
-	mc := metrics.NewCollector(st, metrics.CollectorOptions{FeedStaleAfter: runner.StaleAfter()})
+	mc := metrics.NewCollector(st, metrics.CollectorOptions{FeedStaleAfter: runner.StaleAfter(),
+		NodeAgentStaleAfter: cfg.NodeAgent.StaleAfter})
 	if err := metrics.Register(ctrlmetrics.Registry, mc); err != nil {
 		return d, err
 	}

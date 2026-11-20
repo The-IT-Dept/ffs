@@ -19,10 +19,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/agentapi/wire"
 	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 )
 
 // fixedAuth authenticates every token as worker-1, or fails with err.
@@ -247,4 +249,42 @@ func TestCertReloader_ReloadsChangedFilesAtMostEvery30s(t *testing.T) {
 func TestWireConfig_FromNodeAgentConfig(t *testing.T) {
 	require.Equal(t, wire.AgentConfig{ReportIntervalSeconds: 21600, ImageListIntervalSeconds: 300, JitterPercent: 10,
 		MaxImageBytes: 0, MaxReportBytes: 33554432}, WireConfig(config.Default().NodeAgent))
+}
+
+func TestServer_CountsRejectedReports(t *testing.T) {
+	rejected := func() float64 {
+		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected))
+	}
+	rec := &reportRecorder{resp: wire.ReportResponse{Applied: true}}
+	h := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: rec, MaxReportBytes: 1 << 20}).Handler()
+	report := func(node string) io.Reader { return strings.NewReader(`{"node":"` + node + `","kind":"images"}`) }
+	big := `{"node":"worker-1","kind":"full","host":{"syftJSON":"` + strings.Repeat("a", 2<<20) + `"}}`
+
+	for _, tc := range []struct {
+		name   string
+		bearer string
+		body   io.Reader
+		length int64
+		err    error
+		code   int
+	}{
+		{"no token", "", report("worker-1"), -1, nil, http.StatusUnauthorized},
+		{"another node", "tok", report("worker-2"), -1, nil, http.StatusForbidden},
+		{"over the size cap", "tok", strings.NewReader(big), int64(len(big)), nil, http.StatusRequestEntityTooLarge},
+		{"invalid JSON", "tok", strings.NewReader(`{"node":`), -1, nil, http.StatusBadRequest},
+		{"refused by the handler", "tok", report("worker-1"), -1, fmt.Errorf("%w: unknown report kind", ErrBadRequest), http.StatusBadRequest},
+	} {
+		before := rejected()
+		rec.err = tc.err
+		a := serve(t, h, http.MethodPost, wire.PathReport, tc.bearer, tc.body, tc.length)
+		require.Equal(t, tc.code, a.code, tc.name)
+		require.Equal(t, before+1, rejected(), tc.name)
+	}
+
+	before := rejected()
+	rec.err = errors.New("disk I/O")
+	require.Equal(t, http.StatusInternalServerError, serve(t, h, http.MethodPost, wire.PathReport, "tok", report("worker-1"), -1).code)
+	rec.err = nil
+	require.Equal(t, http.StatusOK, serve(t, h, http.MethodPost, wire.PathReport, "tok", report("worker-1"), -1).code)
+	require.Equal(t, before, rejected(), "neither a 500 nor a 200 is a rejection")
 }

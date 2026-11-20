@@ -18,6 +18,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/nodegroup"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/sbom"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -128,6 +129,7 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 	}
 	rep := store.AgentReport{Node: id.Node, AgentVersion: r.AgentVersion, BootID: r.BootID, StartedAt: r.StartedAt, Seq: r.Seq}
 	if stored != nil && rep.DuplicateOf(*stored) {
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate).Inc()
 		return wire.ReportResponse{Applied: false, Config: cfg}, nil
 	}
 
@@ -160,8 +162,10 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 		return wire.ReportResponse{}, err
 	}
 	if !applied {
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate).Inc()
 		return wire.ReportResponse{Applied: false, Config: cfg}, nil
 	}
+	metrics.AgentReports.WithLabelValues(metrics.AgentReportApplied).Inc()
 
 	if err := i.storeHost(ctx, id.Node, r, gate, now); err != nil {
 		return wire.ReportResponse{}, err
