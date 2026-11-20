@@ -5,6 +5,7 @@ COMMIT  ?= $(shell git rev-parse HEAD 2>/dev/null)
 LDFLAGS := -s -w -X github.com/the-it-dept/ffs/internal/version.Version=$(VERSION) -X github.com/the-it-dept/ffs/internal/version.Commit=$(COMMIT)
 CONTROLLER_GEN ?= go run sigs.k8s.io/controller-tools/cmd/controller-gen@v0.23.0
 GOLANGCI_LINT  ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
+OAPI_CODEGEN   ?= go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.8.2
 PKGS ?= ./...
 RUN  ?=
 .PHONY: build test generate lint e2e golden chart-lint image licenses ui ui-test
@@ -15,6 +16,8 @@ test: ; KUBEBUILDER_ASSETS="$$($(SETUP_ENVTEST) use $(ENVTEST_K8S_VERSION) --bin
 generate:
 	$(CONTROLLER_GEN) object:headerFile=hack/boilerplate.go.txt crd paths=./api/... output:crd:artifacts:config=config/crd/bases
 	rm -f charts/ffs/crds/*.yaml && cp config/crd/bases/*.yaml charts/ffs/crds/
+	$(OAPI_CODEGEN) -config api/oapi-codegen.yaml api/openapi.yaml
+	cd ui && npm run --silent generate:api
 lint:     ; $(GOLANGCI_LINT) run ./...
 golden:   ; hack/golden.sh fetch && FFS_GOLDEN_DB=$(CURDIR)/.cache/golden-db/6 go test -tags golden ./internal/match/grype -run TestGolden -count=1
 chart-lint: ; helm lint --strict --kube-version 1.37.0 charts/ffs

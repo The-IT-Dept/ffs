@@ -15,6 +15,7 @@ require (
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20260904000721-8a72a424fdec
 	github.com/google/osv-scalibr v0.5.3
 	github.com/klauspost/compress v1.20.3
+	github.com/oapi-codegen/runtime v1.9.0
 	github.com/openreports/reports-api v0.2.1
 	github.com/ossf/osv-schema/bindings/go v0.0.0-20260424063704-83285ce2a866
 	github.com/pandatix/go-cvss v0.6.4
@@ -84,6 +85,7 @@ require (
 	github.com/anchore/packageurl-go v0.2.0 // indirect
 	github.com/andybalholm/brotli v1.2.8 // indirect
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
+	github.com/apapsch/go-jsonmerge/v2 v2.0.0 // indirect
 	github.com/apparentlymart/go-textseg/v15 v15.0.0 // indirect
 	github.com/apparentlymart/go-textseg/v17 v17.0.1 // indirect
 	github.com/aquasecurity/go-pep440-version v0.0.1 // indirect

@@ -1,0 +1,1937 @@
+openapi: 3.1.0
+info:
+  title: ffs API
+  version: v1
+  description: >-
+    Read-only API of ffs. Every response names the cluster and the time it was generated. Errors
+    are RFC 9457 problem documents.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+security: []
+servers:
+  - url: /api/v1
+
+paths:
+  /summary:
+    get:
+      operationId: getSummary
+      summary: Headline numbers for a scope
+      description: Reachable workloads, open findings, coverage and feed freshness for the scope.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+      responses:
+        '200':
+          description: The summary.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Summary'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /scope:
+    get:
+      operationId: getScope
+      summary: Scope card for the navigation rail
+      description: The scope's title and summary, breadcrumbs, views with counts, related objects and trust footer.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: from
+          description: Scope the image was opened from, used as the breadcrumb parent of an image scope.
+          schema: {type: string, maxLength: 600}
+      responses:
+        '200':
+          description: The scope card.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ScopeCard'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /exposure:
+    get:
+      operationId: getExposure
+      summary: Exposure table
+      description: >-
+        Entry points and the workloads they reach, with signal columns. Accepts the cluster and
+        namespace scopes; the node grouping is available for the cluster scope only.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: group
+          description: How rows are grouped.
+          schema: {$ref: '#/components/schemas/ExposureGroup'}
+        - in: query
+          name: expand
+          description: Row ids whose collapsed tail or group is shown in full.
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+      responses:
+        '200':
+          description: The exposure table.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExposureTable'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /findings:
+    get:
+      operationId: listFindings
+      summary: Findings explorer
+      description: >-
+        Findings (owner and advisory pairs) matching the filters, flat or grouped, with facet counts.
+        Each facet is counted without its own selection. Without a state filter only open findings
+        are listed; resolved findings cover the last 30 days.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: state
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/FindingState'}}
+        - in: query
+          name: priority
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Priority'}}
+        - in: query
+          name: fix
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/FixClass'}}
+        - in: query
+          name: signal
+          description: Signals that must all hold.
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Signal'}}
+        - in: query
+          name: ecosystem
+          description: Ecosystem of the finding's first package.
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: namespace
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: kind
+          description: Owner kinds, such as Deployment.
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: advisory
+          description: Advisory ID or any of its aliases.
+          schema: {type: string, maxLength: 200}
+        - in: query
+          name: package
+          description: Exact name of any package of the finding.
+          schema: {type: string, maxLength: 300}
+        - in: query
+          name: repo
+          description: Exact image repository.
+          schema: {type: string, maxLength: 300}
+        - in: query
+          name: fixKey
+          description: Exact fix action key (FixAction.key); the group key of group=fix.
+          schema: {type: string, maxLength: 300}
+        - $ref: '#/components/parameters/Q'
+        - in: query
+          name: group
+          description: Group the findings; absent means a flat list.
+          schema: {$ref: '#/components/schemas/FindingGroup'}
+        - in: query
+          name: sort
+          description: Sort of the flat list; grouped rows have a fixed order.
+          schema: {$ref: '#/components/schemas/FindingSort'}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: facets
+          description: Facets to count.
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/FindingFacet'}}
+      responses:
+        '200':
+          description: One page of findings or groups.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FindingsPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /transitions:
+    get:
+      operationId: listTransitions
+      summary: Finding history
+      description: Finding transitions in the scope, newest first. Accepts the cluster, namespace, workload and control plane scopes.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of transitions.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TransitionsPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /advisories/{id}:
+    get:
+      operationId: getAdvisory
+      summary: Advisory detail
+      description: An advisory with its severities by source, exploitation data and the workloads it affects.
+      parameters:
+        - in: path
+          name: id
+          required: true
+          description: Advisory ID or any of its aliases.
+          schema: {type: string}
+      responses:
+        '200':
+          description: The advisory.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/AdvisoryDetail'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /workloads:
+    get:
+      operationId: listWorkloads
+      summary: Workloads explorer
+      description: >-
+        Workloads in the scope, including those with no findings, with facet counts over
+        workloads. Accepts the cluster and namespace scopes.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: kind
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: namespace
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: signal
+          description: Signals that must all hold (exposed, privileged, sa_power, not_running).
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Signal'}}
+        - in: query
+          name: priority
+          description: Worst open priority; none means no open finding.
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Priority'}}
+        - in: query
+          name: coverage
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/CoverageClass'}}
+        - $ref: '#/components/parameters/Q'
+        - in: query
+          name: sort
+          schema: {$ref: '#/components/schemas/WorkloadSort'}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: facets
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/WorkloadFacet'}}
+      responses:
+        '200':
+          description: One page of workloads.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkloadsPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /workloads/{kind}/{namespace}/{name}:
+    get:
+      operationId: getWorkload
+      summary: Workload detail
+      parameters:
+        - in: path
+          name: kind
+          required: true
+          schema: {type: string}
+        - in: path
+          name: namespace
+          required: true
+          description: Namespace, or - for a cluster-level owner.
+          schema: {type: string}
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The workload.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/WorkloadDetail'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /images:
+    get:
+      operationId: listImages
+      summary: Images explorer
+      description: >-
+        Images in use in the scope, including pending and unresolvable ones, with facet counts
+        over images. Accepts the cluster, namespace and workload scopes.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: status
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/ImageStatus'}}
+        - in: query
+          name: source
+          description: Where the SBOM came from, such as registry or attestation.
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: coverage
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/CoverageClass'}}
+        - in: query
+          name: namespace
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: priority
+          description: Worst open priority; none means no open finding.
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Priority'}}
+        - $ref: '#/components/parameters/Q'
+        - in: query
+          name: sort
+          schema: {$ref: '#/components/schemas/ImageSort'}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: facets
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/ImageFacet'}}
+      responses:
+        '200':
+          description: One page of images.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ImagesPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /images/{digest}:
+    get:
+      operationId: getImage
+      summary: Image detail
+      parameters:
+        - in: path
+          name: digest
+          required: true
+          description: >-
+            Image digest, or the ID of an image that could not be resolved, sent as one
+            percent-encoded path segment.
+          schema: {type: string}
+      responses:
+        '200':
+          description: The image.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ImageDetail'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /images/{digest}/packages:
+    get:
+      operationId: listImagePackages
+      summary: Packages of an image
+      description: Packages found in the image, searchable by name, version or ID, with an ecosystem facet.
+      parameters:
+        - in: path
+          name: digest
+          required: true
+          description: >-
+            Image digest, or the ID of an image that could not be resolved, sent as one
+            percent-encoded path segment.
+          schema: {type: string}
+        - $ref: '#/components/parameters/Q'
+        - in: query
+          name: ecosystem
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: One page of packages.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ImagePackagesPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /packages:
+    get:
+      operationId: listPackages
+      summary: Packages explorer
+      description: >-
+        Packages of the images in use in the scope, with facet counts over packages. Accepts the
+        cluster, namespace, workload and image scopes.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+        - in: query
+          name: ecosystem
+          style: form
+          explode: false
+          schema: {type: array, items: {type: string}}
+        - in: query
+          name: priority
+          description: Worst open priority; none means no open finding.
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/Priority'}}
+        - $ref: '#/components/parameters/Q'
+        - in: query
+          name: sort
+          schema: {$ref: '#/components/schemas/PackageSort'}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - in: query
+          name: facets
+          style: form
+          explode: false
+          schema: {type: array, items: {$ref: '#/components/schemas/PackageFacet'}}
+      responses:
+        '200':
+          description: One page of packages.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PackagesPage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /nodegroups:
+    get:
+      operationId: listNodeGroups
+      summary: Control plane and node groups
+      responses:
+        '200':
+          description: The control plane and every node group.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeGroupsList'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /nodegroups/{id}:
+    get:
+      operationId: getNodeGroup
+      summary: Node group detail
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string}
+        - in: query
+          name: compare
+          description: ID of another node group to compare this group with.
+          schema: {type: string, maxLength: 200}
+      responses:
+        '200':
+          description: The node group.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeGroupDetail'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /nodes/{name}:
+    get:
+      operationId: getNode
+      summary: Node detail
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: The node.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/NodeDetail'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /coverage:
+    get:
+      operationId: getCoverage
+      summary: Coverage funnel and gaps
+      description: What ffs can and cannot see in the scope. Accepts the cluster, namespace and workload scopes.
+      parameters:
+        - $ref: '#/components/parameters/Scope'
+      responses:
+        '200':
+          description: The coverage of the scope.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Coverage'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /feeds:
+    get:
+      operationId: listFeeds
+      summary: Feed freshness and data sources
+      responses:
+        '200':
+          description: Every feed and data source.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/FeedsList'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /exceptions:
+    get:
+      operationId: listExceptions
+      summary: Exceptions
+      description: A read-only view of the Exception resources in the cluster.
+      responses:
+        '200':
+          description: Every Exception.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/ExceptionsList'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /settings:
+    get:
+      operationId: getSettings
+      summary: Settings
+      description: A read-only view of the configuration that shapes what ffs reports.
+      responses:
+        '200':
+          description: The settings.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Settings'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /search:
+    get:
+      operationId: search
+      summary: Jump to an object
+      description: Objects of every kind whose name or ID matches, prefix matches first, at most 20.
+      parameters:
+        - in: query
+          name: q
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 100}
+      responses:
+        '200':
+          description: The matching objects.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SearchResult'}
+        default: {$ref: '#/components/responses/Problem'}
+
+  /stream:
+    get:
+      operationId: streamChanges
+      summary: Change notifications
+      description: >-
+        Server-sent events. Each event is named changed and each data line holds one ChangeEvent
+        naming the kinds of data and the scopes that changed. A comment line is sent every 25
+        seconds. A client that reconnects with Last-Event-ID receives the events it missed, or an
+        event of kind all when they are no longer available.
+      parameters:
+        - in: header
+          name: Last-Event-ID
+          description: ID of the last event the client received.
+          schema: {type: string, maxLength: 100}
+      responses:
+        '200':
+          description: An event stream; each data line holds one ChangeEvent.
+          content:
+            text/event-stream:
+              schema: {$ref: '#/components/schemas/ChangeEvent'}
+        default: {$ref: '#/components/responses/Problem'}
+
+components:
+  parameters:
+    Scope:
+      in: query
+      name: scope
+      description: >-
+        What the request is about: cluster, controlplane, namespace:<name>,
+        workload:<kind>/<namespace>/<name> (empty namespace for cluster-level owners),
+        image:<digest>, nodegroup:<id> or node:<name>.
+      schema:
+        type: string
+        pattern: '^(cluster|controlplane|(namespace|image|nodegroup|node):.+|workload:[^/]+/[^/]*/[^/]+)$'
+        default: cluster
+    Cursor:
+      in: query
+      name: cursor
+      description: Opaque cursor from the next field of the previous page of the same query.
+      schema: {type: string}
+    Limit:
+      in: query
+      name: limit
+      description: Rows per page.
+      schema: {type: integer, minimum: 1, maximum: 200, default: 50}
+    Q:
+      in: query
+      name: q
+      description: Case-insensitive text to match.
+      schema: {type: string, maxLength: 200}
+
+  responses:
+    Problem:
+      description: An RFC 9457 problem document.
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Problem'}
+
+  schemas:
+    # Envelope and errors
+
+    Envelope:
+      type: object
+      description: Members every JSON response carries.
+      required: [cluster, generatedAt]
+      properties:
+        cluster: {type: string, description: Name of the cluster.}
+        generatedAt: {type: string, format: date-time}
+
+    Problem:
+      description: An RFC 9457 problem document, with cluster, generatedAt and code as extension members.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [type, title, status, code]
+          properties:
+            type: {type: string, default: about:blank}
+            title: {type: string}
+            status: {type: integer}
+            detail: {type: string}
+            instance: {type: string}
+            code: {$ref: '#/components/schemas/ProblemCode'}
+
+    ProblemCode:
+      type: string
+      enum: [invalid_parameter, invalid_scope, invalid_cursor, not_found, too_many_streams, internal]
+
+    # Enumerations
+
+    Priority:
+      type: string
+      description: Priority of a finding; none means no open finding.
+      enum: [urgent, high, medium, low, none]
+    Severity:
+      type: string
+      enum: [critical, high, medium, low, negligible, unknown]
+    FindingState:
+      type: string
+      enum: [open, excepted, resolved]
+    FixClass:
+      type: string
+      description: >-
+        upgrade: an image upgrade clears it; fixed: a fixed package version exists; none: no fix
+        yet; wontfix: the distribution will not fix it.
+      enum: [upgrade, fixed, none, wontfix]
+    FixKind:
+      type: string
+      enum: [upgrade, rebuild, package, none, wontfix]
+    Signal:
+      type: string
+      description: A ranking signal. epss means the EPSS score is at or above the configured threshold.
+      enum: [exposed, privileged, sa_power, exploited, malicious, provisional, not_running, epss]
+    CoverageClass:
+      type: string
+      description: >-
+        full: catalogued with no coverage notes; partial: catalogued with coverage notes; none:
+        not catalogued.
+      enum: [full, partial, none]
+    ImageStatus:
+      type: string
+      enum: [pending, catalogued, unresolvable, catalogFailed]
+    ScopeKind:
+      type: string
+      enum: [cluster, namespace, workload, image, nodegroup, node, controlplane]
+    EntryKind:
+      type: string
+      enum: [gateway, ingress, loadbalancer, nodeport, externalip, hostnetwork, hostport]
+    GapCode:
+      type: string
+      description: What ffs cannot see.
+      enum:
+        - pending
+        - unresolvable_auth
+        - unresolvable_sideloaded
+        - unresolvable_notfound
+        - unresolvable_unreachable
+        - unresolvable_other
+        - layers_discarded
+        - catalog_failed
+        - attestation_partial
+        - unattributed_executables
+        - rust_no_auditable
+        - cpe_only_classifier
+        - node_agent_missing
+        - node_agent_blocked
+        - no_package_database
+        - content_store_unreadable
+        - feed_stale
+    RemedyCode:
+      type: string
+      description: What to do about a gap.
+      enum:
+        - wait
+        - add_pull_secret
+        - enable_node_agent
+        - check_network
+        - check_reference
+        - repull_image
+        - retry_later
+        - build_with_auditable
+        - check_host_permissions
+        - check_feed_access
+        - informational
+    ChangeKind:
+      type: string
+      description: Kind of data that changed; all means every view may be stale.
+      enum: [findings, inventory, images, feeds, nodes, exceptions, all]
+    ViewId:
+      type: string
+      enum: [exposure, vulnerabilities, workloads, images, packages, nodes, coverage, findings, upgrades, rbac,
+             history, sbom, hostPackages, kernel, cachedImages, members]
+    AgentState:
+      type: string
+      enum: [reporting, stale, never, disabled]
+    NodeGroupKind:
+      type: string
+      description: agent groups come from node agent inventories; nodeinfo groups from the node status.
+      enum: [agent, nodeinfo]
+
+    # Parameter enumerations
+
+    FindingFacet:
+      type: string
+      enum: [state, priority, fix, signal, ecosystem, namespace, kind]
+    WorkloadFacet:
+      type: string
+      enum: [kind, namespace, signal, priority, coverage]
+    ImageFacet:
+      type: string
+      enum: [status, source, coverage, namespace, priority]
+    PackageFacet:
+      type: string
+      enum: [ecosystem, priority]
+    FindingSort:
+      type: string
+      enum: ['-priority', '-severity', '-published', '-epss', advisory, workload, namespace]
+      default: '-priority'
+    WorkloadSort:
+      type: string
+      enum: ['-risk', name, namespace, '-findings']
+      default: '-risk'
+    ImageSort:
+      type: string
+      enum: ['-risk', repo, '-workloads']
+      default: '-risk'
+    PackageSort:
+      type: string
+      enum: ['-risk', name, '-images']
+      default: '-risk'
+    FindingGroup:
+      type: string
+      enum: [advisory, workload, image, package, namespace, fix]
+    ExposureGroup:
+      type: string
+      enum: [entry, namespace, node]
+      default: entry
+
+    # Shared shapes
+
+    PriorityCounts:
+      type: object
+      description: Open findings by priority.
+      required: [urgent, high, medium, low]
+      properties:
+        urgent: {type: integer}
+        high: {type: integer}
+        medium: {type: integer}
+        low: {type: integer}
+
+    CoverageFigure:
+      type: object
+      description: >-
+        Distinct container images in use, how many ffs has seen into (catalogued), and how many in
+        full detail.
+      required: [inUse, seenInto, full]
+      properties:
+        inUse: {type: integer}
+        seenInto: {type: integer}
+        full: {type: integer}
+
+    FeedFreshness:
+      type: object
+      required: [fresh, stale, oldestSuccess]
+      properties:
+        fresh: {type: boolean, description: True when no feed is stale.}
+        stale: {type: array, items: {type: string}, description: Names of the stale feeds.}
+        oldestSuccess: {type: [string, 'null'], format: date-time, description: Earliest last success of any feed.}
+
+    ScopeRef:
+      type: object
+      required: [scope, kind, label]
+      properties:
+        scope: {type: string, description: The scope parameter value.}
+        kind: {$ref: '#/components/schemas/ScopeKind'}
+        label: {type: string}
+
+    WorkloadRef:
+      type: object
+      required: [scope, kind, namespace, name]
+      properties:
+        scope: {type: string}
+        kind: {type: string}
+        namespace: {type: string, description: Empty for cluster-level owners.}
+        name: {type: string}
+
+    ManagedBy:
+      type: object
+      required: [tool, name]
+      properties:
+        tool: {type: string, description: 'helm, flux-helmrelease, flux-kustomization or argocd.'}
+        name: {type: string}
+        namespace: {type: string}
+
+    FacetValue:
+      type: object
+      required: [value, count, selected]
+      properties:
+        value: {type: string}
+        count: {type: integer}
+        selected: {type: boolean}
+
+    Facets:
+      type: object
+      description: Facet name to its values, for the requested facets only.
+      additionalProperties:
+        type: array
+        items: {$ref: '#/components/schemas/FacetValue'}
+
+    FixAction:
+      type: object
+      description: How a finding is cleared. introduces is set only on upgrade actions.
+      required: [kind, key, label]
+      properties:
+        kind: {$ref: '#/components/schemas/FixKind'}
+        key: {type: string}
+        label: {type: string}
+        title: {type: string}
+        package: {type: string}
+        ecosystem: {type: string}
+        from: {type: string}
+        to: {type: string}
+        repo: {type: string}
+        fromTag: {type: string}
+        toTag: {type: string}
+        tier: {type: string}
+        introduces: {$ref: '#/components/schemas/PriorityCounts'}
+
+    Suggestion:
+      type: object
+      description: An image upgrade candidate for a workload's repository.
+      required: [repo, fromTag, toTag, tier, target, netChange, fixes, remaining, introduces, fixedIds, notes, alternatives]
+      properties:
+        repo: {type: string}
+        fromTag: {type: string}
+        toTag: {type: string}
+        toDigest: {type: string}
+        tier: {type: string}
+        target: {type: string}
+        netChange: {type: string}
+        fixes: {$ref: '#/components/schemas/PriorityCounts'}
+        remaining: {$ref: '#/components/schemas/PriorityCounts'}
+        introduces: {$ref: '#/components/schemas/PriorityCounts'}
+        fixedIds: {type: array, items: {type: string}}
+        eol: {type: string}
+        notes: {type: array, items: {type: string}}
+        alternatives: {type: array, items: {$ref: '#/components/schemas/Suggestion'}}
+        computedAt: {type: string, format: date-time}
+
+    FindingPackage:
+      type: object
+      required: [name, ecosystem, installed, fixed]
+      properties:
+        name: {type: string}
+        ecosystem: {type: string}
+        installed: {type: string}
+        path: {type: string}
+        fixed: {type: array, items: {type: string}}
+
+    EOL:
+      type: object
+      description: End-of-life position of a product version.
+      required: [product, cycle, eolDate, isEol, latest, note, text]
+      properties:
+        product: {type: string}
+        cycle: {type: string}
+        eolDate: {type: string}
+        isEol: {type: boolean}
+        latest: {type: string}
+        note: {type: string}
+        text: {type: string}
+
+    ExposureEdge:
+      type: object
+      description: One way a workload is reached.
+      required: [entry, entryName, listener, hostname, route, service, internal]
+      properties:
+        entry: {$ref: '#/components/schemas/EntryKind'}
+        entryName: {type: string}
+        listener: {type: string}
+        hostname: {type: string}
+        route: {type: string}
+        service: {type: string}
+        internal: {type: boolean, description: Marked internal in the ffs configuration.}
+
+    GroupRef:
+      type: object
+      required: [id, label, kind]
+      properties:
+        id: {type: string}
+        label: {type: string}
+        kind: {$ref: '#/components/schemas/NodeGroupKind'}
+
+    # Summary and rail
+
+    Summary:
+      description: Headline numbers for a scope.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [scope, reachable, reachableUrgent, findings, open, fixable, exploited, coverage, feeds, gaps]
+          properties:
+            scope: {$ref: '#/components/schemas/ScopeRef'}
+            reachable: {type: integer, description: Workloads reachable from outside.}
+            reachableUrgent: {type: integer, description: Reachable workloads with urgent findings.}
+            findings: {$ref: '#/components/schemas/PriorityCounts'}
+            open: {type: integer}
+            fixable: {type: integer, description: Open findings where a fixed version exists.}
+            exploited: {type: integer}
+            coverage: {$ref: '#/components/schemas/CoverageFigure'}
+            feeds: {$ref: '#/components/schemas/FeedFreshness'}
+            gaps: {type: integer}
+
+    ScopeCard:
+      description: The navigation rail of a scope.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [scope, clusters, title, summary, breadcrumbs, views, related, trust]
+          properties:
+            scope: {$ref: '#/components/schemas/ScopeRef'}
+            clusters: {type: array, items: {type: string}}
+            title: {type: string}
+            summary: {type: string}
+            breadcrumbs: {type: array, items: {$ref: '#/components/schemas/ScopeRef'}}
+            views: {type: array, items: {$ref: '#/components/schemas/ViewCount'}}
+            related: {type: array, items: {$ref: '#/components/schemas/RelatedSection'}}
+            trust: {$ref: '#/components/schemas/Trust'}
+
+    ViewCount:
+      type: object
+      required: [id, count, gap]
+      properties:
+        id: {$ref: '#/components/schemas/ViewId'}
+        count: {type: [integer, 'null']}
+        gap: {type: boolean}
+
+    RelatedSection:
+      type: object
+      required: [id, items, more]
+      properties:
+        id:
+          type: string
+          enum: [namespaces, nodegroups, controlplane, workloads, containers, siblings, usedBy, notablePackages, members,
+                 exceptions]
+        items: {type: array, items: {$ref: '#/components/schemas/RelatedItem'}}
+        more: {type: integer, description: Items not listed.}
+
+    RelatedItem:
+      type: object
+      required: [kind, label, worst, count, gap]
+      properties:
+        scope: {type: string}
+        kind: {type: string}
+        label: {type: string}
+        detail: {type: string}
+        worst: {$ref: '#/components/schemas/Priority'}
+        count: {type: [integer, 'null']}
+        gap: {type: boolean, description: ffs cannot see all of it.}
+
+    Trust:
+      type: object
+      required: [feeds, coverage, settings]
+      properties:
+        feeds: {$ref: '#/components/schemas/FeedFreshness'}
+        coverage: {$ref: '#/components/schemas/CoverageFigure'}
+        sbomSource: {type: string}
+        sbomTool: {type: string}
+        unattributed: {type: integer}
+        settings: {type: boolean, description: The scope links to the exceptions and settings views.}
+
+    # Exposure
+
+    ExposureTable:
+      description: Rows of the exposure table.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [scope, group, maxUrgent, rows]
+          properties:
+            scope: {$ref: '#/components/schemas/ScopeRef'}
+            group: {$ref: '#/components/schemas/ExposureGroup'}
+            maxUrgent: {type: integer, description: 'Largest urgent count of any row, for magnitude bars.'}
+            rows: {type: array, items: {$ref: '#/components/schemas/ExposureRow'}}
+
+    ExposureRow:
+      type: object
+      required: [id, depth, kind, label, internal, workloads, moreWorkloads, signals, expandable, collapsed]
+      properties:
+        id: {type: string}
+        parent: {type: string}
+        depth: {type: integer, enum: [0, 1]}
+        kind:
+          type: string
+          enum: [entry, internal, hostname, workload, tail, namespace, controlplane, nodegroup, node, notexposed]
+        label: {type: string}
+        detail: {type: string}
+        entry: {$ref: '#/components/schemas/EntryKind'}
+        internal: {type: boolean}
+        workloads: {type: array, items: {$ref: '#/components/schemas/WorkloadRef'}}
+        moreWorkloads: {type: integer}
+        hostnames: {type: integer}
+        signals: {$ref: '#/components/schemas/RowSignals'}
+        expandable: {type: boolean}
+        collapsed: {type: boolean}
+        target: {$ref: '#/components/schemas/ScopeRef'}
+
+    RowSignals:
+      type: object
+      description: Signal columns of an exposure row. privileged and saPower are null for node rows.
+      required: [urgent, high, fixable, exploited, privileged, saPower, coverage]
+      properties:
+        urgent: {type: integer}
+        high: {type: integer}
+        fixable: {type: integer}
+        exploited: {type: integer}
+        privileged: {type: [integer, 'null']}
+        saPower: {type: [integer, 'null']}
+        coverage: {$ref: '#/components/schemas/CoverageFigure'}
+        bestFix: {$ref: '#/components/schemas/FixAction'}
+
+    # Findings
+
+    FindingsPage:
+      description: >-
+        A flat page has total = findings = matching findings, groups 0 and no groupRows. A grouped
+        page has total = groups = matching groups, findings across them, and no rows.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [total, groups, findings, rows, groupRows, next, facets]
+          properties:
+            total: {type: integer}
+            groups: {type: integer}
+            findings: {type: integer}
+            rows: {type: array, items: {$ref: '#/components/schemas/FindingRow'}}
+            groupRows: {type: array, items: {$ref: '#/components/schemas/FindingGroupRow'}}
+            next: {type: [string, 'null'], description: Cursor of the next page; null on the last page.}
+            facets: {$ref: '#/components/schemas/Facets'}
+
+    FindingAdvisory:
+      type: object
+      required: [id, title, kev, epss]
+      properties:
+        id: {type: string}
+        title: {type: string}
+        kev: {type: boolean}
+        epss: {type: [number, 'null'], format: double}
+
+    FindingRow:
+      type: object
+      required: [id, advisory, workload, repo, packages, severity, severitySource, priority, reasons, state, fixState,
+                 fixAvailable, fix, signals]
+      properties:
+        id: {type: string}
+        advisory: {$ref: '#/components/schemas/FindingAdvisory'}
+        workload: {$ref: '#/components/schemas/WorkloadRef'}
+        repo: {type: string}
+        packages: {type: array, items: {$ref: '#/components/schemas/FindingPackage'}}
+        severity: {$ref: '#/components/schemas/Severity'}
+        severitySource: {type: string}
+        priority: {$ref: '#/components/schemas/Priority'}
+        reasons: {type: array, items: {type: string}}
+        state: {$ref: '#/components/schemas/FindingState'}
+        exceptedBy: {type: string}
+        fixState: {type: string}
+        fixAvailable: {type: boolean}
+        fix: {$ref: '#/components/schemas/FixAction'}
+        signals: {type: array, items: {$ref: '#/components/schemas/Signal'}}
+        published: {type: string, format: date-time}
+        observed: {type: string, format: date-time}
+        matched: {type: string, format: date-time}
+        resolvedAt: {type: string, format: date-time}
+
+    FindingGroupRow:
+      type: object
+      description: >-
+        A group of findings. distinct counts advisories, or workloads in advisory groups. fix is set
+        on fix groups.
+      required: [key, label, findings, distinct, counts, fixable, exploited, worst]
+      properties:
+        key: {type: string}
+        label: {type: string}
+        findings: {type: integer}
+        distinct: {type: integer}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        fixable: {type: integer}
+        exploited: {type: integer}
+        worst: {$ref: '#/components/schemas/Priority'}
+        fix: {$ref: '#/components/schemas/FixAction'}
+
+    TransitionsPage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [rows, next]
+          properties:
+            rows: {type: array, items: {$ref: '#/components/schemas/TransitionRow'}}
+            next: {type: [string, 'null']}
+
+    TransitionRow:
+      type: object
+      required: [id, at, advisory, workload, fromState, toState, fromPriority, toPriority, trigger, provisional]
+      properties:
+        id: {type: integer, format: int64}
+        at: {type: string, format: date-time}
+        advisory: {type: string}
+        workload: {$ref: '#/components/schemas/WorkloadRef'}
+        fromState: {type: string, description: Empty when the finding was created.}
+        toState: {$ref: '#/components/schemas/FindingState'}
+        fromPriority: {$ref: '#/components/schemas/Priority'}
+        toPriority: {$ref: '#/components/schemas/Priority'}
+        trigger: {type: string}
+        provisional: {type: boolean}
+
+    # Advisories
+
+    AdvisoryDetail:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [id, aliases, title, links, malicious, withdrawn, severities, kev, epss, timeline, counts, workloads,
+                     findings, byFix, packages, uncatalogued]
+          properties:
+            id: {type: string}
+            aliases: {type: array, items: {type: string}}
+            title: {type: string}
+            links: {type: array, items: {type: string}}
+            malicious: {type: boolean}
+            withdrawn: {type: boolean}
+            severities: {type: array, items: {$ref: '#/components/schemas/SourceSeverity'}}
+            kev:
+              oneOf:
+                - $ref: '#/components/schemas/KevInfo'
+                - type: 'null'
+            epss:
+              oneOf:
+                - $ref: '#/components/schemas/EpssInfo'
+                - type: 'null'
+            timeline: {$ref: '#/components/schemas/AdvisoryTimeline'}
+            counts: {$ref: '#/components/schemas/PriorityCounts'}
+            workloads: {type: integer}
+            findings: {type: integer}
+            byFix: {type: array, items: {$ref: '#/components/schemas/FindingGroupRow'}}
+            packages: {type: array, items: {$ref: '#/components/schemas/AdvisoryPackage'}}
+            uncatalogued: {type: integer, description: Images in use that ffs has not seen into.}
+
+    SourceSeverity:
+      type: object
+      required: [source, severity, used]
+      properties:
+        source: {type: string}
+        severity: {$ref: '#/components/schemas/Severity'}
+        used: {type: boolean, description: The severity ffs ranked with.}
+
+    KevInfo:
+      type: object
+      description: Listing in the CISA Known Exploited Vulnerabilities catalog.
+      required: [added]
+      properties:
+        added: {type: string, format: date}
+
+    EpssInfo:
+      type: object
+      required: [score, percentile]
+      properties:
+        score: {type: number, format: double}
+        percentile: {type: number, format: double}
+
+    AdvisoryTimeline:
+      type: object
+      properties:
+        published: {type: string, format: date-time}
+        observed: {type: string, format: date-time}
+        firstMatched: {type: string, format: date-time}
+
+    AdvisoryPackage:
+      type: object
+      required: [name, ecosystem, installed, fixed, findings]
+      properties:
+        name: {type: string}
+        ecosystem: {type: string}
+        installed: {type: string}
+        fixed: {type: array, items: {type: string}}
+        findings: {type: integer}
+
+    # Workloads
+
+    WorkloadsPage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [total, rows, next, facets]
+          properties:
+            total: {type: integer}
+            rows: {type: array, items: {$ref: '#/components/schemas/WorkloadRow'}}
+            next: {type: [string, 'null']}
+            facets: {$ref: '#/components/schemas/Facets'}
+
+    WorkloadRow:
+      type: object
+      required: [workload, notRunning, exposed, privileged, saPower, counts, open, fixable, exploited, coverage,
+                 coverageClass, pods]
+      properties:
+        workload: {$ref: '#/components/schemas/WorkloadRef'}
+        managedBy: {$ref: '#/components/schemas/ManagedBy'}
+        notRunning: {type: boolean}
+        exposed: {type: boolean}
+        privileged: {type: boolean}
+        saPower: {type: boolean}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        open: {type: integer}
+        fixable: {type: integer}
+        exploited: {type: integer}
+        coverage: {$ref: '#/components/schemas/CoverageFigure'}
+        coverageClass: {$ref: '#/components/schemas/CoverageClass'}
+        bestFix: {$ref: '#/components/schemas/FixAction'}
+        pods: {type: [integer, 'null'], description: Live pods; null until the inventory is ready.}
+
+    WorkloadDetail:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [workload, serviceAccount, notRunning, pods, exposed, exposure, privileged, privilegeReasons, saPower,
+                     saReasons, containers, counts, open, fixable, exploited, excepted, coverage, coverageNotes, upgrades]
+          properties:
+            workload: {$ref: '#/components/schemas/WorkloadRef'}
+            managedBy: {$ref: '#/components/schemas/ManagedBy'}
+            serviceAccount: {type: string}
+            notRunning: {type: boolean}
+            pods: {type: [integer, 'null']}
+            exposed: {type: boolean}
+            exposure: {type: array, items: {$ref: '#/components/schemas/ExposureEdge'}}
+            privileged: {type: boolean}
+            privilegeReasons: {type: array, items: {type: string}}
+            saPower: {type: boolean}
+            saReasons: {type: array, items: {type: string}}
+            containers: {type: array, items: {$ref: '#/components/schemas/WorkloadContainer'}}
+            counts: {$ref: '#/components/schemas/PriorityCounts'}
+            open: {type: integer}
+            fixable: {type: integer}
+            exploited: {type: integer}
+            excepted: {type: integer}
+            coverage: {$ref: '#/components/schemas/CoverageFigure'}
+            coverageNotes: {type: array, items: {type: string}}
+            upgrades: {type: array, items: {$ref: '#/components/schemas/Suggestion'}}
+            bestFix: {$ref: '#/components/schemas/FixAction'}
+
+    WorkloadContainer:
+      type: object
+      required: [name, kind, image, repo]
+      properties:
+        name: {type: string}
+        kind: {type: string}
+        image: {type: string}
+        repo: {type: string}
+        digest: {type: string}
+        platform: {type: string}
+        status: {$ref: '#/components/schemas/ImageStatus'}
+        coverage: {$ref: '#/components/schemas/CoverageClass'}
+
+    # Images and packages
+
+    ImagesPage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [total, rows, next, facets]
+          properties:
+            total: {type: integer}
+            rows: {type: array, items: {$ref: '#/components/schemas/ImageRow'}}
+            next: {type: [string, 'null']}
+            facets: {$ref: '#/components/schemas/Facets'}
+
+    ImageRow:
+      type: object
+      required: [digest, repo, platform, status, statusReason, source, coverage, gaps, workloads, counts, fixable]
+      properties:
+        digest: {type: string}
+        repo: {type: string}
+        platform: {type: string}
+        status: {$ref: '#/components/schemas/ImageStatus'}
+        statusReason: {type: string}
+        source: {type: string}
+        coverage: {$ref: '#/components/schemas/CoverageClass'}
+        gaps: {type: array, items: {$ref: '#/components/schemas/GapCode'}}
+        workloads: {type: integer}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        fixable: {type: integer}
+
+    ImageDetail:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [digest, indexDigest, repo, platform, tags, versionAnnotation, status, statusReason, source, sbom,
+                     ecosystems, counts, fixable, usedBy, upgrades, coverage, eol, notable]
+          properties:
+            digest: {type: string}
+            indexDigest: {type: string}
+            repo: {type: string}
+            platform: {type: string}
+            tags: {type: array, items: {type: string}}
+            versionAnnotation: {type: string}
+            status: {$ref: '#/components/schemas/ImageStatus'}
+            statusReason: {type: string}
+            source: {type: string}
+            sbom: {$ref: '#/components/schemas/SbomInfo'}
+            ecosystems: {type: array, items: {$ref: '#/components/schemas/EcosystemCount'}}
+            counts: {$ref: '#/components/schemas/PriorityCounts'}
+            fixable: {type: integer}
+            usedBy: {type: array, items: {$ref: '#/components/schemas/WorkloadRef'}}
+            upgrades: {type: array, items: {$ref: '#/components/schemas/Suggestion'}}
+            coverage: {$ref: '#/components/schemas/ImageCoverage'}
+            eol: {type: array, items: {$ref: '#/components/schemas/EOL'}}
+            notable:
+              type: array
+              description: Classifier-found packages first, then the rest by findings, at most 8.
+              items: {$ref: '#/components/schemas/ImagePackageRow'}
+
+    SbomInfo:
+      type: object
+      required: [source]
+      properties:
+        source: {type: string, description: 'registry, attestation or agent.'}
+        tool: {type: string}
+        toolVersion: {type: string}
+        agent: {$ref: '#/components/schemas/AgentProvenance'}
+
+    AgentProvenance:
+      type: object
+      required: [node, agentVersion, receivedAt]
+      properties:
+        node: {type: string}
+        agentVersion: {type: string}
+        receivedAt: {type: string, format: date-time}
+
+    EcosystemCount:
+      type: object
+      required: [ecosystem, packages]
+      properties:
+        ecosystem: {type: string}
+        packages: {type: integer}
+
+    ImageCoverage:
+      type: object
+      required: [class, unattributedExecutables, rustWithoutAuditable, notes, cpeOnly, gaps]
+      properties:
+        class: {$ref: '#/components/schemas/CoverageClass'}
+        unattributedExecutables: {type: integer}
+        rustWithoutAuditable: {type: integer}
+        notes: {type: array, items: {type: string}}
+        cpeOnly: {type: array, items: {type: string}, description: Packages matched daily against CPE data only.}
+        gaps: {type: array, items: {$ref: '#/components/schemas/GapCode'}}
+
+    ImagePackagesPage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [total, rows, next, facets]
+          properties:
+            total: {type: integer}
+            rows: {type: array, items: {$ref: '#/components/schemas/ImagePackageRow'}}
+            next: {type: [string, 'null']}
+            facets: {$ref: '#/components/schemas/Facets'}
+
+    ImagePackageRow:
+      type: object
+      required: [name, version, ecosystem, findings, worst]
+      properties:
+        name: {type: string}
+        version: {type: string}
+        ecosystem: {type: string}
+        purl: {type: string}
+        classifier: {type: string}
+        path: {type: string}
+        findings: {type: integer}
+        worst: {$ref: '#/components/schemas/Priority'}
+
+    PackagesPage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [total, rows, next, facets]
+          properties:
+            total: {type: integer}
+            rows: {type: array, items: {$ref: '#/components/schemas/PackageRow'}}
+            next: {type: [string, 'null']}
+            facets: {$ref: '#/components/schemas/Facets'}
+
+    PackageRow:
+      type: object
+      required: [ecosystem, name, version, images, workloads, counts, worst]
+      properties:
+        ecosystem: {type: string}
+        name: {type: string}
+        version: {type: string}
+        images: {type: integer}
+        workloads: {type: integer}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        worst: {$ref: '#/components/schemas/Priority'}
+        classifier: {type: string}
+
+    # Nodes
+
+    NodeGroupsList:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [agentEnabled, controlPlane, groups]
+          properties:
+            agentEnabled: {type: boolean}
+            controlPlane: {$ref: '#/components/schemas/ControlPlane'}
+            groups: {type: array, items: {$ref: '#/components/schemas/NodeGroupRow'}}
+
+    ControlPlane:
+      type: object
+      required: [kubernetes, runtimes, counts, fixable, suggestions]
+      properties:
+        kubernetes: {type: array, items: {$ref: '#/components/schemas/KubernetesVersion'}}
+        runtimes: {type: array, items: {$ref: '#/components/schemas/RuntimeVersion'}}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        fixable: {type: integer}
+        suggestions: {type: array, items: {$ref: '#/components/schemas/Suggestion'}}
+
+    KubernetesVersion:
+      type: object
+      required: [version, nodes]
+      properties:
+        version: {type: string}
+        nodes: {type: integer}
+        eol: {$ref: '#/components/schemas/EOL'}
+
+    RuntimeVersion:
+      type: object
+      required: [name, version, nodes]
+      properties:
+        name: {type: string}
+        version: {type: string}
+        nodes: {type: integer}
+        eol: {$ref: '#/components/schemas/EOL'}
+
+    NodeGroupRow:
+      type: object
+      required: [id, kind, name, label, osImage, kernelRelease, containerRuntimeVersion, kubeletVersion, arch, members,
+                 exposedNodes, counts, fixable, agents, rebootPending, drift]
+      properties:
+        id: {type: string}
+        kind: {$ref: '#/components/schemas/NodeGroupKind'}
+        name: {type: string}
+        label: {type: string}
+        osImage: {type: string}
+        kernelRelease: {type: string}
+        containerRuntimeVersion: {type: string}
+        kubeletVersion: {type: string}
+        arch: {type: string}
+        members: {type: integer}
+        exposedNodes: {type: integer}
+        counts: {$ref: '#/components/schemas/PriorityCounts'}
+        fixable: {type: integer}
+        agents: {$ref: '#/components/schemas/AgentCounts'}
+        rebootPending: {type: integer}
+        drift: {type: string, description: Field differences against the largest group of the same architecture.}
+
+    AgentCounts:
+      type: object
+      required: [reporting, stale, never, disabled]
+      properties:
+        reporting: {type: integer}
+        stale: {type: integer}
+        never: {type: integer}
+        disabled: {type: integer}
+
+    NodeGroupDetail:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [group, agentData, members, drift, counts, fixable, cachedImages]
+          properties:
+            group: {$ref: '#/components/schemas/NodeGroup'}
+            agentData: {type: boolean, description: The node agent has reported for this group.}
+            members: {type: array, items: {$ref: '#/components/schemas/NodeRow'}}
+            drift: {type: array, items: {$ref: '#/components/schemas/DriftRow'}}
+            compare: {$ref: '#/components/schemas/NodeDriftDetail'}
+            counts: {$ref: '#/components/schemas/PriorityCounts'}
+            fixable: {type: integer}
+            cachedImages: {type: array, items: {$ref: '#/components/schemas/NodeImage'}}
+
+    NodeGroup:
+      type: object
+      required: [id, kind, name, label, digest, osImage, kernelRelease, containerRuntimeVersion, kubeletVersion, arch,
+                 binaries, packageDb, packageCount]
+      properties:
+        id: {type: string}
+        kind: {$ref: '#/components/schemas/NodeGroupKind'}
+        name: {type: string}
+        label: {type: string}
+        digest: {type: string}
+        distro: {$ref: '#/components/schemas/Distro'}
+        osImage: {type: string}
+        kernelRelease: {type: string}
+        containerRuntimeVersion: {type: string}
+        kubeletVersion: {type: string}
+        arch: {type: string}
+        kernel: {$ref: '#/components/schemas/NodeKernel'}
+        binaries: {type: array, items: {$ref: '#/components/schemas/NodeBinary'}}
+        packageDb: {type: string}
+        packageCount: {type: integer}
+        firstSeen: {type: string, format: date-time}
+        lastSeen: {type: string, format: date-time}
+
+    Distro:
+      type: object
+      required: [id, versionId, codename]
+      properties:
+        id: {type: string}
+        versionId: {type: string}
+        codename: {type: string}
+
+    NodeKernel:
+      type: object
+      required: [release, package, version, sourceName]
+      properties:
+        release: {type: string}
+        package: {type: string}
+        version: {type: string}
+        sourceName: {type: string}
+
+    NodeBinary:
+      type: object
+      required: [name, path, module, version]
+      properties:
+        name: {type: string}
+        path: {type: string}
+        module: {type: string}
+        version: {type: string}
+
+    NodeRow:
+      type: object
+      required: [name, ready, exposed, agent]
+      properties:
+        name: {type: string}
+        ready: {type: boolean}
+        exposed: {type: boolean}
+        agent: {$ref: '#/components/schemas/AgentStatus'}
+
+    AgentStatus:
+      type: object
+      required: [state, rebootPending, gaps, problems]
+      properties:
+        state: {$ref: '#/components/schemas/AgentState'}
+        agentVersion: {type: string}
+        lastReport: {type: string, format: date-time}
+        lastFullReport: {type: string, format: date-time}
+        lastError: {type: string}
+        kernelRelease: {type: string}
+        rebootPending: {type: boolean}
+        rebootReason: {type: string}
+        gaps: {type: array, items: {$ref: '#/components/schemas/NodeGap'}}
+        problems: {type: array, items: {type: string}}
+
+    NodeGap:
+      type: object
+      required: [code, detail]
+      properties:
+        code: {$ref: '#/components/schemas/GapCode'}
+        detail: {type: string}
+
+    DriftRow:
+      type: object
+      description: Differences between this group (here) and another group (there).
+      required: [other, summary, fields, packagesCompared, newerHere, newerThere, onlyHere, onlyThere]
+      properties:
+        other: {$ref: '#/components/schemas/GroupRef'}
+        summary: {type: string}
+        fields: {type: array, items: {$ref: '#/components/schemas/FieldDrift'}}
+        packagesCompared: {type: boolean}
+        newerHere: {type: integer}
+        newerThere: {type: integer}
+        onlyHere: {type: integer}
+        onlyThere: {type: integer}
+
+    FieldDrift:
+      type: object
+      required: [field, from, to]
+      properties:
+        field: {type: string}
+        from: {type: string}
+        to: {type: string}
+
+    NodeDriftDetail:
+      type: object
+      description: Comparison of two groups; from is the other group and to is this group.
+      required: [from, to, fields, packagesCompared, onlyFrom, onlyTo, changed]
+      properties:
+        from: {type: string}
+        to: {type: string}
+        fields: {type: array, items: {$ref: '#/components/schemas/FieldDrift'}}
+        packagesCompared: {type: boolean}
+        onlyFrom: {type: array, items: {$ref: '#/components/schemas/DriftPackage'}}
+        onlyTo: {type: array, items: {$ref: '#/components/schemas/DriftPackage'}}
+        changed: {type: array, items: {$ref: '#/components/schemas/VersionDrift'}}
+
+    DriftPackage:
+      type: object
+      required: [ecosystem, name, version, arch]
+      properties:
+        ecosystem: {type: string}
+        name: {type: string}
+        version: {type: string}
+        arch: {type: string}
+
+    VersionDrift:
+      type: object
+      required: [ecosystem, name, arch, from, to, newer]
+      properties:
+        ecosystem: {type: string}
+        name: {type: string}
+        arch: {type: string}
+        from: {type: string}
+        to: {type: string}
+        newer:
+          type: string
+          description: The side with the newer version; empty when the versions do not compare.
+          enum: [from, to, '']
+
+    NodeImage:
+      type: object
+      description: An image cached on nodes. source is where the node reported it, not where its SBOM came from.
+      required: [digest, configDigest, kind, names, sizeBytes, complete, inUse, nodes, source]
+      properties:
+        digest: {type: string}
+        configDigest: {type: string}
+        kind: {type: string}
+        names: {type: array, items: {type: string}}
+        sizeBytes: {type: integer, format: int64}
+        complete: {type: boolean}
+        inUse: {type: boolean}
+        nodes: {type: array, items: {type: string}}
+        source:
+          type: string
+          enum: [content-store, status, both]
+        status: {$ref: '#/components/schemas/ImageStatus'}
+        statusReason: {type: string}
+
+    NodeDetail:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [node, group, agent, exposed, counts, fixable, cachedImages]
+          properties:
+            node: {$ref: '#/components/schemas/NodeInfo'}
+            group:
+              oneOf:
+                - $ref: '#/components/schemas/GroupRef'
+                - type: 'null'
+            agent: {$ref: '#/components/schemas/AgentStatus'}
+            exposed: {type: boolean}
+            counts: {$ref: '#/components/schemas/PriorityCounts'}
+            fixable: {type: integer}
+            cachedImages: {type: array, items: {$ref: '#/components/schemas/NodeImage'}}
+
+    NodeInfo:
+      type: object
+      required: [name, os, arch, osImage, kernelVersion, kubeletVersion, containerRuntimeVersion, ready]
+      properties:
+        name: {type: string}
+        os: {type: string}
+        arch: {type: string}
+        osImage: {type: string}
+        kernelVersion: {type: string}
+        kubeletVersion: {type: string}
+        containerRuntimeVersion: {type: string}
+        ready: {type: boolean}
+        osEol: {$ref: '#/components/schemas/EOL'}
+
+    # Coverage
+
+    Coverage:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [scope, funnel, gaps, totalGaps]
+          properties:
+            scope: {$ref: '#/components/schemas/ScopeRef'}
+            funnel: {$ref: '#/components/schemas/CoverageFunnel'}
+            gaps: {type: array, items: {$ref: '#/components/schemas/Gap'}}
+            totalGaps: {type: integer}
+
+    CoverageFunnel:
+      type: object
+      required: [pods, images, catalogued, fullDetail, feedsFresh, feedsTotal]
+      properties:
+        pods: {type: [integer, 'null']}
+        images: {type: integer}
+        catalogued: {type: integer}
+        fullDetail: {type: integer}
+        feedsFresh: {type: integer}
+        feedsTotal: {type: integer}
+
+    Gap:
+      type: object
+      description: >-
+        One thing ffs cannot see. what names the affected object: an image repository (the digest
+        when the repository is empty), a node name, a node count or a feed name. detail holds the
+        variable part only, such as a status reason or a feed's last error.
+      required: [code, remedy, what, detail, affects]
+      properties:
+        code: {$ref: '#/components/schemas/GapCode'}
+        remedy: {$ref: '#/components/schemas/RemedyCode'}
+        what: {type: string}
+        detail: {type: string, maxLength: 200}
+        target: {$ref: '#/components/schemas/ScopeRef'}
+        affects: {$ref: '#/components/schemas/GapAffects'}
+
+    GapAffects:
+      type: object
+      required: [workloads, images, nodes]
+      properties:
+        workloads: {type: integer}
+        images: {type: integer}
+        nodes: {type: integer}
+
+    # Feeds, exceptions, settings
+
+    FeedsList:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [feeds, sources]
+          properties:
+            feeds: {type: array, items: {$ref: '#/components/schemas/Feed'}}
+            sources: {type: array, items: {$ref: '#/components/schemas/Source'}}
+
+    Feed:
+      type: object
+      required: [name, lastError, staleAfter, stale]
+      properties:
+        name: {type: string}
+        lastSuccess: {type: string, format: date-time}
+        lastAttempt: {type: string, format: date-time}
+        lastError: {type: string}
+        staleAfter: {type: string, description: Go duration.}
+        stale: {type: boolean}
+
+    Source:
+      type: object
+      description: An upstream data source, with the licence and attribution its terms ask for.
+      required: [name, feed, licence, attribution, url]
+      properties:
+        name: {type: string}
+        feed: {type: string}
+        licence: {type: string}
+        attribution: {type: string}
+        url: {type: string}
+
+    ExceptionsList:
+      description: A read-only view of the Exception resources.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [exceptions]
+          properties:
+            exceptions: {type: array, items: {$ref: '#/components/schemas/Exception'}}
+
+    Exception:
+      type: object
+      required: [id, namespace, name, reason, expires, advisories, packages, imageRepositories, owners, matchedFindings,
+                 urgentNotExcepted, expired]
+      properties:
+        id: {type: string, description: namespace/name.}
+        namespace: {type: string}
+        name: {type: string}
+        reason: {type: string}
+        expires: {type: string, format: date-time}
+        advisories: {type: array, items: {type: string}}
+        packages: {type: array, items: {type: string}}
+        imageRepositories: {type: array, items: {type: string}}
+        owners: {type: array, items: {type: string}}
+        vexStatus: {type: string}
+        justification: {type: string}
+        matchedFindings: {type: integer}
+        urgentNotExcepted: {type: integer}
+        expired: {type: boolean}
+
+    Settings:
+      description: A read-only view of the configuration that shapes what ffs reports. Durations are Go duration strings.
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [version, clusterName, feeds, priority, exposure, crd, events, openReports, exceptions, retention,
+                     upgrades]
+          properties:
+            version: {type: string}
+            clusterName: {type: string}
+            feeds: {type: array, items: {$ref: '#/components/schemas/FeedSettings'}}
+            priority: {$ref: '#/components/schemas/PrioritySettings'}
+            exposure: {$ref: '#/components/schemas/ExposureSettings'}
+            crd: {$ref: '#/components/schemas/CrdSettings'}
+            events: {$ref: '#/components/schemas/EventsSettings'}
+            openReports: {$ref: '#/components/schemas/OpenReportsSettings'}
+            exceptions: {$ref: '#/components/schemas/ExceptionSettings'}
+            retention: {$ref: '#/components/schemas/RetentionSettings'}
+            upgrades: {$ref: '#/components/schemas/UpgradeSettings'}
+            nodeAgent: {$ref: '#/components/schemas/NodeAgentSettings'}
+
+    FeedSettings:
+      type: object
+      required: [name, enabled, interval, staleAfter]
+      properties:
+        name: {type: string}
+        enabled: {type: boolean}
+        interval: {type: string}
+        staleAfter: {type: string}
+
+    PrioritySettings:
+      type: object
+      required: [epssHigh, epssBump]
+      properties:
+        epssHigh: {type: number, format: double}
+        epssBump: {type: number, format: double}
+
+    ExposureSettings:
+      type: object
+      required: [internalIngressClasses, internalGatewayClasses, internalGateways, internalLBAnnotations]
+      properties:
+        internalIngressClasses: {type: array, items: {type: string}}
+        internalGatewayClasses: {type: array, items: {type: string}}
+        internalGateways: {type: array, items: {type: string}}
+        internalLBAnnotations:
+          type: object
+          additionalProperties: {type: string}
+
+    CrdSettings:
+      type: object
+      required: [minPriority, maxFindings]
+      properties:
+        minPriority: {type: string}
+        maxFindings: {type: integer}
+
+    EventsSettings:
+      type: object
+      required: [minPriority]
+      properties:
+        minPriority: {type: string}
+
+    OpenReportsSettings:
+      type: object
+      required: [mode]
+      properties:
+        mode: {type: string}
+
+    ExceptionSettings:
+      type: object
+      required: [maxDuration]
+      properties:
+        maxDuration: {type: string}
+
+    RetentionSettings:
+      type: object
+      required: [resolved]
+      properties:
+        resolved: {type: string}
+
+    UpgradeSettings:
+      type: object
+      required: [enabled, dailyAt]
+      properties:
+        enabled: {type: boolean}
+        dailyAt: {type: string}
+
+    NodeAgentSettings:
+      type: object
+      required: [enabled, staleAfter]
+      properties:
+        enabled: {type: boolean}
+        staleAfter: {type: string}
+
+    # Search and stream
+
+    SearchResult:
+      allOf:
+        - $ref: '#/components/schemas/Envelope'
+        - type: object
+          required: [query, hits, truncated]
+          properties:
+            query: {type: string}
+            hits: {type: array, items: {$ref: '#/components/schemas/SearchHit'}}
+            truncated: {type: boolean, description: More objects matched than are listed.}
+
+    SearchHit:
+      type: object
+      required: [kind, id, label]
+      properties:
+        kind:
+          type: string
+          enum: [workload, namespace, image, advisory, package, nodegroup, node]
+        id: {type: string}
+        label: {type: string}
+        detail: {type: string}
+        scope: {type: string}
+        worst: {$ref: '#/components/schemas/Priority'}
+
+    ChangeEvent:
+      type: object
+      description: >-
+        One change notification. scopes holds scope values, * for every scope, or <kind>:* for every
+        scope of a kind.
+      required: [seq, kinds, scopes]
+      properties:
+        seq: {type: string}
+        kinds: {type: array, items: {$ref: '#/components/schemas/ChangeKind'}}
+        scopes: {type: array, items: {type: string}}
