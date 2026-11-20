@@ -65,12 +65,15 @@ type Runner func(ctx context.Context, req sbom.CatalogRequest, jobDir string) (*
 
 // Server serves catalog jobs: POST /v1/catalog and GET /healthz.
 type Server struct {
-	ScratchDir    string        // emptyDir mount
+	ScratchDir    string        // emptyDir mount; created (0700) when missing
 	ScratchLimit  int64         // total bytes across jobs; <= 0 is unlimited
 	MaxConcurrent int           // default 2
 	Run           Runner        // default ExecRunner
 	Poll          time.Duration // watchdog interval, default 1s
-	Log           logr.Logger
+	// LocalRoot is the directory local sources (oci-dir, host-dir) must resolve inside, after
+	// symlinks; "" refuses them.
+	LocalRoot string
+	Log       logr.Logger
 
 	once     sync.Once
 	sem      chan struct{}
@@ -116,11 +119,17 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// ListenAndServe serves on the unix socket until ctx is done. A stale socket file is replaced, and job
-// directories left in ScratchDir by a previous run are removed. Jobs still running at shutdown are killed.
+// ListenAndServe serves on the unix socket until ctx is done. A stale socket file is replaced,
+// ScratchDir is created when missing, and job directories left in it by a previous run are removed.
+// Jobs still running at shutdown are killed.
 func (s *Server) ListenAndServe(ctx context.Context, socket string) error {
 	if err := os.Remove(socket); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("removing stale socket: %w", err)
+	}
+	if s.ScratchDir != "" {
+		if err := os.MkdirAll(s.ScratchDir, 0o700); err != nil {
+			return fmt.Errorf("creating scratch directory: %w", err)
+		}
 	}
 	if err := s.removeStaleJobs(); err != nil {
 		return err
@@ -191,62 +200,129 @@ func (s *Server) removeStaleJobs() error {
 func (s *Server) serveCatalog(w http.ResponseWriter, r *http.Request) {
 	var req sbom.CatalogRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxRequestBody)).Decode(&req); err != nil {
-		s.reply(w, req.Ref, nil, &WorkError{Kind: sbom.KindBadRequest, Msg: "invalid request: " + err.Error()})
+		s.reply(w, jobLabel(req), nil, &WorkError{Kind: sbom.KindBadRequest, Msg: "invalid request: " + err.Error()})
 		return
 	}
-	if err := validate(req); err != nil {
-		s.reply(w, req.Ref, nil, err)
+	var err *WorkError
+	switch req.Source {
+	case "", sbom.CatalogSourceRegistry:
+		err = validate(req)
+	case sbom.CatalogSourceOCIDir, sbom.CatalogSourceHostDir:
+		err = s.validateLocal(&req)
+	default:
+		err = badRequest("unknown source %q", req.Source)
+	}
+	if err != nil {
+		s.reply(w, jobLabel(req), nil, err)
 		return
 	}
 	select {
 	case s.sem <- struct{}{}:
 	default:
-		s.reply(w, req.Ref, nil, &WorkError{Kind: sbom.KindBusy, Msg: "cataloguer is busy"})
+		s.reply(w, jobLabel(req), nil, &WorkError{Kind: sbom.KindBusy, Msg: "cataloguer is busy"})
 		return
 	}
-	resp, err := func() (*sbom.CatalogResponse, error) {
+	resp, rerr := func() (*sbom.CatalogResponse, error) {
 		defer func() { <-s.sem }()
 		return s.runJob(r.Context(), req)
 	}()
-	s.reply(w, req.Ref, resp, err)
+	s.reply(w, jobLabel(req), resp, rerr)
 }
 
+func badRequest(format string, a ...any) *WorkError {
+	return &WorkError{Kind: sbom.KindBadRequest, Msg: fmt.Sprintf(format, a...)}
+}
+
+// validate checks a registry request.
 func validate(req sbom.CatalogRequest) *WorkError {
-	bad := func(format string, a ...any) *WorkError {
-		return &WorkError{Kind: sbom.KindBadRequest, Msg: fmt.Sprintf(format, a...)}
-	}
 	if !strings.Contains(req.Ref, "@sha256:") {
-		return bad("ref %q is not pinned by a sha256 digest", req.Ref)
+		return badRequest("ref %q is not pinned by a sha256 digest", req.Ref)
 	}
 	if _, err := name.NewDigest(req.Ref); err != nil {
-		return bad("ref %q: %v", req.Ref, err)
+		return badRequest("ref %q: %v", req.Ref, err)
 	}
 	if _, err := image.NewPlatform(req.Platform); err != nil {
-		return bad("%v", err)
+		return badRequest("%v", err)
 	}
+	return validateLimits(req)
+}
+
+// validateLocal checks a local-source request and rewrites req.Path to its resolved form. The path
+// must resolve, after symlinks, strictly below LocalRoot, which is resolved on every request since
+// the node agent's collector creates it after the cataloguer starts. An oci-dir needs a platform;
+// a host-dir takes none.
+func (s *Server) validateLocal(req *sbom.CatalogRequest) *WorkError {
+	if s.LocalRoot == "" {
+		return badRequest("local sources are disabled: the cataloguer has no --local-root")
+	}
+	if !filepath.IsAbs(req.Path) {
+		return badRequest("path %q must be absolute", req.Path)
+	}
+	root, err := filepath.EvalSymlinks(s.LocalRoot)
+	if err != nil {
+		return badRequest("local root cannot be resolved: %v", err)
+	}
+	p, err := filepath.EvalSymlinks(req.Path)
+	if err != nil {
+		return badRequest("path %q cannot be resolved: %v", req.Path, err)
+	}
+	if !strings.HasPrefix(p, root+string(filepath.Separator)) {
+		return badRequest("path %q is outside the local root", req.Path)
+	}
+	req.Path = p
+	if req.Source == sbom.CatalogSourceOCIDir {
+		if _, err := image.NewPlatform(req.Platform); err != nil {
+			return badRequest("%v", err)
+		}
+	}
+	return validateLimits(*req)
+}
+
+// validateLimits checks the limits every request carries.
+func validateLimits(req sbom.CatalogRequest) *WorkError {
 	if req.MaxBytes <= 0 {
-		return bad("maxBytes must be > 0")
+		return badRequest("maxBytes must be > 0")
 	}
 	if req.TimeoutSeconds <= 0 {
-		return bad("timeoutSeconds must be > 0")
+		return badRequest("timeoutSeconds must be > 0")
 	}
 	return nil
 }
 
-// runJob pre-checks the image size, then runs the job in its own scratch directory under the job
-// timeout and the scratch watchdog. The directory is gone by the time it returns.
+// isLocal reports whether req reads a local source rather than pulling Ref.
+func isLocal(req sbom.CatalogRequest) bool {
+	return req.Source == sbom.CatalogSourceOCIDir || req.Source == sbom.CatalogSourceHostDir
+}
+
+// jobLabel names a job in logs: its ref, or for a local source its source and directory name.
+func jobLabel(req sbom.CatalogRequest) string {
+	if req.Ref != "" || req.Path == "" {
+		return req.Ref
+	}
+	return req.Source + ":" + filepath.Base(req.Path)
+}
+
+// runJob pre-checks the image size (the compressed layers in the registry, or the bytes of a local
+// source), then runs the job in its own scratch directory under the job timeout and the scratch
+// watchdog. The directory is gone by the time it returns.
 func (s *Server) runJob(parent context.Context, req sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 	ctx, stop := context.WithTimeoutCause(ctx, time.Duration(req.TimeoutSeconds)*time.Second, errTimeout)
 	defer stop()
 
-	size, err := compressedSize(ctx, req)
-	if err != nil {
-		return nil, s.jobError(ctx, err)
-	}
-	if size > req.MaxBytes {
-		return nil, &WorkError{Kind: sbom.KindTooLarge, Msg: fmt.Sprintf("compressed layers total %d bytes, limit %d bytes", size, req.MaxBytes)}
+	if isLocal(req) {
+		if size := dirSize(req.Path); size > req.MaxBytes {
+			return nil, &WorkError{Kind: sbom.KindTooLarge, Msg: fmt.Sprintf("local source holds %d bytes, limit %d bytes", size, req.MaxBytes)}
+		}
+	} else {
+		size, err := compressedSize(ctx, req)
+		if err != nil {
+			return nil, s.jobError(ctx, err)
+		}
+		if size > req.MaxBytes {
+			return nil, &WorkError{Kind: sbom.KindTooLarge, Msg: fmt.Sprintf("compressed layers total %d bytes, limit %d bytes", size, req.MaxBytes)}
+		}
 	}
 
 	id := make([]byte, 8)
@@ -256,7 +332,7 @@ func (s *Server) runJob(parent context.Context, req sbom.CatalogRequest) (*sbom.
 		return nil, &WorkError{Kind: sbom.KindFailed, Msg: "creating job directory: " + err.Error()}
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	untrack := s.track(&job{ref: req.Ref, dir: dir, ctx: ctx, cancel: cancel})
+	untrack := s.track(&job{ref: jobLabel(req), dir: dir, ctx: ctx, cancel: cancel})
 	defer untrack()
 
 	resp, err := s.Run(ctx, req, dir)
@@ -398,11 +474,25 @@ func dirSize(dir string) int64 {
 	return total
 }
 
+// execOptions are the ExecRunner options.
+type execOptions struct{ nice int }
+
+// ExecOption configures ExecRunner.
+type ExecOption func(*execOptions)
+
+// WithNice runs each worker at nice value n (0 to 19), so cataloguing yields the CPU to the node's
+// workloads. 0 leaves the priority alone.
+func WithNice(n int) ExecOption { return func(o *execOptions) { o.nice = n } }
+
 // ExecRunner runs each job as `self catalog worker` in its own process group, with TMPDIR set to the
 // job directory. The request (credentials included) goes on stdin, never in argv or the
 // environment; the response comes back on stdout; stderr is discarded. When ctx ends, the whole
 // process group is killed.
-func ExecRunner(self string) Runner {
+func ExecRunner(self string, opts ...ExecOption) Runner {
+	var o execOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	return func(ctx context.Context, req sbom.CatalogRequest, jobDir string) (*sbom.CatalogResponse, error) {
 		in, err := json.Marshal(req)
 		if err != nil {
@@ -417,7 +507,20 @@ func ExecRunner(self string) Runner {
 		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 		cmd.WaitDelay = workerWaitDelay
 
-		err = cmd.Run()
+		err = cmd.Start()
+		if err == nil && o.nice > 0 {
+			// The worker's process group, not its process: nice is per thread on Linux, and the
+			// worker's Go runtime has started threads before this call. PRIO_PGRP sets every thread of
+			// the group, and threads created later inherit it.
+			if perr := syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, o.nice); perr != nil {
+				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+				_ = cmd.Wait()
+				return nil, &WorkError{Kind: sbom.KindFailed, Msg: "setting worker priority: " + perr.Error()}
+			}
+		}
+		if err == nil {
+			err = cmd.Wait()
+		}
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}

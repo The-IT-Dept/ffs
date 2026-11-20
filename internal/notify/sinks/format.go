@@ -85,6 +85,9 @@ func itemLines(it notify.Item) []string {
 	if len(it.Reasons) > 0 {
 		lines = append(lines, strings.Join(it.Reasons, "; "))
 	}
+	if len(it.NodeGroups) > 0 {
+		lines = append(lines, "Node groups: "+strings.Join(it.NodeGroups, ", "))
+	}
 	for i, p := range it.Packages {
 		if i == maxPkgs {
 			lines = append(lines, more(len(it.Packages)-maxPkgs, "package", "packages"))

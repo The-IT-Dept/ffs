@@ -97,8 +97,12 @@ func (e *Engine) recomputeLocked(ctx context.Context, keys []string, trig model.
 }
 
 // recomputeOwner returns the finding upserts and transitions of one owner. rekeyed reports whether
-// alias re-keys were written for it.
+// alias re-keys were written for it. An owner Rehome is awaiting (awaited) returns nothing: its moved
+// findings stand until it is stored or rehomeWait passes.
 func (e *Engine) recomputeOwner(ctx context.Context, p *pass, key string) (ups []model.Finding, ts []model.Transition, rekeyed bool, err error) {
+	if skip, err := e.awaited(ctx, key, p.now); err != nil || skip {
+		return nil, nil, false, err
+	}
 	old, err := e.o.Store.FindingsForOwner(ctx, key)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("stored findings: %w", err)

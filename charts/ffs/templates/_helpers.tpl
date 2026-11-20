@@ -39,7 +39,22 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- $names := list $svc (printf "%s.%s" $svc $ns) (printf "%s.%s.svc" $svc $ns) (printf "%s.%s.svc.cluster.local" $svc $ns) -}}
 {{- $_ = set $c "allowedHosts" (concat (get $c "allowedHosts" | default list) $names | uniq) -}}
 {{- end -}}
+{{- $na := .Values.nodeAgent -}}
+{{- $_ = set $c "nodeAgent" (dict "enabled" $na.enabled "listen" (printf ":%d" (int $na.port)) "certDir" "/etc/ffs/agent-tls"
+  "namespace" (include "ffs.agentNamespace" .) "serviceAccount" (include "ffs.agentServiceAccount" .)
+  "maxReportBytes" (include "ffs.bytes" (list "nodeAgent.maxReportBytes" $na.maxReportBytes) | int64)
+  "reportInterval" $na.reportInterval "imageListInterval" $na.imageListInterval "staleAfter" $na.staleAfter
+  "runtimeGrace" $na.runtimeGrace "workPerReport" (int $na.workPerReport) "workTimeout" $na.workTimeout
+  "exposedNodes" $na.exposedNodes) -}}
 {{- toYaml $c -}}
+{{- end -}}
+
+{{- define "ffs.agentNamespace" -}}
+{{- default (printf "%s-agent" .Release.Namespace) .Values.nodeAgent.namespace | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
+{{- define "ffs.agentServiceAccount" -}}
+{{- printf "%s-agent" (include "ffs.fullname" .) | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- /*

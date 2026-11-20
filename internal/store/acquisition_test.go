@@ -96,3 +96,29 @@ func TestOwnersOfExpiredQuarantine(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"CronJob/b/z", "Deployment/a/x"}, got)
 }
+
+func TestOwnersOfAgentImages(t *testing.T) {
+	s := newStore(t)
+	for _, img := range []model.Image{
+		{Digest: "sha256:a", Status: model.ImageCatalogued, Source: "agent"},
+		{Digest: "nodegroup:x", Status: model.ImageCatalogued, Source: "agent"},
+		{Digest: "sha256:b", Status: model.ImageCatalogued, Source: "registry"},
+		{Digest: "sha256:c", Status: model.ImagePending, Source: "agent"},
+	} {
+		require.NoError(t, s.UpsertImage(ctx, img))
+	}
+	for _, o := range []struct {
+		ref    model.OwnerRef
+		digest string
+	}{
+		{model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "web"}, "sha256:a"},
+		{model.NodesOwner("prod"), "nodegroup:x"},
+		{model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "db"}, "sha256:b"},
+		{model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "new"}, "sha256:c"},
+	} {
+		require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: o.ref, Containers: []model.ContainerUse{{Name: "app", Digest: o.digest}}}))
+	}
+	got, err := s.OwnersOfAgentImages(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"Pod/apps/web"}, got)
+}

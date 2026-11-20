@@ -40,6 +40,9 @@ func TestDefault(t *testing.T) {
 		Exceptions:  ExceptionsConfig{MaxDuration: 8760 * h},
 		Retention:   RetentionConfig{Resolved: 2160 * h},
 		Upgrades:    UpgradesConfig{Enabled: true, MaxCandidatesPerRepo: 4, DailyAt: "03:00"},
+		NodeAgent: NodeAgentConfig{Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent",
+			ServiceAccount: "ffs-agent", MaxReportBytes: 32 << 20, ReportInterval: 6 * h, ImageListInterval: 5 * time.Minute,
+			StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * h, WorkPerReport: 3, WorkTimeout: 30 * time.Minute},
 	}
 	require.Equal(t, want, Default())
 	require.NoError(t, Default().Validate())

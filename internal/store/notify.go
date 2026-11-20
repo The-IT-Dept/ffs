@@ -48,15 +48,16 @@ type NotifyTargetState struct {
 	ConsecutiveFailures                      int
 	Disabled                                 bool
 	DisabledReason                           string
+	NodesBaselineAt                          time.Time // when the target got its node inventory baseline
 }
 
 // NotifyCommit is everything one notification pass writes for a target, applied in one transaction.
 type NotifyCommit struct {
-	Target                   string
-	Cursors                  map[string]int64
-	Ledger                   []LedgerEntry
-	Deliveries               []Delivery
-	BaselineAt, LastDigestAt time.Time // written when non-zero
+	Target                                    string
+	Cursors                                   map[string]int64
+	Ledger                                    []LedgerEntry
+	Deliveries                                []Delivery
+	BaselineAt, LastDigestAt, NodesBaselineAt time.Time // written when non-zero
 }
 
 // DeliveryAttempt is the outcome of sending one delivery.
@@ -93,7 +94,7 @@ func (s *Store) FindingsByFingerprint(ctx context.Context, fps []string) (map[st
 }
 
 const notifyTargetColumns = `target, name, config_hash, baseline_at, last_digest_at, last_delivery_at, last_error,
-	consecutive_failures, disabled, disabled_reason`
+	consecutive_failures, disabled, disabled_reason, nodes_baseline_at`
 
 // NotifyTarget returns the stored state of the target with UID uid.
 func (s *Store) NotifyTarget(ctx context.Context, uid string) (NotifyTargetState, bool, error) {
@@ -111,14 +112,15 @@ func (s *Store) NotifyTargets(ctx context.Context) ([]NotifyTargetState, error) 
 
 func scanNotifyTarget(r scanner) (NotifyTargetState, error) {
 	var (
-		st                         NotifyTargetState
-		baseline, digest, delivery sql.NullInt64
+		st                                NotifyTargetState
+		baseline, digest, delivery, nodes sql.NullInt64
 	)
 	if err := r.Scan(&st.Target, &st.Name, &st.ConfigHash, &baseline, &digest, &delivery, &st.LastError,
-		&st.ConsecutiveFailures, &st.Disabled, &st.DisabledReason); err != nil {
+		&st.ConsecutiveFailures, &st.Disabled, &st.DisabledReason, &nodes); err != nil {
 		return NotifyTargetState{}, err
 	}
 	st.BaselineAt, st.LastDigestAt, st.LastDeliveryAt = fromNanos(baseline), fromNanos(digest), fromNanos(delivery)
+	st.NodesBaselineAt = fromNanos(nodes)
 	return st, nil
 }
 
@@ -179,7 +181,7 @@ func (s *Store) Ledger(ctx context.Context, target string, fps []string) (map[st
 }
 
 // CommitNotify applies one notification pass in a single transaction: the cursors, the ledger
-// upserts, the new deliveries and the non-zero BaselineAt and LastDigestAt. A delivery whose ID
+// upserts, the new deliveries and the non-zero BaselineAt, LastDigestAt and NodesBaselineAt. A delivery whose ID
 // exists is left alone, so a re-run pass enqueues nothing twice; unlike INSERT OR IGNORE, a NOT
 // NULL violation still fails the commit. Ledger entries and deliveries without a Target take
 // c.Target; zero CreatedAt, NotBefore and NextAttempt default to now, CreatedAt and NotBefore.
@@ -228,6 +230,12 @@ func (s *Store) CommitNotify(ctx context.Context, c NotifyCommit) error {
 		if !c.LastDigestAt.IsZero() {
 			if _, err := tx.ExecContext(ctx, `UPDATE notify_targets SET last_digest_at = ? WHERE target = ?`,
 				nanos(c.LastDigestAt), c.Target); err != nil {
+				return err
+			}
+		}
+		if !c.NodesBaselineAt.IsZero() {
+			if _, err := tx.ExecContext(ctx, `UPDATE notify_targets SET nodes_baseline_at = ? WHERE target = ?`,
+				nanos(c.NodesBaselineAt), c.Target); err != nil {
 				return err
 			}
 		}

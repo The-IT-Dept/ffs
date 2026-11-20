@@ -2,6 +2,8 @@
 
 ffs reads its configuration from `/etc/ffs/config.yaml`. The Helm chart renders that file from the `config` block in `values.yaml`, so every key below is set as `config.<key>` in Helm values. For example, `catalog.concurrency` is `--set config.catalog.concurrency=4`.
 
+The `nodeAgent` keys are the exception. They come from the top-level `nodeAgent` Helm values (for example `--set nodeAgent.staleAfter=1h`), and the chart writes them into `config.yaml`.
+
 Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejected at startup, and every invalid value is reported at once.
 
 ## ffs configuration
@@ -74,6 +76,19 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `upgrades.dailyAt` | `03:00` | Time of the daily upgrade pass, `HH:MM` in UTC. |
 | `upgrades.overrides` | `{}` | Per-repository tag parsing, keyed by normalised repository (for example `docker.io/bitnami/postgresql`). Each entry has `pattern`, a regular expression with a named group `version` and optional `suffix` and `revision`, and `ignore`, a list of tag globs dropped before parsing. |
 | `upgrades.kubernetesReleaseURL` | `""` | Base URL for Kubernetes patch releases. Empty means `https://dl.k8s.io/release`. |
+| `nodeAgent.enabled` | `true` | Runs the node agent. When false, ffs moves container runtime findings back to the node-status owner at once and resolves host findings. |
+| `nodeAgent.listen` | `:8444` | The agent API (TLS only, leader only). The chart sets it from `nodeAgent.port`. |
+| `nodeAgent.certDir` | `/etc/ffs/agent-tls` | Holds `tls.crt` and `tls.key` for the agent API. The chart mounts its certificate here; it is not a Helm value. |
+| `nodeAgent.namespace` | `<release namespace>-agent` | The agent namespace. Tokens from any other namespace are refused. |
+| `nodeAgent.serviceAccount` | `<chart full name>-agent` (`ffs-agent` for a release named `ffs`) | The agent ServiceAccount; the chart sets it. |
+| `nodeAgent.maxReportBytes` | `33554432` (32 MiB) | Largest agent report accepted, 1 MiB to 256 MiB; Helm also takes a quantity. A full report over it is sent without its host SBOM. |
+| `nodeAgent.reportInterval` | `6h` | Time between full host reports per node, with jitter. |
+| `nodeAgent.imageListInterval` | `5m` | Time between cached-image checks. Each check is also the heartbeat. Must be shorter than `reportInterval`. |
+| `nodeAgent.staleAfter` | `30m` | After this long without a report, a node shows "node agent not reporting". At least twice `imageListInterval`. |
+| `nodeAgent.runtimeGrace` | `2h` | How long nodes must lack fresh reports before runtime findings move back to the node-status owner. |
+| `nodeAgent.workPerReport` | `3` | Side-loaded and unresolvable image SBOM requests handed out with each report, 0 to 10; 0 turns them off. |
+| `nodeAgent.workTimeout` | `30m` | How long a request stays with the node it was offered to. |
+| `nodeAgent.exposedNodes` | `""` | A Kubernetes node label selector, for example `node-role.example.com/edge`. Host findings on matching nodes count as exposed. Empty exposes no node. |
 
 ## Helm-only values
 

@@ -36,6 +36,7 @@ type Config struct {
 	Exceptions     ExceptionsConfig  `yaml:"exceptions"`
 	Retention      RetentionConfig   `yaml:"retention"`
 	Upgrades       UpgradesConfig    `yaml:"upgrades"`
+	NodeAgent      NodeAgentConfig   `yaml:"nodeAgent"`
 }
 
 type CatalogConfig struct {
@@ -155,6 +156,7 @@ func Default() Config {
 		Exceptions:  ExceptionsConfig{MaxDuration: 8760 * h},
 		Retention:   RetentionConfig{Resolved: 2160 * h},
 		Upgrades:    UpgradesConfig{Enabled: true, MaxCandidatesPerRepo: 4, DailyAt: "03:00"},
+		NodeAgent:   defaultNodeAgent(),
 	}
 }
 
@@ -278,6 +280,7 @@ func (c Config) Validate() error {
 			bad("upgrades.overrides[%s].pattern: must have a named group \"version\"", repo)
 		}
 	}
+	c.NodeAgent.validate(bad)
 	return errors.Join(errs...)
 }
 

@@ -70,6 +70,11 @@ type Item struct {
 	Observed          time.Time
 	Links             []string
 	Provisional       bool
+	// NodeGroups names the node groups a Nodes finding affects: sorted labels, at most
+	// maxNodeGroupNames, then "+N more".
+	NodeGroups []string
+
+	nodeGroupCount int // node groups in all, before NodeGroups is capped
 }
 
 // Summary counts what a baseline or digest covers.
@@ -123,9 +128,12 @@ func plural(n int, one, many string) string {
 func workloads(n int) string { return plural(n, "workload", "workloads") }
 
 // immediateTitle titles an immediate message about subject (an advisory ID or a Go standard
-// library version).
+// library version). An item whose only owner is the Nodes owner counts the node groups it affects.
 func immediateTitle(ev Event, subject string, it Item) string {
 	n := workloads(len(it.Owners))
+	if it.nodeGroupCount > 0 && !slices.ContainsFunc(it.Owners, func(o model.OwnerRef) bool { return !isNodes(o) }) {
+		n = plural(it.nodeGroupCount, "node group", "node groups")
+	}
 	switch ev {
 	case EventEscalated:
 		return fmt.Sprintf("Escalated to %s: %s affects %s", it.Priority, subject, n)
@@ -177,10 +185,12 @@ type group struct {
 	fps     []string
 }
 
-// itemBuilder turns findings into Items, with titles and links from the stored advisories.
+// itemBuilder turns findings into Items, with titles and links from the stored advisories, and the
+// node groups of Nodes findings from nodeGroups (group digest → label).
 type itemBuilder struct {
 	advisories   map[string]model.Advisory
 	dashboardURL string
+	nodeGroups   map[string]string
 }
 
 // groups builds the items of one event: Go standard library findings fold into one item per Go
@@ -195,10 +205,12 @@ func (b itemBuilder) groups(ev Event, fs []model.Finding) []group {
 				members = append(members, f)
 			}
 		}
+		it := stdlibItem(ev, g, members)
+		it.NodeGroups, it.nodeGroupCount = nodeGroupNames(members, b.nodeGroups)
 		out = append(out, group{
 			key:     "go-stdlib@" + g.Installed,
 			subject: "Go " + strings.TrimPrefix(g.Installed, "go") + " standard library",
-			item:    stdlibItem(ev, g, members),
+			item:    it,
 			fps:     fingerprints(members),
 		})
 	}
@@ -214,6 +226,7 @@ func (b itemBuilder) groups(ev Event, fs []model.Finding) []group {
 func (b itemBuilder) advisoryItem(ev Event, id string, fs []model.Finding) Item {
 	it := Item{Event: ev, AdvisoryID: id}
 	fill(&it, fs)
+	it.NodeGroups, it.nodeGroupCount = nodeGroupNames(fs, b.nodeGroups)
 	if a, ok := b.advisories[id]; ok {
 		it.Title = a.Title
 		it.Links = slices.Clone(a.Links)
@@ -228,6 +241,19 @@ func (b itemBuilder) advisoryItem(ev Event, id string, fs []model.Finding) Item 
 		it.Links = append(it.Links, strings.TrimRight(b.dashboardURL, "/")+"/vulnerabilities/"+url.PathEscape(id))
 	}
 	return it
+}
+
+// baselineItems builds one item per advisory of a baseline's open findings, highest priority first,
+// then the most workloads and advisory ID, and keeps the first baselineItems.
+func (b itemBuilder) baselineItems(open []model.Finding) []Item {
+	var items []Item
+	for _, fs := range byAdvisory(open) {
+		items = append(items, b.advisoryItem("", fs[0].AdvisoryID, fs))
+	}
+	slices.SortFunc(items, func(a, b Item) int {
+		return cmp.Or(cmp.Compare(b.Priority, a.Priority), cmp.Compare(len(b.Owners), len(a.Owners)), strings.Compare(a.AdvisoryID, b.AdvisoryID))
+	})
+	return items[:min(len(items), baselineItems)]
 }
 
 // stdlibItem builds the item of one Go standard library version (spec §6.5): the group's title,

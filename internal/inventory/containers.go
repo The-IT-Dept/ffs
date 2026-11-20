@@ -372,6 +372,18 @@ func (inv *Inventory) recordImage(ctx context.Context, f *flushState, u use) err
 	if at, handed := inv.enqueued[img.Digest]; handed && ok && quarantined(stored) && stored.QuarantinedUntil.After(at) {
 		delete(inv.enqueued, img.Digest) // the hand-off ended in a quarantine, which has ended too
 	}
+	if ok && stored.Status == model.ImageCatalogued && stored.Source == sbom.SourceAgent {
+		// Catalogued from a node agent's SBOM: ask the registry for its own, at most once per
+		// UnresolvableRetry. The acquirer replaces the agent SBOM only when that succeeds.
+		if at, asked := inv.superseded[img.Digest]; !asked || f.now.Sub(at) >= UnresolvableRetry {
+			inv.superseded[img.Digest] = f.now
+			f.reqs = append(f.reqs, sbom.Request{Repo: img.Repo, Digest: img.Digest, IndexDigest: img.IndexDigest,
+				Platform: img.Platform, Creds: u.Creds, Supersede: true})
+		}
+		delete(inv.enqueued, img.Digest)
+		return nil
+	}
+	delete(inv.superseded, img.Digest)
 	due := img.Status == model.ImageCatalogFailed && !f.now.Before(img.QuarantinedUntil)
 	if img.Status != model.ImagePending && !due {
 		delete(inv.enqueued, img.Digest)
@@ -406,11 +418,18 @@ func hasImageID(p *corev1.Pod) bool {
 
 // containerList de-duplicates the uses and sorts them by name, then digest.
 func containerList(uses []use) []model.ContainerUse {
-	seen := map[model.ContainerUse]bool{}
+	// ExposurePaths is a slice, so it cannot be part of a map key; workload uses never set it.
+	type key struct {
+		Name, ImageRef, Repo, Digest, Platform string
+		Kind                                   model.ContainerKind
+		Root                                   bool
+	}
+	seen := map[key]bool{}
 	var out []model.ContainerUse
 	for _, u := range uses {
-		if !seen[u.ContainerUse] {
-			seen[u.ContainerUse] = true
+		k := key{u.Name, u.ImageRef, u.Repo, u.Digest, u.Platform, u.Kind, u.RootUnlessImageUser}
+		if !seen[k] {
+			seen[k] = true
 			out = append(out, u.ContainerUse)
 		}
 	}

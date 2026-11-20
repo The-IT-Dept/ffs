@@ -42,6 +42,8 @@ type Store interface {
 	Advisories(ctx context.Context, ids []string) (map[string]model.Advisory, error)
 	Canonical(ctx context.Context, id string) (string, error)
 	RekeyFindings(ctx context.Context, rks []store.FindingRekey) error
+	Rehome(ctx context.Context, upsert *model.Owner, moves []store.FindingMove, drop []string) error
+	FindingsByFingerprint(ctx context.Context, fps []string) (map[string]model.Finding, error)
 	DigestsInUse(ctx context.Context) ([]string, error)
 	LiveDigests(ctx context.Context) ([]string, error)
 	DigestsAwaitingGrype(ctx context.Context, built time.Time) ([]string, error)
@@ -100,6 +102,10 @@ type Engine struct {
 	pending map[string]model.Trigger // owner key → trigger of its queued recompute
 	running atomic.Int32             // Recompute calls in progress, or batches Drain has taken
 	wake    chan struct{}
+	// awaiting, under qmu, holds the To owners Rehome found absent, by owner key, with when it did:
+	// their recompute is skipped for rehomeWait so the moved findings are not resolved before the
+	// owner is stored.
+	awaiting map[string]time.Time
 
 	subMu sync.Mutex
 	subs  []chan struct{}
@@ -116,7 +122,7 @@ func New(o Options) *Engine {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	e := &Engine{o: o, pending: map[string]model.Trigger{}, wake: make(chan struct{}, 1)}
+	e := &Engine{o: o, pending: map[string]model.Trigger{}, awaiting: map[string]time.Time{}, wake: make(chan struct{}, 1)}
 	e.lastCheck = e.now()
 	return e
 }
@@ -146,8 +152,14 @@ func (e *Engine) OnImageCatalogued(ctx context.Context, digest string) error {
 }
 
 // OnOwnersChanged queues owners whose containers, context or existence changed. Diff reports a
-// change that only moves priority as a PriorityChange.
+// change that only moves priority as a PriorityChange. An owner Rehome was awaiting is no longer
+// awaited: its recompute proceeds whether or not it is stored.
 func (e *Engine) OnOwnersChanged(_ context.Context, keys []string) error {
+	e.qmu.Lock()
+	for _, k := range keys {
+		delete(e.awaiting, k)
+	}
+	e.qmu.Unlock()
 	e.enqueue(keys, model.TriggerInventoryChange)
 	return nil
 }

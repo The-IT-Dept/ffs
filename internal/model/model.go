@@ -103,7 +103,7 @@ type Image struct {
 	QuarantinedUntil                    time.Time
 }
 
-// OwnerRef identifies a workload. Kind may be "Cluster" or "ContainerRuntime" for cluster-level subjects.
+// OwnerRef identifies a workload. Kind may be "Cluster", "ContainerRuntime" or "Nodes" for cluster-level subjects.
 type OwnerRef struct{ Kind, Namespace, Name, UID string }
 
 // ManagedBy names the deployment tool. Tool: "helm" | "flux-helmrelease" | "flux-kustomization" | "argocd".
@@ -126,6 +126,8 @@ type ContainerUse struct {
 	Repo, Digest        string
 	Platform            string
 	RootUnlessImageUser bool // effective runAsUser unset and runAsNonRoot not true: runs as the image's user
+	// ExposurePaths is set on the Nodes owner only: one NodeExposurePathFmt entry per exposed member.
+	ExposurePaths []string
 }
 
 type WorkloadContext struct {
@@ -150,7 +152,9 @@ type Owner struct {
 	Context        WorkloadContext
 	Arch           []string // node architectures its pods run on
 	PullSecrets    []string // sorted spec.imagePullSecrets names; never served by the API
-	UpdatedAt      time.Time
+	// SuppressModules lists Go module paths whose matches findings.Build ignores on this owner.
+	SuppressModules []string
+	UpdatedAt       time.Time
 }
 
 type Advisory struct {

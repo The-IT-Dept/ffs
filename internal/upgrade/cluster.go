@@ -21,9 +21,10 @@ const (
 )
 
 // resolveClusterLevel advises a Cluster or ContainerRuntime owner that has an open finding at or
-// above medium, and withdraws its suggestions otherwise.
+// above medium, and withdraws its suggestions otherwise. A Nodes owner gets no advice: host
+// packages are upgraded on the nodes, so its suggestions are always withdrawn.
 func (r *Resolver) resolveClusterLevel(ctx context.Context, o model.Owner, fs []model.Finding) error {
-	qualifies := slices.ContainsFunc(fs, func(f model.Finding) bool {
+	qualifies := o.Ref.Kind != model.OwnerKindNodes && slices.ContainsFunc(fs, func(f model.Finding) bool {
 		return f.State == model.StateOpen && f.Priority >= model.PriorityMedium
 	})
 	if !qualifies {

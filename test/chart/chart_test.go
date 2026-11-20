@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -588,4 +589,20 @@ func TestChart_WebServiceLoopbackGuardAndHosts(t *testing.T) {
 	path := writeTemp(t, renderedConfig(t, o))
 	_, err := config.Load(path)
 	require.NoError(t, err)
+}
+
+func TestChart_NodeAgentConfig(t *testing.T) {
+	o := render(t, "nodeAgent.enabled=false", "nodeAgent.port=9444", "nodeAgent.namespace=node-agents",
+		"nodeAgent.exposedNodes=node-role.example.com/edge", "nodeAgent.staleAfter=1h", "nodeAgent.maxReportBytes=64Mi")
+	c, err := config.Load(writeTemp(t, renderedConfig(t, o)))
+	require.NoError(t, err)
+	require.Equal(t, config.NodeAgentConfig{Enabled: false, Listen: ":9444", CertDir: "/etc/ffs/agent-tls",
+		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
+		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
+		WorkTimeout: 30 * time.Minute, ExposedNodes: "node-role.example.com/edge"}, c.NodeAgent)
+
+	o = render(t, "config.nodeAgent.listen=:1") // the top-level nodeAgent values win
+	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
+	require.NoError(t, err)
+	require.Equal(t, ":8444", c.NodeAgent.Listen)
 }

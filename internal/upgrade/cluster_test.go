@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -252,6 +253,27 @@ func (cr *crig) runtimeOwner() model.Owner {
 	require.NoError(cr.t, err)
 	require.True(cr.t, ok)
 	return o
+}
+
+func TestResolver_SkipsNodesOwner(t *testing.T) {
+	cr := newRuntimeRig(t, []string{"2.2.2"})
+	ref := model.NodesOwner("test")
+	require.NoError(t, cr.st.UpsertOwner(rctx, model.Owner{Ref: ref, Containers: []model.ContainerUse{{Name: "g",
+		Kind: model.ContainerRegular, ImageRef: "g", Repo: model.HostRepo, Digest: "nodegroup:abc"}}}))
+	f := model.Finding{Fingerprint: model.FindingFingerprint("default", ref, model.HostRepo, "CVE-2026-3001"), Owner: ref,
+		ImageRepo: model.HostRepo, AdvisoryID: "CVE-2026-3001", Digests: []string{"nodegroup:abc"}, State: model.StateOpen,
+		Priority: model.PriorityHigh, FixAvailable: true, Matched: rnow, LastSeen: rnow}
+	require.NoError(t, cr.st.ApplyFindings(rctx, []model.Finding{f}, nil))
+	hits := cr.hits.Load()
+
+	require.NoError(t, cr.r.ResolveOwner(rctx, ref.Key()))
+	all, err := cr.st.ListSuggestions(rctx)
+	require.NoError(t, err)
+	require.False(t, slices.ContainsFunc(all, func(s store.OwnerSuggestion) bool { return s.OwnerKey == ref.Key() }))
+	_, ok, err := cr.st.GetImage(rctx, "runtime:containerd@2.2.2") // AdviseRuntime would clone this candidate
+	require.NoError(t, err)
+	require.False(t, ok)
+	require.Equal(t, hits, cr.hits.Load()) // no release-server call (AdviseCluster)
 }
 
 func TestAdviseRuntime_FixedVersionFromMatches(t *testing.T) {
