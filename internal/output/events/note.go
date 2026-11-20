@@ -4,10 +4,12 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/upgrade"
 )
 
 // Event reasons, in the order they are emitted for one owner.
@@ -48,7 +50,7 @@ func regarding(o model.OwnerRef, self *corev1.ObjectReference) (ref *corev1.Obje
 	case o.ClusterLevel():
 		return self, "Container runtime " + o.Name + ": ", self != nil
 	}
-	api, known := model.APIVersionForKind(o.Kind)
+	api, known := o.ObjectAPIVersion()
 	if !known {
 		return nil, "", false
 	}
@@ -87,7 +89,15 @@ func buildItem(reason string, t model.Transition, f *model.Finding) item {
 		it.priority = t.FromPriority
 	case ReasonUpgradeAvailable:
 		if f != nil && f.Suggestion != nil {
-			it.text = fmt.Sprintf("%s (upgrade %s -> %s)", t.AdvisoryID, f.Suggestion.FromTag, f.Suggestion.ToTag)
+			if target := upgrade.Target(*f.Suggestion); target != "" {
+				// "nginx:1.30.6 (new digest)" reads "nginx:1.30.6, new digest" inside the item's parentheses
+				if t, ok := strings.CutSuffix(target, ")"); ok {
+					if head, rest, found := strings.Cut(t, " ("); found {
+						target = head + ", " + rest
+					}
+				}
+				it.text = fmt.Sprintf("%s (upgrade to %s)", t.AdvisoryID, target)
+			}
 		}
 	}
 	return it
@@ -107,7 +117,8 @@ func notePrefix(reason string, n int) string {
 
 // buildNote returns the event type and note for the items of one reason. Items are ordered by
 // priority descending, then advisory ID; listing stops, with " and N more", before the note would
-// pass MaxNoteBytes. The returned note includes ownerPrefix, which counts against the budget.
+// pass MaxNoteBytes. The first item is always listed, cut short with "..." when it alone would pass
+// the cap. The returned note includes ownerPrefix, which counts against the budget.
 func buildNote(reason, ownerPrefix string, items []item) (eventType, note string) {
 	sort.SliceStable(items, func(i, j int) bool {
 		if items[i].priority != items[j].priority {
@@ -119,29 +130,50 @@ func buildNote(reason, ownerPrefix string, items []item) (eventType, note string
 	if reason != ReasonResolved && items[0].priority >= model.PriorityHigh {
 		eventType = "Warning"
 	}
-	prefix := notePrefix(reason, len(items))
 	var b strings.Builder
 	b.WriteString(ownerPrefix)
-	b.WriteString(prefix)
+	b.WriteString(notePrefix(reason, len(items)))
 	listed := 0
 	for i, it := range items {
 		add := it.text
 		if i > 0 {
 			add = ", " + add
 		}
-		more := len(items) - (i + 1)
-		tail := 0
-		if more > 0 {
-			tail = len(fmt.Sprintf(" and %d more", more))
-		}
+		tail := len(moreText(len(items) - (i + 1)))
 		if b.Len()+len(add)+tail > MaxNoteBytes {
+			if i == 0 {
+				b.WriteString(cut(add, MaxNoteBytes-b.Len()-tail-len(ellipsis)) + ellipsis)
+				listed++
+			}
 			break
 		}
 		b.WriteString(add)
 		listed++
 	}
-	if listed < len(items) {
-		fmt.Fprintf(&b, " and %d more", len(items)-listed)
+	b.WriteString(moreText(len(items) - listed))
+	return eventType, cut(b.String(), MaxNoteBytes)
+}
+
+const ellipsis = "..."
+
+// moreText is the note's " and N more" for n unlisted items, "" for none.
+func moreText(n int) string {
+	if n <= 0 {
+		return ""
 	}
-	return eventType, b.String()
+	return fmt.Sprintf(" and %d more", n)
+}
+
+// cut returns s cut to at most n bytes, at a UTF-8 character boundary.
+func cut(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }

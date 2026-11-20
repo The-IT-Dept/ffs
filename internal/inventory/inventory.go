@@ -524,6 +524,7 @@ func (inv *Inventory) unlinkPod(key string) {
 func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string) error {
 	kind, ns, name, _ := splitKey(key)
 	ref := model.OwnerRef{Kind: kind, Namespace: ns, Name: name}
+	ref.APIVersion, _ = model.APIVersionForKind(kind) // a custom kind's comes from its pods' controller reference
 	var pods []*corev1.Pod
 	for _, pk := range sortedKeys(inv.ownerPods[key]) {
 		_, pns, pname, _ := splitKey(pk)
@@ -536,6 +537,9 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 			pods = append(pods, p)
 			if ref.UID == "" {
 				ref.UID = inv.podOwner[pk].UID
+			}
+			if ref.APIVersion == "" {
+				ref.APIVersion = inv.podOwner[pk].APIVersion
 			}
 		}
 	}

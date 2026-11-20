@@ -226,3 +226,86 @@ func TestEvents_NamespacedClusterKindIsNotKubernetes(t *testing.T) {
 		require.False(t, strings.HasPrefix(e.Note, "Kubernetes: "), e.Note)
 	}
 }
+
+// TestEvents_CustomKindOwner (F93): an owner of a custom kind recorded with its apiVersion gets
+// Events on its object.
+func TestEvents_CustomKindOwner(t *testing.T) {
+	h := newHarness(t, self)
+	for _, ref := range []model.OwnerRef{
+		{Kind: "Rollout", Namespace: "web", Name: "r", UID: "r-uid", APIVersion: "argoproj.io/v1alpha1"},
+		{Kind: "CloneSet", Namespace: "web", Name: "c", UID: "c-uid", APIVersion: "apps.kruise.io/v1alpha1"},
+		{Kind: "StrimziPodSet", Namespace: "kafka", Name: "k", UID: "k-uid", APIVersion: "core.strimzi.io/v1beta2"},
+		{Kind: "Cluster", Namespace: "db", Name: "pg", UID: "pg-uid", APIVersion: "postgresql.cnpg.io/v1"},
+	} {
+		h.seed(t, create(ref, "CVE-2026-0005", model.PriorityUrgent), nil)
+	}
+	h.seed(t, create(model.OwnerRef{Kind: "Rollout", Namespace: "web", Name: "old"}, "CVE-2026-0005", model.PriorityUrgent), nil)
+	require.NoError(t, h.em.Drain(context.Background()))
+	var got []*corev1.ObjectReference
+	for _, e := range h.rec.Snapshot() {
+		got = append(got, e.Regarding.(*corev1.ObjectReference))
+	}
+	require.ElementsMatch(t, []*corev1.ObjectReference{
+		{APIVersion: "argoproj.io/v1alpha1", Kind: "Rollout", Namespace: "web", Name: "r", UID: "r-uid"},
+		{APIVersion: "apps.kruise.io/v1alpha1", Kind: "CloneSet", Namespace: "web", Name: "c", UID: "c-uid"},
+		{APIVersion: "core.strimzi.io/v1beta2", Kind: "StrimziPodSet", Namespace: "kafka", Name: "k", UID: "k-uid"},
+		{APIVersion: "postgresql.cnpg.io/v1", Kind: "Cluster", Namespace: "db", Name: "pg", UID: "pg-uid"},
+	}, got, "a custom kind recorded without an apiVersion still gets none")
+}
+
+// TestEvents_UpgradeNoteUsesTarget (F107): the note names the target as upgrade.Target does, never
+// "1.30.6 -> 1.30.6" for a refresh or " -> 1.30.7" for a digest-only reference.
+func TestEvents_UpgradeNoteUsesTarget(t *testing.T) {
+	h := newHarness(t, self)
+	o := model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"}
+	for id, sg := range map[string]model.Suggestion{
+		"CVE-2026-0001": {Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "1.30.6", Tier: model.TierRefresh, FixedIDs: []string{"CVE-2026-0001"}},
+		"CVE-2026-0002": {Repo: "ghcr.io/example/app", FromTag: "", ToTag: "1.30.7", Tier: model.TierPatch, FixedIDs: []string{"CVE-2026-0002"}},
+	} {
+		tr := model.Transition{Owner: o, AdvisoryID: id, FromState: model.StateOpen, ToState: model.StateOpen,
+			FromPriority: model.PriorityHigh, ToPriority: model.PriorityHigh, Trigger: model.TriggerUpgradeAvailable}
+		tr.Fingerprint = model.FindingFingerprint("c", o, sg.Repo, id)
+		f := model.Finding{Fingerprint: tr.Fingerprint, Owner: o, ImageRepo: sg.Repo, AdvisoryID: id, State: model.StateOpen,
+			Priority: model.PriorityHigh}
+		require.NoError(t, h.st.ApplyFindings(context.Background(), []model.Finding{f}, []model.Transition{tr}))
+		require.NoError(t, h.st.PutSuggestion(context.Background(), o.Key(), sg, nil))
+	}
+	require.NoError(t, h.em.Drain(context.Background()))
+	ev := h.byReason(ReasonUpgradeAvailable)
+	require.Len(t, ev, 1)
+	require.Equal(t, "2 with an upgrade available: CVE-2026-0001 (upgrade to nginx:1.30.6, new digest), "+
+		"CVE-2026-0002 (upgrade to ghcr.io/example/app:1.30.7)", ev[0].Note)
+}
+
+// TestEvents_FeedStaleRepeatsWhileStale (F94): Events expire after about an hour, so a feed that stays
+// stale is reported again every hour until it syncs.
+func TestEvents_FeedStaleRepeatsWhileStale(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, self)
+	now := time.Date(2026, 11, 21, 9, 0, 0, 0, time.UTC)
+	h.em.o.Now = func() time.Time { return now }
+	last := now.Add(-3 * time.Hour)
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "osv", LastSuccess: last}))
+	h.em.FeedStale("osv", last, 2*time.Hour)
+	require.Len(t, h.byReason(ReasonFeedStale), 1)
+
+	now = now.Add(59 * time.Minute)
+	h.em.RepeatStale(ctx)
+	require.Len(t, h.byReason(ReasonFeedStale), 1, "within the hour the first Event is still visible")
+	now = now.Add(time.Minute)
+	h.em.RepeatStale(ctx)
+	ev := h.byReason(ReasonFeedStale)
+	require.Len(t, ev, 2)
+	require.Equal(t, ev[0].Note, ev[1].Note)
+	now = now.Add(30 * time.Minute)
+	h.em.RepeatStale(ctx)
+	require.Len(t, h.byReason(ReasonFeedStale), 2, "an hour from the repeat, not from the first")
+
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "osv", LastSuccess: now}))
+	now = now.Add(2 * time.Hour)
+	h.em.RepeatStale(ctx)
+	require.Len(t, h.byReason(ReasonFeedStale), 2, "a feed that synced is not reported again")
+	h.em.mu.Lock()
+	require.Empty(t, h.em.stale)
+	h.em.mu.Unlock()
+}

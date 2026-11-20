@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -95,29 +96,18 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 type findingKey struct{ namespace, kind, name, priority, fixable, kev string }
 
-// Refresh rebuilds the snapshot from the store.
+// Refresh rebuilds the snapshot from the store. The finding counts come from a SQL aggregate, so no
+// finding is decoded.
 func (c *Collector) Refresh(ctx context.Context) error {
-	fs, err := c.st.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}})
+	rows, err := c.st.OpenFindingCounts(ctx)
 	if err != nil {
-		return fmt.Errorf("metrics: list findings: %w", err)
-	}
-	ids := make([]string, 0, len(fs))
-	seen := map[string]bool{}
-	for _, f := range fs {
-		if !seen[f.AdvisoryID] {
-			seen[f.AdvisoryID] = true
-			ids = append(ids, f.AdvisoryID)
-		}
-	}
-	advs, err := c.st.Advisories(ctx, ids)
-	if err != nil {
-		return fmt.Errorf("metrics: advisories: %w", err)
+		return fmt.Errorf("metrics: count findings: %w", err)
 	}
 	counts := map[findingKey]int{}
-	for _, f := range fs {
-		a, ok := advs[f.AdvisoryID]
-		counts[findingKey{f.Owner.Namespace, f.Owner.Kind, f.Owner.Name, f.Priority.String(),
-			strconv.FormatBool(f.FixAvailable), strconv.FormatBool(ok && a.KEVAdded != nil)}]++
+	for _, r := range rows {
+		kind, rest, _ := strings.Cut(r.OwnerKey, "/")
+		_, name, _ := strings.Cut(rest, "/")
+		counts[findingKey{r.Namespace, kind, name, r.Priority.String(), strconv.FormatBool(r.FixAvailable), strconv.FormatBool(r.KEV)}] += r.N
 	}
 
 	snap := make([]prometheus.Metric, 0, len(counts)+3*len(c.o.FeedStaleAfter))

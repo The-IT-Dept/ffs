@@ -2,9 +2,11 @@ package openreports_test
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,8 +35,11 @@ type harness struct {
 	st      *store.Store
 	c       client.Client
 	w       *openreports.Writer
+	disc    *fakedisc.FakeDiscovery
+	now     time.Time
 	creates atomic.Int32
 	updates atomic.Int32
+	lists   atomic.Int32
 }
 
 func newHarness(t *testing.T, cfg config.OpenReportsConfig, served ...string) *harness {
@@ -49,8 +54,12 @@ func newHarness(t *testing.T, cfg config.OpenReportsConfig, served ...string) *h
 	s.AddKnownTypeWithName(wgGV.WithKind("PolicyReport"), &unstructured.Unstructured{})
 	s.AddKnownTypeWithName(wgGV.WithKind("PolicyReportList"), &unstructured.UnstructuredList{})
 
-	h := &harness{st: st}
+	h := &harness{st: st, now: t0}
 	h.c = fake.NewClientBuilder().WithScheme(s).WithInterceptorFuncs(interceptor.Funcs{
+		List: func(ctx context.Context, c client.WithWatch, l client.ObjectList, opts ...client.ListOption) error {
+			h.lists.Add(1)
+			return c.List(ctx, l, opts...)
+		},
 		Create: func(ctx context.Context, c client.WithWatch, o client.Object, opts ...client.CreateOption) error {
 			h.creates.Add(1)
 			return c.Create(ctx, o, opts...)
@@ -69,8 +78,9 @@ func newHarness(t *testing.T, cfg config.OpenReportsConfig, served ...string) *h
 		}
 		fd.Resources = append(fd.Resources, &metav1.APIResourceList{GroupVersion: gv, APIResources: []metav1.APIResource{{Kind: kind}}})
 	}
+	h.disc = fd
 	var d discovery.ServerResourcesInterfaceWithContext = fd
-	h.w = openreports.New(h.c, h.c, d, st, cfg, openreports.Options{Namespace: "ffs"})
+	h.w = openreports.New(h.c, h.c, d, st, cfg, openreports.Options{Namespace: "ffs", Now: func() time.Time { return h.now }})
 	return h
 }
 
@@ -87,6 +97,7 @@ func (h *harness) seed(t *testing.T, ref model.OwnerRef, id string, p model.Prio
 
 func (h *harness) reports(t *testing.T) []orv1alpha1.Report {
 	t.Helper()
+	defer h.lists.Add(-1) // the test's own list is not the writer's
 	var l orv1alpha1.ReportList
 	require.NoError(t, h.c.List(context.Background(), &l))
 	return l.Items
@@ -94,6 +105,7 @@ func (h *harness) reports(t *testing.T) []orv1alpha1.Report {
 
 func (h *harness) policyReports(t *testing.T) []unstructured.Unstructured {
 	t.Helper()
+	defer h.lists.Add(-1)
 	var l unstructured.UnstructuredList
 	l.SetGroupVersionKind(wgGV.WithKind("PolicyReportList"))
 	require.NoError(t, h.c.List(context.Background(), &l))
@@ -194,4 +206,77 @@ func TestWriter_WGPolicyMirrorsMapping(t *testing.T) {
 	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
 	require.NoError(t, h.w.ReconcileOnce(ctx))
 	assert.Empty(t, h.policyReports(t))
+}
+
+// TestWriter_ListsAtStartAndEveryTenMinutes (F86): reports are listed at the first reconcile and
+// then every ten minutes; in between the writer works from what it listed and wrote.
+func TestWriter_ListsAtStartAndEveryTenMinutes(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, config.OpenReportsConfig{Mode: "auto", MaxResults: 100}, orGV)
+	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.EqualValues(t, 1, h.lists.Load())
+	require.EqualValues(t, 1, h.creates.Load())
+
+	h.seed(t, dref, "CVE-2026-0002", model.PriorityUrgent)
+	h.now = h.now.Add(9 * time.Minute)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.EqualValues(t, 1, h.lists.Load(), "no list within ten minutes")
+	require.EqualValues(t, 1, h.updates.Load(), "the writer's own create gave it the resource version to update")
+	require.Equal(t, orv1alpha1.ReportSummary{Fail: 2}, h.reports(t)[0].Summary)
+
+	h.seed(t, dref, "CVE-2026-0001", model.PriorityLow)
+	h.seed(t, dref, "CVE-2026-0002", model.PriorityLow)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.Empty(t, h.reports(t), "a report the writer created is deleted from its own view")
+
+	h.now = h.now.Add(time.Minute)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.EqualValues(t, 2, h.lists.Load(), "listed again after ten minutes")
+}
+
+// TestWriter_StaleViewListsAgain: a report changed behind the writer's back fails its update with a
+// conflict, which is not an error; the next reconcile lists and writes it.
+func TestWriter_StaleViewListsAgain(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, config.OpenReportsConfig{Mode: "auto", MaxResults: 100}, orGV)
+	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	rep := h.reports(t)[0]
+	rep.Labels["touched"] = "yes" // someone else's write moves the resource version on
+	require.NoError(t, h.c.Update(ctx, &rep))
+
+	h.seed(t, dref, "CVE-2026-0002", model.PriorityUrgent)
+	require.NoError(t, h.w.ReconcileOnce(ctx), "the conflict is logged, not returned")
+	require.EqualValues(t, 1, h.lists.Load())
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.EqualValues(t, 2, h.lists.Load(), "the stale view was dropped")
+	require.Equal(t, orv1alpha1.ReportSummary{Fail: 2}, h.reports(t)[0].Summary)
+}
+
+// TestWriter_ModeOnSurvivesDiscoveryError (F54): in mode on a discovery failure does not stop the
+// Reports, and discovery is tried again; in mode auto it is returned.
+func TestWriter_ModeOnSurvivesDiscoveryError(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, config.OpenReportsConfig{Mode: "on", MaxResults: 100, WGPolicy: true}, orGV, wgGV.String())
+	calls := 0
+	h.disc.AddReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+		calls++
+		return true, nil, errors.New("discovery unavailable")
+	})
+	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.Len(t, h.reports(t), 1, "Reports are written in mode on")
+	require.Empty(t, h.policyReports(t), "the PolicyReport mirror waits for discovery")
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.Equal(t, 2, calls, "discovery is tried again on the next reconcile")
+
+	h = newHarness(t, config.OpenReportsConfig{Mode: "auto", MaxResults: 100}, orGV)
+	h.disc.AddReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("discovery unavailable")
+	})
+	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
+	require.ErrorContains(t, h.w.ReconcileOnce(ctx), "discovery unavailable")
+	require.Empty(t, h.reports(t))
 }

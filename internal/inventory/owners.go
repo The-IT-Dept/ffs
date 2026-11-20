@@ -27,9 +27,9 @@ var errOwnerPending = errors.New("inventory: owner not in the cache yet")
 func ownerOf(ctx context.Context, c client.Reader, pod *corev1.Pod) (model.OwnerRef, error) {
 	ref := metav1.GetControllerOfNoCopy(pod)
 	if ref == nil || ref.Kind == "Node" {
-		return model.OwnerRef{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: string(pod.UID)}, nil
+		return model.OwnerRef{Kind: "Pod", Namespace: pod.Namespace, Name: pod.Name, UID: string(pod.UID), APIVersion: "v1"}, nil
 	}
-	owner := model.OwnerRef{Kind: ref.Kind, Namespace: pod.Namespace, Name: ref.Name, UID: string(ref.UID)}
+	owner := model.OwnerRef{Kind: ref.Kind, Namespace: pod.Namespace, Name: ref.Name, UID: string(ref.UID), APIVersion: ref.APIVersion}
 	gv, _ := schema.ParseGroupVersion(ref.APIVersion)
 	switch {
 	case gv.Group == appsv1.GroupName && ref.Kind == "ReplicaSet":
@@ -52,7 +52,7 @@ func controllerOf(ctx context.Context, c client.Reader, obj client.Object, owner
 		return model.OwnerRef{}, err
 	}
 	if p := metav1.GetControllerOfNoCopy(obj); p != nil {
-		return model.OwnerRef{Kind: p.Kind, Namespace: owner.Namespace, Name: p.Name, UID: string(p.UID)}, nil
+		return model.OwnerRef{Kind: p.Kind, Namespace: owner.Namespace, Name: p.Name, UID: string(p.UID), APIVersion: p.APIVersion}, nil
 	}
 	return owner, nil
 }

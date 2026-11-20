@@ -142,7 +142,7 @@ func TestExceptionReconciler_InvalidNotApplied(t *testing.T) {
 	ex.Spec.Expires = metav1.NewTime(t0.Add(400 * 24 * time.Hour))
 	require.NoError(t, env.Client.Update(ctx, &ex))
 	res := reconcileException(t, r, "web", "accept")
-	require.Equal(t, reconcile.Result{}, res)
+	require.Equal(t, reconcile.Result{RequeueAfter: time.Hour}, res, "an invalid exception is checked again within the hour")
 	require.Empty(t, rules(t, st), "an invalid exception's rule is dropped")
 	require.Equal(t, 2, eng.calls)
 
@@ -153,6 +153,28 @@ func TestExceptionReconciler_InvalidNotApplied(t *testing.T) {
 	require.Equal(t, "Invalid", ready.Reason)
 	require.Equal(t, "expires must be at most 365 days from now", ready.Message)
 	require.Equal(t, got.Generation, got.Status.ObservedGeneration)
+}
+
+// TestExceptionReconciler_InvalidRequeuedUntilValid (F54): an Exception whose expiry is too far ahead
+// is requeued for when it comes within exceptions.maxDuration, and then applies, with no spec change.
+func TestExceptionReconciler_InvalidRequeuedUntilValid(t *testing.T) {
+	needEnv(t)
+	st := newStore(t)
+	now := t0
+	r, _ := newReconciler(t, st, &now)
+	createException(t, "web", "later", acceptSpec(cve, t0.Add(8760*time.Hour+30*time.Minute)))
+
+	res := reconcileException(t, r, "web", "later")
+	require.Equal(t, 30*time.Minute, res.RequeueAfter, "requeued for when the expiry comes within a year")
+	require.Empty(t, rules(t, st))
+
+	now = now.Add(res.RequeueAfter)
+	res = reconcileException(t, r, "web", "later")
+	require.Len(t, rules(t, st), 1, "it applies once its expiry is in range")
+	require.Equal(t, 2*time.Minute, res.RequeueAfter)
+	ready := apimeta.FindStatusCondition(getException(t, "web", "later").Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, "Active", ready.Reason)
 }
 
 func TestExceptionReconciler_StatusCounts(t *testing.T) {

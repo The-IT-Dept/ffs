@@ -104,7 +104,13 @@ type Image struct {
 }
 
 // OwnerRef identifies a workload. Kind may be "Cluster", "ContainerRuntime" or "Nodes" for cluster-level subjects.
-type OwnerRef struct{ Kind, Namespace, Name, UID string }
+type OwnerRef struct {
+	Kind, Namespace, Name, UID string
+	// APIVersion is the workload object's apiVersion ("apps/v1", "argoproj.io/v1alpha1"): "" for the
+	// cluster-level subjects, which are no Kubernetes object, and for owners stored before it was
+	// recorded. Key and FindingFingerprint leave it out.
+	APIVersion string `json:",omitempty"`
+}
 
 // ManagedBy names the deployment tool. Tool: "helm" | "flux-helmrelease" | "flux-kustomization" | "argocd".
 type ManagedBy struct{ Tool, Name, Namespace string }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sync"
 	"time"
 
@@ -18,6 +20,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/output/settle"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -27,13 +30,17 @@ const (
 
 	detectTTL     = 10 * time.Minute
 	defaultResync = 60 * time.Second
+	// listEvery is how often the writer lists its reports again; in between, it reads them from what
+	// it last listed and wrote (reportCache).
+	listEvery = 10 * time.Minute
 )
 
 // Options configures a Writer.
 type Options struct {
-	Namespace string          // ffs install namespace; home of reports for cluster-level subjects
-	Changed   <-chan struct{} // engine change signal
-	Resync    time.Duration   // default 60s
+	Namespace string           // ffs install namespace; home of reports for cluster-level subjects
+	Changed   <-chan struct{}  // engine change signal
+	Resync    time.Duration    // default 60s
+	Now       func() time.Time // nil = time.Now
 }
 
 // Writer keeps one Report per owner (and optionally a PolicyReport mirror) in step with the store.
@@ -51,26 +58,43 @@ type Writer struct {
 	detectedAt time.Time
 	hasOR      bool
 	hasWG      bool
+
+	reports, policyReports reportCache // used by ReconcileOnce only, which Start runs one at a time
+}
+
+// reportCache is the writer's view of the reports it manages of one kind, keyed "namespace/name":
+// a full LIST at most every listEvery, kept current by the writer's own writes. A write that fails
+// on a stale view (a create that finds the report, an update that finds it changed or gone) drops
+// the view, so the next reconcile lists. A report someone else deletes comes back after the next
+// list.
+type reportCache struct {
+	listedAt time.Time
+	objs     map[string]client.Object
 }
 
 // New returns a Writer. r must be a non-caching reader: an informer on an absent CRD would block.
+// The writer lists through r at start and every 10 minutes, and keeps its own view in between.
 func New(c client.Client, r client.Reader, disc discovery.ServerResourcesInterfaceWithContext, st *store.Store, cfg config.OpenReportsConfig, o Options) *Writer {
 	if o.Resync <= 0 {
 		o.Resync = defaultResync
 	}
-	return &Writer{c: c, r: r, disc: disc, st: st, cfg: cfg, o: o, now: time.Now}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	return &Writer{c: c, r: r, disc: disc, st: st, cfg: cfg, o: o, now: o.Now}
 }
 
 // NeedLeaderElection reports that the writer runs on the leader only.
 func (w *Writer) NeedLeaderElection() bool { return true }
 
-// Start reconciles on every Changed signal and every Resync until ctx is done.
+// Start reconciles a second after a Changed signal (settle.Wait) and every Resync until ctx is done.
 func (w *Writer) Start(ctx context.Context) error {
 	log := logr.FromContextOrDiscard(ctx)
 	if log.GetSink() == nil {
 		log = logf.Log
 	}
 	log = log.WithName("openreports")
+	ctx = logr.NewContext(ctx, log)
 	tick := time.NewTicker(w.o.Resync)
 	defer tick.Stop()
 	for {
@@ -81,6 +105,9 @@ func (w *Writer) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-w.o.Changed:
+			if !settle.Wait(ctx, w.o.Changed, settle.Window) {
+				return nil
+			}
 		case <-tick.C:
 		}
 	}
@@ -122,14 +149,20 @@ func (w *Writer) served(ctx context.Context, gv, kind string) (bool, error) {
 	return false, nil
 }
 
-// ReconcileOnce brings the Reports (and PolicyReports) in line with the open findings.
+// ReconcileOnce brings the Reports (and PolicyReports) in line with the open findings. A discovery
+// failure is returned in mode auto; in mode on it is logged, Reports are written anyway, the
+// PolicyReport mirror waits, and discovery is tried again on the next reconcile.
 func (w *Writer) ReconcileOnce(ctx context.Context) error {
 	if w.cfg.Mode == "off" {
 		return nil
 	}
 	hasOR, hasWG, err := w.detect(ctx)
 	if err != nil {
-		return err
+		if w.cfg.Mode != "on" {
+			return err
+		}
+		logr.FromContextOrDiscard(ctx).Error(err, "discovering the report kinds failed; writing Reports (openReports.mode on) and trying again next time")
+		hasOR, hasWG = false, false
 	}
 	writeOR := hasOR || w.cfg.Mode == "on"
 	if !writeOR && !hasWG {
@@ -156,17 +189,18 @@ func (w *Writer) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 	if hasWG {
-		errs = append(errs, w.sync(ctx, wantWG, w.listPolicyReports))
+		errs = append(errs, w.sync(ctx, &w.policyReports, wantWG, w.listPolicyReports))
 	}
 	if writeOR {
-		errs = append(errs, w.sync(ctx, wantOR, w.listReports))
+		errs = append(errs, w.sync(ctx, &w.reports, wantOR, w.listReports))
 	}
 	return errors.Join(errs...)
 }
 
-// desired builds the Report of every owner that has a finding at medium priority or above.
+// desired builds the Report of every owner that has a finding at medium priority or above. Only
+// those findings are read.
 func (w *Writer) desired(ctx context.Context) ([]*orv1alpha1.Report, error) {
-	fs, err := w.st.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}})
+	fs, err := w.st.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}, MinPriority: model.PriorityMedium})
 	if err != nil {
 		return nil, fmt.Errorf("list findings: %w", err)
 	}
@@ -237,38 +271,64 @@ func (w *Writer) listPolicyReports(ctx context.Context) ([]client.Object, error)
 }
 
 // sync creates the missing objects in want, updates those whose content hash differs and deletes
-// the managed ones that are no longer wanted. Keys are "namespace/name".
-func (w *Writer) sync(ctx context.Context, want map[string]client.Object, list func(context.Context) ([]client.Object, error)) error {
-	have, err := list(ctx)
-	if err != nil {
-		return err
+// the managed ones that are no longer wanted. Keys are "namespace/name". The managed objects come
+// from rc, listed again when it is older than listEvery. A write that fails because the view was
+// stale is logged at V(1), not returned, and drops the view, so the next reconcile lists.
+func (w *Writer) sync(ctx context.Context, rc *reportCache, want map[string]client.Object, list func(context.Context) ([]client.Object, error)) error {
+	if rc.objs == nil || w.now().Sub(rc.listedAt) >= listEvery {
+		have, err := list(ctx)
+		if err != nil {
+			return err
+		}
+		rc.objs = make(map[string]client.Object, len(have))
+		for _, o := range have {
+			rc.objs[o.GetNamespace()+"/"+o.GetName()] = o
+		}
+		rc.listedAt = w.now()
 	}
-	existing := map[string]client.Object{}
-	for _, o := range have {
-		existing[o.GetNamespace()+"/"+o.GetName()] = o
-	}
+	log := logr.FromContextOrDiscard(ctx)
 	var errs []error
-	for k, obj := range want {
-		cur, ok := existing[k]
+	stale := false
+	fail := func(verb, k string, err error) {
+		if (verb == "create" && apierrors.IsAlreadyExists(err)) || (verb == "update" && (apierrors.IsConflict(err) || apierrors.IsNotFound(err))) {
+			stale = true
+			log.V(1).Info("a report changed since it was listed; the next reconcile lists again", "report", k, "action", verb,
+				"error", err.Error())
+			return
+		}
+		errs = append(errs, fmt.Errorf("%s %s: %w", verb, k, err))
+	}
+	for _, k := range slices.Sorted(maps.Keys(want)) {
+		obj := want[k]
+		cur, ok := rc.objs[k]
 		switch {
 		case !ok:
 			if err := w.c.Create(ctx, obj); err != nil {
-				errs = append(errs, fmt.Errorf("create %s: %w", k, err))
+				fail("create", k, err)
+				continue
 			}
+			rc.objs[k] = obj
 		case cur.GetAnnotations()[AnnotationContentHash] != obj.GetAnnotations()[AnnotationContentHash]:
 			obj.SetResourceVersion(cur.GetResourceVersion())
 			if err := w.c.Update(ctx, obj); err != nil {
-				errs = append(errs, fmt.Errorf("update %s: %w", k, err))
+				fail("update", k, err)
+				continue
 			}
+			rc.objs[k] = obj
 		}
 	}
-	for k, cur := range existing {
+	for _, k := range slices.Sorted(maps.Keys(rc.objs)) {
 		if _, ok := want[k]; ok {
 			continue
 		}
-		if err := w.c.Delete(ctx, cur); client.IgnoreNotFound(err) != nil {
-			errs = append(errs, fmt.Errorf("delete %s: %w", k, err))
+		if err := w.c.Delete(ctx, rc.objs[k]); client.IgnoreNotFound(err) != nil {
+			fail("delete", k, err)
+			continue
 		}
+		delete(rc.objs, k)
+	}
+	if stale {
+		rc.objs = nil
 	}
 	return errors.Join(errs...)
 }

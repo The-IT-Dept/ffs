@@ -28,16 +28,16 @@ func TestOwnerOf(t *testing.T) {
 		want   model.OwnerRef
 	}{
 		{"deployment via replicaset", ctrl("apps/v1", "ReplicaSet", "web-5d9"),
-			model.OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web", UID: "web-uid"}},
+			model.OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web", UID: "web-uid", APIVersion: "apps/v1"}},
 		{"cronjob via job", ctrl("batch/v1", "Job", "backup-29"),
-			model.OwnerRef{Kind: "CronJob", Namespace: "apps", Name: "backup", UID: "backup-uid"}},
+			model.OwnerRef{Kind: "CronJob", Namespace: "apps", Name: "backup", UID: "backup-uid", APIVersion: "batch/v1"}},
 		{"statefulset", ctrl("apps/v1", "StatefulSet", "db"),
-			model.OwnerRef{Kind: "StatefulSet", Namespace: "apps", Name: "db", UID: "db-uid"}},
+			model.OwnerRef{Kind: "StatefulSet", Namespace: "apps", Name: "db", UID: "db-uid", APIVersion: "apps/v1"}},
 		{"unknown kind", ctrl("argoproj.io/v1alpha1", "Rollout", "r"),
-			model.OwnerRef{Kind: "Rollout", Namespace: "apps", Name: "r", UID: "r-uid"}},
-		{"static pod", ctrl("v1", "Node", "n1"), model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "p", UID: "p-uid"}},
+			model.OwnerRef{Kind: "Rollout", Namespace: "apps", Name: "r", UID: "r-uid", APIVersion: "argoproj.io/v1alpha1"}},
+		{"static pod", ctrl("v1", "Node", "n1"), model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "p", UID: "p-uid", APIVersion: "v1"}},
 		{"no controller", []metav1.OwnerReference{{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "x", UID: "x-uid"}},
-			model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "p", UID: "p-uid"}},
+			model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "p", UID: "p-uid", APIVersion: "v1"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pod := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Namespace: "apps", Name: "p", UID: "p-uid", OwnerReferences: tc.owners}}

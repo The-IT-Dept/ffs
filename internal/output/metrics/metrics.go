@@ -82,11 +82,15 @@ const (
 var AgentRejectReasons = []string{AgentRejectUnauthenticated, AgentRejectRateLimited, AgentRejectForbidden, AgentRejectBadRequest,
 	AgentRejectTooLarge}
 
-// crsDropped is the name of the gauge the crds package defines and registers itself.
-const crsDropped = "ffs_finding_crs_dropped"
+// crsDropped and crNameCollisions are the names of the gauges the crds package defines and registers
+// itself.
+const (
+	crsDropped       = "ffs_finding_crs_dropped"
+	crNameCollisions = "ffs_finding_cr_name_collisions"
+)
 
 // Register registers c and every metric variable of this package on reg. The crds package registers
-// its own gauge.
+// its own gauges.
 func Register(reg prometheus.Registerer, c *Collector) error {
 	for _, col := range []prometheus.Collector{c, RematchDuration, CatalogQueueDepth, CatalogFailures, RegistryBudgetRemaining,
 		NotifyDeliveries, AgentReports, AgentIngestBytesInFlight} {
@@ -121,5 +125,6 @@ func Names() []string {
 		"ffs_agent_reports_total",
 		"ffs_agent_ingest_bytes_in_flight",
 		crsDropped,
+		crNameCollisions,
 	}
 }

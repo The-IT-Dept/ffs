@@ -16,6 +16,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -27,6 +28,7 @@ import (
 	"github.com/the-it-dept/ffs/api/v1alpha1"
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/output/settle"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -54,7 +56,15 @@ var FindingCRsDropped = prometheus.NewGauge(prometheus.GaugeOpts{
 	Help: "Open findings at or above crd.minPriority not written as Finding resources because of crd.maxFindings.",
 })
 
-func init() { ctrlmetrics.Registry.MustRegister(FindingCRsDropped) }
+// FindingCRNameCollisions is the number of open findings at or above crd.minPriority that the last
+// Sync left out because a higher-ranked finding has the same Finding resource name: one owner with
+// the same advisory on two image repositories, or two long names that share a truncated name.
+var FindingCRNameCollisions = prometheus.NewGauge(prometheus.GaugeOpts{
+	Name: "ffs_finding_cr_name_collisions",
+	Help: "Open findings at or above crd.minPriority not written as Finding resources because another finding has the same resource name.",
+})
+
+func init() { ctrlmetrics.Registry.MustRegister(FindingCRsDropped, FindingCRNameCollisions) }
 
 // WriterStore is the part of the store the writer reads.
 type WriterStore interface {
@@ -91,8 +101,8 @@ func NewWriter(o WriterOptions) *Writer {
 // NeedLeaderElection reports that only the leader writes resources.
 func (w *Writer) NeedLeaderElection() bool { return true }
 
-// Start runs Sync once, then on every Changed signal and every 60s, until ctx is done. Sync
-// errors are logged, never returned.
+// Start runs Sync once, then a second after a Changed signal (settle.Wait) and every 60s, until ctx
+// is done. Sync errors are logged, never returned.
 func (w *Writer) Start(ctx context.Context) error {
 	log := ctrllog.FromContext(ctx).WithName("crds")
 	tick := time.NewTicker(resyncInterval)
@@ -105,6 +115,9 @@ func (w *Writer) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-w.o.Changed:
+			if !settle.Wait(ctx, w.o.Changed, settle.Window) {
+				return nil
+			}
 		case <-tick.C:
 		}
 	}
@@ -125,8 +138,10 @@ type crKind struct {
 
 // Sync writes one Finding per open finding at or above crd.minPriority, up to crd.maxFindings,
 // and one Vulnerability per advisory with a Finding; it deletes every other resource it manages.
-// Writes happen only when a status's content hash changed. A failed write is logged and Sync
-// carries on; the failures are returned together.
+// Only the open findings at or above crd.minPriority are read, plus every open finding of the
+// advisories that get a Vulnerability, which summarises them at any priority. Writes happen only
+// when a status's content hash changed. A failed write is logged and Sync carries on; the failures
+// are returned together.
 func (w *Writer) Sync(ctx context.Context) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -134,15 +149,30 @@ func (w *Writer) Sync(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("crds: crd.minPriority: %w", err)
 	}
-	open, err := w.o.Store.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}})
+	eligible, err := w.o.Store.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}, MinPriority: minPriority})
 	if err != nil {
 		return fmt.Errorf("crds: list open findings: %w", err)
 	}
-	byAdvisory := map[string][]model.Finding{}
-	for _, f := range open {
-		byAdvisory[f.AdvisoryID] = append(byAdvisory[f.AdvisoryID], f)
+	keep, dropped, collisions := w.selectFindings(eligible, minPriority)
+	w.reportCap(dropped)
+	FindingCRNameCollisions.Set(float64(collisions))
+
+	ids := map[string]bool{}
+	for _, f := range keep {
+		ids[f.AdvisoryID] = true
 	}
-	advs, err := w.o.Store.Advisories(ctx, slices.Sorted(maps.Keys(byAdvisory)))
+	byAdvisory := map[string][]model.Finding{}
+	if len(ids) > 0 {
+		all, err := w.o.Store.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen},
+			AdvisoryIDs: slices.Sorted(maps.Keys(ids))})
+		if err != nil {
+			return fmt.Errorf("crds: list open findings of advisories: %w", err)
+		}
+		for _, f := range all {
+			byAdvisory[f.AdvisoryID] = append(byAdvisory[f.AdvisoryID], f)
+		}
+	}
+	advs, err := w.o.Store.Advisories(ctx, slices.Sorted(maps.Keys(ids)))
 	if err != nil {
 		return fmt.Errorf("crds: load advisories: %w", err)
 	}
@@ -154,9 +184,6 @@ func (w *Writer) Sync(ctx context.Context) error {
 	for _, o := range ownerList {
 		owners[o.Ref.Key()] = o
 	}
-
-	keep, dropped := w.selectFindings(open, minPriority)
-	w.reportCap(dropped)
 
 	var findingCRs, vulnCRs []desiredCR
 	vulnWritten := map[string]bool{} // advisory ids with a desired Vulnerability
@@ -173,7 +200,11 @@ func (w *Writer) Sync(ctx context.Context) error {
 			continue
 		}
 		vulnWritten[f.AdvisoryID] = true
-		vst := vulnerabilityStatus(f.AdvisoryID, advs[f.AdvisoryID], byAdvisory[f.AdvisoryID])
+		onAdvisory := byAdvisory[f.AdvisoryID]
+		if len(onAdvisory) == 0 { // the finding changed between the two reads
+			onAdvisory = []model.Finding{f}
+		}
+		vst := vulnerabilityStatus(f.AdvisoryID, advs[f.AdvisoryID], onAdvisory)
 		vulnCRs = append(vulnCRs, desiredCR{obj: &v1alpha1.Vulnerability{
 			ObjectMeta: metav1.ObjectMeta{Name: VulnerabilityName(f.AdvisoryID),
 				Labels: map[string]string{LabelManagedBy: managedByFFS, LabelPriority: vst.HighestPriority}},
@@ -191,12 +222,13 @@ func (w *Writer) Sync(ctx context.Context) error {
 	)
 }
 
-// selectFindings returns the open findings to write as resources, highest priority first, and how
-// many eligible findings the cap left out. Findings at or above minPriority are ranked by
-// priority, then earliest matched, then fingerprint. When two findings share a resource name (one owner running
-// two affected repositories), the higher-ranked one is written; the other stays in the API. A cap
-// (crd.maxFindings) of 0 or less means unlimited, as documented.
-func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority) (keep []model.Finding, dropped int) {
+// selectFindings returns the open findings to write as resources, highest priority first, how many
+// eligible findings the cap left out, and how many a name collision left out. Findings at or above
+// minPriority are ranked by priority, then earliest matched, then fingerprint. When two findings
+// share a resource name (one owner running two affected repositories), the higher-ranked one is
+// written; the other stays in the API and counts as a collision. A cap (crd.maxFindings) of 0 or
+// less means unlimited, as documented.
+func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority) (keep []model.Finding, dropped, collisions int) {
 	var eligible []model.Finding
 	for _, f := range open {
 		if f.Priority >= minPriority {
@@ -210,6 +242,7 @@ func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority
 	eligible = slices.DeleteFunc(eligible, func(f model.Finding) bool {
 		k := w.namespaceOf(f) + "/" + FindingName(f.Owner, f.AdvisoryID)
 		if seen[k] {
+			collisions++
 			return true
 		}
 		seen[k] = true
@@ -219,7 +252,7 @@ func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority
 	if limit := w.o.Config.CRD.MaxFindings; limit > 0 && len(keep) > limit {
 		keep = keep[:limit]
 	}
-	return keep, len(eligible) - len(keep)
+	return keep, len(eligible) - len(keep), collisions
 }
 
 // reportCap publishes the dropped count, with a Warning Event on the ffs Deployment whenever a
@@ -260,11 +293,16 @@ func (w *Writer) apply(ctx context.Context, k crKind, desiredCRs []desiredCR) er
 	}
 	var errs []error
 	fail := func(verb, key string, err error) {
-		if err == nil {
-			return
+		switch {
+		case err == nil:
+		case apierrors.IsAlreadyExists(err) || apierrors.IsConflict(err):
+			// the cached list was behind the writer's own writes; the next Sync sees them
+			log.V(1).Info("a resource changed since it was listed; the next sync writes it", "kind", k.name, "resource", key,
+				"action", verb, "error", err.Error())
+		default:
+			log.Error(err, "writing a resource failed", "kind", k.name, "resource", key, "action", verb)
+			errs = append(errs, fmt.Errorf("crds: %s %s %s: %w", verb, k.name, key, err))
 		}
-		log.Error(err, "writing a resource failed", "kind", k.name, "resource", key, "action", verb)
-		errs = append(errs, fmt.Errorf("crds: %s %s %s: %w", verb, k.name, key, err))
 	}
 	existing := map[string]bool{}
 	for _, item := range items {
