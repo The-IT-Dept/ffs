@@ -30,7 +30,9 @@ controller:
     # Resource ceilings.
     limits:
       # Memory limit, as a byte count or a quantity such as 1536Mi or 1.5Gi. GOMEMLIMIT is set to 90% of it.
-      memory: 1Gi
+      # The first node-agent inventories of a cluster are the peak: an 8-node cluster held about 860 MiB
+      # live while matching its node groups' host packages for the first time.
+      memory: 2Gi
   # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
   tmpSizeLimit: 1Gi
 
