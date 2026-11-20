@@ -454,3 +454,34 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		require.False(t, ok)
 	})
 }
+
+// TestWork_ExpiredOffersCountTowardQuarantine: an offer that expires without a result (the agent killed
+// cataloguing it) counts as a failure, so an image that keeps killing collectors is quarantined after the
+// usual two and no longer offered (spec §9.3).
+func TestWork_ExpiredOffersCountTowardQuarantine(t *testing.T) {
+	f := newWorkFixture(t)
+	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
+
+	f.clk.Add(30 * time.Minute) // every deadline passes with no result
+	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"), "offered again after one failure")
+	for _, d := range []string{dig1, dig2, dig3} {
+		j, ok := f.job(t, d)
+		require.True(t, ok, d)
+		require.Equal(t, 1, j.Attempts)
+		require.Equal(t, "worker-1", j.LastNode)
+		require.Equal(t, "the node agent sent no result before the request expired", j.LastError)
+		require.True(t, j.QuarantinedUntil.IsZero())
+	}
+
+	// dig2's result arrives in time; dig1 and dig3 expire again.
+	require.NoError(t, f.q.SBOM(context.Background(), worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig2, SyftJSON: sideloadDoc(t)}))
+	f.clk.Add(30 * time.Minute)
+	require.Equal(t, []string{dig4}, f.offer(t, "worker-1"), "dig1 and dig3 are quarantined; dig2 is catalogued")
+	for _, d := range []string{dig1, dig3} {
+		j, _ := f.job(t, d)
+		require.Equal(t, 2, j.Attempts, d)
+		require.Equal(t, f.clk.Now().Add(24*time.Hour), j.QuarantinedUntil, d)
+	}
+	_, ok := f.job(t, dig2)
+	require.False(t, ok, "a handled offer is never counted")
+}

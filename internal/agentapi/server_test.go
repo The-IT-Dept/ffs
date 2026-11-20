@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -252,39 +253,137 @@ func TestWireConfig_FromNodeAgentConfig(t *testing.T) {
 }
 
 func TestServer_CountsRejectedReports(t *testing.T) {
-	rejected := func() float64 {
-		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected))
+	rejected := func(reason string) float64 {
+		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected, reason))
 	}
 	rec := &reportRecorder{resp: wire.ReportResponse{Applied: true}}
-	h := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: rec, MaxReportBytes: 1 << 20}).Handler()
+	sboms := &sbomRecorder{}
+	h := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: rec, SBOMs: sboms, MaxReportBytes: 1 << 20, MaxSBOMBytes: 1 << 20}).Handler()
 	report := func(node string) io.Reader { return strings.NewReader(`{"node":"` + node + `","kind":"images"}`) }
+	result := func(node string) io.Reader {
+		return strings.NewReader(`{"id":"w1","node":"` + node + `","digest":"sha256:aa"}`)
+	}
 	big := `{"node":"worker-1","kind":"full","host":{"syftJSON":"` + strings.Repeat("a", 2<<20) + `"}}`
 
 	for _, tc := range []struct {
-		name   string
-		bearer string
-		body   io.Reader
-		length int64
-		err    error
-		code   int
+		name, path, bearer string
+		body               io.Reader
+		length             int64
+		err                error
+		code               int
+		reason             string
 	}{
-		{"no token", "", report("worker-1"), -1, nil, http.StatusUnauthorized},
-		{"another node", "tok", report("worker-2"), -1, nil, http.StatusForbidden},
-		{"over the size cap", "tok", strings.NewReader(big), int64(len(big)), nil, http.StatusRequestEntityTooLarge},
-		{"invalid JSON", "tok", strings.NewReader(`{"node":`), -1, nil, http.StatusBadRequest},
-		{"refused by the handler", "tok", report("worker-1"), -1, fmt.Errorf("%w: unknown report kind", ErrBadRequest), http.StatusBadRequest},
+		{"no token", wire.PathReport, "", report("worker-1"), -1, nil, http.StatusUnauthorized, metrics.AgentRejectUnauthenticated},
+		{"another node", wire.PathReport, "tok", report("worker-2"), -1, nil, http.StatusForbidden, metrics.AgentRejectForbidden},
+		{"over the size cap", wire.PathReport, "tok", strings.NewReader(big), int64(len(big)), nil, http.StatusRequestEntityTooLarge,
+			metrics.AgentRejectTooLarge},
+		{"invalid JSON", wire.PathReport, "tok", strings.NewReader(`{"node":`), -1, nil, http.StatusBadRequest, metrics.AgentRejectBadRequest},
+		{"refused by the handler", wire.PathReport, "tok", report("worker-1"), -1, fmt.Errorf("%w: unknown report kind", ErrBadRequest),
+			http.StatusBadRequest, metrics.AgentRejectBadRequest},
+		{"SBOM, no token", wire.PathSBOM, "", result("worker-1"), -1, nil, http.StatusUnauthorized, metrics.AgentRejectUnauthenticated},
+		{"SBOM, another node", wire.PathSBOM, "tok", result("worker-2"), -1, nil, http.StatusForbidden, metrics.AgentRejectForbidden},
+		{"SBOM, not offered", wire.PathSBOM, "tok", result("worker-1"), -1, fmt.Errorf("%w: sha256:aa was not offered", ErrForbidden),
+			http.StatusForbidden, metrics.AgentRejectForbidden},
+		{"SBOM, over the size cap", wire.PathSBOM, "tok", strings.NewReader(big), int64(len(big)), nil, http.StatusRequestEntityTooLarge,
+			metrics.AgentRejectTooLarge},
 	} {
-		before := rejected()
-		rec.err = tc.err
-		a := serve(t, h, http.MethodPost, wire.PathReport, tc.bearer, tc.body, tc.length)
+		before := rejected(tc.reason)
+		rec.err, sboms.err = tc.err, tc.err
+		a := serve(t, h, http.MethodPost, tc.path, tc.bearer, tc.body, tc.length)
 		require.Equal(t, tc.code, a.code, tc.name)
-		require.Equal(t, before+1, rejected(), tc.name)
+		require.Equal(t, before+1, rejected(tc.reason), tc.name)
 	}
 
-	before := rejected()
-	rec.err = errors.New("disk I/O")
+	sum := func() float64 {
+		total := 0.0
+		for _, r := range metrics.AgentRejectReasons {
+			total += rejected(r)
+		}
+		return total
+	}
+	before := sum()
+	rec.err, sboms.err = errors.New("disk I/O"), nil
 	require.Equal(t, http.StatusInternalServerError, serve(t, h, http.MethodPost, wire.PathReport, "tok", report("worker-1"), -1).code)
 	rec.err = nil
 	require.Equal(t, http.StatusOK, serve(t, h, http.MethodPost, wire.PathReport, "tok", report("worker-1"), -1).code)
-	require.Equal(t, before, rejected(), "neither a 500 nor a 200 is a rejection")
+	require.Equal(t, http.StatusNoContent, serve(t, h, http.MethodPost, wire.PathSBOM, "tok", result("worker-1"), -1).code)
+	require.Equal(t, before, sum(), "neither a 500 nor a success is a rejection")
+}
+
+// blockingReports is a ReportHandler that holds every report until release is closed, counting the reports
+// it holds.
+type blockingReports struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingReports) Report(ctx context.Context, _ Identity, _ *wire.Report) (wire.ReportResponse, error) {
+	b.entered <- struct{}{}
+	select {
+	case <-b.release:
+	case <-ctx.Done():
+	}
+	return wire.ReportResponse{Applied: true}, nil
+}
+
+// TestServer_IngestBudgetDefersFullReports: full reports beyond the ingest budget wait IngestWait and are
+// answered 429 with a Retry-After of 10 to 60 seconds, before their bodies are read; the bytes held never
+// exceed the budget, and a deferred report is counted as deferred, not rejected.
+func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
+	const size = 1 << 20
+	prefix, suffix := `{"node":"worker-1","kind":"full","agentVersion":"`, `"}`
+	body := prefix + strings.Repeat("a", size-len(prefix)-len(suffix)) + suffix
+	require.Len(t, body, size)
+	reports := &blockingReports{entered: make(chan struct{}, 8), release: make(chan struct{})}
+	srv := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: reports, MaxReportBytes: 4 * size, IngestBudget: 3 * size,
+		IngestWait: 50 * time.Millisecond})
+	h := srv.Handler()
+	deferred := func() float64 {
+		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportDeferred, ""))
+	}
+	deferredBefore := deferred()
+	// post sends one full report and returns its status; it runs on other goroutines, so it asserts nothing.
+	post := func() int {
+		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, wire.PathReport, strings.NewReader(body))
+		req.ContentLength = int64(len(body))
+		req.Header.Set("Authorization", "Bearer tok")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code
+	}
+
+	answers := make(chan int, 8)
+	for range 3 {
+		go func() { answers <- post() }()
+	}
+	for range 3 {
+		<-reports.entered // three reports hold the whole budget
+	}
+	require.Equal(t, int64(3*size), srv.held.Load())
+
+	for range 4 {
+		a := serve(t, h, http.MethodPost, wire.PathReport, "tok", strings.NewReader(body), int64(len(body)))
+		requireError(t, a, http.StatusTooManyRequests, "the controller is busy; retry later")
+		secs, err := strconv.Atoi(a.header.Get("Retry-After"))
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, secs, 10)
+		require.LessOrEqual(t, secs, 60)
+	}
+	// A body without a Content-Length takes MaxReportBytes, capped at the budget: it waits too.
+	a := serve(t, h, http.MethodPost, wire.PathReport, "tok", strings.NewReader(body), -1)
+	require.Equal(t, http.StatusTooManyRequests, a.code)
+	require.Equal(t, deferredBefore+5, deferred())
+
+	close(reports.release)
+	for range 3 {
+		require.Equal(t, http.StatusOK, <-answers)
+	}
+	require.Zero(t, srv.held.Load(), "every share is released")
+	require.LessOrEqual(t, srv.peak.Load(), int64(3*size), "the bytes held never exceed the budget")
+
+	// With the budget free, a report goes through at once.
+	go func() { answers <- post() }()
+	<-reports.entered
+	require.Equal(t, http.StatusOK, <-answers)
+	require.LessOrEqual(t, srv.peak.Load(), int64(3*size))
 }

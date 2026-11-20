@@ -7,15 +7,19 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/the-it-dept/ffs/internal/agentapi/wire"
 	"github.com/the-it-dept/ffs/internal/config"
@@ -35,6 +39,16 @@ const (
 	certCheckEvery = 30 * time.Second
 	// jitterPercent spreads every agent's intervals.
 	jitterPercent = 10
+
+	// defaultIngestBudget caps the bytes of report and SBOM bodies being read and handled at once, the
+	// host part's preparation included: a rollout's herd of full reports waits or is deferred instead of
+	// taking the controller past its memory limit.
+	defaultIngestBudget = 256 << 20
+	// defaultIngestWait is how long a report waits for its share of the budget before it is answered
+	// 429 with a Retry-After of retryAfterMin to retryAfterMax seconds.
+	defaultIngestWait = 2 * time.Second
+	retryAfterMin     = 10
+	retryAfterMax     = 60
 )
 
 var (
@@ -66,12 +80,17 @@ type ServerOptions struct {
 	Config          func() wire.AgentConfig // nil: /agent/v1/config is not served
 	Log             logr.Logger
 	Now             func() time.Time // certificate reload and rate-limit clock; nil: time.Now
+	IngestBudget    int64            // bytes of bodies read and handled at once; 0: 256 MiB
+	IngestWait      time.Duration    // a report's wait for budget before 429; 0: 2s
 }
 
 // Server serves /agent/v1 over TLS on the leader.
 type Server struct {
-	o     ServerOptions
-	fails *failLimiter // failed authentications per source IP
+	o      ServerOptions
+	fails  *failLimiter        // failed authentications per source IP
+	budget *semaphore.Weighted // the ingest budget, by body bytes
+	// held and peak are the budget bytes held now and at most, for tests.
+	held, peak atomic.Int64
 }
 
 // NewServer returns the agent API server.
@@ -85,8 +104,52 @@ func NewServer(o ServerOptions) *Server {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Server{o: o, fails: newFailLimiter()}
+	if o.IngestBudget <= 0 {
+		o.IngestBudget = defaultIngestBudget
+	}
+	if o.IngestWait <= 0 {
+		o.IngestWait = defaultIngestWait
+	}
+	return &Server{o: o, fails: newFailLimiter(), budget: semaphore.NewWeighted(o.IngestBudget)}
 }
+
+// acquire takes n bytes of the ingest budget, waiting at most wait (no limit when 0) and while ctx lasts.
+// It returns the release func, or false when the budget could not be had.
+func (s *Server) acquire(ctx context.Context, n int64, wait time.Duration) (func(), bool) {
+	if wait > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, wait)
+		defer cancel()
+	}
+	if err := s.budget.Acquire(ctx, n); err != nil {
+		return nil, false
+	}
+	held := s.held.Add(n)
+	for {
+		peak := s.peak.Load()
+		if held <= peak || s.peak.CompareAndSwap(peak, held) {
+			break
+		}
+	}
+	return func() {
+		s.held.Add(-n)
+		s.budget.Release(n)
+	}, true
+}
+
+// bodyWeight is the budget a request body takes: its Content-Length, or limit when it has none, never more
+// than limit nor than the whole budget, and at least 1.
+func (s *Server) bodyWeight(r *http.Request, limit int64) int64 {
+	n := r.ContentLength
+	if n < 0 || n > limit {
+		n = limit
+	}
+	return min(max(n, 1), s.o.IngestBudget)
+}
+
+// retryAfter is a Retry-After in seconds, spread between retryAfterMin and retryAfterMax so deferred agents
+// do not come back together.
+func retryAfter() int { return retryAfterMin + rand.IntN(retryAfterMax-retryAfterMin+1) } //nolint:gosec // jitter, not a secret
 
 // NeedLeaderElection makes the agent API leader-only: reports write the leader's store.
 func (s *Server) NeedLeaderElection() bool { return true }
@@ -177,10 +240,12 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
-// statusWriter records the status a handler answers with.
+// statusWriter records the status a handler answers with, and whether a 429 deferred the request for the
+// ingest budget rather than rejecting it.
 type statusWriter struct {
 	http.ResponseWriter
-	status int
+	status   int
+	deferred bool
 }
 
 func (w *statusWriter) WriteHeader(code int) {
@@ -261,11 +326,20 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity,
 	return id, true
 }
 
+// declaredTooLarge answers 413 for a request whose Content-Length is over max, before any of the body is read
+// or any ingest budget is taken.
+func declaredTooLarge(w http.ResponseWriter, r *http.Request, max int64, what string) bool {
+	if r.ContentLength <= max {
+		return false
+	}
+	writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("%s larger than %d bytes", what, max))
+	return true
+}
+
 // decode reads one JSON value of at most max bytes, answering the request itself when it fails.
 func decode(w http.ResponseWriter, r *http.Request, max int64, what string, v any) bool {
 	tooLarge := fmt.Sprintf("%s larger than %d bytes", what, max)
-	if r.ContentLength > max {
-		writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
+	if declaredTooLarge(w, r, max, what) {
 		return false
 	}
 	// MaxBytesReader tells the server's own writer to close the connection once the limit is hit.
@@ -315,17 +389,52 @@ func nodeMismatch(w http.ResponseWriter, id Identity, node string) bool {
 	return true
 }
 
+// countAnswer counts a report or SBOM result answered with w's status: a 4xx is rejected, by reason, or
+// deferred for the ingest budget. Applied and duplicate reports are counted by the handler.
+func countAnswer(w *statusWriter) {
+	switch {
+	case w.deferred:
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportDeferred, "").Inc()
+	case w.status >= 400 && w.status < 500:
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected, rejectReason(w.status)).Inc()
+	}
+}
+
+// rejectReason is the AgentReports reason of a 4xx status.
+func rejectReason(status int) string {
+	switch status {
+	case http.StatusUnauthorized:
+		return metrics.AgentRejectUnauthenticated
+	case http.StatusTooManyRequests:
+		return metrics.AgentRejectRateLimited
+	case http.StatusForbidden:
+		return metrics.AgentRejectForbidden
+	case http.StatusRequestEntityTooLarge:
+		return metrics.AgentRejectTooLarge
+	}
+	return metrics.AgentRejectBadRequest
+}
+
+// serveReport takes the report's share of the ingest budget before reading its body, and keeps it until
+// the report is handled (its host part prepared and stored). A report that cannot have it within
+// IngestWait is answered 429 with a jittered Retry-After; the agent resends it without cataloguing again.
 func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
-	defer func() {
-		if w.status >= 400 && w.status < 500 {
-			metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected).Inc()
-		}
-	}()
+	defer countAnswer(w)
 	id, ok := s.authenticate(w, r)
-	if !ok {
+	if !ok || declaredTooLarge(w, r, s.o.MaxReportBytes, "report") {
 		return
 	}
+	release, ok := s.acquire(r.Context(), s.bodyWeight(r, s.o.MaxReportBytes), s.o.IngestWait)
+	if !ok {
+		if r.Context().Err() == nil {
+			w.deferred = true
+			w.Header().Set("Retry-After", strconv.Itoa(retryAfter()))
+			writeError(w, http.StatusTooManyRequests, "the controller is busy; retry later")
+		}
+		return
+	}
+	defer release()
 	var rep wire.Report
 	if !decode(w, r, s.o.MaxReportBytes, "report", &rep) || nodeMismatch(w, id, rep.Node) {
 		return
@@ -338,11 +447,20 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) serveSBOM(w http.ResponseWriter, r *http.Request) {
+// serveSBOM takes the result's share of the ingest budget, waiting for it as long as the request lasts: the
+// agent offers no back-pressure for results, and a result it gives up on expires and counts against the image.
+func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
+	w := &statusWriter{ResponseWriter: rw}
+	defer countAnswer(w)
 	id, ok := s.authenticate(w, r)
-	if !ok {
+	if !ok || declaredTooLarge(w, r, s.o.MaxSBOMBytes, "SBOM result") {
 		return
 	}
+	release, ok := s.acquire(r.Context(), s.bodyWeight(r, s.o.MaxSBOMBytes), 0)
+	if !ok {
+		return // the agent went away
+	}
+	defer release()
 	var res wire.SBOMResult
 	if !decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res) || nodeMismatch(w, id, res.Node) {
 		return

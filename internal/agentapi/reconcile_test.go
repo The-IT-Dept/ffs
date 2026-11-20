@@ -458,3 +458,50 @@ func TestNodeEvents_TriggerOnAddDeleteLabelOrReady(t *testing.T) {
 	h.OnUpdate(node, notReady)
 	require.Equal(t, 4, n)
 }
+
+// TestReconciler_IdlePassWritesNothing: the grouping and the in-use marks are one transaction that writes
+// only what changed, so a pass over an unchanged cluster writes no row; a pod change writes its row only.
+func TestReconciler_IdlePassWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRehomer{}
+	f := newRecFixture(t, fr)
+	fr.st = f.st
+	seedGroup(t, f.st, grpA, hostPkg(nodegroup.GroupDigest(grpA), "deb", "openssl", "3.0.13-0ubuntu1", ""))
+	img1, img2 := hexDigest("1"), hexDigest("2")
+	for _, n := range []string{"worker-1", "worker-2", "cp-1"} {
+		report(t, f.st, n, t0)
+		f.fingerprint(t, n, grpA)
+		require.NoError(t, f.st.ReplaceNodeImages(ctx, n, []model.NodeImage{{Digest: img1, Complete: true, Source: "content-store"},
+			{Digest: img2, Complete: true, Source: "content-store"}}))
+	}
+	f.pods.run("worker-1", img1)
+	f.setConfig(func(c *config.Config) { c.NodeAgent.ExposedNodes = "node-role.example.com/edge" })
+	f.pass(t)
+	require.True(t, f.state(t).RuntimeRetired)
+	require.False(t, f.state(t).BaselineReadyAt.IsZero())
+	rows, err := f.st.NodeImages(ctx, "worker-1")
+	require.NoError(t, err)
+	require.True(t, rows[0].InUse)
+	require.False(t, rows[1].InUse)
+
+	changes := func() int64 {
+		t.Helper()
+		n, err := f.st.WriteChanges(ctx)
+		require.NoError(t, err)
+		return n
+	}
+	before := changes()
+	for range 3 {
+		f.clk.Add(time.Minute)
+		f.pass(t)
+	}
+	require.Equal(t, before, changes(), "an idle pass writes nothing")
+
+	f.pods.run("worker-2", img2)
+	f.clk.Add(time.Minute)
+	f.pass(t)
+	require.Equal(t, before+1, changes(), "a new pod writes its image's in-use mark only")
+	rows, err = f.st.NodeImages(ctx, "worker-2")
+	require.NoError(t, err)
+	require.True(t, rows[1].InUse)
+}

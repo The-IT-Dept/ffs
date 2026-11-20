@@ -7,3 +7,10 @@
       annotations:
         summary: "ffs node agents have stopped reporting"
         description: "{{ $value }} nodes have stopped reporting to ffs, so their host packages are not checked. Check the agent DaemonSet pods in the agent namespace."
+    - alert: FFSNodeAgentNeverReported
+      expr: sum(ffs_node_agent_nodes{state=~"reporting|reporting_without_inventory"}) == 0 and sum(ffs_node_agent_nodes{state="never"}) > 0
+      for: 1h
+      labels: {severity: warning}
+      annotations:
+        summary: "No ffs node agent has reported"
+        description: "No node agent has reported to ffs for an hour, so host packages are not checked on any node. Check the agent DaemonSet pods in the agent namespace: their image pull, Pod Security admission, host path mounts and the connection to the controller on the agent API port."

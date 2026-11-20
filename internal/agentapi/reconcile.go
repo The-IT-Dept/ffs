@@ -305,18 +305,18 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	slices.SortFunc(agentIDs, func(a, b string) int {
 		return cmp.Or(cmp.Compare(p.groups[a].g.Label, p.groups[b].g.Label), cmp.Compare(a, b))
 	})
-	if err := st.ApplyNodeGrouping(ctx, store.NodeGrouping{Members: members, Fallback: nodegroup.FallbackGroups(fallback, now),
-		Exposed: exposed, Now: now}); err != nil {
-		return err
-	}
+	inUse := make(map[string][]string, len(agentRows))
 	for _, a := range agentRows {
 		digests, err := r.o.Pods.DigestsOnNode(ctx, a.Node)
 		if err != nil {
 			return fmt.Errorf("pods on %s: %w", a.Node, err)
 		}
-		if err := st.SetNodeImagesInUse(ctx, a.Node, slices.Sorted(maps.Keys(digests))); err != nil {
-			return err
-		}
+		inUse[a.Node] = slices.Sorted(maps.Keys(digests))
+	}
+	// One transaction that writes only what changed: an idle pass writes nothing.
+	if err := st.ApplyNodeGrouping(ctx, store.NodeGrouping{Members: members, Fallback: nodegroup.FallbackGroups(fallback, now),
+		Exposed: exposed, InUse: inUse, Now: now}); err != nil {
+		return err
 	}
 
 	fresh, err := r.fresh(p, nodes, agents, members, state.Unsupported, now)

@@ -46,19 +46,34 @@ var (
 		Help: "Total notification delivery attempts, by alert target and result.",
 	}, []string{"target", "result"})
 
-	// AgentReports counts node agent reports by result: "applied", "duplicate" or "rejected".
+	// AgentReports counts node agent reports by result, "applied", "duplicate", "deferred" or "rejected",
+	// and by reason for rejected ones. Rejected SBOM results are counted too.
 	AgentReports = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ffs_agent_reports_total",
-		Help: "Node agent reports received, by result.",
-	}, []string{"result"})
+		Help: "Node agent reports received, by result; rejected reports and SBOM results also by reason.",
+	}, []string{"result", "reason"})
 )
 
-// AgentReports results.
+// AgentReports results. Deferred is a report answered 429 because the controller's ingest budget was spent.
 const (
 	AgentReportApplied   = "applied"
 	AgentReportDuplicate = "duplicate"
+	AgentReportDeferred  = "deferred"
 	AgentReportRejected  = "rejected"
 )
+
+// AgentReports rejection reasons; every other result has the reason "".
+const (
+	AgentRejectUnauthenticated = "unauthenticated"
+	AgentRejectRateLimited     = "rate_limited"
+	AgentRejectForbidden       = "forbidden"
+	AgentRejectBadRequest      = "bad_request"
+	AgentRejectTooLarge        = "too_large"
+)
+
+// AgentRejectReasons lists every rejection reason.
+var AgentRejectReasons = []string{AgentRejectUnauthenticated, AgentRejectRateLimited, AgentRejectForbidden, AgentRejectBadRequest,
+	AgentRejectTooLarge}
 
 // crsDropped is the name of the gauge the crds package defines and registers itself.
 const crsDropped = "ffs_finding_crs_dropped"
@@ -73,8 +88,11 @@ func Register(reg prometheus.Registerer, c *Collector) error {
 		}
 	}
 	// Every result is exported from the start, so a rate over it never starts from a missing series.
-	for _, r := range []string{AgentReportApplied, AgentReportDuplicate, AgentReportRejected} {
-		AgentReports.WithLabelValues(r)
+	for _, r := range []string{AgentReportApplied, AgentReportDuplicate, AgentReportDeferred} {
+		AgentReports.WithLabelValues(r, "")
+	}
+	for _, reason := range AgentRejectReasons {
+		AgentReports.WithLabelValues(AgentReportRejected, reason)
 	}
 	return nil
 }

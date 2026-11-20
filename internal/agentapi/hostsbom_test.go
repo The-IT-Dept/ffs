@@ -54,7 +54,16 @@ func TestIngest_CoverageOf(t *testing.T) {
 			mutableOS: true, want: []model.NodeCoverageGap{notMounted}},
 		"empty package db, not image-based": {r: wire.Report{Host: &wire.Host{}, Images: withStore}, mutableOS: true,
 			want: []model.NodeCoverageGap{notMounted}},
+		"images-only keeps the host gaps": {r: wire.Report{Kind: wire.KindImages},
+			stored: []model.NodeCoverageGap{store, blocked("/var/lib/rpm"), noDB}, want: []model.NodeCoverageGap{store, noDB, blocked("/var/lib/rpm")}},
+		"images-only sets the content-store gap": {r: wire.Report{Kind: wire.KindImages, Images: &wire.Images{}},
+			stored: []model.NodeCoverageGap{blocked("/var/lib/rpm")}, want: []model.NodeCoverageGap{store, blocked("/var/lib/rpm")}},
+		"images-only clears the content-store gap": {r: wire.Report{Kind: wire.KindImages, Images: withStore},
+			stored: []model.NodeCoverageGap{store, noDB}, want: []model.NodeCoverageGap{noDB}},
 	} {
+		if tc.r.Kind == "" {
+			tc.r.Kind = wire.KindFull
+		}
 		require.Equal(t, tc.want, coverageOf(&tc.r, tc.stored, !tc.mutableOS), name)
 	}
 }

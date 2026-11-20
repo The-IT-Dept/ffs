@@ -25,8 +25,9 @@ import (
 )
 
 const (
-	// hostConcurrency bounds the host documents decoded at once, so a DaemonSet rollout cannot exhaust the
-	// controller's memory.
+	// hostConcurrency bounds the host documents decoded into Syft models at once. The server's ingest
+	// budget bounds the report bodies held meanwhile, and a report keeps its share of it while its host
+	// part is prepared here.
 	hostConcurrency = 2
 	// hostKeyPrefix keys a node's host processing in acquisitions_inflight and agent_jobs.
 	hostKeyPrefix = "nodehost:"
@@ -35,6 +36,9 @@ const (
 	hostQuarantineFor   = 24 * time.Hour
 	// reasonHostStale is the counted failure of a host acquisition the controller never ended.
 	reasonHostStale = "the controller stopped while processing the host inventory"
+	// hostStoreTimeout bounds storing one group's host SBOM. The store runs detached from the request that
+	// started it, since other nodes' reports of the same fingerprint wait on it.
+	hostStoreTimeout = 2 * time.Minute
 )
 
 // AgentIngest stores an agent-catalogued SBOM; *sbom.Acquirer implements it.
@@ -111,7 +115,9 @@ type hostGate struct {
 }
 
 // Report applies one report (see Contract › Data flows › Report). A duplicate writes nothing and answers
-// Applied false.
+// Applied false. A full report whose host part was not stored for a reason that may pass (a transient
+// failure, the node's host part already in progress, or a duplicate that lost the race to an earlier copy)
+// answers HostRetry, so the agent resends it on its backoff rather than in reportInterval.
 func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wire.ReportResponse, error) {
 	cfg := WireConfig(i.o.Config)
 	if r.Kind != wire.KindFull && r.Kind != wire.KindImages {
@@ -124,13 +130,18 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 	if !ok {
 		return wire.ReportResponse{}, fmt.Errorf("%w: node %s is not in the cluster", ErrForbidden, id.Node)
 	}
-	stored, err := i.storedRow(ctx, id.Node)
+	row, found, err := i.o.Store.AgentNode(ctx, id.Node)
 	if err != nil {
 		return wire.ReportResponse{}, err
 	}
-	rep := store.AgentReport{Node: id.Node, AgentVersion: r.AgentVersion, BootID: r.BootID, StartedAt: r.StartedAt, Seq: r.Seq}
+	var stored *store.AgentNode
+	if found {
+		stored = &row
+	}
+	rep := store.AgentReport{Node: id.Node, AgentVersion: r.AgentVersion, BootID: r.BootID, Instance: r.Instance,
+		StartedAt: r.StartedAt, Seq: r.Seq}
 	if stored != nil && rep.DuplicateOf(*stored) {
-		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate).Inc()
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate, "").Inc()
 		return wire.ReportResponse{Applied: false, Config: cfg}, nil
 	}
 
@@ -167,12 +178,15 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 		return wire.ReportResponse{}, err
 	}
 	if !applied {
-		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate).Inc()
-		return wire.ReportResponse{Applied: false, Config: cfg}, nil
+		// An earlier copy of this report was applied while this one prepared its host part, so this one's host
+		// part is not stored: the agent sends it again rather than waiting reportInterval.
+		metrics.AgentReports.WithLabelValues(metrics.AgentReportDuplicate, "").Inc()
+		return wire.ReportResponse{Applied: false, HostRetry: gate.prep != nil, Config: cfg}, nil
 	}
-	metrics.AgentReports.WithLabelValues(metrics.AgentReportApplied).Inc()
+	metrics.AgentReports.WithLabelValues(metrics.AgentReportApplied, "").Inc()
 
-	if err := i.storeHost(ctx, id.Node, r, gate, now); err != nil {
+	hostRetry, err := i.storeHost(ctx, id.Node, r, gate, now)
+	if err != nil {
 		return wire.ReportResponse{}, err
 	}
 	if r.Images != nil {
@@ -183,7 +197,7 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 	if i.o.Trigger != nil {
 		i.o.Trigger()
 	}
-	resp := wire.ReportResponse{Applied: true, Config: cfg}
+	resp := wire.ReportResponse{Applied: true, HostRetry: hostRetry, Config: cfg}
 	if i.o.Work != nil {
 		work, err := i.o.Work.Offer(ctx, id.Node)
 		if err != nil {
@@ -193,20 +207,6 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 		}
 	}
 	return resp, nil
-}
-
-// storedRow reads node's nodes_agent row; nil when it has none.
-func (i *Ingester) storedRow(ctx context.Context, node string) (*store.AgentNode, error) {
-	rows, err := i.o.Store.AgentNodes(ctx)
-	if err != nil {
-		return nil, err
-	}
-	for k := range rows {
-		if rows[k].Node == node {
-			return &rows[k], nil
-		}
-	}
-	return nil, nil
 }
 
 // hostGate decides whether this report's host part is processed and prepares it. A node already in host
@@ -327,25 +327,31 @@ func quarantineText(job store.AgentJob) string {
 }
 
 // storeHost writes the host part of an applied full report: the group SBOM once per fingerprint, then the
-// node's fingerprint, then the group row. On failure the node keeps its current group.
-func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, gate hostGate, now time.Time) error {
+// node's fingerprint, then the group row. On failure the node keeps its current group. retry says the host
+// part was not stored for a reason that may pass: another report of the node is processing it, or a
+// transient failure.
+func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, gate hostGate, now time.Time) (retry bool, err error) {
 	st := i.o.Store
 	switch {
 	case r.Kind != wire.KindFull:
-		return nil
+		return false, nil
 	case r.Host == nil:
 		// The node shows host_not_inventoried with this text until a full report carries its host part.
-		return st.SetAgentError(ctx, node, hostNotSent(r.Problems))
+		return false, st.SetAgentError(ctx, node, hostNotSent(r.Problems))
 	case gate.skipErr != "":
-		return st.SetAgentError(ctx, node, gate.skipErr)
+		return false, st.SetAgentError(ctx, node, gate.skipErr)
 	case gate.prepErr != nil:
-		return st.SetAgentError(ctx, node, "host inventory could not be read: "+gate.prepErr.Error())
+		return false, st.SetAgentError(ctx, node, "host inventory could not be read: "+gate.prepErr.Error())
 	case gate.prep == nil:
-		return nil // already being processed by another report of this node
+		return true, nil // already being processed by another report of this node
 	}
 	prep := gate.prep
 	hk := hostKeyPrefix + node
 	v, err, _ := i.flight.Do(prep.Fingerprint, func() (ingested any, err error) {
+		// Detached from the request that leads: every report of this fingerprint waits on it, so a leader
+		// that disconnects must not fail them.
+		fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), hostStoreTimeout)
+		defer cancel()
 		// A panic is a counted failure, so a document that panics the acquirer is quarantined rather than
 		// stored again on every full report.
 		defer func() {
@@ -356,23 +362,24 @@ func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, g
 			}
 		}()
 		digest := nodegroup.GroupDigest(prep.Fingerprint)
-		img, ok, err := st.GetImage(ctx, digest)
+		img, ok, err := st.GetImage(fctx, digest)
 		if err != nil {
 			return false, &sbom.AcquireError{Kind: sbom.FailTransient, Reason: "reading the image", Err: err}
 		}
 		if ok && img.Status == model.ImageCatalogued {
 			return false, nil
 		}
-		return true, i.o.Acquirer.Ingest(ctx, sbom.Request{Repo: model.HostRepo, Digest: digest, Platform: "linux/" + r.Arch},
+		return true, i.o.Acquirer.Ingest(fctx, sbom.Request{Repo: model.HostRepo, Digest: digest, Platform: "linux/" + r.Arch},
 			&sbom.Result{SyftJSON: prep.SyftJSON, Source: sbom.SourceAgent})
 	})
 	if err != nil {
 		if werr := st.SetAgentError(ctx, node, "host inventory not stored: "+err.Error()); werr != nil {
-			return werr
+			return false, werr
 		}
 		quarantineAfter := 0
 		switch sbom.KindOf(err) {
 		case sbom.FailTransient:
+			retry = true
 		case sbom.FailQuarantine:
 			quarantineAfter = 1
 		default:
@@ -380,22 +387,22 @@ func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, g
 		}
 		if quarantineAfter > 0 {
 			if _, werr := st.RecordAgentJobFailure(ctx, hk, node, err.Error(), now, quarantineAfter, hostQuarantineFor); werr != nil {
-				return werr
+				return false, werr
 			}
 		}
 		i.o.Log.Info("host inventory not stored", "node", node, "error", err.Error())
-		return nil
+		return retry, nil
 	}
 	if err := st.SetAgentFingerprint(ctx, node, prep.Fingerprint); err != nil {
-		return err
+		return false, err
 	}
 	if ingested, _ := v.(bool); ingested {
 		if err := st.SetAgentError(ctx, node, ""); err != nil {
-			return err
+			return false, err
 		}
 	}
 	if err := st.PutNodeGroup(ctx, prep.Group, now); err != nil {
-		return err
+		return false, err
 	}
-	return st.ClearAgentJob(ctx, hk)
+	return false, st.ClearAgentJob(ctx, hk)
 }

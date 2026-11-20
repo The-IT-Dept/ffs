@@ -195,15 +195,23 @@ func mainModuleOf(meta any) (string, bool) {
 	return "", false
 }
 
-// coverageOf derives a report's coverage gaps, de-duplicated and sorted by code and detail. A report without
-// Images keeps the stored content-store gap. A missing package database is an image-based OS only when
-// imageBased says so (imageBasedOS); on any other OS the database was not mounted.
+// coverageOf derives a report's coverage gaps, de-duplicated and sorted by code and detail. An images-only
+// report carries no host part, so it keeps the stored gaps but the content-store one, which its images
+// decide; a report without Images keeps the stored content-store gap. A missing package database is an
+// image-based OS only when imageBased says so (imageBasedOS); on any other OS the database was not mounted.
 func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool) []model.NodeCoverageGap {
 	noDB := model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: detailPackageDBNotMounted}
 	if imageBased {
 		noDB.Detail = detailNoPackageDatabase
 	}
 	var gaps []model.NodeCoverageGap
+	if r.Kind != wire.KindFull {
+		for _, g := range stored {
+			if g.Code != model.GapContentStoreUnreadable {
+				gaps = append(gaps, g)
+			}
+		}
+	}
 	denied := false
 	for _, p := range r.Problems {
 		switch p.Code {

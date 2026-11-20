@@ -94,7 +94,7 @@ func TestCollector_NoHighCardinalityLabels(t *testing.T) {
 
 	allowed := map[string]bool{}
 	for _, l := range []string{"namespace", "owner_kind", "owner_name", "priority", "fixable", "kev", "feed", "registry", "target",
-		"result", "source", "le", "state", "kind"} {
+		"result", "reason", "source", "le", "state", "kind"} {
 		allowed[l] = true
 	}
 	var n int
@@ -206,10 +206,15 @@ func TestMetrics_NamesAndAgentReportsRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	require.NoError(t, metrics.Register(reg, metrics.NewCollector(newStore(t), metrics.CollectorOptions{})))
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-# HELP ffs_agent_reports_total Node agent reports received, by result.
+# HELP ffs_agent_reports_total Node agent reports received, by result; rejected reports and SBOM results also by reason.
 # TYPE ffs_agent_reports_total counter
-ffs_agent_reports_total{result="applied"} 0
-ffs_agent_reports_total{result="duplicate"} 0
-ffs_agent_reports_total{result="rejected"} 0
+ffs_agent_reports_total{reason="",result="applied"} 0
+ffs_agent_reports_total{reason="",result="deferred"} 0
+ffs_agent_reports_total{reason="",result="duplicate"} 0
+ffs_agent_reports_total{reason="bad_request",result="rejected"} 0
+ffs_agent_reports_total{reason="forbidden",result="rejected"} 0
+ffs_agent_reports_total{reason="rate_limited",result="rejected"} 0
+ffs_agent_reports_total{reason="too_large",result="rejected"} 0
+ffs_agent_reports_total{reason="unauthenticated",result="rejected"} 0
 `), "ffs_agent_reports_total"))
 }

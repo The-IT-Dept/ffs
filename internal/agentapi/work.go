@@ -24,6 +24,10 @@ import (
 const (
 	defaultWorkQuarantineAfter = 2
 	defaultWorkQuarantineFor   = 24 * time.Hour
+	// reasonOfferExpired is the counted failure of an offer that expired without a result: the agent was
+	// probably killed cataloguing the image (out of memory, or past its deadline), so an image that keeps
+	// doing it is quarantined like one whose cataloguer fails (spec §9.3).
+	reasonOfferExpired = "the node agent sent no result before the request expired"
 )
 
 // offeredClasses are the unresolvable images a node agent may catalogue from its content store.
@@ -109,7 +113,13 @@ func (q *WorkQueue) Offer(ctx context.Context, node string) ([]wire.WorkRequest,
 			candidates = append(candidates, img)
 		}
 	}
-	q.forget(now, offerable)
+	for d, o := range q.forget(now, offerable) {
+		q.o.Log.Info("node agent sent no result for an image before the request expired", "node", o.node, "digest", d)
+		if _, err := q.o.Store.RecordAgentJobFailure(ctx, d, o.node, reasonOfferExpired, now, q.o.QuarantineAfter,
+			q.o.QuarantineFor); err != nil {
+			return nil, err
+		}
+	}
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -170,8 +180,9 @@ func (q *WorkQueue) Offer(ctx context.Context, node string) ([]wire.WorkRequest,
 }
 
 // forget records when each offerable digest was first seen, and drops what is no longer needed: the order of
-// digests that are no longer offerable, expired offers and expired declines.
-func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) {
+// digests that are no longer offerable, expired offers and expired declines. It returns the expired offers of
+// digests still offerable, by digest, for the caller to count.
+func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) map[string]offer {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	for d := range offerable {
@@ -184,9 +195,17 @@ func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) {
 			delete(q.seen, d)
 		}
 	}
+	var expired map[string]offer
 	for d, o := range q.offers {
-		if !o.deadline.After(now) {
-			delete(q.offers, d)
+		if o.deadline.After(now) {
+			continue
+		}
+		delete(q.offers, d)
+		if offerable[d] {
+			if expired == nil {
+				expired = map[string]offer{}
+			}
+			expired[d] = o
 		}
 	}
 	for k, until := range q.declined {
@@ -194,6 +213,7 @@ func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) {
 			delete(q.declined, k)
 		}
 	}
+	return expired
 }
 
 func offerID() (string, error) {
@@ -316,21 +336,9 @@ func (q *WorkQueue) unavailable(ctx context.Context, id Identity, res *wire.SBOM
 	if res.Unavailable != wire.UnavailableLayersDiscarded {
 		return nil
 	}
-	nodes, err := q.o.Store.AgentNodes(ctx)
-	if err != nil {
+	held, err := q.o.Store.HeldCompleteElsewhere(ctx, res.Digest, img.IndexDigest, id.Node)
+	if err != nil || held {
 		return err
-	}
-	for _, n := range nodes {
-		if n.Node == id.Node {
-			continue
-		}
-		rows, err := q.o.Store.NodeImages(ctx, n.Node)
-		if err != nil {
-			return err
-		}
-		if heldComplete(rows, res.Digest, img.IndexDigest) {
-			return nil
-		}
 	}
 	_, err = q.o.Store.SetImageStatusReason(ctx, res.Digest, inventory.ReasonLayersDiscarded)
 	return err

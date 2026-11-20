@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"time"
 
@@ -18,7 +19,8 @@ const agentHostJobPrefix = "nodehost:"
 // AgentReport is one agent report as the store applies it.
 type AgentReport struct {
 	Node, AgentVersion, BootID string
-	StartedAt                  time.Time // when the reporting agent process started
+	Instance                   string    // random per agent process start; with BootID and Seq it orders reports
+	StartedAt                  time.Time // when the reporting agent process started; shown only, never orders reports
 	Seq                        uint64    // per-process report counter, starting at 1
 	At                         time.Time // when the report was received; zero means now
 	// Full is false for an images-only report, whose host fields below are ignored.
@@ -26,23 +28,25 @@ type AgentReport struct {
 	KernelRelease, Arch, PackageDB string
 	RebootPending                  bool
 	RebootReason                   string
-	Coverage                       []model.NodeCoverageGap
-	Problems                       []string
+	// Coverage is the node's coverage gaps after this report, written for every applied report: the
+	// caller carries the last full report's host gaps into an images-only report.
+	Coverage []model.NodeCoverageGap
+	Problems []string
 }
 
-// DuplicateOf reports whether r is a duplicate or stale report given the node's stored row: the
-// stored boot ID equals r's and r comes from an earlier process of that boot, or from the same
-// process with a sequence number no higher than the stored one.
+// DuplicateOf reports whether r is a duplicate or stale report given the node's stored row: the same
+// boot and the same agent process (Instance) as the stored report, with a sequence number no higher
+// than the stored one. A report of another boot, or of another process of the same boot (a newer
+// one: the older has exited), is never a duplicate and starts a new sequence. The wall clock, which
+// can step back, never orders reports.
 func (r AgentReport) DuplicateOf(n AgentNode) bool {
-	if n.BootID != r.BootID {
-		return false
-	}
-	return r.StartedAt.Before(n.StartedAt) || (r.StartedAt.Equal(n.StartedAt) && r.Seq <= n.Seq)
+	return n.BootID == r.BootID && n.Instance == r.Instance && r.Seq <= n.Seq
 }
 
 // AgentNode is one nodes_agent row.
 type AgentNode struct {
 	Node, AgentVersion, BootID string
+	Instance                   string
 	StartedAt                  time.Time
 	Seq                        uint64
 	LastReport, LastFullReport time.Time
@@ -57,7 +61,7 @@ type AgentNode struct {
 	Problems                   []string
 }
 
-const agentNodeCols = `node, agent_version, boot_id, started_at, seq, last_report, last_full_report, last_error,
+const agentNodeCols = `node, agent_version, boot_id, instance, started_at, seq, last_report, last_full_report, last_error,
 	kernel_release, arch, package_db, fingerprint, group_id, reboot_pending, reboot_reason, coverage, problems`
 
 func scanAgentNode(r scanner) (AgentNode, error) {
@@ -67,7 +71,7 @@ func scanAgentNode(r scanner) (AgentNode, error) {
 		seq                     int64
 		coverage, problems      string
 	)
-	if err := r.Scan(&n.Node, &n.AgentVersion, &n.BootID, &started, &seq, &last, &lastFull, &n.LastError,
+	if err := r.Scan(&n.Node, &n.AgentVersion, &n.BootID, &n.Instance, &started, &seq, &last, &lastFull, &n.LastError,
 		&n.KernelRelease, &n.Arch, &n.PackageDB, &n.Fingerprint, &n.GroupID, &n.RebootPending, &n.RebootReason,
 		&coverage, &problems); err != nil {
 		return AgentNode{}, err
@@ -100,12 +104,26 @@ func (s *Store) AgentNodes(ctx context.Context) ([]AgentNode, error) {
 	return queryAll(ctx, s.rdb, scanAgentNode, `SELECT `+agentNodeCols+` FROM nodes_agent ORDER BY node`)
 }
 
+// WriteChanges returns how many rows the writer connection has inserted, updated or deleted since it
+// opened (SQLite total_changes), so a caller can tell whether a pass wrote anything.
+func (s *Store) WriteChanges(ctx context.Context) (int64, error) {
+	var n int64
+	err := s.wdb.QueryRowContext(ctx, `SELECT total_changes()`).Scan(&n)
+	return n, err
+}
+
+// AgentNode returns node's nodes_agent row; false when it has none.
+func (s *Store) AgentNode(ctx context.Context, node string) (AgentNode, bool, error) {
+	return agentNodeOf(ctx, s.rdb, node)
+}
+
 // AcceptAgentReport applies r in one transaction and reports whether it was applied. A duplicate
 // or stale report (r.DuplicateOf the stored row) writes nothing.
 //
-// An applied report writes the agent version, boot ID, process start, sequence and last_report =
-// r.At (zero means now). A Full report also writes last_full_report, the host fields, coverage and
-// problems, and clears last_error. A report never writes the fingerprint or the group.
+// An applied report writes the agent version, boot ID, instance, process start, sequence,
+// last_report = r.At (zero means now) and the coverage. A Full report also writes
+// last_full_report, the host fields and problems, and clears last_error. A report never writes
+// the fingerprint or the group.
 func (s *Store) AcceptAgentReport(ctx context.Context, r AgentReport) (applied bool, err error) {
 	at := orNow(r.At)
 	err = s.inTx(ctx, func(tx *sql.Tx) error {
@@ -119,21 +137,21 @@ func (s *Store) AcceptAgentReport(ctx context.Context, r AgentReport) (applied b
 		if _, err := tx.ExecContext(ctx, `INSERT INTO nodes_agent(node) VALUES(?) ON CONFLICT(node) DO NOTHING`, r.Node); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE nodes_agent SET agent_version = ?, boot_id = ?, started_at = ?, seq = ?,
-			last_report = ? WHERE node = ?`,
-			r.AgentVersion, r.BootID, nanos(r.StartedAt), int64(r.Seq), nanos(at), r.Node); err != nil {
+		coverage := "[]"
+		if len(r.Coverage) > 0 {
+			if coverage, err = jsonText(r.Coverage); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes_agent SET agent_version = ?, boot_id = ?, instance = ?, started_at = ?,
+			seq = ?, last_report = ?, coverage = ? WHERE node = ?`,
+			r.AgentVersion, r.BootID, r.Instance, nanos(r.StartedAt), int64(r.Seq), nanos(at), coverage, r.Node); err != nil {
 			return err
 		}
 		if r.Full {
-			coverage := "[]"
-			if len(r.Coverage) > 0 {
-				if coverage, err = jsonText(r.Coverage); err != nil {
-					return err
-				}
-			}
 			if _, err := tx.ExecContext(ctx, `UPDATE nodes_agent SET last_full_report = ?, kernel_release = ?, arch = ?,
-				package_db = ?, reboot_pending = ?, reboot_reason = ?, coverage = ?, problems = ?, last_error = '' WHERE node = ?`,
-				nanos(at), r.KernelRelease, r.Arch, r.PackageDB, r.RebootPending, r.RebootReason, coverage,
+				package_db = ?, reboot_pending = ?, reboot_reason = ?, problems = ?, last_error = '' WHERE node = ?`,
+				nanos(at), r.KernelRelease, r.Arch, r.PackageDB, r.RebootPending, r.RebootReason,
 				stringsText(r.Problems), r.Node); err != nil {
 				return err
 			}
@@ -178,7 +196,7 @@ func (s *Store) PutNodeGroup(ctx context.Context, g model.NodeGroup, now time.Ti
 	return s.inTx(ctx, func(tx *sql.Tx) error { return putNodeGroupTx(ctx, tx, g, orNow(now)) })
 }
 
-// putNodeGroupTx is the one node_groups upsert, shared by PutNodeGroup and ApplyNodeGrouping.
+// putNodeGroupTx is PutNodeGroup inside tx: g keeps the stored row's exposure.
 func putNodeGroupTx(ctx context.Context, tx *sql.Tx, g model.NodeGroup, now time.Time) error {
 	if g.ID == "" {
 		return errors.New("store: node group without an ID")
@@ -191,16 +209,7 @@ func putNodeGroupTx(ctx context.Context, tx *sql.Tx, g model.NodeGroup, now time
 	if ok {
 		g.ExposedNodes = stored.ExposedNodes
 	}
-	g.Members, g.FirstSeen, g.LastSeen = nil, time.Time{}, time.Time{}
-	data, err := jsonText(g)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO node_groups(id, kind, label, digest, data, first_seen, last_seen)
-		VALUES(?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET kind = excluded.kind, label = excluded.label, digest = excluded.digest, data = excluded.data`,
-		g.ID, string(g.Kind), g.Label, g.Digest, data, nanos(now), nanos(now))
-	return err
+	return writeNodeGroupTx(ctx, tx, g, now)
 }
 
 // nodeGroupRow reads one node_groups row, with its times and without Members.
@@ -238,19 +247,29 @@ type NodeGrouping struct {
 	Members  map[string]string   // node → group ID, for every node
 	Fallback []model.NodeGroup   // the nodeinfo groups of nodes outside an agent group
 	Exposed  map[string][]string // group ID → its members matching the exposed-node selector
-	Now      time.Time           // zero means now
+	// InUse is node → the digests its pods run, for the nodes whose cached images' in_use is set as
+	// SetNodeImagesInUse does; nodes not in it are left alone.
+	InUse map[string][]string
+	Now   time.Time // zero means now
 }
 
-// ApplyNodeGrouping writes g in one transaction:
+// lastSeenEvery is how often the last_seen of a group with members is moved forward: often enough to
+// show, rarely enough that a pass with nothing new writes nothing.
+const lastSeenEvery = 10 * time.Minute
+
+// ApplyNodeGrouping writes g in one transaction, writing only what differs from the stored rows, so
+// a pass that changes nothing writes nothing:
 //
 //  1. the Fallback groups are upserted like PutNodeGroup;
-//  2. node_group_members is replaced with Members, as given (a group ID without a row included);
+//  2. node_group_members is made Members, as given (a group ID without a row included);
 //  3. nodes_agent.group_id is the node's group when that is an agent group, else "" (a node in a
 //     nodeinfo group or outside Members);
-//  4. every group's exposure is rewritten from Exposed, sorted, nil when absent;
-//  5. groups with members are seen at Now;
+//  4. every group's exposure is Exposed's, sorted, nil when absent;
+//  5. groups with members are seen at Now, once last_seen is lastSeenEvery old;
 //  6. memberless nodeinfo groups, and memberless agent groups that no nodes_agent fingerprint names,
-//     are deleted.
+//     are deleted;
+//  7. the cached images of each node in InUse are marked in use exactly when a digest of its pods
+//     names them (SetNodeImagesInUse).
 func (s *Store) ApplyNodeGrouping(ctx context.Context, g NodeGrouping) error {
 	now := orNow(g.Now)
 	exposed := make(map[string][]string, len(g.Exposed))
@@ -259,40 +278,29 @@ func (s *Store) ApplyNodeGrouping(ctx context.Context, g NodeGrouping) error {
 			exposed[id] = slices.Sorted(slices.Values(nodes))
 		}
 	}
-	exposedJSON, err := jsonText(exposed)
-	if err != nil {
-		return err
-	}
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		for _, fb := range g.Fallback {
-			if err := putNodeGroupTx(ctx, tx, fb, now); err != nil {
+			fb.ExposedNodes = exposed[fb.ID]
+			if err := writeNodeGroupTx(ctx, tx, fb, now); err != nil {
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM node_group_members`); err != nil {
+		if err := replaceMembersTx(ctx, tx, g.Members); err != nil {
 			return err
 		}
-		ins, err := tx.PrepareContext(ctx, `INSERT INTO node_group_members(node, group_id) VALUES(?, ?)`)
-		if err != nil {
+		if err := setExposureTx(ctx, tx, exposed); err != nil {
 			return err
 		}
-		defer func() { _ = ins.Close() }()
-		for node, id := range g.Members {
-			if _, err := ins.ExecContext(ctx, node, id); err != nil {
-				return err
-			}
-		}
+		const groupOf = `COALESCE((SELECT m.group_id FROM node_group_members m JOIN node_groups ng ON ng.id = m.group_id
+			WHERE m.node = nodes_agent.node AND ng.kind = ?), '')`
+		agent := string(model.NodeGroupAgent)
 		for _, q := range []struct {
 			query string
 			args  []any
 		}{
-			{`UPDATE nodes_agent SET group_id = COALESCE((SELECT m.group_id FROM node_group_members m
-				JOIN node_groups g ON g.id = m.group_id WHERE m.node = nodes_agent.node AND g.kind = ?), '')`,
-				[]any{string(model.NodeGroupAgent)}},
-			{`UPDATE node_groups SET data = json_remove(data, '$.exposedNodes')`, nil},
-			{`UPDATE node_groups SET data = json_set(data, '$.exposedNodes', json(e.value))
-				FROM json_each(?) e WHERE e.key = node_groups.id`, []any{exposedJSON}},
-			{`UPDATE node_groups SET last_seen = ? WHERE id IN (SELECT group_id FROM node_group_members)`, []any{nanos(now)}},
+			{`UPDATE nodes_agent SET group_id = ` + groupOf + ` WHERE group_id <> ` + groupOf, []any{agent, agent}},
+			{`UPDATE node_groups SET last_seen = ? WHERE id IN (SELECT group_id FROM node_group_members)
+				AND (last_seen IS NULL OR last_seen <= ?)`, []any{nanos(now), nanos(now.Add(-lastSeenEvery))}},
 			{`DELETE FROM node_groups WHERE id NOT IN (SELECT group_id FROM node_group_members)
 				AND (kind = ? OR NOT EXISTS (SELECT 1 FROM nodes_agent a WHERE a.fingerprint = node_groups.id))`,
 				[]any{string(model.NodeGroupNodeInfo)}},
@@ -301,13 +309,122 @@ func (s *Store) ApplyNodeGrouping(ctx context.Context, g NodeGrouping) error {
 				return fmt.Errorf("store: apply node grouping: %w", err)
 			}
 		}
+		for _, node := range slices.Sorted(maps.Keys(g.InUse)) {
+			if err := setInUseTx(ctx, tx, node, g.InUse[node]); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
 }
 
+// writeNodeGroupTx upserts g with g.ExposedNodes as its exposure, writing nothing when the stored row
+// is the same. Its Members and times are not stored in data; a new row is first and last seen at now.
+func writeNodeGroupTx(ctx context.Context, tx *sql.Tx, g model.NodeGroup, now time.Time) error {
+	if g.ID == "" {
+		return errors.New("store: node group without an ID")
+	}
+	g.Members, g.FirstSeen, g.LastSeen = nil, time.Time{}, time.Time{}
+	data, err := jsonText(g)
+	if err != nil {
+		return err
+	}
+	var kind, label, digest, stored string
+	err = tx.QueryRowContext(ctx, `SELECT kind, label, digest, data FROM node_groups WHERE id = ?`, g.ID).
+		Scan(&kind, &label, &digest, &stored)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		_, err = tx.ExecContext(ctx, `INSERT INTO node_groups(id, kind, label, digest, data, first_seen, last_seen)
+			VALUES(?, ?, ?, ?, ?, ?, ?)`, g.ID, string(g.Kind), g.Label, g.Digest, data, nanos(now), nanos(now))
+		return err
+	case err != nil:
+		return err
+	case kind == string(g.Kind) && label == g.Label && digest == g.Digest && stored == data:
+		return nil
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE node_groups SET kind = ?, label = ?, digest = ?, data = ? WHERE id = ?`,
+		string(g.Kind), g.Label, g.Digest, data, g.ID)
+	return err
+}
+
+// replaceMembersTx makes node_group_members members, deleting and inserting only the rows that differ.
+func replaceMembersTx(ctx context.Context, tx *sql.Tx, members map[string]string) error {
+	type row struct{ node, group string }
+	stored, err := queryAll(ctx, tx, func(r scanner) (row, error) {
+		var x row
+		err := r.Scan(&x.node, &x.group)
+		return x, err
+	}, `SELECT node, group_id FROM node_group_members`)
+	if err != nil {
+		return err
+	}
+	have := make(map[string]string, len(stored))
+	for _, x := range stored {
+		have[x.node] = x.group
+	}
+	for node, group := range have {
+		if want, ok := members[node]; !ok || want != group {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM node_group_members WHERE node = ?`, node); err != nil {
+				return err
+			}
+		}
+	}
+	for _, node := range slices.Sorted(maps.Keys(members)) {
+		if group, ok := have[node]; ok && group == members[node] {
+			continue
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO node_group_members(node, group_id) VALUES(?, ?)`, node, members[node]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setExposureTx sets every stored group's exposure to exposed's, rewriting only the groups whose
+// exposure differs.
+func setExposureTx(ctx context.Context, tx *sql.Tx, exposed map[string][]string) error {
+	type row struct{ id, data string }
+	rows, err := queryAll(ctx, tx, func(r scanner) (row, error) {
+		var x row
+		err := r.Scan(&x.id, &x.data)
+		return x, err
+	}, `SELECT id, data FROM node_groups`)
+	if err != nil {
+		return err
+	}
+	for _, x := range rows {
+		var g model.NodeGroup
+		if err := json.Unmarshal([]byte(x.data), &g); err != nil {
+			return fmt.Errorf("node group %s: %w", x.id, err)
+		}
+		if slices.Equal(g.ExposedNodes, exposed[x.id]) {
+			continue
+		}
+		g.ExposedNodes = exposed[x.id]
+		data, err := jsonText(g)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE node_groups SET data = ? WHERE id = ?`, data, x.id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// setInUseTx is SetNodeImagesInUse inside tx, writing only the rows whose in_use changes.
+func setInUseTx(ctx context.Context, e execer, node string, digests []string) error {
+	list := idList(digests)
+	const inUse = `(digest IN (SELECT value FROM json_each(?)) OR (config_digest <> '' AND config_digest IN (SELECT value FROM json_each(?))))`
+	_, err := e.ExecContext(ctx, `UPDATE node_images SET in_use = `+inUse+` WHERE node = ? AND in_use <> `+inUse,
+		list, list, node, list, list)
+	return err
+}
+
 // PruneAgentNodes deletes the agent state of every node not in live: its nodes_agent,
-// node_images and node_group_members rows and its host inventory's agent_jobs row. An empty live
-// is an error and deletes nothing, so an informer that has not synced never wipes agent state.
+// node_images and node_group_members rows, and its host inventory's agent_jobs and
+// acquisitions_inflight rows. An empty live is an error and deletes nothing, so an informer that
+// has not synced never wipes agent state.
 func (s *Store) PruneAgentNodes(ctx context.Context, live []string) error {
 	if len(live) == 0 {
 		return errors.New("store: prune agent nodes without live nodes")
@@ -323,10 +440,14 @@ func (s *Store) PruneAgentNodes(ctx context.Context, live []string) error {
 				return fmt.Errorf("store: prune agent nodes: %w", err)
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM agent_jobs WHERE substr(digest, 1, ?) = ?
-			AND substr(digest, ?) NOT IN (SELECT value FROM json_each(?))`,
-			len(agentHostJobPrefix), agentHostJobPrefix, len(agentHostJobPrefix)+1, list); err != nil {
-			return fmt.Errorf("store: prune agent nodes: %w", err)
+		for _, q := range []string{
+			`DELETE FROM agent_jobs WHERE substr(digest, 1, ?) = ? AND substr(digest, ?) NOT IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM acquisitions_inflight WHERE substr(digest, 1, ?) = ?
+				AND substr(digest, ?) NOT IN (SELECT value FROM json_each(?))`,
+		} {
+			if _, err := tx.ExecContext(ctx, q, len(agentHostJobPrefix), agentHostJobPrefix, len(agentHostJobPrefix)+1, list); err != nil {
+				return fmt.Errorf("store: prune agent nodes: %w", err)
+			}
 		}
 		return nil
 	})
@@ -378,10 +499,18 @@ func (s *Store) ReplaceNodeImages(ctx context.Context, node string, imgs []model
 // SetNodeImagesInUse marks node's cached images in use exactly when their digest or config digest
 // is in digests.
 func (s *Store) SetNodeImagesInUse(ctx context.Context, node string, digests []string) error {
-	list := idList(digests)
-	_, err := s.wdb.ExecContext(ctx, `UPDATE node_images SET in_use = (digest IN (SELECT value FROM json_each(?))
-		OR (config_digest <> '' AND config_digest IN (SELECT value FROM json_each(?)))) WHERE node = ?`, list, list, node)
-	return err
+	return setInUseTx(ctx, s.wdb, node, digests)
+}
+
+// HeldCompleteElsewhere reports whether a node other than except, with an agent report, holds image
+// digest complete: a complete node_images row for the digest itself, for the manifest whose config
+// digest it is, or for indexDigest when that is not "".
+func (s *Store) HeldCompleteElsewhere(ctx context.Context, digest, indexDigest, except string) (bool, error) {
+	var held bool
+	err := s.rdb.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM node_images i JOIN nodes_agent a ON a.node = i.node
+		WHERE i.node <> ? AND i.complete AND (i.digest = ? OR i.config_digest = ? OR (? <> '' AND i.digest = ?)))`,
+		except, digest, digest, indexDigest, indexDigest).Scan(&held)
+	return held, err
 }
 
 // SetImageStatusReason sets the status reason of an unresolvable image and reports whether it did.
