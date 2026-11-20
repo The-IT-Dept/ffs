@@ -69,27 +69,106 @@ func groupKindRank(k model.NodeGroupKind) int {
 	return 1
 }
 
-// groupSet is the node groups the API shows, with the key each is linked by: its stable name, which
-// survives the fingerprint changes package updates bring, unless another current group has the same
-// name; then its ID.
+// groupSet is the node groups the API shows, with the key each is linked by. The key is the
+// group's stable name (nodegroup.GroupName), which survives the fingerprint changes package updates
+// bring. When several current groups share the name, each key adds what tells them apart and also
+// survives package updates: "-<arch>" when they span architectures, and "-nodeinfo" on a nodeinfo
+// group when an agent group shares the name. Groups that still share a key (a rollout of package
+// updates, or two pools with the same OS, kernel and architecture) are each anchored to their first
+// member node, "<key>@<node>", which find follows into whichever group with that key holds the node
+// next. A key that is another group's ID, label or key falls back to the group's ID.
 type groupSet struct {
 	groups []model.NodeGroup
 	keys   map[string]string // group ID → key
+	forms  map[string][]int  // stable form (stableForms) → indexes into groups, in group order
+}
+
+const (
+	// nodeInfoSuffix marks a nodeinfo group's key when an agent group shares its stable name.
+	nodeInfoSuffix = "-nodeinfo"
+	// anchorSep joins a key that several groups share to a member node's name. Neither stable
+	// names nor node names (DNS subdomains) contain it.
+	anchorSep = "@"
+)
+
+// stableKey is g's stable name, with its architecture and, for a nodeinfo group, nodeInfoSuffix
+// when asked for.
+func stableKey(g model.NodeGroup, withArch, withKind bool) string {
+	k := g.Name
+	if withArch && g.Arch != "" {
+		k += "-" + g.Arch
+	}
+	if withKind && g.Kind == model.NodeGroupNodeInfo {
+		k += nodeInfoSuffix
+	}
+	return k
+}
+
+// stableForms are the stable keys g may have been linked by, whichever groups shared its name.
+func stableForms(g model.NodeGroup) []string {
+	if g.Name == "" {
+		return nil
+	}
+	forms := []string{stableKey(g, false, false), stableKey(g, true, false)}
+	if g.Kind == model.NodeGroupNodeInfo {
+		forms = append(forms, stableKey(g, false, true), stableKey(g, true, true))
+	}
+	slices.Sort(forms)
+	return slices.Compact(forms)
+}
+
+// spans reports whether the groups at idx differ in attr.
+func spans(groups []model.NodeGroup, idx []int, attr func(model.NodeGroup) string) bool {
+	return slices.ContainsFunc(idx, func(i int) bool { return attr(groups[i]) != attr(groups[idx[0]]) })
 }
 
 func newGroupSet(groups []model.NodeGroup) *groupSet {
-	names, ids := map[string]int{}, map[string]bool{}
-	for _, g := range groups {
-		names[g.Name]++
-		ids[g.ID] = true
-	}
-	gs := &groupSet{groups: groups, keys: make(map[string]string, len(groups))}
-	for _, g := range groups {
-		k := g.ID
-		if g.Name != "" && names[g.Name] == 1 && !ids[g.Name] {
-			k = g.Name
+	keys := make([]string, len(groups))
+	byName := map[string][]int{}
+	for i, g := range groups {
+		keys[i] = g.ID
+		if g.Name != "" {
+			byName[g.Name] = append(byName[g.Name], i)
 		}
-		gs.keys[g.ID] = k
+	}
+	for _, idx := range byName {
+		withArch := spans(groups, idx, func(g model.NodeGroup) string { return g.Arch })
+		withKind := spans(groups, idx, func(g model.NodeGroup) string { return string(g.Kind) })
+		shared := map[string]int{}
+		for _, i := range idx {
+			keys[i] = stableKey(groups[i], withArch, withKind)
+			shared[keys[i]]++
+		}
+		for _, i := range idx {
+			switch g := groups[i]; {
+			case shared[keys[i]] == 1:
+			case len(g.Members) > 0:
+				keys[i] += anchorSep + g.Members[0]
+			default:
+				keys[i] = g.ID
+			}
+		}
+	}
+	// How many groups each exact reference names: their key, ID and label, each once per group. (A
+	// key that is another group's stable name wins over it in find, as a current key should.)
+	refs := map[string]int{}
+	for i, g := range groups {
+		own := []string{keys[i], g.ID, g.Label}
+		for j, r := range own {
+			if r != "" && !slices.Contains(own[:j], r) {
+				refs[r]++
+			}
+		}
+	}
+	gs := &groupSet{groups: groups, keys: make(map[string]string, len(groups)), forms: map[string][]int{}}
+	for i, g := range groups {
+		if refs[keys[i]] > 1 {
+			keys[i] = g.ID
+		}
+		gs.keys[g.ID] = keys[i]
+		for _, f := range stableForms(g) {
+			gs.forms[f] = append(gs.forms[f], i)
+		}
 	}
 	return gs
 }
@@ -102,9 +181,12 @@ func (gs *groupSet) key(g model.NodeGroup) string {
 	return g.ID
 }
 
-// find resolves a group reference: a group ID, a key, a label, or a stable name that several
-// current groups share (during a rollout of package updates), which is the one with the most members:
-// agent groups first, then the most recently seen, then by ID.
+// find resolves a group reference: a group ID, a current key or label, or a key built while other
+// groups shared the name (or none did). A stable form names the current groups it is a stable form
+// of (stableForms); "<form>-nodeinfo" with none of those names the groups of <form>, which the
+// nodeinfo group's nodes moved to once their agent reported. An anchored reference, "<form>@<node>",
+// is the one of those groups that holds the node; else, and for a bare form, it is the preferred one
+// (preferGroup).
 func (gs *groupSet) find(ref string) (model.NodeGroup, bool) {
 	if ref == "" {
 		return model.NodeGroup{}, false
@@ -117,20 +199,34 @@ func (gs *groupSet) find(ref string) (model.NodeGroup, bool) {
 			return gs.groups[i], true
 		}
 	}
-	var (
-		best  model.NodeGroup
-		found bool
-	)
-	better := func(g, than model.NodeGroup) bool {
-		return cmp.Or(cmp.Compare(len(g.Members), len(than.Members)), cmp.Compare(groupKindRank(than.Kind), groupKindRank(g.Kind)),
-			g.LastSeen.Compare(than.LastSeen), strings.Compare(than.ID, g.ID)) > 0
+	form, node, anchored := ref, "", false
+	if i := strings.LastIndex(ref, anchorSep); i >= 0 {
+		form, node, anchored = ref[:i], ref[i+len(anchorSep):], true
 	}
-	for _, g := range gs.groups {
-		if g.Name == ref && (!found || better(g, best)) {
-			best, found = g, true
+	tiers := [][]int{gs.forms[form]}
+	if base, ok := strings.CutSuffix(form, nodeInfoSuffix); ok {
+		tiers = append(tiers, gs.forms[base])
+	}
+	if anchored {
+		for _, idx := range tiers {
+			if i := slices.IndexFunc(idx, func(j int) bool { return slices.Contains(gs.groups[j].Members, node) }); i >= 0 {
+				return gs.groups[idx[i]], true
+			}
 		}
 	}
-	return best, found
+	for _, idx := range tiers {
+		if len(idx) > 0 {
+			return gs.groups[slices.MaxFunc(idx, func(a, b int) int { return preferGroup(gs.groups[a], gs.groups[b]) })], true
+		}
+	}
+	return model.NodeGroup{}, false
+}
+
+// preferGroup is positive when a reference that names both a and b should resolve to a: an agent
+// group first, then the one with the most members, then the most recently seen, then the lowest ID.
+func preferGroup(a, b model.NodeGroup) int {
+	return cmp.Or(cmp.Compare(groupKindRank(b.Kind), groupKindRank(a.Kind)), cmp.Compare(len(a.Members), len(b.Members)),
+		a.LastSeen.Compare(b.LastSeen), strings.Compare(b.ID, a.ID))
 }
 
 // byID is the group with exactly this ID.
@@ -173,7 +269,7 @@ func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, boo
 	return g, ok, nil
 }
 
-// findGroup is the group a reference resolves to (groupSet.find): its ID, key, label or stable name.
+// findGroup is the group a reference resolves to (groupSet.find): its ID, key, label or a stable form.
 func (s *Server) findGroup(ctx context.Context, ref string) (model.NodeGroup, bool, error) {
 	gs, err := s.groupSet(ctx)
 	if err != nil {
@@ -311,9 +407,10 @@ func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequ
 		ControlPlane: cp, Groups: rows}, nil
 }
 
-// GetNodeGroup is one node group, found by its stable name, label or ID: its description, members,
-// drift against every other group (with the package comparison when both are agent groups), an
-// optional detailed comparison, its host findings and the images cached on its members.
+// GetNodeGroup is one node group, found by its key, a stable form of it, its label or its ID
+// (groupSet.find): its description, members, drift against every other group (with the package
+// comparison when both are agent groups), an optional detailed comparison, its host findings and
+// the images cached on its members.
 func (s *Server) GetNodeGroup(ctx context.Context, req apigen.GetNodeGroupRequestObject) (apigen.GetNodeGroupResponseObject, error) {
 	gs, err := s.groupSet(ctx)
 	if err != nil {

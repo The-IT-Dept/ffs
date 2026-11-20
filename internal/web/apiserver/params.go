@@ -118,9 +118,9 @@ func textParam(name string, p *string, maxLen int) (string, error) {
 
 // resolveScope narrows a parsed scope to one the store answers and checks that its object exists: a
 // node scope is its group's (host findings are per group), a node group scope names the group by
-// its ID (it may name it by its stable name or label), and a workload scope must name a stored
-// owner. An unknown node, node group or workload is 404 not_found. Every other scope is returned
-// unchanged.
+// its ID (it may name it by its key or label: groupSet.find), and a workload scope must name a
+// stored owner. An unknown node, node group or workload is 404 not_found. Every other scope is
+// returned unchanged.
 func (s *Server) resolveScope(ctx context.Context, sc model.Scope) (model.Scope, error) {
 	switch sc.Kind {
 	case model.ScopeNode, model.ScopeNodeGroup:

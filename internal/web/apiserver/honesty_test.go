@@ -205,25 +205,144 @@ func TestNodeGroups_StableNameSurvivesFingerprintChange(t *testing.T) {
 	node := ok[apigen.NodeDetail](t, get(t, h, "/api/v1/nodes/worker-1"))
 	require.Equal(t, webtest.AgentGroupKey, node.Group.Id, "the API links groups by their stable name")
 
-	// During a rollout two current groups share the name: each is linked by its ID, and the name
-	// still opens one of them.
+	// During a rollout two current groups share the name, kind and architecture: each is linked by
+	// the name anchored to its first member, never by a fingerprint, and the bare name opens one.
 	require.NoError(t, f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{
 		Members:  map[string]string{"worker-1": webtest.AgentGroupID, "worker-2": newID, "cp-1": webtest.CP1GroupID},
 		Fallback: nodegroup.FallbackGroups(cpNodes, webtest.Now), Exposed: map[string][]string{webtest.AgentGroupID: {"worker-1"}},
 		Now: webtest.Now,
 	}))
 	h = handlerOf(f)
-	list := ok[apigen.NodeGroupsList](t, get(t, h, "/api/v1/nodegroups"))
-	var ids []string
-	for _, g := range list.Groups {
-		ids = append(ids, g.Id)
+	onW1, onW2 := webtest.AgentGroupKey+"@worker-1", webtest.AgentGroupKey+"@worker-2"
+	require.ElementsMatch(t, []string{onW1, onW2, webtest.CP1GroupKey}, groupKeys(t, h))
+	for id, key := range map[string]string{webtest.AgentGroupID: onW1, newID: onW2} {
+		require.Equal(t, key, ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+id)).Group.Id)
+		require.Equal(t, "nodegroup:"+id, ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+url.PathEscape(key))).Group.Digest)
 	}
-	require.ElementsMatch(t, []string{webtest.AgentGroupID, newID, webtest.CP1GroupKey}, ids)
-	for _, id := range []string{webtest.AgentGroupID, newID} {
-		require.Equal(t, id, ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+id)).Group.Id)
-	}
+	require.Equal(t, onW1, ok[apigen.NodeDetail](t, get(t, h, "/api/v1/nodes/worker-1")).Group.Id)
 	byName := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+webtest.AgentGroupKey))
-	require.Contains(t, []string{webtest.AgentGroupID, newID}, byName.Group.Id)
+	require.Contains(t, []string{onW1, onW2}, byName.Group.Id)
+
+	// The rollout completes: the links built during it open the group their node is in now.
+	require.NoError(t, f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{
+		Members:  map[string]string{"worker-1": newID, "worker-2": newID, "cp-1": webtest.CP1GroupID},
+		Fallback: nodegroup.FallbackGroups(cpNodes, webtest.Now), Exposed: map[string][]string{newID: {"worker-1"}}, Now: webtest.Now,
+	}))
+	h = handlerOf(f)
+	require.ElementsMatch(t, []string{webtest.AgentGroupKey, webtest.CP1GroupKey}, groupKeys(t, h))
+	for _, ref := range []string{onW1, onW2} {
+		d := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+url.PathEscape(ref)))
+		require.Equal(t, "nodegroup:"+newID, d.Group.Digest, ref)
+		require.Equal(t, webtest.AgentGroupKey, d.Group.Id, ref)
+		require.Equal(t, moved.Label, scopeCard(t, h, "?scope="+url.QueryEscape("nodegroup:"+ref)).Title, ref)
+	}
+}
+
+// groupKeys are the keys /nodegroups names the groups by, after checking that none is a group's
+// fingerprint.
+func groupKeys(t *testing.T, h http.Handler) []string {
+	t.Helper()
+	list := ok[apigen.NodeGroupsList](t, get(t, h, "/api/v1/nodegroups"))
+	var keys []string
+	for _, g := range list.Groups {
+		require.NotRegexp(t, `^[0-9a-f]{64}$`, g.Id, "a group is never linked by its fingerprint")
+		keys = append(keys, g.Id)
+	}
+	return keys
+}
+
+// V6: on a multi-arch cluster with an agentless node whose nodeinfo group takes the agent group's
+// stable name, every link the API builds names a group by what survives package updates (its
+// architecture and kind), and those links open the same pools after updates re-key them and the
+// agentless node's agent reports.
+func TestNodeGroups_MultiArchAndAgentlessKeysSurvivePackageUpdates(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	name := webtest.AgentGroupKey
+	nodes, err := f.Store.ListNodes(ctx)
+	require.NoError(t, err)
+	i := slices.IndexFunc(nodes, func(n model.Node) bool { return n.Name == "worker-1" })
+	require.GreaterOrEqual(t, i, 0)
+	arm, fresh := nodes[i], nodes[i]
+	arm.Name, arm.Arch = "arm-1", "arm64"
+	fresh.Name, fresh.OSImage = "worker-3", "Ubuntu 24.04 LTS"
+	require.Equal(t, name, nodegroup.GroupName(nil, fresh.OSImage, fresh.KernelVersion),
+		"the agentless node's nodeinfo group takes the agent group's stable name")
+	var cpNodes []model.Node
+	for _, n := range nodes {
+		if n.Name == "cp-1" {
+			cpNodes = append(cpNodes, n)
+		}
+	}
+	require.NoError(t, f.Store.ReplaceNodes(ctx, append(nodes, arm, fresh)))
+
+	groups, err := f.Store.NodeGroups(ctx)
+	require.NoError(t, err)
+	i = slices.IndexFunc(groups, func(g model.NodeGroup) bool { return g.ID == webtest.AgentGroupID })
+	require.GreaterOrEqual(t, i, 0)
+	rekey := func(g model.NodeGroup, id, arch string) model.NodeGroup {
+		g.ID, g.Label, g.Digest, g.Arch, g.Members = id, nodegroup.GroupLabel(g.Name, id), nodegroup.GroupDigest(id), arch, nil
+		require.NoError(t, f.Store.PutNodeGroup(ctx, g, webtest.Now))
+		return g
+	}
+	armGroup := rekey(groups[i], "7a7a7a"+strings.Repeat("0", 58), "arm64")
+	group := func(members map[string]string, exposed string) {
+		t.Helper()
+		members["cp-1"] = webtest.CP1GroupID
+		require.NoError(t, f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{Members: members,
+			Fallback: nodegroup.FallbackGroups(cpNodes, webtest.Now), Exposed: map[string][]string{exposed: {"worker-1"}},
+			Now: webtest.Now}))
+	}
+	group(map[string]string{"worker-1": webtest.AgentGroupID, "worker-2": webtest.AgentGroupID, "arm-1": armGroup.ID},
+		webtest.AgentGroupID)
+	h := handlerOf(f)
+
+	amdKey, armKey, freshKey := name+"-amd64", name+"-arm64", name+"-amd64-nodeinfo"
+	require.ElementsMatch(t, []string{amdKey, armKey, freshKey, webtest.CP1GroupKey}, groupKeys(t, h))
+	for key, members := range map[string][]string{amdKey: {"worker-1", "worker-2"}, armKey: {"arm-1"}, freshKey: {"worker-3"}} {
+		d := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+key))
+		require.Equal(t, key, d.Group.Id)
+		var got []string
+		for _, m := range d.Members {
+			got = append(got, m.Name)
+		}
+		require.Equal(t, members, got, key)
+		for _, other := range d.Drift {
+			require.NotRegexp(t, `^[0-9a-f]{64}$`, other.Other.Id, "drift rows link groups by key")
+		}
+	}
+	for node, key := range map[string]string{"worker-1": amdKey, "arm-1": armKey, "worker-3": freshKey} {
+		require.Equal(t, key, ok[apigen.NodeDetail](t, get(t, h, "/api/v1/nodes/"+node)).Group.Id, node)
+	}
+	page := ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?scope="+url.QueryEscape("nodegroup:"+amdKey)))
+	require.Len(t, page.Rows, 1)
+	require.NotNil(t, page.Rows[0].NodeGroups)
+	require.Equal(t, amdKey, (*page.Rows[0].NodeGroups)[0].Id, "a host finding links its group by key")
+	require.Equal(t, armGroup.Label, scopeCard(t, h, "?scope="+url.QueryEscape("nodegroup:"+armKey)).Title)
+	crumbs := scopeCard(t, h, "?scope="+url.QueryEscape("node:arm-1")).Breadcrumbs
+	require.True(t, slices.ContainsFunc(crumbs, func(c apigen.ScopeRef) bool { return c.Scope == "nodegroup:"+armKey }),
+		"a node's breadcrumb links its group by key: %+v", crumbs)
+	res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q="+url.QueryEscape(name)))
+	for _, key := range []string{amdKey, armKey, freshKey} {
+		require.Equal(t, "nodegroup:"+key, *hitOf(t, res, apigen.SearchHitKindNodegroup, key).Scope)
+	}
+
+	// unattended-upgrades re-keys both agent pools, and the agentless node's agent reports, moving
+	// it into the amd64 pool: every link built before opens the same pool.
+	amdNext := rekey(groups[i], "9e8d7c"+strings.Repeat("1", 58), "amd64")
+	armNext := rekey(groups[i], "8b8b8b"+strings.Repeat("1", 58), "arm64")
+	group(map[string]string{"worker-1": amdNext.ID, "worker-2": amdNext.ID, "worker-3": amdNext.ID, "arm-1": armNext.ID},
+		amdNext.ID)
+	h = handlerOf(f)
+	require.ElementsMatch(t, []string{amdKey, armKey, webtest.CP1GroupKey}, groupKeys(t, h))
+	for ref, want := range map[string]model.NodeGroup{amdKey: amdNext, armKey: armNext, freshKey: amdNext} {
+		d := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+ref))
+		require.Equal(t, want.Digest, d.Group.Digest, ref)
+		require.Equal(t, want.Label, scopeCard(t, h, "?scope="+url.QueryEscape("nodegroup:"+ref)).Title, ref)
+	}
+	for _, id := range []string{webtest.AgentGroupID, armGroup.ID} {
+		wantProblem(t, get(t, h, "/api/v1/nodegroups/"+id), http.StatusNotFound, apigen.ProblemCodeNotFound)
+	}
 }
 
 func TestScopes_UnknownNodeGroupWorkloadOrNodeIsNotFound(t *testing.T) {
