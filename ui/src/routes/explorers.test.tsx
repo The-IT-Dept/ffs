@@ -50,6 +50,15 @@ test('the packages explorer links a package to its findings', async () => {
   expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?package=openssl')
 })
 
+test('a scoped packages explorer links a package to its findings in the same scope', async () => {
+  mockApi().on(
+    '/packages',
+    packagesPage({ total: 1, rows: [{ ecosystem: 'deb', name: 'openssl', version: '3.5.1-1', images: 2, workloads: 3, counts: counts({ high: 2 }), worst: 'high' }] }),
+  )
+  renderApp('/packages?scope=namespace:shop')
+  expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?scope=namespace:shop&package=openssl')
+})
+
 test('explorers never send parameters their endpoint does not take', async () => {
   const api = mockApi().on('/workloads', workloadsPage())
   renderApp('/workloads?state=open&group=advisory&kind=Deployment')

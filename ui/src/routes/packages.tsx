@@ -1,4 +1,5 @@
 import { createRoute } from '@tanstack/react-router'
+import { useMemo } from 'react'
 import type { S } from '@/api/types'
 import { ExplorerPage } from '@/components/explorer/ExplorerPage'
 import type { Column } from '@/components/explorer/ExplorerTable'
@@ -18,32 +19,37 @@ function Count({ n }: { n: number }) {
   return <span className={n === 0 ? 'text-muted-foreground' : undefined}>{formatCount(n)}</span>
 }
 
-const columns: Column<Row>[] = [
-  {
-    id: 'package',
-    header: copy.col.package,
-    sort: 'name',
-    cell: (r) => (
-      <span className="inline-flex items-center gap-1.5">
-        <AppLink href={explorerHref('findings', { package: r.name })} className="hover:underline">
-          {r.name}
-        </AppLink>
-        {r.classifier ? <span className="rounded border px-1 text-[10px] leading-4 text-muted-foreground">{r.classifier}</span> : null}
-      </span>
-    ),
-  },
-  { id: 'ecosystem', header: copy.col.ecosystem, cell: (r) => r.ecosystem },
-  { id: 'version', header: copy.col.version, cell: (r) => <Mono>{r.version}</Mono> },
-  { id: 'images', header: copy.col.images, sort: '-images', align: 'right', cell: (r) => <Count n={r.images} /> },
-  { id: 'workloads', header: copy.col.workloads, align: 'right', cell: (r) => <Count n={r.workloads} /> },
-  { id: 'urgent', header: copy.col.urgent, sort: '-risk', align: 'right', cell: (r) => <PriorityCount priority="urgent" n={r.counts.urgent} /> },
-  { id: 'high', header: copy.col.high, align: 'right', cell: (r) => <PriorityCount priority="high" n={r.counts.high} /> },
-  { id: 'worst', header: copy.col.worst, cell: (r) => <PriorityDot priority={r.worst} /> },
-]
+// columnsFor builds the columns for a scope. A package links to its findings in that scope, the
+// scope its counts were taken in.
+function columnsFor(scope: string | undefined): Column<Row>[] {
+  return [
+    {
+      id: 'package',
+      header: copy.col.package,
+      sort: 'name',
+      cell: (r) => (
+        <span className="inline-flex items-center gap-1.5">
+          <AppLink href={explorerHref('findings', { scope, package: r.name })} className="hover:underline">
+            {r.name}
+          </AppLink>
+          {r.classifier ? <span className="rounded border px-1 text-[10px] leading-4 text-muted-foreground">{r.classifier}</span> : null}
+        </span>
+      ),
+    },
+    { id: 'ecosystem', header: copy.col.ecosystem, cell: (r) => r.ecosystem },
+    { id: 'version', header: copy.col.version, cell: (r) => <Mono>{r.version}</Mono> },
+    { id: 'images', header: copy.col.images, sort: '-images', align: 'right', cell: (r) => <Count n={r.images} /> },
+    { id: 'workloads', header: copy.col.workloads, align: 'right', cell: (r) => <Count n={r.workloads} /> },
+    { id: 'urgent', header: copy.col.urgent, sort: '-risk', align: 'right', cell: (r) => <PriorityCount priority="urgent" n={r.counts.urgent} /> },
+    { id: 'high', header: copy.col.high, align: 'right', cell: (r) => <PriorityCount priority="high" n={r.counts.high} /> },
+    { id: 'worst', header: copy.col.worst, cell: (r) => <PriorityDot priority={r.worst} /> },
+  ]
+}
 
 function PackagesPage() {
   const search = packagesRoute.useSearch()
   const navigate = packagesRoute.useNavigate()
+  const columns = useMemo(() => columnsFor(search.scope), [search.scope])
   return (
     <ExplorerPage
       kind="packages"
