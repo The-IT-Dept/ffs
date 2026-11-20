@@ -18,18 +18,15 @@ import (
 // forward or from inside the pod.
 const PprofAddrEnv = "FFS_PPROF_ADDR"
 
-// checkPprofAddr accepts host:port with an explicit port and a loopback host: "localhost" or a
-// loopback IP literal.
+// checkPprofAddr accepts host:port with an explicit port and a loopback IP literal host. Names,
+// "localhost" included, are refused: they resolve through the resolver and /etc/hosts.
 func checkPprofAddr(addr string) error {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return fmt.Errorf("pprof address %q: %w", addr, err)
 	}
-	if port == "" || port == "0" {
+	if port == "" {
 		return fmt.Errorf("pprof address %q: needs an explicit port", addr)
-	}
-	if host == "localhost" {
-		return nil
 	}
 	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
 		return nil
@@ -53,12 +50,22 @@ func pprofMux() *http.ServeMux {
 // returned stop is called. The listener is bound before it returns, so a bad or busy address is an
 // error of the caller's.
 func startPprof(ctx context.Context, addr string, log logr.Logger) (stop func(), err error) {
+	_, stop, err = startPprofAddr(ctx, addr, log)
+	return stop, err
+}
+
+// startPprofAddr is startPprof that also returns the address bound, which differs from addr for port 0.
+func startPprofAddr(ctx context.Context, addr string, log logr.Logger) (bound string, stop func(), err error) {
 	if err := checkPprofAddr(addr); err != nil {
-		return nil, err
+		return "", nil, err
 	}
 	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("pprof listener: %w", err)
+		return "", nil, fmt.Errorf("pprof listener: %w", err)
+	}
+	if ta, ok := ln.Addr().(*net.TCPAddr); !ok || !ta.IP.IsLoopback() {
+		_ = ln.Close()
+		return "", nil, fmt.Errorf("pprof listener bound %s: not a loopback address", ln.Addr())
 	}
 	srv := &http.Server{Handler: pprofMux(), ReadHeaderTimeout: 10 * time.Second}
 	log.Info("diagnostic pprof listener started", "address", ln.Addr().String())
@@ -75,5 +82,5 @@ func startPprof(ctx context.Context, addr string, log logr.Logger) (stop func(),
 		}
 		_ = srv.Close()
 	}()
-	return func() { close(done) }, nil
+	return ln.Addr().String(), func() { close(done) }, nil
 }

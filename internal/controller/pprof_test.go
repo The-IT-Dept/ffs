@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"testing"
 
@@ -11,11 +12,11 @@ import (
 )
 
 func TestCheckPprofAddr(t *testing.T) {
-	for _, ok := range []string{"127.0.0.1:6060", "localhost:6060", "[::1]:6060", "127.0.0.2:6060"} {
+	for _, ok := range []string{"127.0.0.1:6060", "127.0.0.1:0", "[::1]:6060", "127.0.0.2:6060"} {
 		require.NoError(t, checkPprofAddr(ok), ok)
 	}
-	for _, bad := range []string{"", ":6060", "0.0.0.0:6060", "[::]:6060", "10.0.0.1:6060", "ffs.example:6060",
-		"127.0.0.1", "127.0.0.1:0", "127.0.0.1:"} {
+	for _, bad := range []string{"", ":6060", "0.0.0.0:6060", "[::]:6060", "10.0.0.1:6060", "ffs.example:6060", "localhost:6060",
+		"127.0.0.1", "127.0.0.1:"} {
 		require.Error(t, checkPprofAddr(bad), bad)
 	}
 }
@@ -27,10 +28,13 @@ func TestStartPprof_ServesOnLoopbackOnly(t *testing.T) {
 	_, err := startPprof(ctx, "0.0.0.0:0", logr.Discard())
 	require.Error(t, err)
 
-	stop, err := startPprof(ctx, "127.0.0.1:16061", logr.Discard())
+	bound, stop, err := startPprofAddr(ctx, "127.0.0.1:0", logr.Discard())
 	require.NoError(t, err)
 	defer stop()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://127.0.0.1:16061/debug/pprof/heap?debug=1", nil)
+	ta, err := net.ResolveTCPAddr("tcp", bound)
+	require.NoError(t, err)
+	require.True(t, ta.IP.IsLoopback())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+bound+"/debug/pprof/heap?debug=1", nil)
 	require.NoError(t, err)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
