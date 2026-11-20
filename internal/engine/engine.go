@@ -45,6 +45,8 @@ type Store interface {
 	DigestsInUse(ctx context.Context) ([]string, error)
 	LiveDigests(ctx context.Context) ([]string, error)
 	DigestsAwaitingGrype(ctx context.Context, built time.Time) ([]string, error)
+	UnmatchedDigests(ctx context.Context, digests []string) ([]string, error)
+	MarkMatched(ctx context.Context, digest string) error
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
 	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
@@ -123,8 +125,16 @@ func (e *Engine) now() time.Time { return e.o.Now().UTC() }
 
 // OnImageCatalogued re-matches a newly catalogued digest with every matcher and queues the owners
 // running it. The owners are queued even when a matcher failed; the error is returned afterwards.
+// Once every matcher succeeded the digest's mark as unmatched (store.MarkUnmatched) is cleared
+// before its owners are queued, so their recompute resolves findings against its matches instead
+// of carrying them.
 func (e *Engine) OnImageCatalogued(ctx context.Context, digest string) error {
 	_, err := e.matchImage(ctx, digest, matchPersist)
+	if err == nil {
+		if merr := e.o.Store.MarkMatched(ctx, digest); merr != nil {
+			err = fmt.Errorf("engine: record %s matched: %w", digest, merr)
+		}
+	}
 	// The owners are looked up now: a synthetic digest can be catalogued before its owner is stored,
 	// and the owner change then arrives through OnOwnersChanged.
 	owners, oerr := e.o.Store.OwnersForDigests(ctx, []string{digest})

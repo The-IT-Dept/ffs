@@ -39,11 +39,22 @@ func TestUnmatchedImages(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []UnmatchedImage{{Digest: "sha256:b", Attempts: 2}, {Digest: "sha256:a"}}, got)
 
+	ds, err := s.UnmatchedDigests(ctx, []string{"sha256:b", "sha256:none", "sha256:a"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"sha256:a", "sha256:b"}, ds)
+
 	require.NoError(t, s.MarkMatched(ctx, "sha256:b"))
 	require.NoError(t, s.MarkUnmatched(ctx, "sha256:a", at)) // catalogued again: attempts reset
 	got, err = s.UnmatchedImages(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []UnmatchedImage{{Digest: "sha256:a"}}, got)
+
+	ds, err = s.UnmatchedDigests(ctx, []string{"sha256:b", "sha256:a"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"sha256:a"}, ds)
+	ds, err = s.UnmatchedDigests(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, ds)
 }
 
 func TestAcquisitionsInflight(t *testing.T) {

@@ -47,6 +47,16 @@ func (s *Store) MarkMatched(ctx context.Context, digest string) error {
 	return err
 }
 
+// UnmatchedDigests returns, sorted, the digests among digests whose first full match has not
+// completed. The engine treats such a digest's matches as unknown, like an uncatalogued digest's.
+func (s *Store) UnmatchedDigests(ctx context.Context, digests []string) ([]string, error) {
+	if len(digests) == 0 {
+		return nil, nil
+	}
+	return queryAll(ctx, s.rdb, scanString, `SELECT digest FROM images_unmatched
+		WHERE digest IN (SELECT value FROM json_each(?)) ORDER BY digest`, idList(digests))
+}
+
 // UnmatchedImages returns the catalogued images whose first full match has not completed, oldest
 // first. Marks left for images that are gone or no longer catalogued are dropped.
 func (s *Store) UnmatchedImages(ctx context.Context) ([]UnmatchedImage, error) {

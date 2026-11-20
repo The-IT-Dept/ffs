@@ -169,9 +169,10 @@ func (p *pass) canonical(ctx context.Context, st Store, id string) (string, erro
 
 // build returns the owner's findings from its current matches, or nil when the owner is gone, and
 // what Diff needs to tell a withdrawal from a fix. old holds the owner's stored findings: those on
-// an image repository that runs a digest not yet catalogued (or with no digest) are carried, since
-// that digest's matches are unknown; resolving them would report every rollout as fixed and reopen
-// everything once the new digest is catalogued.
+// an image repository that runs a digest not yet catalogued, catalogued but not yet matched
+// (store.UnmatchedDigests), or with no digest are carried, since that digest's matches are unknown;
+// resolving them would report every rollout as fixed and reopen everything once the new digest is
+// matched.
 func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Finding) ([]model.Finding, findings.Withdrawals, error) {
 	var w findings.Withdrawals
 	o, ok, err := e.o.Store.GetOwner(ctx, key)
@@ -208,6 +209,10 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		matched[m.ImageDigest] = true
 		addID(m.AdvisoryID)
 	}
+	unmatched, err := e.o.Store.UnmatchedDigests(ctx, digests)
+	if err != nil {
+		return nil, w, fmt.Errorf("unmatched digests: %w", err)
+	}
 	pkgs := map[string]model.Package{}
 	users := map[string]string{}
 	for _, d := range digests {
@@ -217,7 +222,8 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		}
 		if ok && img.Status == model.ImageCatalogued {
 			users[d] = img.ConfigUser
-		} else {
+		}
+		if !ok || img.Status != model.ImageCatalogued || slices.Contains(unmatched, d) {
 			for _, c := range o.Containers {
 				if c.Digest == d {
 					uncatalogued[c.Repo] = true

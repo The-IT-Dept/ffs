@@ -797,6 +797,62 @@ func TestEngine_RolloutToUncataloguedDigestKeepsFindings(t *testing.T) {
 	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
 }
 
+// TestEngine_CataloguedButUnmatchedDigestKeepsFindings covers where F3 meets F7: the acquirer
+// marks a digest unmatched and stores it catalogued before OnImageCatalogued matches it. A
+// recompute in that window, after a failed match, or after a restart that cut the match short
+// carries the owner's findings; once OnImageCatalogued has matched the digest they resolve
+// against it.
+func TestEngine_CataloguedButUnmatchedDigestKeepsFindings(t *testing.T) {
+	h := newHarness(t)
+	h.catalogueAPI()
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	n := len(h.transitions())
+
+	const d3 = "sha256:d3"
+	h.clock.now = t0.Add(time.Hour)
+	fixed := h.libssl3
+	fixed.ImageDigest, fixed.Version = d3, "3.0.15-1"
+	fixed.ID = model.PackageID(d3, fixed)
+	require.NoError(t, h.st.PutSBOM(ctx, d3, []byte(`{"artifacts":[]}`), []model.Package{fixed}))
+	require.NoError(t, h.st.MarkUnmatched(ctx, d3, h.clock.now))
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64",
+		Status: model.ImageCatalogued, CataloguedAt: h.clock.now}))
+	o, _, err := h.st.GetOwner(ctx, apiKey)
+	require.NoError(t, err)
+	o.Containers[0].Digest = d3
+	require.NoError(t, h.st.UpsertOwner(ctx, o))
+	require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+	require.NoError(t, h.e.Drain(ctx))
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State, "a catalogued digest not yet matched is not clean")
+	require.Len(t, h.transitions(), n, "no resolution while the new digest's matches are unknown")
+
+	// A failed match keeps the mark, so the findings are still carried.
+	h.clock.now = t0.Add(2 * time.Hour)
+	boom := errors.New("osv matcher failed")
+	h.osv.fn = func(match.ImageInput) ([]model.Match, error) { return nil, boom }
+	require.ErrorIs(t, h.e.OnImageCatalogued(ctx, d3), boom)
+	require.NoError(t, h.e.Drain(ctx))
+	unmatched, err := h.st.UnmatchedDigests(ctx, []string{d3})
+	require.NoError(t, err)
+	require.Equal(t, []string{d3}, unmatched)
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State, "a digest whose match failed is not clean")
+	require.Len(t, h.transitions(), n)
+
+	// The match completes: the mark is cleared before the owners are queued, and the finding
+	// resolves as an inventory change.
+	h.clock.now = t0.Add(3 * time.Hour)
+	h.osv.fn = nil
+	require.NoError(t, h.e.OnImageCatalogued(ctx, d3))
+	unmatched, err = h.st.UnmatchedDigests(ctx, []string{d3})
+	require.NoError(t, err)
+	require.Empty(t, unmatched)
+	require.NoError(t, h.e.Drain(ctx))
+	require.Equal(t, model.StateResolved, h.finding(apiKey, cve).State)
+	ts := h.transitions()
+	require.Len(t, ts, n+1)
+	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
+}
+
 // TestEngine_ProvisionalResolutionTrigger is the F29 regression: a provisional finding resolves as
 // withdrawn only when the advisory went away for the image the owner still runs (a feed change, or
 // grype's not-affected verdict), never when the team shipped the fix.
