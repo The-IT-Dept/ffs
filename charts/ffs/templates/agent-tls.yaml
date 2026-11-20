@@ -1,0 +1,66 @@
+{{- if .Values.nodeAgent.enabled }}
+{{- $fullname := include "ffs.fullname" . }}
+{{- $ns := .Release.Namespace }}
+{{- $agentNs := include "ffs.agentNamespace" . }}
+{{- $svc := printf "%s-agent-api" $fullname }}
+{{- $tls := .Values.nodeAgent.tls }}
+{{- if $tls.certManager.enabled }}
+{{- if not $tls.caBundle }}
+{{- fail "nodeAgent.tls.caBundle is required when nodeAgent.tls.certManager.enabled is true" }}
+{{- end }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fullname }}-agent-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+spec:
+  secretName: {{ $fullname }}-agent-tls
+  dnsNames:
+    - {{ $svc }}
+    - {{ $svc }}.{{ $ns }}
+    - {{ $svc }}.{{ $ns }}.svc
+    - {{ $svc }}.{{ $ns }}.svc.cluster.local
+  issuerRef:
+    {{- toYaml $tls.certManager.issuerRef | nindent 4 }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-agent-ca
+  namespace: {{ $agentNs }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+data:
+  ca.crt: {{ $tls.caBundle | quote }}
+{{- else }}
+{{- $secret := lookup "v1" "Secret" $ns (printf "%s-agent-tls" $fullname) }}
+{{- $cm := lookup "v1" "ConfigMap" $agentNs (printf "%s-agent-ca" $fullname) }}
+{{- $pair := include "ffs.agentTLSPair" (dict "secret" $secret "configMap" $cm "root" .) | fromJson }}
+apiVersion: v1
+kind: Secret
+type: kubernetes.io/tls
+metadata:
+  name: {{ $fullname }}-agent-tls
+  namespace: {{ $ns }}
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+  annotations:
+    # When this pair expires, in unix seconds; the chart keeps it until 30 days before.
+    ffs.theitdept.au/not-after: {{ $pair.notAfter | quote }}
+data:
+  tls.crt: {{ $pair.tlsCrt }}
+  tls.key: {{ $pair.tlsKey }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $fullname }}-agent-ca
+  namespace: {{ $agentNs }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+data:
+  ca.crt: {{ $pair.caCrt | quote }}
+{{- end }}
+{{- end }}

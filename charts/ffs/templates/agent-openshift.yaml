@@ -1,0 +1,61 @@
+{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.openshift.scc }}
+{{- $name := printf "%s-agent" (include "ffs.fullname" .) }}
+apiVersion: security.openshift.io/v1
+kind: SecurityContextConstraints
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+allowHostDirVolumePlugin: true
+allowHostIPC: false
+allowHostNetwork: false
+allowHostPID: false
+allowHostPorts: false
+allowPrivilegeEscalation: false
+allowPrivilegedContainer: false
+allowedCapabilities: []
+defaultAddCapabilities: []
+requiredDropCapabilities: [ALL]
+readOnlyRootFilesystem: true
+priority: null
+runAsUser:
+  type: RunAsAny
+seLinuxContext:
+  type: RunAsAny
+fsGroup:
+  type: RunAsAny
+supplementalGroups:
+  type: RunAsAny
+seccompProfiles: [runtime/default]
+volumes: [configMap, emptyDir, hostPath, projected]
+users: []
+groups: []
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}-scc
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+rules:
+  - apiGroups: [security.openshift.io]
+    resources: [securitycontextconstraints]
+    resourceNames: [{{ $name }}]
+    verbs: [use]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}-scc
+  namespace: {{ include "ffs.agentNamespace" . }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "ffs.agentServiceAccount" . }}
+    namespace: {{ include "ffs.agentNamespace" . }}
+{{- end }}

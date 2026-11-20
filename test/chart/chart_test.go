@@ -115,7 +115,7 @@ func TestChart_DeploymentShape(t *testing.T) {
 	for _, p := range ctl.Ports {
 		ports[p.Name] = p.ContainerPort
 	}
-	require.Equal(t, map[string]int32{"http": 8080, "metrics": 8443, "health": 8081}, ports)
+	require.Equal(t, map[string]int32{"http": 8080, "metrics": 8443, "health": 8081, "agent-api": 8444}, ports)
 	require.Equal(t, "/healthz", ctl.LivenessProbe.HTTPGet.Path)
 	require.EqualValues(t, 8081, ctl.LivenessProbe.HTTPGet.Port.IntVal)
 	require.Equal(t, "/readyz", ctl.ReadinessProbe.HTTPGet.Path)

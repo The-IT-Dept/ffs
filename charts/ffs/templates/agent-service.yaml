@@ -1,0 +1,18 @@
+{{- if .Values.nodeAgent.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "ffs.fullname" . }}-agent-api
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "ffs.labels" . | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "ffs.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: agent-api
+      port: {{ include "ffs.agentPort" . }}
+      targetPort: agent-api
+      protocol: TCP
+{{- end }}

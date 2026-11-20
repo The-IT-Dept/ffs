@@ -69,6 +69,9 @@ spec:
             - {name: http, containerPort: 8080, protocol: TCP}
             - {name: metrics, containerPort: 8443, protocol: TCP}
             - {name: health, containerPort: 8081, protocol: TCP}
+            {{- if .Values.nodeAgent.enabled }}
+            - {name: agent-api, containerPort: {{ include "ffs.agentPort" . }}, protocol: TCP}
+            {{- end }}
           livenessProbe:
             httpGet: {path: /healthz, port: 8081}
           readinessProbe:
@@ -86,6 +89,9 @@ spec:
             - {name: data, mountPath: {{ $dataDir }}}
             - {name: tmp, mountPath: /tmp}
             - {name: kube-api-access, mountPath: /var/run/secrets/kubernetes.io/serviceaccount, readOnly: true}
+            {{- if .Values.nodeAgent.enabled }}
+            - {name: agent-tls, mountPath: /etc/ffs/agent-tls, readOnly: true}
+            {{- end }}
         - name: catalog
           image: {{ include "ffs.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -126,6 +132,13 @@ spec:
         - name: config
           configMap:
             name: {{ $name }}
+        {{- if .Values.nodeAgent.enabled }}
+        - name: agent-tls
+          secret:
+            secretName: {{ $name }}-agent-tls
+            # The agent API listens before its certificate exists (cert-manager may issue it later).
+            optional: true
+        {{- end }}
         - name: kube-api-access
           projected:
             sources:
