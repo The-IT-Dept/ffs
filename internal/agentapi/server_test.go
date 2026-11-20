@@ -171,13 +171,13 @@ func TestServer_StartServesTLS13AndStops(t *testing.T) {
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := ln.Addr().String()
-	require.NoError(t, ln.Close())
 
 	rec := &reportRecorder{resp: wire.ReportResponse{Applied: true}}
 	srv := NewServer(ServerOptions{Listen: addr, CertDir: dir, Auth: fixedAuth{}, Reports: rec})
+	require.ErrorContains(t, srv.Start(context.Background()), "agent API: ", "Start listens on Listen, which is taken")
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- srv.Start(ctx) }()
+	go func() { done <- srv.serve(ctx, ln) }() // the listener is handed over: no port to lose between two listens
 
 	pemBytes, err := os.ReadFile(filepath.Join(dir, "tls.crt")) //nolint:gosec // G304: the test's own file
 	require.NoError(t, err)
@@ -623,20 +623,18 @@ func TestServer_AbandonedSBOMResultIsUnread(t *testing.T) {
 	require.Equal(t, held, inFlight())
 }
 
-// serveTLS runs s.Start on a free local port with a certificate of its own until the test ends, and returns its
-// URL and a client built like the agent's (a clone of the default transport): over HTTP/2 when h2, else
-// HTTP/1.1 only.
+// serveTLS serves s on a free local port with a certificate of its own until the test ends, and returns its URL
+// and a client built like the agent's (a clone of the default transport): over HTTP/2 when h2, else HTTP/1.1
+// only. The listener is handed to the server, so no other process can take the port between two listens.
 func serveTLS(t *testing.T, s *Server, h2 bool) (string, *http.Client) {
 	t.Helper()
 	s.o.CertDir = t.TempDir()
 	writeCert(t, s.o.CertDir, 1)
 	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	s.o.Listen = ln.Addr().String()
-	require.NoError(t, ln.Close())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- s.Start(ctx) }()
+	go func() { done <- s.serve(ctx, ln) }()
 	t.Cleanup(func() {
 		cancel()
 		require.NoError(t, <-done)
@@ -654,17 +652,7 @@ func serveTLS(t *testing.T, s *Server, h2 bool) (string, *http.Client) {
 	}
 	hc := &http.Client{Transport: tr}
 	t.Cleanup(hc.CloseIdleConnections)
-	url := "https://" + s.o.Listen
-	require.Eventually(t, func() bool {
-		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url+"/", nil)
-		resp, err := hc.Do(req)
-		if err != nil {
-			return false
-		}
-		_ = resp.Body.Close()
-		return true
-	}, 5*time.Second, 20*time.Millisecond)
-	return url, hc
+	return "https://" + ln.Addr().String(), hc
 }
 
 // sent is the answer to sendResult: the protocol and status, or the error.
@@ -677,12 +665,20 @@ type sent struct {
 // sendResult POSTs an SBOM result body naming workID to url on another goroutine, and returns the answer on
 // the channel; it asserts nothing.
 func sendResult(hc *http.Client, url string, body io.Reader, workID string) <-chan sent {
+	return sendResultWith(context.Background(), hc, url, body, -1, workID)
+}
+
+// sendResultWith is sendResult with the request's context and Content-Length (-1: the client's choice).
+func sendResultWith(ctx context.Context, hc *http.Client, url string, body io.Reader, contentLength int64, workID string) <-chan sent {
 	out := make(chan sent, 1)
 	go func() {
-		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url+wire.PathSBOM, body)
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+wire.PathSBOM, body)
 		if err != nil {
 			out <- sent{err: err}
 			return
+		}
+		if contentLength >= 0 {
+			req.ContentLength = contentLength
 		}
 		req.Header.Set("Authorization", "Bearer tok")
 		req.Header.Set(wire.HeaderWorkID, workID)
@@ -755,6 +751,105 @@ func TestServer_StalledBodyIsCutOff(t *testing.T) {
 				t.Fatal("the stalled body was not cut off")
 			}
 			require.Empty(t, sboms.entered, "nothing was handled")
+		})
+	}
+}
+
+// TestServer_UnreadableResultAfterAWaitIsUnread: a result whose body cannot be read in full once it has its share
+// of the SBOM budget leaves its request unread, so it is not counted against the image, over HTTP/2 and
+// HTTP/1.1. After a wait close to MaxResultWait the agent's client timeout leaves about a minute for the body;
+// here the agent gives up after sending a quarter of it.
+func TestServer_UnreadableResultAfterAWaitIsUnread(t *testing.T) {
+	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
+		t.Run(proto, func(t *testing.T) {
+			const size = 1 << 20
+			sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
+				MaxSBOMBytes: 2 * size, SBOMBudget: size})
+			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+			held := inFlight()
+			result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+			first := sendResult(hc, url, strings.NewReader(result), "w1")
+			select { // the first result holds the whole SBOM budget
+			case <-sboms.entered:
+			case got := <-first:
+				t.Fatalf("the first result was answered without being handled: %+v", got)
+			}
+
+			// The second result is half the size, so its share tells it apart from the first's.
+			body, stall := io.Pipe()
+			defer func() { _ = stall.Close() }()
+			go func() { _, _ = stall.Write([]byte(result[:size/4])) }() // then nothing more
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			second := sendResultWith(ctx, hc, url, body, size/2, "w2")
+			require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second,
+				time.Millisecond)
+			close(sboms.release)
+			require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, <-first)
+			require.Eventually(t, func() bool { return inFlight() == held+size/2 }, 10*time.Second, time.Millisecond,
+				"the second result has its share and reads its body")
+			require.Empty(t, sboms.unreadRequests())
+
+			cancel() // the agent's client timeout
+			// Over HTTP/1.1 the client's write of the body ends only when its body does; the agent's is a file.
+			_ = stall.CloseWithError(context.Canceled)
+			require.Error(t, (<-second).err)
+			require.Eventually(t, func() bool { return len(sboms.unreadRequests()) > 0 }, 10*time.Second, time.Millisecond)
+			require.Equal(t, []string{"worker-1/w2"}, sboms.unreadRequests(), "the request it answers is not counted")
+			require.Eventually(t, func() bool { return inFlight() == held }, 10*time.Second, time.Millisecond)
+			require.Empty(t, sboms.entered, "nothing of it was handled")
+		})
+	}
+}
+
+// slowHandlers hold every report and SBOM result for hold before answering, unless the request's context ends
+// first, which they answer with its error.
+type slowHandlers struct{ hold time.Duration }
+
+func (s slowHandlers) wait(ctx context.Context) error {
+	select {
+	case <-time.After(s.hold):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s slowHandlers) Report(ctx context.Context, _ Identity, _ *wire.Report) (wire.ReportResponse, error) {
+	return wire.ReportResponse{Applied: true}, s.wait(ctx)
+}
+
+func (s slowHandlers) SBOM(ctx context.Context, _ Identity, _ *wire.SBOMResult) error {
+	return s.wait(ctx)
+}
+
+// TestServer_HandlingOutlastsTheReadTimeout: once a report's or a result's body is read, handling it may take
+// longer than the read timeout, over HTTP/2 and HTTP/1.1. Over HTTP/1.1 the server watches the connection with
+// a background read once the body is read, and a read deadline still in force would end that read and cancel
+// the request's context.
+func TestServer_HandlingOutlastsTheReadTimeout(t *testing.T) {
+	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
+		t.Run(proto, func(t *testing.T) {
+			slow := slowHandlers{hold: time.Second}
+			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: slow, SBOMs: slow})
+			s.readTimeout = 200 * time.Millisecond
+			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url+wire.PathReport,
+				strings.NewReader(`{"node":"worker-1","kind":"images"}`))
+			require.NoError(t, err)
+			req.Header.Set("Authorization", "Bearer tok")
+			resp, err := hc.Do(req)
+			require.NoError(t, err)
+			b, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode, "the report is handled: %s", b)
+			require.Equal(t, proto, resp.Proto)
+
+			got := <-sendResult(hc, url, strings.NewReader(`{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"boom"}`), "w1")
+			require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, got, "the result is handled")
 		})
 	}
 }
