@@ -8,7 +8,7 @@ GOLANGCI_LINT  ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@
 OAPI_CODEGEN   ?= go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.8.2
 PKGS ?= ./...
 RUN  ?=
-.PHONY: build test generate lint e2e golden chart-lint image licenses ui ui-test bench-api
+.PHONY: build test generate lint e2e golden chart-lint image licenses ui ui-test bench-api ui-e2e
 build:    ; go build -trimpath -ldflags '$(LDFLAGS)' -o bin/ffs ./cmd/ffs
 SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3
 ENVTEST_K8S_VERSION ?= 1.37.0
@@ -26,6 +26,9 @@ ui-test: ; cd ui && npm ci && npm run typecheck && npm test
 # API latency gate (spec G8): p95 of every list, facet and aggregate operation on the 25,000-finding
 # webtest.Scale fixture, in process.
 bench-api: ; GOFLAGS=-p=4 go test -tags bench -run TestAPILatency_P95 -count=1 -v ./internal/web/apiserver/
+# Playwright suite against hack/uiserve over the Small fixture. Needs `cd ui && npm ci` and a browser:
+# `npx playwright install chromium`, or FFS_PW_CHANNEL=chrome to use an installed Chrome.
+ui-e2e: ; cd ui && npm run e2e
 image:   ; docker buildx build --platform linux/$(shell go env GOARCH) --build-arg VERSION=dev --build-arg COMMIT=$$(git rev-parse --short=7 HEAD) -t ghcr.io/the-it-dept/ffs:dev --load .
 
 # Licence check of every package linked into the linux/amd64 and linux/arm64 binaries. It fails on
