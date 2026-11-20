@@ -385,10 +385,18 @@ func compressedSize(ctx context.Context, req sbom.CatalogRequest) (int64, error)
 	return total, nil
 }
 
-// reply writes the job's outcome and logs it with the ref and kind only.
+// reply writes the job's outcome and logs it with the ref and kind only. A response the worker
+// encoded already is sent as it is.
 func (s *Server) reply(w http.ResponseWriter, ref string, resp *sbom.CatalogResponse, err error) {
 	if err == nil {
 		s.Log.Info("catalogued image", "ref", ref)
+		if resp.Encoded != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Content-Length", strconv.Itoa(len(resp.Encoded)))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(resp.Encoded)
+			return
+		}
 		writeJSON(w, http.StatusOK, resp)
 		return
 	}
@@ -477,9 +485,13 @@ func dirSize(dir string) int64 {
 
 // execOptions are the ExecRunner options.
 type execOptions struct {
-	nice     int
-	memLimit int64
+	nice        int
+	memLimit    int64
+	outputLimit int // bytes of worker output read; sbom.MaxCatalogResponseBytes unless a test sets it
 }
+
+// withOutputLimit bounds the worker output read to n bytes (tests).
+func withOutputLimit(n int) ExecOption { return func(o *execOptions) { o.outputLimit = n } }
 
 // ExecOption configures ExecRunner.
 type ExecOption func(*execOptions)
@@ -493,12 +505,35 @@ func WithNice(n int) ExecOption { return func(o *execOptions) { o.nice = n } }
 // it gets that limit less what the server needs. 0 leaves the worker the server's GOMEMLIMIT.
 func WithMemoryLimit(n int64) ExecOption { return func(o *execOptions) { o.memLimit = n } }
 
+// errOutputTooLarge is a worker's output past its limit, sbom.MaxCatalogResponseBytes.
+var errOutputTooLarge = errors.New("catalog: worker output over the limit")
+
+// limitedBuffer collects up to limit bytes; a write past it fails, which ends the copy from the
+// worker's stdout and closes the pipe, so the worker stops at its next write.
+type limitedBuffer struct {
+	buf   bytes.Buffer
+	limit int
+	over  bool
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.buf.Len()+len(p) > b.limit {
+		b.over = true
+		return 0, errOutputTooLarge
+	}
+	return b.buf.Write(p)
+}
+
 // ExecRunner runs each job as `self catalog worker` in its own process group, with TMPDIR set to the
 // job directory. The request (credentials included) goes on stdin, never in argv or the
 // environment; the response comes back on stdout; stderr is discarded. When ctx ends, the whole
 // process group is killed.
+//
+// The worker's output is read up to sbom.MaxCatalogResponseBytes, the most the controller accepts; a
+// larger SBOM is answered too-large without being held whole. A successful response is passed on
+// as the worker encoded it (CatalogResponse.Encoded), not decoded and encoded again.
 func ExecRunner(self string, opts ...ExecOption) Runner {
-	var o execOptions
+	o := execOptions{outputLimit: sbom.MaxCatalogResponseBytes}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -507,14 +542,14 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		if err != nil {
 			return nil, err
 		}
-		var out bytes.Buffer
+		out := &limitedBuffer{limit: o.outputLimit}
 		cmd := exec.CommandContext(ctx, self, "catalog", "worker") //nolint:gosec // G204: self is this binary
 		cmd.Env = append(os.Environ(), "TMPDIR="+jobDir)
 		if o.memLimit > 0 {
 			cmd.Env = append(cmd.Env, "GOMEMLIMIT="+strconv.FormatInt(o.memLimit, 10))
 		}
 		cmd.Stdin = bytes.NewReader(in)
-		cmd.Stdout = &out
+		cmd.Stdout = out
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 		cmd.WaitDelay = workerWaitDelay
@@ -536,19 +571,22 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		if ctx.Err() != nil {
 			return nil, context.Cause(ctx)
 		}
+		if out.over {
+			return nil, &WorkError{Kind: sbom.KindTooLarge,
+				Msg: fmt.Sprintf("SBOM is larger than the %d byte limit", sbom.MaxSBOMBytes)}
+		}
 		if err == nil {
-			var resp sbom.CatalogResponse
-			if err := json.Unmarshal(out.Bytes(), &resp); err != nil {
+			if !json.Valid(out.buf.Bytes()) {
 				return nil, &WorkError{Kind: sbom.KindFailed, Msg: "cataloguer returned an unreadable response"}
 			}
-			return &resp, nil
+			return &sbom.CatalogResponse{Encoded: out.buf.Bytes()}, nil
 		}
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
 			return nil, &WorkError{Kind: sbom.KindFailed, Msg: "starting cataloguer: " + err.Error()}
 		}
 		var ce sbom.CatalogError
-		if json.Unmarshal(out.Bytes(), &ce) == nil && ce.Kind != "" {
+		if json.Unmarshal(out.buf.Bytes(), &ce) == nil && ce.Kind != "" {
 			return nil, &WorkError{Kind: ce.Kind, Msg: ce.Error}
 		}
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {

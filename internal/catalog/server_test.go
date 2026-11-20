@@ -573,3 +573,50 @@ func TestExecRunner_MemoryLimitForWorker(t *testing.T) {
 		require.Equal(t, tc.want, string(got))
 	}
 }
+
+// TestExecRunner_OutputBoundedAndPassedThrough (F82): the worker's output is read up to the response
+// limit, and a larger one is answered too-large without being held whole; a successful response is
+// passed to the client exactly as the worker wrote it, not decoded and encoded again.
+func TestExecRunner_OutputBoundedAndPassedThrough(t *testing.T) {
+	dir := t.TempDir()
+	script := func(name, body string) string {
+		p := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(p, []byte("#!/bin/sh\n"+body+"\n"), 0o700)) //nolint:gosec // G306: the test runs it
+		return p
+	}
+	const answer = `{"syftJSON":{"artifacts":[],"source":{"name":"x"}},"coverage":{"notes":["a note"]}}`
+	req := sbom.CatalogRequest{Ref: "r@sha256:" + strings.Repeat("a", 64)}
+
+	_, err := catalog.ExecRunner(script("big.sh", "head -c 1048576 /dev/zero"), catalog.WithOutputLimit(4096))(ctx, req, t.TempDir())
+	var we *catalog.WorkError
+	require.ErrorAs(t, err, &we)
+	require.Equal(t, sbom.KindTooLarge, we.Kind)
+	require.Equal(t, fmt.Sprintf("SBOM is larger than the %d byte limit", sbom.MaxSBOMBytes), we.Msg)
+
+	_, err = catalog.ExecRunner(script("garbage.sh", "echo 'not json'"))(ctx, req, t.TempDir())
+	require.ErrorAs(t, err, &we)
+	require.Equal(t, sbom.KindFailed, we.Kind)
+
+	ok := script("ok.sh", "cat >/dev/null; printf '%s' '"+answer+"'")
+	resp, err := catalog.ExecRunner(ok, catalog.WithOutputLimit(len(answer)))(ctx, req, t.TempDir())
+	require.NoError(t, err)
+	require.Equal(t, answer, string(resp.Encoded), "an answer exactly at the limit")
+
+	// Served as it is.
+	root, inside, _ := localRoot(t, 16)
+	c := serve(t, &catalog.Server{ScratchDir: t.TempDir(), LocalRoot: root, Run: catalog.ExecRunner(ok)})
+	b, err := json.Marshal(sbom.CatalogRequest{Source: sbom.CatalogSourceHostDir, Path: inside, MaxBytes: 1 << 20, TimeoutSeconds: 5})
+	require.NoError(t, err)
+	hreq, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://catalog/v1/catalog", bytes.NewReader(b))
+	require.NoError(t, err)
+	hresp, err := c.Do(hreq)
+	require.NoError(t, err)
+	defer func() { _ = hresp.Body.Close() }()
+	require.Equal(t, http.StatusOK, hresp.StatusCode)
+	body, err := io.ReadAll(hresp.Body)
+	require.NoError(t, err)
+	require.Equal(t, answer, string(body))
+	var cr sbom.CatalogResponse
+	require.NoError(t, json.Unmarshal(body, &cr))
+	require.Equal(t, []string{"a note"}, cr.Coverage.Notes)
+}

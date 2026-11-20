@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -90,6 +91,7 @@ type Inventory struct {
 	retry  *retrier    // backs off keys whose flush failed
 	cache  cache.Cache // set by Register
 	access *accessCache
+	misses *missCache // template references whose registry lookup ended unresolvable
 	synced atomic.Bool
 	// podCounts is the live pod count per owner key as of the last Flush; nil before the first.
 	podCounts atomic.Pointer[map[string]int]
@@ -102,6 +104,10 @@ type Inventory struct {
 	catalogRetry map[string]bool                // synthetic digests whose OnImageCatalogued failed
 	unreported   map[string]bool                // owner keys whose OnOwnersChanged failed
 	superseded   map[string]time.Time           // agent-catalogued digests → last Supersede request
+	// tagsSince is when the TagTTL refresh being flushed started (zero otherwise): resolveRef then
+	// uses only tag records written since, so no tag is used for longer than TagTTL, while the owners
+	// of one tag under the same credentials still share a single lookup per refresh.
+	tagsSince time.Time
 
 	mu             sync.Mutex
 	known          map[string]bool // stored workload owner keys
@@ -126,7 +132,8 @@ func New(o Options) *Inventory {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
+	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), misses: newMissCache(),
+		podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
 		enqueued: map[string]time.Time{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
 		superseded: map[string]time.Time{}, known: map[string]bool{}, templateBacked: map[string]bool{}}
 	inv.batch = newBatcher(o.Debounce, func(ctx context.Context, keys []string) {
@@ -213,10 +220,11 @@ func (inv *Inventory) nodeHandler() toolscache.ResourceEventHandler {
 func (inv *Inventory) NeedLeaderElection() bool { return true }
 
 // Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
-// then flushes batches. Every TagTTL it re-resolves template-backed owners; every VersionPoll it
-// re-reads the control-plane version; every RetryPoll it flushes the owners of images whose
-// quarantine has ended, which hands those images back to the acquirer or the normaliser, and the
-// owners of images catalogued from a node agent's SBOM, which asks the registry to supersede them.
+// then flushes batches. Every TagTTL it re-resolves the tags of template-backed owners
+// (refreshTemplates); every VersionPoll it re-reads the control-plane version; every RetryPoll it
+// flushes the owners of images whose quarantine has ended, which hands those images back to the
+// acquirer or the normaliser, and the owners of images catalogued from a node agent's SBOM, which
+// asks the registry to supersede them, and forgets the hand-offs of images no owner uses any more.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -254,6 +262,9 @@ func (inv *Inventory) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-retries.C:
+			if err := inv.pruneHandedOff(ctx); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "listing the images in use")
+			}
 			keys, err := inv.o.Store.OwnersOfExpiredQuarantine(ctx, inv.now())
 			if err != nil {
 				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images due a retry")
@@ -265,15 +276,52 @@ func (inv *Inventory) Start(ctx context.Context) error {
 			}
 			inv.batch.Add(append(keys, agent...)...)
 		case <-tags.C:
-			inv.mu.Lock()
-			keys := sortedKeys(inv.templateBacked)
-			inv.mu.Unlock()
-			inv.batch.Add(keys...)
+			if err := inv.refreshTemplates(ctx); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "refreshing the tags of owners that are not running failed")
+			}
 		case <-versions.C:
 			inv.refreshVersion(ctx)
 			inv.batch.Add(clusterKey)
 		}
 	}
+}
+
+// pruneHandedOff forgets the digests handed to the acquirer, or asked to be superseded, that no owner
+// uses any more: an image whose workloads left the cluster is not held in memory for the life of the
+// process. If an owner uses it again, it is handed off again as any new image would be.
+func (inv *Inventory) pruneHandedOff(ctx context.Context) error {
+	inv.flushMu.Lock()
+	defer inv.flushMu.Unlock()
+	if len(inv.enqueued) == 0 && len(inv.superseded) == 0 {
+		return nil
+	}
+	inUse, err := inv.o.Store.DigestsInUse(ctx)
+	if err != nil {
+		return err
+	}
+	used := make(map[string]bool, len(inUse))
+	for _, d := range inUse {
+		used[d] = true
+	}
+	for _, m := range []map[string]time.Time{inv.enqueued, inv.superseded} {
+		maps.DeleteFunc(m, func(d string, _ time.Time) bool { return !used[d] })
+	}
+	return nil
+}
+
+// refreshTemplates flushes the template-backed owners now, looking up again every tag whose record
+// was written before the refresh started, however young. A record written just after one refresh is
+// therefore replaced at the next, so a tag is used for at most TagTTL (one refresh period), not up to
+// twice that. A record this refresh writes is used by the rest of it, so the owners that share a tag
+// and credentials cost one registry lookup per refresh, not one each.
+func (inv *Inventory) refreshTemplates(ctx context.Context) error {
+	inv.mu.Lock()
+	keys := sortedKeys(inv.templateBacked)
+	inv.mu.Unlock()
+	if len(keys) == 0 {
+		return nil
+	}
+	return inv.flush(ctx, keys, inv.now())
 }
 
 // MarkCluster queues "cluster", which rebuilds the synthetic Cluster and ContainerRuntime owners (the
@@ -347,7 +395,7 @@ type flushState struct {
 	now      time.Time
 	nodes    map[string]model.Node
 	nodeList []model.Node // sorted by name
-	platform NodePlatform // majority Ready-node platform, for owners with no running pods
+	platform NodePlatform // majority Ready-node platform, for owners with no running pods and no platform pins
 	reqs     []sbom.Request
 	changed  []string
 }
@@ -359,8 +407,15 @@ type flushState struct {
 // Flush returns an error only when the batch as a whole could not be applied or reported; what it
 // could not report is reported by a later Flush.
 func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
+	return inv.flush(ctx, keys, time.Time{})
+}
+
+// flush is Flush; with tagsSince set, tags recorded before it are looked up again (refreshTemplates).
+func (inv *Inventory) flush(ctx context.Context, keys []string, tagsSince time.Time) error {
 	inv.flushMu.Lock()
 	defer inv.flushMu.Unlock()
+	inv.tagsSince = tagsSince
+	defer func() { inv.tagsSince = time.Time{} }()
 	f, err := inv.newFlush(ctx)
 	if err != nil {
 		inv.batch.Add(keys...)
@@ -584,13 +639,14 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 	running := len(archs) > 0
 	fromTemplate := !running && tmpl != nil
 	if fromTemplate {
-		if uses, err = inv.templateUses(ctx, tmpl, ns, f.platform, prev); err != nil {
+		platform := templatePlatform(&tmpl.Spec, f.nodeList, f.platform)
+		if uses, err = inv.templateUses(ctx, tmpl, ns, platform, prev); err != nil {
 			if uses == nil {
 				return err
 			}
 			pending = append(pending, err)
 		}
-		archs[f.platform.Arch] = true
+		archs[platform.Arch] = true
 	}
 	for _, u := range uses {
 		if err := inv.recordImage(ctx, f, u); err != nil {

@@ -53,9 +53,11 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 			}},
 		},
 		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name: "app", Image: "docker.io/library/nginx:1.27", ImageID: "docker.io/library/nginx@" + idx,
+				Ready: true, RestartCount: 3, Started: ptr.To(true),
 				VolumeMounts: []corev1.VolumeMountStatus{{Name: "models", MountPath: "/models", VolumeStatus: volStatus}},
 			}},
 		},
@@ -91,10 +93,11 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 	require.Equal(t, int32(8080), c.Ports[0].HostPort)
 	require.Equal(t, containerSC, c.SecurityContext)
 
-	st := p.Status.ContainerStatuses[0]
-	require.Equal(t, "docker.io/library/nginx@"+idx, st.ImageID)
-	require.Equal(t, volStatus, st.VolumeMounts[0].VolumeStatus)
-	require.Equal(t, corev1.PodRunning, p.Status.Phase)
+	// Only what is read is kept: no phase, conditions, readiness or restarts.
+	require.Equal(t, corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+		Name: "app", Image: "docker.io/library/nginx:1.27", ImageID: "docker.io/library/nginx@" + idx,
+		VolumeMounts: []corev1.VolumeMountStatus{{Name: "models", MountPath: "/models", VolumeStatus: volStatus}},
+	}}}, p.Status)
 
 	t.Run("workload", func(t *testing.T) {
 		d := &appsv1.Deployment{
@@ -116,6 +119,49 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		require.Len(t, got.Spec.Template.Spec.Volumes, 2)
 		require.Equal(t, appsv1.DeploymentStatus{Replicas: 2}, got.Status)
 
+		// A template keeps only its platform pins of the scheduling constraints (F84).
+		pinned := d.DeepCopy()
+		pinned.Spec.Template.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "arm64", "pool": "general"}
+		pinned.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
+		pinned.Spec.Template.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+						{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}},
+					}},
+					{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
+				}}},
+			PodAntiAffinity: &corev1.PodAntiAffinity{},
+		}
+		out, err = transformWorkload(pinned)
+		require.NoError(t, err)
+		spec := out.(*appsv1.Deployment).Spec.Template.Spec
+		require.Equal(t, map[string]string{corev1.LabelArchStable: "arm64"}, spec.NodeSelector)
+		require.Nil(t, spec.Tolerations)
+		require.Equal(t, &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}}},
+				{},
+			}}}}, spec.Affinity)
+		unpinned := d.DeepCopy()
+		unpinned.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}}}}}}
+		out, err = transformWorkload(unpinned)
+		require.NoError(t, err)
+		require.Nil(t, out.(*appsv1.Deployment).Spec.Template.Spec.Affinity, "no platform pin, no affinity kept")
+
+		// A Job keeps its Complete and Failed conditions, type and status only (F77).
+		job := &batchv1.Job{Status: batchv1.JobStatus{Active: 1, Succeeded: 2, Conditions: []batchv1.JobCondition{
+			{Type: batchv1.JobSuspended, Status: corev1.ConditionFalse},
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, Reason: "Done", Message: "finished"},
+		}}}
+		out, err = transformWorkload(job)
+		require.NoError(t, err)
+		require.Equal(t, batchv1.JobStatus{Active: 1, Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete,
+			Status: corev1.ConditionTrue}}}, out.(*batchv1.Job).Status)
+
 		cj := &batchv1.CronJob{Spec: batchv1.CronJobSpec{Schedule: "@daily", JobTemplate: batchv1.JobTemplateSpec{
 			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: in.Spec}}}}}
 		out, err = transformWorkload(cj)
@@ -124,9 +170,11 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 	})
 
 	t.Run("node", func(t *testing.T) {
+		taints := []corev1.Taint{{Key: "dedicated", Value: "gpu", Effect: corev1.TaintEffectNoSchedule}}
 		n := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{Name: "n1", Annotations: map[string]string{"flannel": "x"},
 				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}}},
+			Spec: corev1.NodeSpec{PodCIDR: "10.42.0.0/24", ProviderID: "k3s://n1", Unschedulable: true, Taints: taints},
 			Status: corev1.NodeStatus{
 				NodeInfo: corev1.NodeSystemInfo{Architecture: "arm64", KubeletVersion: "v1.35.2+k3s1"},
 				Images: []corev1.ContainerImage{{Names: []string{"docker.io/library/nginx@sha256:" + strings.Repeat("e", 64),
@@ -142,5 +190,6 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		require.Equal(t, n.Status.Images, got.Status.Images)
 		require.Equal(t, n.Status.NodeInfo, got.Status.NodeInfo)
 		require.Equal(t, []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}, got.Status.Conditions)
+		require.Equal(t, corev1.NodeSpec{Taints: taints}, got.Spec, "of the spec, only the taints (#11)")
 	})
 }

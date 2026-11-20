@@ -37,6 +37,19 @@ type NodeAgentConfig struct {
 	// merging into it, and an explicitly empty (or null) value means every node.
 	Architectures []string          `yaml:"architectures"`
 	NodeSelector  map[string]string `yaml:"nodeSelector"`
+	// Tolerations are the agent DaemonSet's tolerations, as the chart renders them: a node with a
+	// NoSchedule or NoExecute taint none of them tolerates is shown as not scheduled. The default is the
+	// chart's, tolerate everything; a value in the file replaces it.
+	Tolerations []Toleration `yaml:"tolerations"`
+}
+
+// Toleration is a pod toleration (the fields of a Kubernetes toleration, under their YAML names).
+type Toleration struct {
+	Key               string `yaml:"key"`
+	Operator          string `yaml:"operator"`
+	Value             string `yaml:"value"`
+	Effect            string `yaml:"effect"`
+	TolerationSeconds *int64 `yaml:"tolerationSeconds"`
 }
 
 func defaultNodeAgent() NodeAgentConfig {
@@ -45,6 +58,7 @@ func defaultNodeAgent() NodeAgentConfig {
 		MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
 		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
 		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Tolerations: []Toleration{{Operator: "Exists"}},
 	}
 }
 
@@ -108,8 +122,8 @@ func (n NodeAgentConfig) validate(bad func(format string, a ...any)) {
 
 // ScheduledOn reports whether the agent DaemonSet schedules on a node with these labels and architecture
 // (its kubernetes.io/arch label, else arch), as far as the configuration tells: its architecture is one of
-// Architectures and its labels match NodeSelector. Taints are not known here. When it does not, reason
-// says why.
+// Architectures and its labels match NodeSelector. Taints are checked against Tolerations by the caller,
+// which has the node. When it does not, reason says why.
 func (n NodeAgentConfig) ScheduledOn(nodeLabels map[string]string, arch string) (ok bool, reason string) {
 	if a := nodeLabels["kubernetes.io/arch"]; a != "" {
 		arch = a

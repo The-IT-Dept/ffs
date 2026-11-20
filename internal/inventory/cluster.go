@@ -83,6 +83,9 @@ type ClusterOptions struct {
 	// RuntimeRetired: the node agent reports the container runtime (the Nodes owner), so no
 	// ContainerRuntime owners are built and the Kubernetes images drop NoteBundled.
 	RuntimeRetired bool
+	// KubeProxyTag is the kube-proxy image tag ci.KubeProxyVersion was normalised from, such as
+	// "v1.30.4-eksbuild.3"; "" when unknown.
+	KubeProxyTag string
 }
 
 // BuildClusterInventory builds the synthetic Cluster owner (control plane, kubelet and kube-proxy
@@ -168,6 +171,16 @@ func clusterSynthetic(clusterName string, ci model.ClusterInfo, nodes []model.No
 			raw = ci.GitVersion
 			if ci.LowConfidence {
 				lowRaw = ci.GitVersion
+			}
+		case raw == "" && r.kubeProxy:
+			// Only kube-proxy runs this version. On a managed distribution it is a vendor build too,
+			// whose tag rarely names the vendor (EKS's "-eksbuild.<n>").
+			raw = "v" + v
+			if o.KubeProxyTag != "" {
+				raw = o.KubeProxyTag
+			}
+			if _, _, low, err := NormalizeK8sVersion(raw); ci.LowConfidence || (err == nil && low) {
+				lowRaw = raw
 			}
 		case raw == "":
 			raw = "v" + v
@@ -286,7 +299,7 @@ func (inv *Inventory) flushCluster(ctx context.Context, f *flushState) error {
 	if err := inv.o.Store.ReplaceNodes(ctx, f.nodeList); err != nil {
 		return err
 	}
-	ci, err := inv.clusterInfo(ctx, f.now)
+	ci, proxyTag, err := inv.clusterInfo(ctx, f.now)
 	if err != nil {
 		return err
 	}
@@ -294,7 +307,8 @@ func (inv *Inventory) flushCluster(ctx context.Context, f *flushState) error {
 		return err
 	}
 	var errs []error
-	for _, s := range BuildClusterInventory(inv.o.ClusterName, ci, f.nodeList, f.now, ClusterOptions{RuntimeRetired: state.RuntimeRetired}) {
+	opts := ClusterOptions{RuntimeRetired: state.RuntimeRetired, KubeProxyTag: proxyTag}
+	for _, s := range BuildClusterInventory(inv.o.ClusterName, ci, f.nodeList, f.now, opts) {
 		for _, img := range s.Images {
 			if err := inv.recordSynthetic(ctx, img, s.Packages[img.Digest]); err != nil {
 				errs = append(errs, err)
@@ -355,15 +369,16 @@ func packageIDs(pkgs []model.Package) []string {
 }
 
 // clusterInfo builds the cluster info from the last control-plane version read (or the stored
-// one, when Version is nil or has not answered yet) and the kube-proxy DaemonSet.
-func (inv *Inventory) clusterInfo(ctx context.Context, now time.Time) (model.ClusterInfo, error) {
+// one, when Version is nil or has not answered yet) and the kube-proxy DaemonSet, and returns the
+// kube-proxy image tag its version was normalised from.
+func (inv *Inventory) clusterInfo(ctx context.Context, now time.Time) (model.ClusterInfo, string, error) {
 	inv.mu.Lock()
 	gv := inv.gitVersion
 	inv.mu.Unlock()
 	if gv == "" {
 		stored, ok, err := inv.o.Store.GetClusterInfo(ctx)
 		if err != nil {
-			return model.ClusterInfo{}, err
+			return model.ClusterInfo{}, "", err
 		}
 		if ok {
 			gv = stored.GitVersion
@@ -373,20 +388,21 @@ func (inv *Inventory) clusterInfo(ctx context.Context, now time.Time) (model.Clu
 	if v, dist, low, err := NormalizeK8sVersion(gv); err == nil {
 		ci.Version, ci.Distribution, ci.LowConfidence = v, dist, low
 	}
-	kp, err := inv.kubeProxyVersion(ctx)
+	kp, tag, err := inv.kubeProxyVersion(ctx)
 	if err != nil {
-		return model.ClusterInfo{}, err
+		return model.ClusterInfo{}, "", err
 	}
 	ci.KubeProxyVersion = kp
-	return ci, nil
+	return ci, tag, nil
 }
 
-// kubeProxyVersion returns the normalised image tag of the kube-system/kube-proxy DaemonSet, or "".
-func (inv *Inventory) kubeProxyVersion(ctx context.Context) (string, error) {
+// kubeProxyVersion returns the normalised image tag of the kube-system/kube-proxy DaemonSet and the
+// tag itself, or "" for both.
+func (inv *Inventory) kubeProxyVersion(ctx context.Context) (version, tag string, err error) {
 	ds := &appsv1.DaemonSet{}
 	found, err := inv.get(ctx, "kube-system", "kube-proxy", ds)
 	if err != nil || !found || len(ds.Spec.Template.Spec.Containers) == 0 {
-		return "", err
+		return "", "", err
 	}
 	image := ds.Spec.Template.Spec.Containers[0].Image
 	for _, c := range ds.Spec.Template.Spec.Containers {
@@ -396,10 +412,10 @@ func (inv *Inventory) kubeProxyVersion(ctx context.Context) (string, error) {
 	}
 	if _, tag, _, err := SplitRef(image); err == nil {
 		if v, _, _, err := NormalizeK8sVersion(tag); err == nil {
-			return v, nil
+			return v, tag, nil
 		}
 	}
-	return "", nil
+	return "", "", nil
 }
 
 // refreshVersion reads the control-plane version; a nil Version skips it.

@@ -294,7 +294,8 @@ func TestAcquirer_TransientNotCountedOnCancel(t *testing.T) {
 	require.EqualValues(t, 1, src.calls.Load())
 }
 
-func TestAcquirer_SingleflightDedup(t *testing.T) {
+// TestAcquirer_OneJobPerDigest: concurrent requests for a digest join its one job.
+func TestAcquirer_OneJobPerDigest(t *testing.T) {
 	st, clock := acqStore(t), acqClock()
 	release := make(chan struct{})
 	entered := make(chan struct{}, 1)

@@ -220,23 +220,51 @@ func (r *Resolver) defaultIngressClass(ctx context.Context) (string, error) {
 }
 
 // routeEdges returns an edge per Gateway parent, hostname ("" when the route lists none) and backend
-// Service in selecting, for the Gateway API routes in ns.
+// Service in selecting (the Services in ns that select the workload), for the Gateway API routes to
+// them. A route in another namespace counts only where a ReferenceGrant in ns allows it to reference
+// the Service, as for the Gateway itself.
 func (r *Resolver) routeEdges(ctx context.Context, ns string, selecting map[string]bool) ([]model.ExposureEdge, error) {
-	routes, err := routesIn(ctx, r.c, ns)
+	kinds, grantKinds := r.readKinds()
+	routes, err := routesTo(ctx, r.c, ns, kinds)
 	if err != nil {
 		return nil, err
+	}
+	var (
+		grants     []gatewayv1.ReferenceGrantSpec
+		grantsRead bool
+	)
+	allowed := func(rt route, svc string) (bool, error) {
+		if rt.Namespace == ns {
+			return true, nil
+		}
+		if !grantsRead {
+			g, gerr := grantsIn(ctx, r.c, ns, grantKinds)
+			if gerr != nil {
+				return false, gerr
+			}
+			grants, grantsRead = g, true
+		}
+		return grantsBackend(grants, rt.Kind, rt.Namespace, svc), nil
 	}
 	var edges []model.ExposureEdge
 	for _, rt := range routes {
 		var services []string
 		for _, b := range rt.Backends {
-			if b.Namespace == ns && selecting[b.Name] {
-				port := ""
-				if b.Port != 0 {
-					port = strconv.Itoa(int(b.Port))
-				}
-				services = append(services, serviceRef(b.Namespace, b.Name, port))
+			if b.Namespace != ns || !selecting[b.Name] {
+				continue
 			}
+			ok, err := allowed(rt, b.Name)
+			if err != nil {
+				return nil, err
+			}
+			if !ok {
+				continue
+			}
+			port := ""
+			if b.Port != 0 {
+				port = strconv.Itoa(int(b.Port))
+			}
+			services = append(services, serviceRef(b.Namespace, b.Name, port))
 		}
 		if len(services) == 0 {
 			continue

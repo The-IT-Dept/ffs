@@ -27,7 +27,7 @@ The Coverage page and the API (`/api/v1/coverage`) report each gap with a code a
 | `no_package_database` | no package database (image-based OS) | `informational` | Image-based operating systems have no package database. On any other OS, set `nodeAgent.packageDatabases`. |
 | `content_store_unreadable` | no containerd content store | `informational` | Side-loaded images on this node cannot be catalogued from it. |
 | `host_not_inventoried` | agent reporting, host not inventoried | `check_node_agent` | Check the node agent's logs on these nodes; the last error is shown. |
-| `node_agent_unsupported` | not scheduled by the node agent | `informational` | Its architecture or node selector excludes this node from the node agent. To cover it, add it to `nodeAgent.architectures` or `nodeAgent.nodeSelector`. |
+| `node_agent_unsupported` | not scheduled by the node agent | `informational` | Its architecture, the node selector or a taint the agent does not tolerate excludes this node from the node agent. To cover it, add it to `nodeAgent.architectures`, `nodeAgent.nodeSelector` or `nodeAgent.tolerations`. |
 | `feed_stale` | feed out of date | `check_feed_access` | Check that ffs can reach the feed; the last error is shown. |
 
 ## Blind spots
@@ -42,7 +42,7 @@ Rust binaries built without cargo-auditable, bundled or minified JavaScript, cop
 
 Images whose credentials only the kubelet holds, through a credential-provider plugin or KEP-4412 service-account tokens; images pulled through a node-level registry mirror that the mirror map does not cover; and side-loaded images (`ctr import`, `kind load`, k3s airgap tarballs), whose image ID is a node-local config digest.
 
-**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. A registry that ffs itself cannot reach (DNS, refused or timed-out connections, blocked egress) gives `registry not reachable from ffs for <repository>: <problem>` after about five minutes of failures, and is retried hourly. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
+**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. A registry that ffs itself cannot reach (DNS, refused or timed-out connections, blocked egress) gives `registry not reachable from ffs for <repository>: <problem>` after about five minutes of failures, and is retried hourly. An image named only by a workload that is not running is looked up again after one hour, then after two, four and at most six hours while it stays unresolvable. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
 - `registry.operatorSecret` supplies registry credentials that otherwise only the nodes hold;
 - `registry.mirrors` is a registry mirror rewrite map, so pulls go where the nodes pull from.
 
@@ -69,7 +69,7 @@ Kernel packages that are installed but not running, components bundled into k3s 
 - `node agent cannot read <path>: permission denied`, for example under SELinux;
 - `no containerd content store on this node; side-loaded images cannot be catalogued from it`;
 - `host_not_inventoried`: the agent reports but the node's host inventory is not stored or not current, with the reason;
-- `not scheduled by the node agent: <reason>` (`node_agent_unsupported`) on nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector`.
+- `not scheduled by the node agent: <reason>` (`node_agent_unsupported`) on nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector`, or with a `NoSchedule` or `NoExecute` taint that `nodeAgent.tolerations` does not tolerate.
 
 A node group is seen into in full only while none of its members has a host coverage gap.
 
@@ -103,7 +103,7 @@ Private images on EKS, GKE or AKS that the nodes pull with cloud workload identi
 
 ### Whether a LoadBalancer or Ingress is internet-facing
 
-ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account.
+ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account. A Gateway API route in another namespace than its backend Service counts only when a ReferenceGrant in the Service's namespace allows it, as for the Gateway itself, and ffs must be able to list ReferenceGrants to check this. The chart's RBAC does not grant that access, so with the chart as installed such routes are not counted as exposure. To count them, grant the controller's service account `get`, `list` and `watch` on `referencegrants` in the `gateway.networking.k8s.io` API group; ffs checks for the access every 5 minutes and needs no restart.
 
 **What ffs shows:** the reason names the path, for example `exposed via HTTPRoute shop/web on Gateway edge/external`. Internal paths can be excluded with `exposure.internalIngressClasses`, `exposure.internalGatewayClasses`, `exposure.internalGateways` and `exposure.internalLBAnnotations`.
 

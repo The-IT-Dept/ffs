@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -143,4 +144,30 @@ func TestBuildClusterInventory_RuntimeRetired(t *testing.T) {
 	syn = BuildClusterInventory("dev", eks, nil, t0, ClusterOptions{RuntimeRetired: true})
 	require.Equal(t, []string{"version normalised from v1.30.4-eks-a737599; vendor builds may include backported fixes"},
 		syn[0].Images[0].Coverage.Notes)
+}
+
+// TestBuildClusterInventory_KubeProxyOnlyVendorNote (F53): a version only kube-proxy runs is named by
+// its image tag, and on a managed distribution (or with a vendor tag) carries the vendor note too.
+func TestBuildClusterInventory_KubeProxyOnlyVendorNote(t *testing.T) {
+	const vendorNote = "version normalised from %s; vendor builds may include backported fixes"
+	eks := model.ClusterInfo{GitVersion: "v1.30.4-eks-a737599", Version: "1.30.4", Distribution: "eks", LowConfidence: true,
+		KubeProxyVersion: "1.29.0"}
+	syn := BuildClusterInventory("dev", eks, nil, t0, ClusterOptions{RuntimeRetired: true, KubeProxyTag: "v1.29.0-minimal-eksbuild.1"})
+	require.Len(t, syn, 1)
+	cl := syn[0]
+	require.Equal(t, []string{"k8s:1.29.0", "k8s:1.30.4"}, digestsOf(cl.Owner.Containers))
+	require.Equal(t, "v1.29.0-minimal-eksbuild.1", cl.Owner.Containers[0].ImageRef)
+	require.Equal(t, "kube-proxy", cl.Packages["k8s:1.29.0"][0].Path)
+	require.Equal(t, []string{fmt.Sprintf(vendorNote, "v1.29.0-minimal-eksbuild.1")}, cl.Images[0].Coverage.Notes)
+
+	// A vendor tag on a distribution ffs does not know as managed.
+	plain := model.ClusterInfo{GitVersion: "v1.27.4", Version: "1.27.4", KubeProxyVersion: "1.27.3"}
+	syn = BuildClusterInventory("dev", plain, nil, t0, ClusterOptions{RuntimeRetired: true, KubeProxyTag: "v1.27.3-gke.100"})
+	require.Equal(t, []string{fmt.Sprintf(vendorNote, "v1.27.3-gke.100")}, syn[0].Images[0].Coverage.Notes)
+
+	// An upstream build gets no note; without a tag the version is the reference.
+	k3s := model.ClusterInfo{GitVersion: "v1.35.2+k3s1", Version: "1.35.2", Distribution: "k3s", KubeProxyVersion: "1.34.1"}
+	syn = BuildClusterInventory("dev", k3s, nil, t0, ClusterOptions{RuntimeRetired: true})
+	require.Equal(t, "v1.34.1", syn[0].Owner.Containers[0].ImageRef)
+	require.Empty(t, syn[0].Images[0].Coverage.Notes)
 }

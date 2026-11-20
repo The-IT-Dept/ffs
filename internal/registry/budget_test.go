@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"regexp"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,4 +171,84 @@ func TestBudget_429SetsExhaustedAndClassifies(t *testing.T) {
 	clk.Advance(6 * time.Minute)
 	_, err = c2.Image(within(t, 5*time.Second), s2.Host+"/app", d2, CredSet{})
 	require.NoError(t, err)
+}
+
+// roundTripFunc is an http.RoundTripper made of a function.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestBudget_RemainingNeverGivesBackUnseenTokens (F53): a response's RateLimit-Remaining is no newer
+// than the tokens taken locally that the registry has not counted yet (a manifest GET still in flight,
+// a recent Reserve for the cataloguer's pulls), so while there are any it may lower the bucket but
+// never give those tokens back.
+func TestBudget_RemainingNeverGivesBackUnseenTokens(t *testing.T) {
+	const host = "registry.example.com"
+	var remaining atomic.Int32
+	remaining.Store(10)
+	release := make(chan struct{})
+	base := roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path == "/v2/app/manifests/slow" {
+			<-release
+		}
+		h := http.Header{}
+		h.Set("RateLimit-Limit", "10;w=3600")
+		h.Set("RateLimit-Remaining", strconv.Itoa(int(remaining.Load())))
+		return &http.Response{StatusCode: http.StatusOK, Header: h, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	})
+	clk := newClock()
+	tr := newBudgetTransport(base, clk.Now)
+	call := func(method, path string) {
+		t.Helper()
+		req, err := http.NewRequestWithContext(within(t, 5*time.Second), method, "https://"+host+path, nil)
+		require.NoError(t, err)
+		resp, err := tr.RoundTrip(req)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+	}
+	tokens := func() float64 {
+		t.Helper()
+		for _, s := range tr.states() {
+			if s.Registry == host {
+				return s.Remaining
+			}
+		}
+		t.Fatal("no budget for " + host)
+		return 0
+	}
+
+	call(http.MethodHead, "/v2/app/manifests/v1") // learns the budget without spending it
+	require.Equal(t, 10.0, tokens())
+
+	slow := make(chan struct{})
+	go func() {
+		defer close(slow)
+		call(http.MethodGet, "/v2/app/manifests/slow")
+	}()
+	require.Eventually(t, func() bool { return tokens() == 9 }, 5*time.Second, time.Millisecond)
+
+	// The registry has counted this GET but not the slow one: 9 left by its count, 8 by ours.
+	remaining.Store(9)
+	call(http.MethodGet, "/v2/app/manifests/fast")
+	require.Equal(t, 8.0, tokens(), "the slow GET's token is not given back")
+	// A lower count is taken: another client of the registry spent some.
+	remaining.Store(5)
+	call(http.MethodHead, "/v2/app/manifests/v1")
+	require.Equal(t, 5.0, tokens())
+
+	// Once nothing is unseen, the registry's count is the budget again, higher or lower.
+	remaining.Store(7)
+	close(release)
+	<-slow
+	require.Equal(t, 7.0, tokens())
+
+	// Reserve's tokens stay spent while the cataloguer's pulls may not have reached the registry.
+	require.NoError(t, tr.reserveFor(ctx, host, 2))
+	require.Equal(t, 5.0, tokens())
+	call(http.MethodHead, "/v2/app/manifests/v1")
+	require.Equal(t, 5.0, tokens(), "a count from before the pulls does not refund the reservation")
+	clk.Advance(reserveHold)
+	remaining.Store(6)
+	call(http.MethodHead, "/v2/app/manifests/v1")
+	require.Equal(t, 6.0, tokens())
 }

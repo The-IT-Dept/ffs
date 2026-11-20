@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"regexp"
@@ -305,4 +306,30 @@ func TestHead_NoManifestGET(t *testing.T) {
 	_, err = c.Head(ctx, s.Host+"/app:2.0", CredSet{})
 	require.ErrorIs(t, err, ErrNotFound)
 	require.Equal(t, 0, s.Count("GET", manifestsRe))
+}
+
+// TestReferrers_BadBodyIsAnError (F53): a registry that answers the referrers API with a body that is
+// not an image index, or is too large, has referrers ffs cannot read: an error, not "none".
+func TestReferrers_BadBodyIsAnError(t *testing.T) {
+	for name, body := range map[string]string{
+		"not an index": "<html>maintenance</html>",
+		"too large":    `{"manifests":[` + strings.Repeat(" ", maxReferrersBytes) + `]}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := regtest.Start(t, regtest.WithReferrers(), regtest.WithMiddleware(func(next http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.Contains(r.URL.Path, "/referrers/") {
+						w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+						_, _ = io.WriteString(w, body)
+						return
+					}
+					next.ServeHTTP(w, r)
+				})
+			}))
+			d := s.Push(t, "app:1", randomImage(t))
+			descs, err := New(Options{}).Referrers(ctx, s.Host+"/app", d, CredSet{})
+			require.Error(t, err)
+			require.Nil(t, descs)
+		})
+	}
 }

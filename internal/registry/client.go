@@ -64,6 +64,8 @@ type Client struct {
 
 	mu        sync.Mutex
 	keychains map[string]cachedKeychain
+	// operatorMissing is set while the configured operator secret was last read as missing.
+	operatorMissing bool
 }
 
 // platformKey identifies an index's platform pick; the index digest pins its content.
@@ -436,7 +438,7 @@ func (c *Client) Reserve(ctx context.Context, repo string, n int) error {
 	if err != nil {
 		return err
 	}
-	return c.budget.take(ctx, r.RegistryStr(), float64(n))
+	return c.budget.reserveFor(ctx, r.RegistryStr(), float64(n))
 }
 
 // Budgets reports every registry that has sent rate-limit headers or answered 429, sorted by host.

@@ -3,19 +3,28 @@ package exposure
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	gatewayv1alpha2 "sigs.k8s.io/gateway-api/apis/v1alpha2"
+	gatewayv1beta1 "sigs.k8s.io/gateway-api/apis/v1beta1"
 )
 
 const gatewayGroup = "gateway.networking.k8s.io"
 
-// AddToScheme registers the Gateway API types (apis/v1 and apis/v1alpha2) ffs reads.
+// RouteBackendIndex is the cache index of Gateway API routes by the namespaces of the Services they
+// send traffic to, so the routes to a workload's Services are found in any namespace.
+const RouteBackendIndex = "ffs.routeBackendNamespaces"
+
+// AddToScheme registers the Gateway API types (apis/v1, apis/v1beta1 and apis/v1alpha2) ffs reads.
 func AddToScheme(s *runtime.Scheme) error {
 	if err := gatewayv1.Install(s); err != nil {
+		return err
+	}
+	if err := gatewayv1beta1.Install(s); err != nil {
 		return err
 	}
 	return gatewayv1alpha2.Install(s)
@@ -51,29 +60,60 @@ type rawRoute struct {
 	Backends        []gatewayv1.BackendObjectReference
 }
 
-// routeKind describes how to list and read one route kind at one API version.
+// routeKind describes how to list, index and read one route kind at one API version.
 type routeKind struct {
-	name string
-	// list lists the kind in ns; it reports false when the kind is not served.
-	list func(ctx context.Context, c client.Reader, ns string) ([]rawRoute, bool, error)
+	name    string // the route kind, such as "HTTPRoute"
+	version string // its API version, such as "v1"
+	// newObj returns an empty object of the kind, for its informer and index.
+	newObj func() client.Object
+	// index is the RouteBackendIndex extractor: the backend Service namespaces of a route.
+	index client.IndexerFunc
+	// list lists the routes of the kind with a backend Service in ns, through RouteBackendIndex; it
+	// reports false when the kind is not served.
+	list func(ctx context.Context, c client.Reader, ns string) ([]route, bool, error)
 }
 
 // kindOf builds a routeKind from a list object constructor, an items accessor and a converter.
-func kindOf[L client.ObjectList, T any](name string, newList func() L, items func(L) []T, conv func(T) rawRoute) routeKind {
-	return routeKind{name: name, list: func(ctx context.Context, c client.Reader, ns string) ([]rawRoute, bool, error) {
-		l := newList()
-		if err := c.List(ctx, l, client.InNamespace(ns)); err != nil {
-			if absent(err) {
-				return nil, false, nil
+func kindOf[L client.ObjectList, T any, PT interface {
+	*T
+	client.Object
+}](name, version string, newList func() L, items func(L) []T, conv func(*T) rawRoute) routeKind {
+	return routeKind{
+		name: name, version: version,
+		newObj: func() client.Object { return PT(new(T)) },
+		index: func(o client.Object) []string {
+			p, ok := o.(PT)
+			if !ok {
+				return nil
 			}
-			return nil, false, fmt.Errorf("exposure: list %T: %w", l, err)
-		}
-		var out []rawRoute
-		for _, it := range items(l) {
-			out = append(out, conv(it))
-		}
-		return out, true, nil
-	}}
+			return backendNamespaces(toRoute(name, conv((*T)(p))))
+		},
+		list: func(ctx context.Context, c client.Reader, ns string) ([]route, bool, error) {
+			l := newList()
+			if err := c.List(ctx, l, client.MatchingFields{RouteBackendIndex: ns}); err != nil {
+				if absent(err) {
+					return nil, false, nil
+				}
+				return nil, false, fmt.Errorf("exposure: list %T: %w", l, err)
+			}
+			its := items(l)
+			out := make([]route, 0, len(its))
+			for i := range its {
+				out = append(out, toRoute(name, conv(&its[i])))
+			}
+			return out, true, nil
+		},
+	}
+}
+
+// backendNamespaces returns the distinct namespaces of r's backend Services, sorted.
+func backendNamespaces(r route) []string {
+	var out []string
+	for _, b := range r.Backends {
+		out = append(out, b.Namespace)
+	}
+	slices.Sort(out)
+	return slices.Compact(out)
 }
 
 // backendsOf flattens the backend refs of every rule.
@@ -105,80 +145,79 @@ func hostnamesOf(hs []gatewayv1.Hostname) []string {
 
 // routeKinds lists, per route kind, the versions to try in order; the first served one wins.
 var routeKinds = [][]routeKind{
-	{kindOf("HTTPRoute", func() *gatewayv1.HTTPRouteList { return &gatewayv1.HTTPRouteList{} },
+	{kindOf("HTTPRoute", "v1", func() *gatewayv1.HTTPRouteList { return &gatewayv1.HTTPRouteList{} },
 		func(l *gatewayv1.HTTPRouteList) []gatewayv1.HTTPRoute { return l.Items },
-		func(o gatewayv1.HTTPRoute) rawRoute {
+		func(o *gatewayv1.HTTPRoute) rawRoute {
 			return rawRoute{o.Namespace, o.Name, hostnamesOf(o.Spec.Hostnames), o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 				func(r gatewayv1.HTTPRouteRule) []gatewayv1.HTTPBackendRef { return r.BackendRefs },
 				func(b gatewayv1.HTTPBackendRef) gatewayv1.BackendObjectReference { return b.BackendObjectReference })}
 		})},
-	{kindOf("GRPCRoute", func() *gatewayv1.GRPCRouteList { return &gatewayv1.GRPCRouteList{} },
+	{kindOf("GRPCRoute", "v1", func() *gatewayv1.GRPCRouteList { return &gatewayv1.GRPCRouteList{} },
 		func(l *gatewayv1.GRPCRouteList) []gatewayv1.GRPCRoute { return l.Items },
-		func(o gatewayv1.GRPCRoute) rawRoute {
+		func(o *gatewayv1.GRPCRoute) rawRoute {
 			return rawRoute{o.Namespace, o.Name, hostnamesOf(o.Spec.Hostnames), o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 				func(r gatewayv1.GRPCRouteRule) []gatewayv1.GRPCBackendRef { return r.BackendRefs },
 				func(b gatewayv1.GRPCBackendRef) gatewayv1.BackendObjectReference { return b.BackendObjectReference })}
 		})},
 	{
-		kindOf("TLSRoute", func() *gatewayv1.TLSRouteList { return &gatewayv1.TLSRouteList{} },
+		kindOf("TLSRoute", "v1", func() *gatewayv1.TLSRouteList { return &gatewayv1.TLSRouteList{} },
 			func(l *gatewayv1.TLSRouteList) []gatewayv1.TLSRoute { return l.Items },
-			func(o gatewayv1.TLSRoute) rawRoute {
+			func(o *gatewayv1.TLSRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, hostnamesOf(o.Spec.Hostnames), o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1.TLSRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
-		kindOf("TLSRoute", func() *gatewayv1alpha2.TLSRouteList { return &gatewayv1alpha2.TLSRouteList{} },
+		kindOf("TLSRoute", "v1alpha2", func() *gatewayv1alpha2.TLSRouteList { return &gatewayv1alpha2.TLSRouteList{} },
 			func(l *gatewayv1alpha2.TLSRouteList) []gatewayv1alpha2.TLSRoute { return l.Items },
-			func(o gatewayv1alpha2.TLSRoute) rawRoute {
+			func(o *gatewayv1alpha2.TLSRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, hostnamesOf(o.Spec.Hostnames), o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1alpha2.TLSRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
 	},
 	{
-		kindOf("TCPRoute", func() *gatewayv1.TCPRouteList { return &gatewayv1.TCPRouteList{} },
+		kindOf("TCPRoute", "v1", func() *gatewayv1.TCPRouteList { return &gatewayv1.TCPRouteList{} },
 			func(l *gatewayv1.TCPRouteList) []gatewayv1.TCPRoute { return l.Items },
-			func(o gatewayv1.TCPRoute) rawRoute {
+			func(o *gatewayv1.TCPRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, nil, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1.TCPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
-		kindOf("TCPRoute", func() *gatewayv1alpha2.TCPRouteList { return &gatewayv1alpha2.TCPRouteList{} },
+		kindOf("TCPRoute", "v1alpha2", func() *gatewayv1alpha2.TCPRouteList { return &gatewayv1alpha2.TCPRouteList{} },
 			func(l *gatewayv1alpha2.TCPRouteList) []gatewayv1alpha2.TCPRoute { return l.Items },
-			func(o gatewayv1alpha2.TCPRoute) rawRoute {
+			func(o *gatewayv1alpha2.TCPRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, nil, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1alpha2.TCPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
 	},
 	{
-		kindOf("UDPRoute", func() *gatewayv1.UDPRouteList { return &gatewayv1.UDPRouteList{} },
+		kindOf("UDPRoute", "v1", func() *gatewayv1.UDPRouteList { return &gatewayv1.UDPRouteList{} },
 			func(l *gatewayv1.UDPRouteList) []gatewayv1.UDPRoute { return l.Items },
-			func(o gatewayv1.UDPRoute) rawRoute {
+			func(o *gatewayv1.UDPRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, nil, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1.UDPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
-		kindOf("UDPRoute", func() *gatewayv1alpha2.UDPRouteList { return &gatewayv1alpha2.UDPRouteList{} },
+		kindOf("UDPRoute", "v1alpha2", func() *gatewayv1alpha2.UDPRouteList { return &gatewayv1alpha2.UDPRouteList{} },
 			func(l *gatewayv1alpha2.UDPRouteList) []gatewayv1alpha2.UDPRoute { return l.Items },
-			func(o gatewayv1alpha2.UDPRoute) rawRoute {
+			func(o *gatewayv1alpha2.UDPRoute) rawRoute {
 				return rawRoute{o.Namespace, o.Name, nil, o.Spec.ParentRefs, backendsOf(o.Spec.Rules,
 					func(r gatewayv1alpha2.UDPRouteRule) []gatewayv1.BackendRef { return r.BackendRefs }, plainRef)}
 			}),
 	},
 }
 
-// routesIn lists the HTTP, GRPC, TLS, TCP and UDP routes in ns. A kind the cluster does not serve
-// is skipped; TLS, TCP and UDP routes fall back to v1alpha2 when v1 is not served.
-func routesIn(ctx context.Context, c client.Reader, ns string) ([]route, error) {
+// routesTo lists the HTTP, GRPC, TLS, TCP and UDP routes, in any namespace, with a backend Service in
+// ns. kinds holds, per route kind, the versions to try in order: a kind the cluster does not serve is
+// skipped, and the first version served is used.
+func routesTo(ctx context.Context, c client.Reader, ns string, kinds [][]routeKind) ([]route, error) {
 	var out []route
-	for _, versions := range routeKinds {
+	for _, versions := range kinds {
 		for _, k := range versions {
-			raws, ok, err := k.list(ctx, c, ns)
+			routes, ok, err := k.list(ctx, c, ns)
 			if err != nil {
 				return nil, err
 			}
 			if !ok {
 				continue
 			}
-			for _, raw := range raws {
-				out = append(out, toRoute(k.name, raw))
-			}
+			out = append(out, routes...)
 			break
 		}
 	}
@@ -222,4 +261,83 @@ func refNamespace(ns *gatewayv1.Namespace, def string) string {
 		return string(*ns)
 	}
 	return def
+}
+
+// grantKind describes how to list ReferenceGrants at one API version.
+type grantKind struct {
+	version string
+	newObj  func() client.Object
+	newList func() client.ObjectList
+	// list lists the grant specs in ns; it reports false when the kind is not served.
+	list func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error)
+}
+
+// probe lists at most one ReferenceGrant through c, an uncached reader: it fails when ffs may not
+// list them.
+func (k grantKind) probe(ctx context.Context, c client.Reader) error {
+	return c.List(ctx, k.newList(), client.Limit(1))
+}
+
+// grantKinds are the ReferenceGrant versions to try in order: v1, then v1beta1 on clusters with
+// older Gateway API CRDs.
+var grantKinds = []grantKind{
+	{version: "v1", newObj: func() client.Object { return &gatewayv1.ReferenceGrant{} },
+		newList: func() client.ObjectList { return &gatewayv1.ReferenceGrantList{} },
+		list: func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
+			var l gatewayv1.ReferenceGrantList
+			if err := c.List(ctx, &l, client.InNamespace(ns)); err != nil {
+				return grantListErr(err)
+			}
+			out := make([]gatewayv1.ReferenceGrantSpec, len(l.Items))
+			for i := range l.Items {
+				out[i] = l.Items[i].Spec
+			}
+			return out, true, nil
+		}},
+	{version: "v1beta1", newObj: func() client.Object { return &gatewayv1beta1.ReferenceGrant{} },
+		newList: func() client.ObjectList { return &gatewayv1beta1.ReferenceGrantList{} },
+		list: func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
+			var l gatewayv1beta1.ReferenceGrantList
+			if err := c.List(ctx, &l, client.InNamespace(ns)); err != nil {
+				return grantListErr(err)
+			}
+			out := make([]gatewayv1.ReferenceGrantSpec, len(l.Items))
+			for i := range l.Items {
+				out[i] = l.Items[i].Spec
+			}
+			return out, true, nil
+		}},
+}
+
+func grantListErr(err error) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
+	if absent(err) {
+		return nil, false, nil
+	}
+	return nil, false, fmt.Errorf("exposure: list referencegrants: %w", err)
+}
+
+// grantsIn lists the ReferenceGrants in ns with the first of kinds the cluster serves; none when it
+// serves none of them.
+func grantsIn(ctx context.Context, c client.Reader, ns string, kinds []grantKind) ([]gatewayv1.ReferenceGrantSpec, error) {
+	for _, k := range kinds {
+		specs, ok, err := k.list(ctx, c, ns)
+		if err != nil || ok {
+			return specs, err
+		}
+	}
+	return nil, nil
+}
+
+// grantsBackend reports whether one of grants (the ReferenceGrants in the Service's namespace) lets
+// a route of kind in namespace from send traffic to the Service named svc, as the Gateway API
+// defines it: a grant allows the reference when one of its From entries names the route's group,
+// kind and namespace, and one of its To entries names core Services, either all of them or this one.
+func grantsBackend(grants []gatewayv1.ReferenceGrantSpec, kind, from, svc string) bool {
+	return slices.ContainsFunc(grants, func(g gatewayv1.ReferenceGrantSpec) bool {
+		return slices.ContainsFunc(g.From, func(f gatewayv1.ReferenceGrantFrom) bool {
+			return string(f.Group) == gatewayGroup && string(f.Kind) == kind && string(f.Namespace) == from
+		}) && slices.ContainsFunc(g.To, func(t gatewayv1.ReferenceGrantTo) bool {
+			return string(t.Group) == "" && string(t.Kind) == "Service" && (t.Name == nil || *t.Name == "" || string(*t.Name) == svc)
+		})
+	})
 }

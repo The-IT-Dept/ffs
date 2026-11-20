@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -76,4 +78,38 @@ func TestKeychain(t *testing.T) {
 		require.Equal(t, "get", a.GetVerb(), "%s %s", a.GetVerb(), a.GetResource().Resource)
 		require.Contains(t, []string{"secrets", "serviceaccounts"}, a.GetResource().Resource)
 	}
+}
+
+// TestKeychain_MissingOperatorSecretLoggedOnce (F85): a configured operator secret that does not exist
+// is logged, by its configured reference only, the first time it is found missing, and again only
+// after it has existed in between.
+func TestKeychain_MissingOperatorSecretLoggedOnce(t *testing.T) {
+	kube := fake.NewClientset()
+	clk := newClock()
+	c := New(Options{Kube: kube, Namespace: "ffs", Config: config.RegistryConfig{OperatorSecret: "regcreds"}, Now: clk.Now})
+	var lines []string
+	lctx := logr.NewContext(ctx, funcr.New(func(_, args string) { lines = append(lines, args) }, funcr.Options{}))
+	read := func() {
+		t.Helper()
+		_, err := c.keychain(lctx, CredSet{})
+		require.NoError(t, err)
+		clk.Advance(keychainTTL) // past the keychain cache, so the next read goes to the API
+	}
+
+	read()
+	read()
+	require.Len(t, lines, 1)
+	require.Contains(t, lines[0], "the configured operator registry secret does not exist")
+	require.Contains(t, lines[0], `"secret"="ffs/regcreds"`)
+
+	_, err := kube.CoreV1().Secrets("ffs").Create(ctx, dockerConfigSecret(t, "ffs", "regcreds", "registry.example.com"),
+		metav1.CreateOptions{})
+	require.NoError(t, err)
+	read()
+	require.Len(t, lines, 1)
+
+	require.NoError(t, kube.CoreV1().Secrets("ffs").Delete(ctx, "regcreds", metav1.DeleteOptions{}))
+	read()
+	read()
+	require.Len(t, lines, 2, "missing again after it existed")
 }

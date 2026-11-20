@@ -51,7 +51,6 @@ func transformPod(in any) (any, error) {
 		ObjectMeta: trimMeta(p.ObjectMeta),
 		Spec:       trimPodSpec(p.Spec),
 		Status: corev1.PodStatus{
-			Phase:                      p.Status.Phase,
 			ContainerStatuses:          trimStatuses(p.Status.ContainerStatuses),
 			InitContainerStatuses:      trimStatuses(p.Status.InitContainerStatuses),
 			EphemeralContainerStatuses: trimStatuses(p.Status.EphemeralContainerStatuses),
@@ -102,14 +101,16 @@ func trimContainers(cs []corev1.Container) []corev1.Container {
 	return out
 }
 
+// trimStatuses keeps what inventory and the node agent's pod index read of each container status:
+// its name, image and image ID, and the image refs of its image volume mounts. Phase, readiness and
+// restarts are not read: a pod counts as running once a container reports an image ID.
 func trimStatuses(ss []corev1.ContainerStatus) []corev1.ContainerStatus {
 	if ss == nil {
 		return nil
 	}
 	out := make([]corev1.ContainerStatus, len(ss))
 	for i, s := range ss {
-		out[i] = corev1.ContainerStatus{Name: s.Name, Image: s.Image, ImageID: s.ImageID, Ready: s.Ready,
-			RestartCount: s.RestartCount, Started: s.Started}
+		out[i] = corev1.ContainerStatus{Name: s.Name, Image: s.Image, ImageID: s.ImageID}
 		for _, m := range s.VolumeMounts {
 			if m.VolumeStatus != nil {
 				out[i].VolumeMounts = append(out[i].VolumeMounts,
@@ -120,16 +121,60 @@ func trimStatuses(ss []corev1.ContainerStatus) []corev1.ContainerStatus {
 	return out
 }
 
+// trimTemplate keeps a template's labels and annotations, its trimmed pod spec, and the scheduling
+// constraints on the node platform (see trimPlatformPins), which pick the platform a workload that is
+// not running is resolved at.
 func trimTemplate(t corev1.PodTemplateSpec) corev1.PodTemplateSpec {
 	m := trimMeta(t.ObjectMeta)
+	spec := trimPodSpec(t.Spec)
+	spec.NodeSelector, spec.Affinity = trimPlatformPins(t.Spec)
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: m.Labels, Annotations: m.Annotations},
-		Spec:       trimPodSpec(t.Spec),
+		Spec:       spec,
 	}
 }
 
+// platformLabels are the node labels a pod spec can pin its platform with.
+var platformLabels = []string{corev1.LabelArchStable, corev1.LabelOSStable}
+
+// trimPlatformPins returns the part of s's nodeSelector, and of its required node affinity, on the
+// kubernetes.io/arch and kubernetes.io/os labels; nil for each when there is none. Affinity terms keep
+// their place, emptied of other expressions, so a term that does not constrain the platform still
+// lets it be anything.
+func trimPlatformPins(s corev1.PodSpec) (map[string]string, *corev1.Affinity) {
+	var sel map[string]string
+	for _, k := range platformLabels {
+		if v, ok := s.NodeSelector[k]; ok {
+			if sel == nil {
+				sel = map[string]string{}
+			}
+			sel[k] = v
+		}
+	}
+	if s.Affinity == nil || s.Affinity.NodeAffinity == nil || s.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return sel, nil
+	}
+	pinned := false
+	terms := s.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	out := make([]corev1.NodeSelectorTerm, len(terms))
+	for i, term := range terms {
+		for _, e := range term.MatchExpressions {
+			if slices.Contains(platformLabels, e.Key) {
+				out[i].MatchExpressions = append(out[i].MatchExpressions,
+					corev1.NodeSelectorRequirement{Key: e.Key, Operator: e.Operator, Values: slices.Clone(e.Values)})
+				pinned = true
+			}
+		}
+	}
+	if !pinned {
+		return sel, nil
+	}
+	return sel, &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: out}}}
+}
+
 // transformWorkload keeps metadata, the trimmed pod template, the scale and suspend fields, and
-// status replicas, desiredNumberScheduled and active.
+// status replicas, desiredNumberScheduled and active, and a Job's Complete and Failed conditions.
 func transformWorkload(in any) (any, error) {
 	switch w := in.(type) {
 	case *appsv1.Deployment:
@@ -145,9 +190,15 @@ func transformWorkload(in any) (any, error) {
 			Spec:   appsv1.DaemonSetSpec{Template: trimTemplate(w.Spec.Template)},
 			Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: w.Status.DesiredNumberScheduled}}, nil
 	case *batchv1.Job:
+		var conds []batchv1.JobCondition
+		for _, c := range w.Status.Conditions {
+			if c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed {
+				conds = append(conds, batchv1.JobCondition{Type: c.Type, Status: c.Status})
+			}
+		}
 		return &batchv1.Job{TypeMeta: w.TypeMeta, ObjectMeta: trimMeta(w.ObjectMeta),
 			Spec:   batchv1.JobSpec{Suspend: w.Spec.Suspend, Template: trimTemplate(w.Spec.Template)},
-			Status: batchv1.JobStatus{Active: w.Status.Active}}, nil
+			Status: batchv1.JobStatus{Active: w.Status.Active, Conditions: conds}}, nil
 	case *batchv1.CronJob:
 		return &batchv1.CronJob{TypeMeta: w.TypeMeta, ObjectMeta: trimMeta(w.ObjectMeta),
 			Spec: batchv1.CronJobSpec{Suspend: w.Spec.Suspend, JobTemplate: batchv1.JobTemplateSpec{
@@ -157,8 +208,9 @@ func transformWorkload(in any) (any, error) {
 	return in, nil
 }
 
-// transformNode keeps name, labels, status.nodeInfo, the Ready condition's status and
-// status.images (names and sizes), which the node agent's report merges with the cached images.
+// transformNode keeps name, labels, spec.taints (of the spec, only those: the node agent's tolerations
+// decide where it runs), status.nodeInfo, the Ready condition's status and status.images (names and
+// sizes), which the node agent's report merges with the cached images.
 func transformNode(in any) (any, error) {
 	n, ok := in.(*corev1.Node)
 	if !ok {
@@ -168,6 +220,7 @@ func transformNode(in any) (any, error) {
 		TypeMeta: n.TypeMeta,
 		ObjectMeta: metav1.ObjectMeta{Name: n.Name, UID: n.UID, ResourceVersion: n.ResourceVersion,
 			Labels: n.Labels},
+		Spec:   corev1.NodeSpec{Taints: n.Spec.Taints},
 		Status: corev1.NodeStatus{NodeInfo: n.Status.NodeInfo},
 	}
 	if n.Status.Images != nil {
