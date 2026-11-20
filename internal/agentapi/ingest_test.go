@@ -527,6 +527,87 @@ func TestIngest_HostPoisonPill(t *testing.T) {
 	})
 }
 
+// requireHostReleased asserts that the Ingester holds nothing for worker-1's host: every slot is free, the node
+// is not busy and its acquisition record is ended.
+func (h *harness) requireHostReleased(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	require.True(t, h.ing.slots.TryAcquire(hostConcurrency), "every host slot is free")
+	h.ing.slots.Release(hostConcurrency)
+	h.ing.mu.Lock()
+	busy := h.ing.busy["worker-1"]
+	h.ing.mu.Unlock()
+	require.False(t, busy, "the node is not left busy")
+	stale, err := h.st.BeginAcquire(ctx, "nodehost:worker-1", h.clk.Now())
+	require.NoError(t, err)
+	require.False(t, stale, "the host acquisition record is ended")
+	require.NoError(t, h.st.EndAcquire(ctx, "nodehost:worker-1"))
+}
+
+func TestIngest_PreparePanicReleasesAndCounts(t *testing.T) {
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	h.ing.prepare = func(*wire.Report, *corev1.Node, time.Time) (hostPrep, error) {
+		h.prepares++
+		panic("decoder blew up")
+	}
+
+	resp := h.report(t, fullReport(1, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.True(t, resp.Applied, "a report whose host panics is still a heartbeat")
+	h.requireHostReleased(t)
+	job, ok := h.job(t)
+	require.True(t, ok)
+	require.Equal(t, 1, job.Attempts)
+	require.Equal(t, "preparing the host inventory: panic: decoder blew up", job.LastError)
+	require.True(t, job.QuarantinedUntil.IsZero())
+	require.Equal(t, "host inventory could not be read: panic: decoder blew up", h.agentNode(t).LastError)
+	require.Zero(t, h.fake.count())
+
+	h.report(t, fullReport(2, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.Equal(t, 2, h.prepares, "the next report's host is processed")
+	h.requireHostReleased(t)
+	job, _ = h.job(t)
+	require.Equal(t, 2, job.Attempts)
+	require.Equal(t, t0.Add(24*time.Hour), job.QuarantinedUntil, "a second panic quarantines the host")
+
+	h.report(t, fullReport(3, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.Equal(t, 2, h.prepares, "a quarantined host is never decoded")
+	require.True(t, strings.HasPrefix(h.agentNode(t).LastError, "host inventory quarantined until "), h.agentNode(t).LastError)
+}
+
+func TestIngest_IngestPanicIsCounted(t *testing.T) {
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	h.fake.during = func() { panic("acquirer blew up") }
+
+	resp := h.report(t, fullReport(1, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.True(t, resp.Applied)
+	h.requireHostReleased(t)
+	job, ok := h.job(t)
+	require.True(t, ok)
+	require.Equal(t, 1, job.Attempts)
+	require.True(t, job.QuarantinedUntil.IsZero())
+	n := h.agentNode(t)
+	require.Equal(t, "host inventory not stored: storing the host inventory panicked: acquirer blew up", n.LastError)
+	require.Empty(t, n.Fingerprint)
+}
+
+func TestIngest_HostGateErrorReleasesNode(t *testing.T) {
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	require.NoError(t, h.ing.slots.Acquire(context.Background(), hostConcurrency)) // every slot is taken
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	// The report waits for a slot until its deadline (or, on a very slow machine, fails at an earlier store
+	// call): either way it fails without leaving the node busy or its record open.
+	_, err := h.ing.Report(ctx, worker1, fullReport(1, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.Error(t, err)
+	h.ing.slots.Release(hostConcurrency)
+	h.requireHostReleased(t)
+	require.Zero(t, h.prepares)
+
+	h.report(t, fullReport(1, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))
+	require.Equal(t, 1, h.prepares)
+	require.NotEmpty(t, h.agentNode(t).Fingerprint)
+}
+
 func TestIngest_KeepsRebootSignalWithoutHost(t *testing.T) {
 	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
 	h.report(t, fullReport(1, ubuntuHost(t, "3.0.13-0ubuntu3.5"), &wire.Images{ContentStore: true}))

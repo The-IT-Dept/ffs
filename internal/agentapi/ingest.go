@@ -3,6 +3,7 @@ package agentapi
 import (
 	"context"
 	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -104,7 +105,7 @@ type hostGate struct {
 	prep    *hostPrep
 	prepErr error  // the host SBOM could not be prepared
 	skipErr string // last_error to write for a skipped host (quarantine)
-	end     func() // ends the host acquisition record
+	end     func() // ends the host acquisition record and frees the node
 }
 
 // Report applies one report (see Contract › Data flows › Report). A duplicate writes nothing and answers
@@ -201,64 +202,96 @@ func (i *Ingester) storedRow(ctx context.Context, node string) (*store.AgentNode
 
 // hostGate decides whether this report's host part is processed and prepares it. A node already in host
 // processing here is skipped uncounted; a quarantined one is skipped with the quarantine as its error; an
-// acquisition record left by a stopped controller counts toward quarantine. end must be called once the host
-// part is stored.
+// acquisition record left by a stopped controller counts toward quarantine. The returned end must be called
+// once the host part is stored. When hostGate returns an error or panics, it ends the acquisition record and
+// frees the node itself.
 func (i *Ingester) hostGate(ctx context.Context, node string, r *wire.Report, n *corev1.Node, now time.Time) (hostGate, error) {
-	gate := hostGate{end: func() {}}
 	i.mu.Lock()
 	if i.busy[node] {
 		i.mu.Unlock()
-		return gate, nil
+		return hostGate{end: func() {}}, nil
 	}
 	i.busy[node] = true
 	i.mu.Unlock()
-	release := func() {
+
+	hk := hostKeyPrefix + node
+	acquired, handed := false, false
+	end := func() {
+		if acquired {
+			if err := i.o.Store.EndAcquire(context.WithoutCancel(ctx), hk); err != nil {
+				i.o.Log.Error(err, "ending the host acquisition record", "node", node)
+			}
+		}
 		i.mu.Lock()
 		delete(i.busy, node)
 		i.mu.Unlock()
 	}
-	gate.end = release
+	// net/http recovers a handler's panic, so neither an error nor a panic may leave the node busy (its host
+	// reports skipped for good) or its acquisition record open.
+	defer func() {
+		if !handed {
+			end()
+		}
+	}()
+	handOver := func(g hostGate) (hostGate, error) {
+		g.end, handed = end, true
+		return g, nil
+	}
 
-	hk := hostKeyPrefix + node
 	job, ok, err := i.o.Store.AgentJobOf(ctx, hk)
 	if err != nil {
-		release()
 		return hostGate{}, err
 	}
 	if ok && job.QuarantinedUntil.After(now) {
-		gate.skipErr = quarantineText(job)
-		return gate, nil
+		return handOver(hostGate{skipErr: quarantineText(job)})
 	}
 	stale, err := i.o.Store.BeginAcquire(ctx, hk, now)
 	if err != nil {
-		release()
 		return hostGate{}, err
 	}
-	gate.end = func() {
-		if err := i.o.Store.EndAcquire(context.WithoutCancel(ctx), hk); err != nil {
-			i.o.Log.Error(err, "ending the host acquisition record", "node", node)
-		}
-		release()
-	}
+	acquired = true
 	if stale {
 		job, err := i.o.Store.RecordAgentJobFailure(ctx, hk, node, reasonHostStale, now, hostQuarantineAfter, hostQuarantineFor)
 		if err != nil {
-			gate.end()
 			return hostGate{}, err
 		}
 		if job.QuarantinedUntil.After(now) {
-			gate.skipErr = quarantineText(job)
-			return gate, nil
+			return handOver(hostGate{skipErr: quarantineText(job)})
 		}
 	}
-	if err := i.slots.Acquire(ctx, 1); err != nil {
-		gate.end()
+	prep, err := i.prepareInSlot(ctx, hk, node, r, n, now)
+	if err != nil {
 		return hostGate{}, err
 	}
-	// A host SBOM that cannot be prepared is kept as prepErr: the report still counts as a heartbeat.
-	prep, perr := i.prepare(r, n, now)
-	i.slots.Release(1)
-	gate.prepErr = perr
+	return handOver(prep)
+}
+
+// prepareInSlot prepares the host SBOM while holding one of the hostConcurrency slots. A host SBOM that
+// cannot be prepared is kept as prepErr: the report still counts as a heartbeat. A panic while preparing is a
+// prepErr too, and it is counted toward the host's quarantine: net/http would recover it uncounted, so one
+// document that panics the decoder would otherwise be decoded again on every full report.
+func (i *Ingester) prepareInSlot(ctx context.Context, hk, node string, r *wire.Report, n *corev1.Node, now time.Time) (hostGate, error) {
+	if err := i.slots.Acquire(ctx, 1); err != nil {
+		return hostGate{}, err
+	}
+	panicked := false
+	prep, perr := func() (_ hostPrep, err error) {
+		defer i.slots.Release(1)
+		defer func() {
+			if p := recover(); p != nil {
+				panicked, err = true, fmt.Errorf("panic: %v", p)
+				i.o.Log.Error(err, "preparing the host inventory panicked", "node", node, "stack", string(debug.Stack()))
+			}
+		}()
+		return i.prepare(r, n, now)
+	}()
+	if panicked {
+		if _, err := i.o.Store.RecordAgentJobFailure(ctx, hk, node, "preparing the host inventory: "+perr.Error(), now,
+			hostQuarantineAfter, hostQuarantineFor); err != nil {
+			return hostGate{}, err
+		}
+	}
+	gate := hostGate{prepErr: perr}
 	if perr == nil {
 		gate.prep = &prep
 	}
@@ -285,7 +318,16 @@ func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, g
 	}
 	prep := gate.prep
 	hk := hostKeyPrefix + node
-	v, err, _ := i.flight.Do(prep.Fingerprint, func() (any, error) {
+	v, err, _ := i.flight.Do(prep.Fingerprint, func() (ingested any, err error) {
+		// A panic is a counted failure, so a document that panics the acquirer is quarantined rather than
+		// stored again on every full report.
+		defer func() {
+			if p := recover(); p != nil {
+				ingested, err = false, &sbom.AcquireError{Kind: sbom.FailCounted, Reason: "storing the host inventory panicked",
+					Err: fmt.Errorf("%v", p)}
+				i.o.Log.Error(err, "storing the host inventory panicked", "node", node, "stack", string(debug.Stack()))
+			}
+		}()
 		digest := nodegroup.GroupDigest(prep.Fingerprint)
 		img, ok, err := st.GetImage(ctx, digest)
 		if err != nil {
