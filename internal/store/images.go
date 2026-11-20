@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -245,18 +246,45 @@ func (s *Store) PackagesForImage(ctx context.Context, digest string) ([]model.Pa
 // version must match and the codename is ignored. With bySource it matches the source package
 // name, treating an empty source name as equal to the binary name (dpkg omits Source then).
 func (s *Store) PackagesByName(ctx context.Context, ecosystem string, distro *model.Distro, name string, bySource bool) ([]model.Package, error) {
-	var w where
-	w.add(`ecosystem = ?`, ecosystem)
-	if distro != nil {
-		w.add(`distro_id = ? AND distro_version = ?`, distro.ID, distro.VersionID)
+	q, args := packagesByNameQuery(ecosystem, distro, []string{name}, bySource)
+	return queryAll(ctx, s.rdb, scanPackage, q, args...)
+}
+
+// PackagesByNames is PackagesByName in any distro for several names at once: the packages that
+// match any of them, each once.
+func (s *Store) PackagesByNames(ctx context.Context, ecosystem string, names []string, bySource bool) ([]model.Package, error) {
+	if len(names) == 0 {
+		return nil, nil
 	}
-	if bySource {
-		w.add(`(source_name = ? OR (source_name = '' AND name = ?))`, name, name)
-	} else {
-		w.add(`name = ?`, name)
+	q, args := packagesByNameQuery(ecosystem, nil, names, bySource)
+	return queryAll(ctx, s.rdb, scanPackage, q, args...)
+}
+
+// packagesByNameQuery is the SQL of PackagesByNames. The source-name lookup is two indexed SELECTs
+// joined by UNION ALL, not one OR: SQLite serves the OR form by reading every package of the
+// ecosystem, which made the OSV fast path's lookups for a large record take seconds.
+func packagesByNameQuery(ecosystem string, distro *model.Distro, names []string, bySource bool) (string, []any) {
+	sel := func(cond string, args ...any) (string, []any) {
+		var w where
+		w.add(`ecosystem = ?`, ecosystem)
+		if distro != nil {
+			w.add(`distro_id = ? AND distro_version = ?`, distro.ID, distro.VersionID)
+		}
+		w.add(cond, args...)
+		return `SELECT ` + packageCols + ` FROM packages` + w.String(), w.args
 	}
-	return queryAll(ctx, s.rdb, scanPackage,
-		`SELECT `+packageCols+` FROM packages`+w.String()+` ORDER BY digest, name, version, id`, w.args...)
+	const order = ` ORDER BY digest, name, version, id`
+	if !bySource {
+		q, args := sel(`name IN (SELECT value FROM json_each(?))`, idList(names))
+		return q + order, args
+	}
+	q, args := sel(`source_name IN (SELECT value FROM json_each(?))`, idList(names))
+	// An empty name already has the first SELECT return every package with an empty source name.
+	if !slices.Contains(names, "") {
+		q2, args2 := sel(`source_name = '' AND name IN (SELECT value FROM json_each(?))`, idList(names))
+		q, args = q+` UNION ALL `+q2, append(args, args2...)
+	}
+	return q + order, args
 }
 
 // foldedEcosystems are the package ecosystems whose packages have a folded name.
@@ -267,11 +295,25 @@ var foldedEcosystems = map[string]bool{"python": true, "java-archive": true}
 // '-': PEP 503 normalisation, the way PyPI compares names, so a record for "jinja2" finds a stored
 // "Jinja2". Only python and java-archive packages have folded names; other ecosystems are an error.
 func (s *Store) PackagesByFoldedName(ctx context.Context, ecosystem, name string) ([]model.Package, error) {
+	return s.PackagesByFoldedNames(ctx, ecosystem, []string{name})
+}
+
+// PackagesByFoldedNames is PackagesByFoldedName for several names at once: the packages whose
+// folded name equals the folded form of any of them, each once.
+func (s *Store) PackagesByFoldedNames(ctx context.Context, ecosystem string, names []string) ([]model.Package, error) {
 	if !foldedEcosystems[ecosystem] {
 		return nil, fmt.Errorf("store: %q packages have no folded names", ecosystem)
 	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	folded := make([]string, len(names))
+	for i, n := range names {
+		folded[i] = foldName(n)
+	}
 	return queryAll(ctx, s.rdb, scanPackage, `SELECT `+packageCols+` FROM packages
-		WHERE ecosystem = ? AND folded_name = ? ORDER BY digest, name, version, id`, ecosystem, foldName(name))
+		WHERE ecosystem = ? AND folded_name IN (SELECT value FROM json_each(?)) ORDER BY digest, name, version, id`,
+		ecosystem, idList(folded))
 }
 
 // foldName computes the folded_name column of 010_package_folded_names.sql for name: '_' and '.'

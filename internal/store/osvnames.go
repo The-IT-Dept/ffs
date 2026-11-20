@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"slices"
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -11,25 +12,27 @@ import (
 // PutOSVRecordNames replaces the index names of the cached record id in bucket. Empty names are
 // ignored; no names removes the record from the index.
 func (s *Store) PutOSVRecordNames(ctx context.Context, bucket, id string, names []string) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM osv_record_names WHERE bucket = ? AND id = ?`, bucket, id); err != nil {
+	return s.inTx(ctx, func(tx *sql.Tx) error { return putOSVRecordNames(ctx, tx, bucket, id, names) })
+}
+
+func putOSVRecordNames(ctx context.Context, tx *sql.Tx, bucket, id string, names []string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM osv_record_names WHERE bucket = ? AND id = ?`, bucket, id); err != nil {
+		return err
+	}
+	ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO osv_record_names(bucket, id, name) VALUES(?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ins.Close() }()
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if _, err := ins.ExecContext(ctx, bucket, id, n); err != nil {
 			return err
 		}
-		ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO osv_record_names(bucket, id, name) VALUES(?, ?, ?)`)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = ins.Close() }()
-		for _, n := range names {
-			if n == "" {
-				continue
-			}
-			if _, err := ins.ExecContext(ctx, bucket, id, n); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // OSVRecordIDsByName returns the sorted IDs of the records in bucket indexed under any of names.
@@ -37,9 +40,18 @@ func (s *Store) OSVRecordIDsByName(ctx context.Context, bucket string, names []s
 	if len(names) == 0 {
 		return nil, nil
 	}
-	return queryAll(ctx, s.rdb, scanString, `SELECT DISTINCT id FROM osv_record_names
-		WHERE bucket = ? AND name IN (SELECT value FROM json_each(?)) ORDER BY id`, bucket, idList(names))
+	ids, err := queryAll(ctx, s.rdb, scanString, osvRecordIDsByNameQuery, bucket, idList(names))
+	if err != nil {
+		return nil, err
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
 }
+
+// osvRecordIDsByNameQuery leaves DISTINCT and ORDER BY to Go: with them SQLite walks the primary
+// key, every index name of the bucket in id order (over a million rows for Ubuntu), instead of
+// looking each name up in osv_record_names_by_name.
+const osvRecordIDsByNameQuery = `SELECT id FROM osv_record_names WHERE bucket = ? AND name IN (SELECT value FROM json_each(?))`
 
 // OSVRecordsByID returns the decompressed cached records with any of ids, in any bucket, ordered by
 // id. A record cached in several buckets is returned once: its most recently modified copy.

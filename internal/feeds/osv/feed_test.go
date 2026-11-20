@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -246,18 +247,21 @@ func gitRecord(id, repo string, modified time.Time) []byte {
 		`"events":[{"introduced":"0"},{"fixed":"abc123"}]}],"versions":["v1.0.0"]}]}`, id, modified.UTC().Format(time.RFC3339Nano), repo)
 }
 
-// sink records handler calls and fails the first fail calls.
+// sink records handler calls and fails the first fail calls, and the failAt-th call (1-based).
 type sink struct {
-	mu    sync.Mutex
-	calls [][]osv.Changed
-	fail  int
+	mu       sync.Mutex
+	calls    [][]osv.Changed
+	fail     int
+	failAt   int
+	attempts int
 }
 
 func (s *sink) handle(_ context.Context, recs []osv.Changed) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.fail > 0 {
-		s.fail--
+	s.attempts++
+	if s.fail > 0 || s.attempts == s.failAt {
+		s.fail = max(s.fail-1, 0)
 		return errors.New("handler unavailable")
 	}
 	s.calls = append(s.calls, slices.Clone(recs))
@@ -412,6 +416,42 @@ func TestOSVSync_ChangedAffectedDelivered(t *testing.T) {
 	require.Equal(t, "PyPI", got[0].Ecosystem)
 	require.Equal(t, "PYSEC-2026-2", got[0].ID)
 	require.JSONEq(t, string(records["PYSEC-2026-2"]), string(got[0].Raw))
+	ids, err := e.st.OSVRecordIDsByName(ctx, "PyPI", []string{"requests-pysec-2026-2"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"PYSEC-2026-2"}, ids)
+}
+
+// A failed name-index write must not lose the record: the write is one transaction with the
+// record's, so the next poll sees the record as changed again, hands it off and indexes it.
+func TestOSVSync_IndexWriteFailureRetried(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	st, err := store.Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	e := &env{st: st, srv: newBucketServer(t), sink: &sink{}, dataDir: t.TempDir()}
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-10*time.Minute)
+	e.cache(t, "PyPI", "PYSEC-2026-2", t0, pypi("PYSEC-2026-2", "1.2.3", t0))
+	rec := pypi("PYSEC-2026-2", "1.2.4", t1)
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(row{t1, "PYSEC-2026-2"}), records: map[string][]byte{"PYSEC-2026-2": rec}})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now)})
+
+	inj, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, inj.Close()) })
+	_, err = inj.ExecContext(ctx, `CREATE TRIGGER fail_index BEFORE INSERT ON osv_record_names
+		BEGIN SELECT RAISE(ABORT, 'injected index failure'); END`)
+	require.NoError(t, err)
+
+	require.Error(t, e.feed().Sync(ctx))
+	require.Empty(t, e.sink.all())
+
+	_, err = inj.ExecContext(ctx, `DROP TRIGGER fail_index`)
+	require.NoError(t, err)
+	require.NoError(t, e.feed().Sync(ctx))
+	got := e.sink.all()
+	require.Len(t, got, 1)
+	require.Equal(t, "PYSEC-2026-2", got[0].ID)
 	ids, err := e.st.OSVRecordIDsByName(ctx, "PyPI", []string{"requests-pysec-2026-2"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"PYSEC-2026-2"}, ids)
@@ -747,15 +787,143 @@ func TestOSVSync_PendingRedeliveredAfterHandlerError(t *testing.T) {
 	err := e.feed().Sync(ctx)
 	require.ErrorContains(t, err, "handler unavailable")
 	meta := e.meta(t)
-	require.Equal(t, ts(t0), meta["wm.PyPI"])
+	// the record is cached and pending, so the watermark already covers it
+	require.Equal(t, ts(t1), meta["wm.PyPI"])
 	require.Equal(t, "PyPI/PYSEC-2026-1", meta["pending"])
 	require.Empty(t, e.sink.all())
+	gets := e.srv.recordGETs("PyPI")
 
 	require.NoError(t, e.feed().Sync(ctx)) // the record is cached unchanged now, yet still delivered, once
 	require.Equal(t, []string{"PyPI/PYSEC-2026-1"}, e.sink.keys())
+	require.Equal(t, gets, e.srv.recordGETs("PyPI"), "a pending record is delivered from the cache")
 	meta = e.meta(t)
 	require.NotContains(t, meta, "pending")
 	require.Equal(t, ts(t1), meta["wm.PyPI"])
+}
+
+// TestOSVSync_BacklogResumesAfterFailedChunk guards the recovery of a large backlog whose hand-off
+// fails part-way, as when the sync timeout cuts it short: the chunks the handler took stay taken,
+// and the next Sync delivers only the rest, from the cache, without reading the bucket again.
+func TestOSVSync_BacklogResumesAfterFailedChunk(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-3*time.Hour), now.Add(-time.Minute)
+	const n = 1200
+	records := make(map[string][]byte, n)
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("GHSA-2026-%05d", i)
+		records[id] = pypi(id, "2.0.0", t1)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+	e.sink.failAt = 2 // the second chunk of 500 fails
+
+	require.ErrorContains(t, e.feed().Sync(ctx), "handler unavailable")
+	require.Len(t, e.sink.all(), 500)
+	meta := e.meta(t)
+	require.Equal(t, ts(t1), meta["wm.PyPI"], "every record is cached and pending: the backlog is not read again")
+	require.Len(t, strings.Split(meta["pending"], "\n"), n-500, "the first chunk is no longer pending")
+	reads := []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")}
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n, "each record is delivered once")
+	require.Len(t, slices.Compact(e.sink.keys()), n)
+	require.NotContains(t, e.meta(t), "pending")
+	require.Equal(t, reads, []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")})
+}
+
+// TestOSVSync_TimeoutKeepsProgress is the sync timeout cutting a hand-off short: the handler's context
+// ends part-way, and the chunks it took are still recorded as no longer pending.
+func TestOSVSync_TimeoutKeepsProgress(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-3*time.Hour), now.Add(-time.Minute)
+	const n = 1200
+	records := make(map[string][]byte, n)
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("GHSA-2026-%05d", i)
+		records[id] = pypi(id, "2.0.0", t1)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	calls := 0
+	f := e.feed(func(o *osv.Options) {
+		o.Handler = func(hctx context.Context, recs []osv.Changed) error {
+			if calls++; calls == 3 { // the deadline passes during the third chunk
+				cancel()
+				return hctx.Err()
+			}
+			return nil
+		}
+	})
+	require.ErrorIs(t, f.Sync(sctx), context.Canceled)
+	pending := strings.Split(e.meta(t)["pending"], "\n")
+	require.Len(t, pending, n-1000, "the two chunks taken before the deadline are not pending")
+	require.Equal(t, "PyPI/GHSA-2026-01000", pending[0])
+}
+
+// bigPyPI is a PyPI record padded with details to about size bytes, the way Ubuntu kernel records
+// run to hundreds of KB.
+func bigPyPI(id string, modified time.Time, size int) []byte {
+	return fmt.Appendf(nil, `{"id":%q,"modified":%q,"details":%q,"affected":[{"package":{"ecosystem":"PyPI","name":"r"},`+
+		`"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"2.0"}]}]}]}`,
+		id, modified.UTC().Format(time.RFC3339Nano), strings.Repeat("x", size))
+}
+
+// requireBoundedCalls checks that every handler call holds at most 16 MiB of records, or a single
+// record: the record matchers parse all of a call at once.
+func requireBoundedCalls(t *testing.T, calls [][]osv.Changed) {
+	t.Helper()
+	for _, c := range calls {
+		size := 0
+		for _, r := range c {
+			size += len(r.Raw)
+		}
+		require.True(t, len(c) == 1 || size <= 16<<20, "a handler call of %d records holds %d bytes", len(c), size)
+	}
+}
+
+// TestOSVSync_LargeRecordsDeliveredInBoundedChunks guards the memory of a hand-off of large records:
+// handler calls are cut by size as well as by count, both for a poll and for a redelivery whose
+// bucket has no measured record size yet.
+func TestOSVSync_LargeRecordsDeliveredInBoundedChunks(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-time.Minute)
+	const n = 40
+	records := map[string][]byte{}
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("PYSEC-2026-%03d", i)
+		records[id] = bigPyPI(id, t1, 1<<20)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n)
+	require.Greater(t, len(e.sink.calls), 1)
+	requireBoundedCalls(t, e.sink.calls)
+
+	// a redelivery of the same records with no measured size: cut by the records' real size
+	pending := e.sink.keys()
+	e.sink.calls = nil
+	st, err := e.st.FeedState(ctx, feeds.NameOSV)
+	require.NoError(t, err)
+	delete(st.Meta, "size.PyPI")
+	feeds.SetPending(&st, pending)
+	require.NoError(t, e.st.PutFeedState(ctx, st))
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n)
+	requireBoundedCalls(t, e.sink.calls)
 }
 
 func TestOSVSetDiff_VanishedMarkedWithdrawn(t *testing.T) {

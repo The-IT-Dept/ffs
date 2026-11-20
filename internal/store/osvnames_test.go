@@ -7,6 +7,22 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestOSVRecordIDsByName_UsesNameIndex guards the OSV fast path's image match: the lookup must
+// search the name index. Walking the bucket's primary key reads every index name of the bucket,
+// over a million rows for Ubuntu, for each image matched.
+func TestOSVRecordIDsByName_UsesNameIndex(t *testing.T) {
+	s := newStore(t)
+	plan := planOf(t, s, osvRecordIDsByNameQuery, "Ubuntu", idList([]string{"openssl", "curl"}))
+	require.Contains(t, plan, "SEARCH osv_record_names USING COVERING INDEX osv_record_names_by_name (bucket=? AND name=?)")
+
+	// a record indexed under several of the names is returned once, in id order
+	require.NoError(t, s.PutOSVRecordNames(ctx, "Ubuntu", "UBUNTU-CVE-2", []string{"openssl", "curl"}))
+	require.NoError(t, s.PutOSVRecordNames(ctx, "Ubuntu", "UBUNTU-CVE-1", []string{"curl"}))
+	ids, err := s.OSVRecordIDsByName(ctx, "Ubuntu", []string{"openssl", "curl"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"UBUNTU-CVE-1", "UBUNTU-CVE-2"}, ids)
+}
+
 func TestOSVRecordNames_Lookup(t *testing.T) {
 	s := newStore(t)
 	require.NoError(t, s.PutOSVRecordNames(ctx, "Debian", "DEBIAN-CVE-1", []string{"openssl"}))

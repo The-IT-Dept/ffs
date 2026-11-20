@@ -244,8 +244,13 @@ var (
 	zdec = mustZstdDecoder()
 )
 
+// mustZstdEncoder returns the encoder of SBOMs and OSV records. By default an encoder keeps one
+// window-sized history per GOMAXPROCS, 16 MiB each at the default 8 MiB window, for good: 192 MiB
+// on a 12-core node once a burst of OSV records had cycled through them. Two encoders cover the
+// writers that run at once (the store has one writer connection), and a 1 MiB window compresses
+// syft JSON within 0.3% of the default.
 func mustZstdEncoder() *zstd.Encoder {
-	e, err := zstd.NewWriter(nil)
+	e, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(2), zstd.WithWindowSize(1<<20), zstd.WithLowerEncoderMem(true))
 	if err != nil {
 		panic(err)
 	}

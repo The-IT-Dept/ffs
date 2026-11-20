@@ -29,7 +29,7 @@ controller:
       memory: 512Mi
     # Resource ceilings.
     limits:
-      # Memory limit.
+      # Memory limit, as a byte count or a whole quantity such as 1536Mi. GOMEMLIMIT is set to 90% of it.
       memory: 1Gi
   # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
   tmpSizeLimit: 1Gi

@@ -65,29 +65,52 @@ func (s *Store) PutOSVRecord(ctx context.Context, eco, id string, modified time.
 // the stored one otherwise: it is when ffs first saw the record's current affected content.
 func (s *Store) PutOSVRecordAt(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte, observed time.Time) (bool, error) {
 	var changed bool
-	err := s.inTx(ctx, func(tx *sql.Tx) error {
-		var (
-			prev    string
-			prevObs sql.NullInt64
-		)
-		err := tx.QueryRowContext(ctx, `SELECT affected_hash, observed FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).
-			Scan(&prev, &prevObs)
-		switch {
-		case errors.Is(err, sql.ErrNoRows):
-			changed = true
-		case err != nil:
-			return err
-		default:
-			changed = prev != affectedHash
-		}
-		obs := nanos(orNow(observed))
-		if !changed && prevObs.Valid {
-			obs = prevObs
-		}
-		_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
-			VALUES(?, ?, ?, ?, ?, ?)`, eco, id, nanos(modified), affectedHash, zstdEncode(raw), obs)
+	err := s.inTx(ctx, func(tx *sql.Tx) (err error) {
+		changed, err = putOSVRecord(ctx, tx, eco, id, modified, affectedHash, raw, observed)
 		return err
 	})
+	return changed, err
+}
+
+// PutOSVRecordIndexed is PutOSVRecord and, in the same transaction, PutOSVRecordNames with names
+// when the record changed or reindex is set. A failed index write rolls the record back too, so a
+// record is never cached without the index entry its change calls for, and the next poll sees it
+// as changed again.
+func (s *Store) PutOSVRecordIndexed(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte, names []string, reindex bool) (bool, error) {
+	var changed bool
+	err := s.inTx(ctx, func(tx *sql.Tx) (err error) {
+		if changed, err = putOSVRecord(ctx, tx, eco, id, modified, affectedHash, raw, time.Now()); err != nil {
+			return err
+		}
+		if changed || reindex {
+			return putOSVRecordNames(ctx, tx, eco, id, names)
+		}
+		return nil
+	})
+	return changed, err
+}
+
+func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time.Time, affectedHash string, raw []byte, observed time.Time) (changed bool, _ error) {
+	var (
+		prev    string
+		prevObs sql.NullInt64
+	)
+	err := tx.QueryRowContext(ctx, `SELECT affected_hash, observed FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).
+		Scan(&prev, &prevObs)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		changed = true
+	case err != nil:
+		return false, err
+	default:
+		changed = prev != affectedHash
+	}
+	obs := nanos(orNow(observed))
+	if !changed && prevObs.Valid {
+		obs = prevObs
+	}
+	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
+		VALUES(?, ?, ?, ?, ?, ?)`, eco, id, nanos(modified), affectedHash, zstdEncode(raw), obs)
 	return changed, err
 }
 

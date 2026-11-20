@@ -8,6 +8,7 @@
 package osvfast
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"maps"
@@ -194,8 +195,11 @@ func (m *Matcher) records(ctx context.Context, ids []string, override map[string
 }
 
 // parsed returns the cached records with ids, with override replacing (or adding) records by id,
-// sorted by id. Cached records that do not parse are skipped.
+// sorted by id. Cached records that do not parse are skipped; those override replaces are not read.
 func (m *Matcher) parsed(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, error) {
+	if len(override) > 0 {
+		ids = slices.DeleteFunc(slices.Clone(ids), func(id string) bool { _, ok := override[id]; return ok })
+	}
 	raws, err := m.st.OSVRecordsByID(ctx, ids)
 	if err != nil {
 		return nil, err
@@ -236,14 +240,19 @@ const (
 // for Maven (the group is checked against the PURL later) and by name elsewhere. That is a superset
 // of the packages MatchImage would match against recs (for Maven, because Syft's PURL artifact is
 // the package name), so the two paths agree once indexPackages and evalRecord apply the exact index
-// names. Withdrawn records and skipped ecosystems name none.
+// names. Withdrawn records and skipped ecosystems name none. The names are looked up together, one
+// query per package type and lookup: an Ubuntu kernel record alone names over a hundred packages.
 func (m *Matcher) candidates(ctx context.Context, recs []*osvschema.Vulnerability) ([]model.Package, error) {
 	type query struct {
 		typ, name string
 		by        lookup
 	}
+	type group struct {
+		typ string
+		by  lookup
+	}
 	seen := map[query]bool{}
-	var out []model.Package
+	names := map[group][]string{}
 	for _, v := range recs {
 		if v.GetWithdrawn() != nil {
 			continue
@@ -271,19 +280,27 @@ func (m *Matcher) candidates(ctx context.Context, recs []*osvschema.Vulnerabilit
 					continue
 				}
 				seen[q] = true
-				var pkgs []model.Package
-				var err error
-				if q.by == byFoldedName {
-					pkgs, err = m.st.PackagesByFoldedName(ctx, q.typ, q.name)
-				} else {
-					pkgs, err = m.st.PackagesByName(ctx, q.typ, nil, q.name, q.by == bySource)
-				}
-				if err != nil {
-					return nil, err
-				}
-				out = append(out, pkgs...)
+				g := group{q.typ, q.by}
+				names[g] = append(names[g], q.name)
 			}
 		}
+	}
+	groups := slices.SortedFunc(maps.Keys(names), func(a, b group) int {
+		return cmp.Or(strings.Compare(a.typ, b.typ), cmp.Compare(a.by, b.by))
+	})
+	var out []model.Package
+	for _, g := range groups {
+		var pkgs []model.Package
+		var err error
+		if g.by == byFoldedName {
+			pkgs, err = m.st.PackagesByFoldedNames(ctx, g.typ, names[g])
+		} else {
+			pkgs, err = m.st.PackagesByNames(ctx, g.typ, names[g], g.by == bySource)
+		}
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, pkgs...)
 	}
 	return out, nil
 }

@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"maps"
 	"net/http"
 	"os"
@@ -58,6 +59,16 @@ const (
 	metaSetDiff     = "setdiff"
 )
 
+// pendingSaveEvery is how often a hand-off records the chunks the handler has taken: often enough
+// that a crash costs little, rarely enough that a backlog of 200,000 records does not rewrite its
+// pending list after each of 450 chunks.
+const pendingSaveEvery = 30 * time.Second
+
+// handlerBytes bounds the uncompressed records of one handler call and of one read of cached records
+// for it: the record matchers parse every record of a call, and an Ubuntu record averages over
+// 400 KB, so 500 of them took gigabytes.
+const handlerBytes = 16 << 20
+
 // zipBehindWait is how long polls of a bucket wait for its all.zip to catch up with its
 // modified_id.csv. The OSV exporter uploads all.zip seconds after the listing; a zip still behind
 // after this (a mirror that refreshes it less often) is read anyway, and what it lacks is read one
@@ -79,8 +90,8 @@ type Changed struct {
 	Raw           []byte
 }
 
-// Handler consumes changed records, at most 500 per call. Until it returns nil the records stay
-// pending and the next Sync offers them again.
+// Handler consumes changed records, at most 500 and about 16 MiB of them per call. Until it returns
+// nil the records stay pending and the next Sync offers them again.
 type Handler func(ctx context.Context, recs []Changed) error
 
 // Options configures a Feed.
@@ -241,13 +252,16 @@ func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string)
 		}
 	}
 	changed, takeErr := f.take(ctx, st, b, want, "")
+	if takeErr == nil {
+		// Every record is cached and the changed ones are pending (see handOff), in the same write.
+		st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
+	}
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
 	if takeErr != nil { // not marked loaded: the next Sync takes the rest
 		return errors.Join(takeErr, f.save(ctx, st))
 	}
-	st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
 	return f.save(ctx, st)
 }
 
@@ -268,7 +282,7 @@ func (f *Feed) redeliver(ctx context.Context, st *store.FeedState) error {
 		}
 	}
 	// A crash can separate a record's write from its index names: rewrite them from the record.
-	if err := f.deliverKeys(ctx, keys, true); err != nil {
+	if err := f.deliverKeys(ctx, st, keys, true); err != nil {
 		return err
 	}
 	feeds.SetPending(st, nil)
@@ -276,7 +290,9 @@ func (f *Feed) redeliver(ctx context.Context, st *store.FeedState) error {
 }
 
 // poll reads b's modified_id.csv down to the watermark and hands off the records whose affected
-// set changed. The watermark and generation advance only once the handler has taken them.
+// set changed. Once every listed record is cached, the watermark and generation advance in the same
+// write that records the changed ones as pending, before they are handed off: a hand-off cut short
+// resumes from pending (redeliver) instead of reading the backlog again.
 func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 	rd := newCSVReader(f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
 	rows, err := rd.next(ctx)
@@ -317,17 +333,19 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		logr.FromContextOrDiscard(ctx).V(1).Info("OSV all.zip is older than modified_id.csv; polling again next time", "bucket", b)
 		return f.save(ctx, st)
 	}
+	if takeErr == nil {
+		if newest.After(wm) {
+			st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
+		}
+		setMeta(st, metaGeneration+b, rd.gen)
+		delete(st.Meta, metaZipBehind+b)
+	}
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
 	if takeErr != nil { // the watermark stays, so the rest is read again next time
 		return errors.Join(takeErr, f.save(ctx, st))
 	}
-	if newest.After(wm) {
-		st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
-	}
-	setMeta(st, metaGeneration+b, rd.gen)
-	delete(st.Meta, metaZipBehind+b)
 	return f.save(ctx, st)
 }
 
@@ -666,19 +684,19 @@ func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[
 		if !gitCached[id] {
 			return putSkipped, modified, nil
 		}
-		if _, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw); err != nil {
+		if _, err := f.o.Store.PutOSVRecordIndexed(ctx, b, id, modified, hash, raw, nil, true); err != nil {
 			return putSkipped, modified, err
 		}
-		return putDropped, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, nil)
+		return putDropped, modified, nil
 	}
-	changed, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw)
+	changed, err := f.o.Store.PutOSVRecordIndexed(ctx, b, id, modified, hash, raw, info.names(b), false)
 	switch {
 	case err != nil:
 		return putSkipped, modified, err
 	case !changed:
 		return putUnchanged, modified, nil
 	}
-	return putChanged, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
+	return putChanged, modified, nil
 }
 
 // tracked reports whether a GIT record references one of the GitRepos repositories.
@@ -833,15 +851,15 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 	return f.save(ctx, st)
 }
 
-// handOff records keys as pending and delivers them; on success it clears pending (the caller
-// saves). With no keys it only clears pending.
+// handOff records keys as pending, with whatever else st holds, and delivers them; on success it
+// clears pending (the caller saves). With no keys it only clears pending.
 func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) error {
 	if len(keys) > 0 {
 		setPending(st, keys)
 		if err := f.save(ctx, st); err != nil {
 			return err
 		}
-		if err := f.deliverKeys(ctx, keys, false); err != nil {
+		if err := f.deliverKeys(ctx, st, keys, false); err != nil {
 			return err
 		}
 	}
@@ -849,12 +867,22 @@ func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) 
 	return nil
 }
 
-// deliverKeys hands the cached records of keys to the handler in chunks of 500, skipping records no
-// longer cached. With refreshNames it first rewrites each record's index names. A GIT record that
-// references no GitRepos repository is a drop (see put): once the handler has taken it, it is
-// deleted from the cache. Deciding this from the cached raw lets a redelivery finish a drop.
-func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool) error {
-	for chunk := range slices.Chunk(keys, handlerChunk) {
+// deliverKeys hands the cached records of keys, which st holds as pending, to the handler in chunks
+// (see keyChunks), skipping records no longer cached. Pending is cut to the keys after the chunks the
+// handler has taken and saved every pendingSaveEvery, and when a chunk fails, even once ctx is done,
+// so a hand-off cut short by the sync timeout loses none of its progress. With refreshNames it first
+// rewrites each record's index names. A GIT record that references no GitRepos repository is a drop
+// (see put): once the handler has taken it, it is deleted from the cache. Deciding this from the
+// cached raw lets a redelivery finish a drop.
+func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recKey, refreshNames bool) (err error) {
+	done, saved := 0, time.Now()
+	defer func() {
+		if err != nil && done > 0 {
+			setPending(st, keys[done:])
+			err = errors.Join(err, f.save(context.WithoutCancel(ctx), st))
+		}
+	}()
+	for chunk := range keyChunks(*st, keys) {
 		ids := make([]string, len(chunk))
 		for i, k := range chunk {
 			ids[i] = k.id
@@ -901,18 +929,60 @@ func (f *Feed) deliverKeys(ctx context.Context, keys []recKey, refreshNames bool
 				return err
 			}
 		}
+		done += len(chunk)
+		if time.Since(saved) >= pendingSaveEvery {
+			setPending(st, keys[done:])
+			if err := f.save(ctx, st); err != nil {
+				return err
+			}
+			saved = time.Now()
+		}
 	}
 	return nil
 }
 
-// deliver calls the handler with recs in chunks of 500.
+// deliver calls the handler with recs in chunks of at most 500 records and handlerBytes, except
+// that a single larger record is a chunk of its own.
 func (f *Feed) deliver(ctx context.Context, recs []Changed) error {
-	for chunk := range slices.Chunk(recs, handlerChunk) {
-		if err := f.o.Handler(ctx, chunk); err != nil {
+	for len(recs) > 0 {
+		n, size := 0, 0
+		for n < len(recs) && n < handlerChunk && (n == 0 || size+len(recs[n].Raw) <= handlerBytes) {
+			size += len(recs[n].Raw)
+			n++
+		}
+		if err := f.o.Handler(ctx, recs[:n]); err != nil {
 			return fmt.Errorf("osv: handler: %w", err)
 		}
+		recs = recs[n:]
 	}
 	return nil
+}
+
+// keyChunks splits keys into consecutive chunks of at most 500 keys whose records are estimated, at
+// their bucket's measured average size (see recordBytesOf), to total at most handlerBytes; a chunk
+// always holds at least one key.
+func keyChunks(st store.FeedState, keys []recKey) iter.Seq[[]recKey] {
+	return func(yield func([]recKey) bool) {
+		avg := map[string]int64{}
+		for len(keys) > 0 {
+			n, size := 0, int64(0)
+			for n < len(keys) && n < handlerChunk {
+				b := keys[n].bucket
+				if _, ok := avg[b]; !ok {
+					avg[b] = recordBytesOf(st, b)
+				}
+				if n > 0 && size+avg[b] > handlerBytes {
+					break
+				}
+				size += avg[b]
+				n++
+			}
+			if !yield(keys[:n:n]) {
+				return
+			}
+			keys = keys[n:]
+		}
+	}
 }
 
 // setDiff runs weekly. It reads each polled bucket's whole modified_id.csv and withdraws the cached

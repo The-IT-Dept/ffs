@@ -49,7 +49,10 @@ type Options struct {
 	LeaderElect bool   // default true
 	MetricsAddr string // default ":8443"; "0" disables
 	ProbeAddr   string // default ":8081"; "0" disables
-	Namespace   string // tests only: overrides Config.Namespace
+	// PprofAddr, when set, serves net/http/pprof on this loopback address for diagnosis; off by
+	// default. It is not the manager's pprof server, which stays disabled.
+	PprofAddr string
+	Namespace string // tests only: overrides Config.Namespace
 }
 
 // NewScheme returns the scheme the manager uses: the client-go types, the ffs API and the Gateway
@@ -124,6 +127,14 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 		ns = cfg.Namespace
 	}
 	log := logf.Log
+
+	if o.PprofAddr != "" {
+		stop, err := startPprof(ctx, o.PprofAddr, log)
+		if err != nil {
+			return err
+		}
+		defer stop()
+	}
 
 	// Before the first database is opened: the SQLite runtime reads the environment once.
 	if _, err := grypedb.UseSQLiteTempDir(cfg.DataDir); err != nil {
