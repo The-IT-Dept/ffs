@@ -22,6 +22,14 @@ var ubuntuKernels = []model.Package{
 	deb("openssl", "3.0.13-1", "openssl"),
 }
 
+// debianKernels is a Debian 13 node: releases are <x.y.z>+deb13-<flavour>.
+var debianKernels = []model.Package{
+	deb("linux-image-6.12.41+deb13-amd64", "6.12.41-1", "linux-signed-amd64"), deb("linux-headers-6.12.41+deb13-amd64", "6.12.41-1", "linux"),
+	deb("linux-image-6.12.48+deb13-amd64", "6.12.48-1", "linux-signed-amd64"), deb("linux-headers-6.12.48+deb13-amd64", "6.12.48-1", "linux"),
+	deb("linux-image-amd64", "6.12.48-1", "linux-signed-amd64"), // meta package: not a kernel package
+	deb("openssl", "3.5.1-1", "openssl"),
+}
+
 func rpm(name, version string) model.Package {
 	return model.Package{Ecosystem: "rpm", Name: name, Version: version, Arch: "x86_64", SourceName: "kernel"}
 }
@@ -46,6 +54,12 @@ func TestKernelReleaseOf(t *testing.T) {
 		{deb("linux-tools-7.0.0-34-generic", "7.0.0-34.34", "linux"), "7.0.0-34-generic"},
 		{deb("linux-headers-7.0.0-34", "7.0.0-34.34", "linux"), "7.0.0-34"},
 		{deb("linux-image-6.1.0-18-amd64", "6.1.76-1", "linux-signed-amd64"), "6.1.0-18-amd64"},
+		{deb("linux-image-6.12.48+deb13-amd64", "6.12.48-1", "linux-signed-amd64"), "6.12.48+deb13-amd64"},
+		{deb("linux-image-6.12.48+deb13-cloud-amd64", "6.12.48-1", "linux-signed-amd64"), "6.12.48+deb13-cloud-amd64"},
+		{deb("linux-headers-6.12.48+deb13-amd64", "6.12.48-1", "linux"), "6.12.48+deb13-amd64"},
+		{deb("linux-image-6.12.12+bpo-amd64", "6.12.12-1~bpo12+1", "linux-signed-amd64"), "6.12.12+bpo-amd64"},
+		{deb("linux-image-amd64", "6.12.48-1", "linux-signed-amd64"), ""},
+		{deb("linux-kbuild-6.12.48+deb13", "6.12.48-1", "linux"), ""},
 		{deb("linux-image-generic", "7.0.0.34.34", "linux-meta"), ""},
 		{deb("linux-libc-dev", "7.0.0-34.34", "linux"), ""},
 		{deb("linux-firmware", "20260301", "linux-firmware"), ""},
@@ -82,6 +96,14 @@ func TestKernels_OnlyRunningKernelKept(t *testing.T) {
 	require.Equal(t, []model.Package{rpm("kernel-core", "5.14.0-503.el9")}, s.Other)
 	require.Equal(t, "kernel-core", s.Kernel.Package) // preferred over the kernel meta package
 
+	s = SplitKernels(debianKernels, "6.12.48+deb13-amd64")
+	require.Equal(t, []string{"linux-image-6.12.48+deb13-amd64", "linux-headers-6.12.48+deb13-amd64", "linux-image-amd64", "openssl"},
+		names(s.Running))
+	require.Equal(t, []string{"linux-image-6.12.41+deb13-amd64", "linux-headers-6.12.41+deb13-amd64"}, names(s.Other))
+	require.Equal(t, &model.NodeKernel{Release: "6.12.48+deb13-amd64", Package: "linux-image-6.12.48+deb13-amd64",
+		Version: "6.12.48-1", SourceName: "linux-signed-amd64"}, s.Kernel)
+	require.False(t, s.RebootPending)
+
 	lts := model.Package{Ecosystem: "apk", Name: "linux-lts", Version: "6.6.31-r0", Arch: "x86_64", SourceName: "linux-lts"}
 	s = SplitKernels([]model.Package{lts, {Ecosystem: "apk", Name: "musl", Version: "1.2.5-r0"}}, "6.6.31-0-lts")
 	require.Empty(t, s.Other)
@@ -108,6 +130,11 @@ func TestKernels_RebootPendingWhenNewerInstalled(t *testing.T) {
 
 	s = SplitKernels([]model.Package{rpm("kernel-core", "5.14.0-427.el9"), rpm("kernel-core", "5.14.0-503.el9")}, "5.14.0-427.el9.x86_64")
 	require.Equal(t, "installed kernel 5.14.0-503.el9.x86_64 is newer than the running kernel 5.14.0-427.el9.x86_64", s.RebootReason)
+
+	s = SplitKernels(debianKernels, "6.12.41+deb13-amd64") // Debian 13, before the reboot
+	require.True(t, s.RebootPending)
+	require.Equal(t, "installed kernel 6.12.48+deb13-amd64 is newer than the running kernel 6.12.41+deb13-amd64", s.RebootReason)
+	require.Equal(t, "linux-image-6.12.41+deb13-amd64", s.Kernel.Package)
 
 	// Alpine replaces linux-lts in place: the running kernel's package is gone.
 	s = SplitKernels([]model.Package{{Ecosystem: "apk", Name: "linux-lts", Version: "6.6.32-r0"}}, "6.6.31-0-lts")

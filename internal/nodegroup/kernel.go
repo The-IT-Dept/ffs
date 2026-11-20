@@ -9,16 +9,21 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
+// debABI is the ABI part of a deb kernel release, before any flavour: <x.y.z>-<N> on Ubuntu and
+// Debian 12 and earlier (7.0.0-34, 6.1.0-18), <x.y.z>+deb<N> from Debian 13 (6.12.48+deb13), and
+// <x.y.z>+bpo on Debian backports (6.12.12+bpo).
+const debABI = `\d+\.\d+\.\d+(?:-\d+|\+(?:deb\d+|bpo))`
+
 // The kernel package rule table: which installed packages belong to which kernel release.
 var (
 	// debKernelRe captures the package kind and the release of a per-release deb kernel package.
-	// Meta packages (linux-image-generic, linux-generic) do not match.
-	debKernelRe = regexp.MustCompile(`^linux-(image|image-unsigned|modules|modules-extra|headers|tools)-(\d+\.\d+\.\d+-\d+[-a-z0-9]*)$`)
+	// Meta packages (linux-image-generic, linux-image-amd64, linux-generic) do not match.
+	debKernelRe = regexp.MustCompile(`^linux-(image|image-unsigned|modules|modules-extra|headers|tools)-(` + debABI + `(?:-[a-z0-9]+)*)$`)
 	// apkKernelRe captures the flavour of an Alpine kernel package.
 	apkKernelRe = regexp.MustCompile(`^linux-(lts|virt|edge|rpi)$`)
 	// flavourlessReleaseRe matches a deb release without a flavour (linux-headers-7.0.0-34), which
 	// belongs to every release that starts with it and a "-".
-	flavourlessReleaseRe = regexp.MustCompile(`^\d+\.\d+\.\d+-\d+$`)
+	flavourlessReleaseRe = regexp.MustCompile(`^` + debABI + `$`)
 )
 
 // rpmKernelNames are the rpm kernel packages besides the kernel-uek* family.
