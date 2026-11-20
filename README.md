@@ -24,6 +24,8 @@ Then install it:
 helm install ffs oci://ghcr.io/the-it-dept/charts/ffs --version $V -n ffs --create-namespace
 ```
 
+A node agent DaemonSet is installed by default, in the namespace `<namespace>-agent` (`ffs-agent` here), labelled for the privileged Pod Security level because it reads host paths. It reports each node's host packages, running kernel and cached images; [docs/node-agent.md](docs/node-agent.md) lists everything it reads and how to turn it off. On GKE Autopilot, add `--set nodeAgent.enabled=false`.
+
 The chart pins the ffs image by digest. Every setting is described in [docs/configuration.md](docs/configuration.md).
 
 ## Quick start
@@ -140,7 +142,7 @@ Only Exceptions in the ffs namespace can except `urgent` findings. An Exception 
 
 ## Coverage
 
-ffs never reports an image as clean when it could not see inside it. Images it cannot pull or resolve are shown as `unresolvable`, with the reason. Images with software the cataloguer cannot attribute, such as Rust binaries without cargo-auditable, are marked partial coverage. [docs/coverage.md](docs/coverage.md) lists every blind spot and the supported environments.
+ffs never reports an image as clean when it could not see inside it. Images it cannot pull or resolve are shown as `unresolvable`, with the reason. Images with software the cataloguer cannot attribute, such as Rust binaries without cargo-auditable, are marked partial coverage. With the node agent, ffs also checks each node's host packages and the packages of its running kernel. [docs/coverage.md](docs/coverage.md) lists every blind spot and the supported environments.
 
 ## Data sources and attribution
 
@@ -159,6 +161,7 @@ NVD and Chainguard OSV data (CC-BY-NC-ND-4.0) are off by default; NVD is not sup
 
 - **Read-mostly RBAC.** ffs reads workloads, pods, nodes, services, ingresses, Gateway API routes, RBAC objects and Flux and Argo CD metadata. It writes only its own resources, `events.k8s.io` Events, OpenReports reports and its leader-election Lease (plus PolicyReports when enabled, and token and access reviews for metrics authentication). It cannot exec into pods, create workloads or write to git.
 - **Secrets.** Cluster-wide `get` only, never list or watch, used to read the pull secrets that pods and ServiceAccounts reference. Turn it off with `rbac.readPullSecrets: false`; ffs then reads Secrets only in its own namespace, for AlertTargets and registry credentials. Secret contents are used in memory only, and never logged, stored or returned by the API.
+- **Node agent.** It mounts a fixed list of host paths, all read-only, and has no Kubernetes API permissions, no listening ports and no container runtime socket. The collector runs as UID 0 with every capability dropped; cataloguing runs as non-root in a separate container with no host mounts. See [docs/node-agent.md](docs/node-agent.md).
 - **Runtime.** A distroless static image running as nonroot, with a read-only root filesystem, all capabilities dropped, no privilege escalation and the RuntimeDefault seccomp profile. The cataloguer runs in its own container with its own memory limit and no Kubernetes API token.
 - **Supply chain.** Images and charts are keyless-signed with cosign. Every image platform has an SPDX SBOM attestation, images and charts have SLSA build provenance, and the chart pins the image by digest. Releases are immutable, and GitHub Actions are pinned by commit.
 

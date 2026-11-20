@@ -2,7 +2,7 @@
 
 ffs reads its configuration from `/etc/ffs/config.yaml`. The Helm chart renders that file from the `config` block in `values.yaml`, so every key below is set as `config.<key>` in Helm values. For example, `catalog.concurrency` is `--set config.catalog.concurrency=4`.
 
-The `nodeAgent` keys are the exception. They come from the top-level `nodeAgent` Helm values (for example `--set nodeAgent.staleAfter=1h`), and the chart writes them into `config.yaml`.
+The `nodeAgent` keys are the exception. They come from the top-level `nodeAgent` Helm values (for example `--set nodeAgent.staleAfter=1h`), and the chart writes them into `config.yaml`. The DaemonSet and its chart-only values are described in [docs/node-agent.md](node-agent.md).
 
 Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejected at startup, and every invalid value is reported at once.
 

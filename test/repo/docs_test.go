@@ -133,7 +133,66 @@ func TestDocs_NoHiddenCategory(t *testing.T) {
 func TestDocs_CoverageListsBlindSpots(t *testing.T) {
 	doc := readFile(t, "../../docs/coverage.md")
 	for _, want := range []string{"cargo-auditable", "KEP-4412", "unresolvable", "registry mirror", "kernel", "runc",
-		"CPE", "workload identity", "LoadBalancer", "triage", "attestation"} {
+		"CPE", "workload identity", "LoadBalancer", "triage", "attestation", "node agent", "no package database (image-based OS)",
+		"node agent has not reported", "no containerd content store on this node", "deferred"} {
+		require.Contains(t, doc, want)
+	}
+	require.NotContains(t, doc, "A later node agent")
+}
+
+func TestDocs_NodeAgentListsEveryMount(t *testing.T) {
+	doc := readFile(t, "../../docs/node-agent.md")
+	for _, p := range []string{"/etc/os-release", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/var/lib/dpkg", "/var/lib/rpm", "/lib/apk/db",
+		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", "/var/lib/containerd/io.containerd.content.v1.content",
+		"/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content",
+		"/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content"} {
+		require.Contains(t, doc, "`"+p+"`", "docs/node-agent.md does not list the mount %s", p)
+	}
+	for _, want := range []string{"GKE Autopilot", "--set nodeAgent.enabled=false", "spc_t", "nodeAgent.openshift.scc",
+		"no package database (image-based OS)", "pod-security.kubernetes.io/enforce: privileged", "ffs-agent", "empty directory",
+		"under-report", "FFSNodeAgentNotReporting", "/usr/lib/sysimage/rpm", "ffs.theitdept.au/not-after", "certManager", "Argo CD",
+		"crio", "runc findings re-detect"} {
+		require.Contains(t, doc, want)
+	}
+}
+
+// nodeAgentLeaves are the nodeAgent values documented as one row although they hold maps or lists.
+var nodeAgentLeaves = map[string]bool{"resources": true, "nodeSelector": true, "tolerations": true,
+	"tls.certManager.issuerRef": true, "hostPaths.extraBinDirs": true}
+
+// valuePaths returns the dotted paths of the leaves under m, prefix included.
+func valuePaths(prefix string, m map[string]any) []string {
+	var out []string
+	for k, v := range m {
+		p := k
+		if prefix != "" {
+			p = prefix + "." + k
+		}
+		if sub, ok := v.(map[string]any); ok && !nodeAgentLeaves[p] {
+			out = append(out, valuePaths(p, sub)...)
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func TestDocs_NodeAgentCoversEveryValue(t *testing.T) {
+	var values struct {
+		NodeAgent map[string]any `json:"nodeAgent"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../charts/ffs/values.yaml")), &values))
+	paths := valuePaths("", values.NodeAgent)
+	require.Len(t, paths, 28)
+	doc := readFile(t, "../../docs/node-agent.md")
+	for _, p := range paths {
+		require.Contains(t, doc, "`nodeAgent."+p+"`", "docs/node-agent.md does not describe nodeAgent.%s", p)
+	}
+}
+
+func TestDocs_ReadmeSaysAgentIsDefault(t *testing.T) {
+	doc := readFile(t, "../../README.md")
+	for _, want := range []string{"DaemonSet", "installed by default", "docs/node-agent.md", "--set nodeAgent.enabled=false", "GKE Autopilot"} {
 		require.Contains(t, doc, want)
 	}
 }
