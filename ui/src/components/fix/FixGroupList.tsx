@@ -91,7 +91,10 @@ function GroupFindings({ row, group, base }: { row: Row; group: FixGroupKind; ba
         <Skeleton className="h-16" />
       )}
       {row.findings > GROUP_PREVIEW ? (
-        <AppLink href={explorerHref('findings', filter)} className="mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline">
+        <AppLink
+          href={explorerHref('findings', filter)}
+          className="mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center"
+        >
           {copy.fixList.more(row.findings - GROUP_PREVIEW)}
         </AppLink>
       ) : null}
@@ -105,7 +108,10 @@ function FixGroup({ row, group, base, initiallyOpen }: { row: Row; group: FixGro
   return (
     <Collapsible open={open} onOpenChange={setOpen}>
       <CollapsibleTrigger asChild>
-        <button type="button" className="flex w-full items-center gap-2 rounded-md bg-muted/50 px-2 py-1.5 text-left text-[12px] font-semibold hover:bg-muted">
+        <button
+          type="button"
+          className="flex w-full items-center gap-2 rounded-md bg-muted/50 px-2 py-1.5 text-left text-[12px] font-semibold hover:bg-muted max-lg:min-h-10"
+        >
           <Chevron aria-hidden="true" className="size-3.5 shrink-0 text-muted-foreground" />
           <span className="min-w-0 truncate">{header(group, row)}</span>
         </button>

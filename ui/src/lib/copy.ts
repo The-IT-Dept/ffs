@@ -198,6 +198,11 @@ export const copy = {
   view: (id: ViewId, kind: ScopeKind) => (id === 'upgrades' && kind === 'image' ? 'Upgrade candidates' : viewLabel[id]),
   related: (id: RelatedSectionId, scope: Scope) =>
     id === 'siblings' && scope.kind === 'workload' ? `Siblings in ${scope.value.split('/')[1] ?? ''}` : relatedLabel[id],
+  shell: {
+    openNavigation: 'Open navigation',
+    navigation: 'Navigation',
+    close: 'Close',
+  },
   rail: {
     views: 'Views',
     filter: 'Filter',
@@ -231,6 +236,8 @@ export const copy = {
   },
   explorer: {
     clear: 'Clear filters',
+    filters: (n: number) => (n > 0 ? `Filters (${formatCount(n)})` : 'Filters'),
+    filtersTitle: 'Filters',
     groupBy: 'Group by',
     page: (n: number, m: number) => `Page ${formatCount(n)} of ${formatCount(m)}`,
     pages: (m: number) => plural(m, 'page', 'pages'),

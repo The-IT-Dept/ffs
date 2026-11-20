@@ -58,7 +58,7 @@ export function PackageTable({ digest, q, onQ }: { digest: string; q?: string; o
         placeholder={copy.image.searchPackages}
         value={input}
         onChange={(e) => setInput(e.target.value)}
-        className="mb-2 h-8 max-w-xs text-[12px] md:text-[12px]"
+        className="mb-2 h-8 max-w-xs text-base max-lg:h-10 md:text-[12px]"
       />
       {list.data ? (
         list.data.total === 0 ? (

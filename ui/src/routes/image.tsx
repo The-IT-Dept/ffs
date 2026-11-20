@@ -42,9 +42,15 @@ function ImagePage() {
 
   const subParts = d
     ? [
-        <Mono key="digest">{d.digest}</Mono>,
+        <Mono key="digest" wrap>
+          {d.digest}
+        </Mono>,
         ...(d.platform ? [<span key="platform">{d.platform}</span>] : []),
-        ...d.tags.map((t) => <Mono key={`tag:${t}`}>{t}</Mono>),
+        ...d.tags.map((t) => (
+          <Mono key={`tag:${t}`} wrap>
+            {t}
+          </Mono>
+        )),
         ...(d.versionAnnotation ? [<span key="version">{d.versionAnnotation}</span>] : []),
       ]
     : []

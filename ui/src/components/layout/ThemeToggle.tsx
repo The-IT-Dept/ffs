@@ -23,6 +23,7 @@ export function ThemeToggle() {
     <Button
       variant="ghost"
       size="icon-sm"
+      className="max-lg:size-10"
       aria-label={`Theme: ${copy.theme[choice]}`}
       title={`Theme: ${copy.theme[choice]}`}
       onClick={() => {

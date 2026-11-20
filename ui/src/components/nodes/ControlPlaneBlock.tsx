@@ -21,7 +21,7 @@ export function ControlPlaneBlock({ controlPlane, link }: { controlPlane: S<'Con
   return (
     <section className="mb-4 rounded-md border px-3 py-2 text-[12px]">
       {link ? (
-        <AppLink href="/controlplane" className="font-semibold hover:underline">
+        <AppLink href="/controlplane" className="font-semibold hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
           {copy.page.controlplane}
         </AppLink>
       ) : null}

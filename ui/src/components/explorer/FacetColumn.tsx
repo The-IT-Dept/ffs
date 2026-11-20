@@ -4,6 +4,7 @@ import { Checkbox } from '@/components/ui/checkbox'
 import { copy, facetValueLabel } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
 import { EXPLORERS, type ExplorerKind, type ExplorerSearch } from '@/lib/query'
+import { cn } from '@/lib/utils'
 
 const FOLD_AFTER = 8
 
@@ -35,7 +36,7 @@ function FacetSection({
       <ul className="flex flex-col gap-0.5">
         {shown.map((v) => (
           <li key={v.value}>
-            <label className="flex cursor-pointer items-center gap-2 py-0.5 text-[12px]">
+            <label className="flex cursor-pointer items-center gap-2 py-0.5 text-[12px] max-lg:min-h-10">
               <Checkbox
                 className="size-3.5"
                 checked={on.includes(v.value)}
@@ -48,7 +49,11 @@ function FacetSection({
         ))}
       </ul>
       {values.length > FOLD_AFTER ? (
-        <button type="button" className="self-start text-[11px] text-muted-foreground hover:text-foreground hover:underline" onClick={() => setAll(!all)}>
+        <button
+          type="button"
+          className="self-start text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:min-h-10"
+          onClick={() => setAll(!all)}
+        >
           {all ? copy.explorer.showFewer : copy.explorer.showAll}
         </button>
       ) : null}
@@ -57,22 +62,25 @@ function FacetSection({
 }
 
 // FacetColumn lists each facet's values with the server's counts. A box is checked when the URL
-// selects its value (the state facet defaults to open). Folding long lists only hides rows.
+// selects its value (the state facet defaults to open). Folding long lists only hides rows. Below
+// the lg breakpoint the same list fills the filters sheet (className widens it).
 export function FacetColumn({
   kind,
   facets,
   search,
   epssBump,
   onToggle,
+  className,
 }: {
   kind: ExplorerKind
   facets: S<'Facets'>
   search: ExplorerSearch
   epssBump: number
   onToggle: (key: keyof ExplorerSearch, value: string, on: boolean) => void
+  className?: string
 }) {
   return (
-    <div className="flex w-[175px] shrink-0 flex-col gap-4 border-r pr-4">
+    <div className={cn('flex w-[175px] shrink-0 flex-col gap-4 border-r pr-4', className)}>
       {EXPLORERS[kind].facets
         .filter((name) => facets[name] !== undefined)
         .map((name) => (

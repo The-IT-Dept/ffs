@@ -153,7 +153,7 @@ export function ExposureTable({ table, expand, onToggle }: { table: S<'ExposureT
         {table.rows.map((row, i) => {
           const next = table.rows[i + 1]
           return (
-            <TableRow key={row.id} className={cn('h-[30px]', row.depth === 0 && 'bg-muted/50 font-semibold')}>
+            <TableRow key={row.id} data-tinted={row.depth === 0 ? '' : undefined} className={cn('h-[30px]', row.depth === 0 && 'bg-muted/50 font-semibold')}>
               <TableCell className="max-w-[34rem] truncate py-0">
                 {row.depth === 0 ? (
                   <GroupPath row={row} open={open.has(row.id)} onToggle={onToggle} />

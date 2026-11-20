@@ -46,7 +46,7 @@ export function RelatedList({ scope, section }: { scope: Scope; section: S<'Rela
           type="search"
           aria-label={`${copy.rail.filter} ${heading}`}
           placeholder={copy.rail.filter}
-          className="h-7 bg-background px-2 text-[12px] md:text-[12px]"
+          className="h-7 bg-background px-2 text-base max-lg:h-10 md:text-[12px]"
           onKeyDown={(e) => {
             if (e.key !== 'Enter') return
             e.preventDefault()
@@ -59,7 +59,7 @@ export function RelatedList({ scope, section }: { scope: Scope; section: S<'Rela
       <ul className="flex flex-col gap-px">
         {section.items.map((item, i) => {
           const href = itemHref(scope, item)
-          const row = 'flex items-center gap-2 rounded-md px-2 py-0.5 text-[12px]'
+          const row = 'flex items-center gap-2 rounded-md px-2 py-0.5 text-[12px] max-lg:min-h-10'
           return (
             <li key={`${item.scope ?? item.label}:${i}`}>
               {href ? (
@@ -76,7 +76,7 @@ export function RelatedList({ scope, section }: { scope: Scope; section: S<'Rela
         })}
       </ul>
       {moreHref ? (
-        <AppLink href={moreHref} className="px-2 text-[11px] text-muted-foreground hover:text-foreground hover:underline">
+        <AppLink href={moreHref} className="px-2 text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:flex max-lg:min-h-10 max-lg:items-center">
           {copy.rail.more(section.more)}
         </AppLink>
       ) : null}

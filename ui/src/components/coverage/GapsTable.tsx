@@ -48,7 +48,7 @@ export function GapsTable({ gaps, totalGaps }: { gaps: S<'Gap'>[]; totalGaps: nu
                 <CoverageMark>{copy.gaps[g.code].gap}</CoverageMark>
               </TableCell>
               <TableCell className="py-1.5 tabular-nums">{copy.affects(g.affects)}</TableCell>
-              <TableCell className="py-1.5 whitespace-normal">
+              <TableCell className="py-1.5 whitespace-normal max-lg:min-w-[16rem]">
                 <div>{gapTodo(g)}</div>
                 {g.detail && g.code !== 'cpe_only_classifier' ? <div className="text-muted-foreground">{g.detail}</div> : null}
               </TableCell>

@@ -29,7 +29,7 @@ export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope 
               <Fragment key={b.scope}>
                 {i > 0 ? <span aria-hidden="true"> › </span> : null}
                 {href ? (
-                  <AppLink href={href} className="hover:text-foreground hover:underline">
+                  <AppLink href={href} className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
                     {b.label}
                   </AppLink>
                 ) : (
@@ -50,7 +50,7 @@ export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope 
         {scope.kind === 'cluster' ? (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <Button variant="ghost" size="icon-xs" aria-label={copy.rail.switchCluster} title={copy.rail.switchCluster}>
+              <Button variant="ghost" size="icon-xs" className="max-lg:size-10" aria-label={copy.rail.switchCluster} title={copy.rail.switchCluster}>
                 <span aria-hidden="true">⇅</span>
               </Button>
             </DropdownMenuTrigger>
