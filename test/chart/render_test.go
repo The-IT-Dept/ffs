@@ -36,13 +36,20 @@ func requireHelm(t *testing.T) {
 
 func helmTemplate(t *testing.T, sets ...string) (string, error) {
 	t.Helper()
-	requireHelm(t)
-	args := []string{"template", "ffs", chartDir, "-n", "ffs", "--kube-version", kubeVersion}
+	var args []string
 	for _, s := range sets {
 		args = append(args, "--set", s)
 	}
+	return helmTemplateChart(t, chartDir, args...)
+}
+
+// helmTemplateChart renders the chart in dir as release ffs in namespace ffs, with extra helm arguments.
+func helmTemplateChart(t *testing.T, dir string, extra ...string) (string, error) {
+	t.Helper()
+	requireHelm(t)
+	args := append([]string{"template", "ffs", dir, "-n", "ffs", "--kube-version", kubeVersion}, extra...)
 	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(t.Context(), "helm", args...)
+	cmd := exec.CommandContext(t.Context(), "helm", args...) //nolint:gosec // helm with arguments the tests build
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {
 		return stderr.String(), fmt.Errorf("helm template: %w: %s", err, stderr.String())
@@ -59,6 +66,12 @@ func render(t *testing.T, sets ...string) objs {
 	t.Helper()
 	out, err := helmTemplate(t, sets...)
 	require.NoError(t, err, out)
+	return decodeObjs(t, out)
+}
+
+// decodeObjs decodes a multi-document render.
+func decodeObjs(t *testing.T, out string) objs {
+	t.Helper()
 	var o objs
 	dec := yaml.NewYAMLOrJSONDecoder(bytes.NewReader([]byte(out)), 4096)
 	for {

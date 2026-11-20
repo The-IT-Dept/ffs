@@ -1,0 +1,18 @@
+{{- if .Values.nodeAgent.enabled }}
+{{- $ns := include "ffs.agentNamespace" . }}
+{{- if eq $ns .Release.Namespace }}
+{{- fail (printf "nodeAgent.namespace must differ from the release namespace (%s): the agent namespace is labelled privileged and the ffs namespace stays restricted" .Release.Namespace) }}
+{{- end }}
+{{- if .Values.nodeAgent.createNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+    # hostPath volumes need the privileged Pod Security level; only the agent runs here.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
+{{- end }}
+{{- end }}

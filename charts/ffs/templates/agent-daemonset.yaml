@@ -1,0 +1,202 @@
+{{- if .Values.nodeAgent.enabled }}
+{{- $na := .Values.nodeAgent }}
+{{- $fullname := include "ffs.fullname" . }}
+{{- $host := include "ffs.agentHost" . | fromJson }}
+{{- $dist := $host.distribution }}
+{{- $store := include "ffs.agentContentStore" $dist }}
+{{- $extra := include "ffs.agentExtraBinDirs" . | fromJsonArray }}
+{{- $port := include "ffs.agentPort" . }}
+{{- $maxImage := include "ffs.bytes" (list "nodeAgent.maxImageBytes" $na.maxImageBytes) }}
+{{- $scratchLimit := include "ffs.agentScratchLimit" . }}
+{{- /* Host volumes: every one read-only at /host<path>, on the collector only (docs/node-agent.md). */}}
+{{- $vols := list (dict "name" "host-os-release" "path" "/etc/os-release" "type" "File")
+  (dict "name" "host-usr-bin" "path" "/usr/bin" "type" "Directory")
+  (dict "name" "host-usr-sbin" "path" "/usr/sbin" "type" "Directory") }}
+{{- if not $host.imageBased }}
+{{- $vols = append $vols (dict "name" "host-usr-local-bin" "path" "/usr/local/bin" "type" "Directory") }}
+{{- end }}
+{{- if has "dpkg" $host.packageDatabases }}
+{{- $vols = append $vols (dict "name" "host-dpkg" "path" "/var/lib/dpkg" "type" "") }}
+{{- end }}
+{{- if has "rpm" $host.packageDatabases }}
+{{- $vols = append $vols (dict "name" "host-rpm" "path" "/var/lib/rpm" "type" "") }}
+{{- end }}
+{{- if has "apk" $host.packageDatabases }}
+{{- $vols = append $vols (dict "name" "host-apk" "path" "/lib/apk/db" "type" "Directory") }}
+{{- end }}
+{{- if eq $dist "k3s" "rke2" }}
+{{- $vols = append $vols (dict "name" (printf "host-%s-data" $dist) "path" (printf "/var/lib/rancher/%s/data" $dist) "type" "Directory") }}
+{{- end }}
+{{- if $store }}
+{{- $vols = append $vols (dict "name" "host-content-store" "path" $store "type" "Directory") }}
+{{- end }}
+{{- range $i, $d := $extra }}
+{{- $vols = append $vols (dict "name" (printf "host-extra-%d" $i) "path" $d "type" "Directory") }}
+{{- end }}
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ $fullname }}-agent
+  namespace: {{ include "ffs.agentNamespace" . }}
+  labels:
+    {{- include "ffs.agentLabels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "ffs.agentSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "ffs.agentSelectorLabels" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "ffs.agentServiceAccount" . }}
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $na.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        # The UID 0 collector has no CAP_DAC_OVERRIDE; group 65532 lets it reach the cataloguer's 0660 socket.
+        fsGroup: 65532
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: collector
+          image: {{ include "ffs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - agent
+            - --controller=https://{{ $fullname }}-agent-api.{{ .Release.Namespace }}.svc:{{ $port }}
+            - --ca-file=/etc/ffs-agent/ca/ca.crt
+            - --token-file=/var/run/secrets/ffs-agent/token
+            - --host-root=/host
+            - --distribution={{ $dist }}
+            {{- if $store }}
+            - --content-store=/host{{ $store }}
+            {{- end }}
+            - --scratch=/scratch/stage
+            - --catalog-socket=/run/ffs/catalog.sock
+            - --heartbeat=/scratch/heartbeat
+            - --max-image-bytes={{ $maxImage }}
+            {{- range $extra }}
+            - --extra-bin-dir={{ . }}
+            {{- end }}
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: collector
+                  resource: limits.memory
+          livenessProbe:
+            exec:
+              command: [/ffs, agent, check, --heartbeat=/scratch/heartbeat, --max-age=15m]
+            initialDelaySeconds: 60
+            periodSeconds: 60
+            timeoutSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml $na.resources.collector | nindent 12 }}
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            runAsNonRoot: false
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+            {{- with $na.seLinuxType }}
+            seLinuxOptions:
+              type: {{ . }}
+            {{- end }}
+          volumeMounts:
+            {{- range $vols }}
+            - {name: {{ .name }}, mountPath: /host{{ .path }}, readOnly: true, mountPropagation: None}
+            {{- end }}
+            - {name: scratch, mountPath: /scratch}
+            - {name: run, mountPath: /run/ffs}
+            - {name: token, mountPath: /var/run/secrets/ffs-agent, readOnly: true}
+            - {name: ca, mountPath: /etc/ffs-agent/ca, readOnly: true}
+        - name: catalog
+          image: {{ include "ffs.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - catalog
+            - --socket=/run/ffs/catalog.sock
+            - --scratch=/scratch/catalog
+            - --local-root=/scratch/stage
+            - --max-concurrent=1
+            - --nice=10
+            - --scratch-limit={{ $scratchLimit }}
+          env:
+            - name: GOMEMLIMIT
+              valueFrom:
+                resourceFieldRef:
+                  containerName: catalog
+                  resource: limits.memory
+          resources:
+            {{- toYaml $na.resources.catalog | nindent 12 }}
+          securityContext:
+            runAsUser: 65532
+            runAsGroup: 65532
+            runAsNonRoot: true
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          volumeMounts:
+            - {name: scratch, mountPath: /scratch}
+            - {name: run, mountPath: /run/ffs}
+      volumes:
+        {{- range $vols }}
+        - name: {{ .name }}
+          hostPath:
+            path: {{ .path }}
+            type: {{ .type | quote }}
+        {{- end }}
+        - name: scratch
+          emptyDir:
+            sizeLimit: {{ $na.scratchSizeLimit }}
+        - name: run
+          emptyDir: {}
+        - name: token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: ffs-agent
+                  expirationSeconds: 3600
+                  path: token
+        - name: ca
+          configMap:
+            name: {{ $fullname }}-agent-ca
+      {{- with $na.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $na.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      {{- toYaml $na.architectures | nindent 22 }}
+{{- end }}

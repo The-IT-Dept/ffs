@@ -19,6 +19,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/agentapi/wire"
 	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/sbom"
 )
 
@@ -173,6 +174,29 @@ func (s *Server) Handler() http.Handler {
 	})
 }
 
+// statusWriter records the status a handler answers with.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	if w.status == 0 {
+		w.status = code
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *statusWriter) Write(p []byte) (int, error) {
+	if w.status == 0 {
+		w.status = http.StatusOK
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+// Unwrap lets http.ResponseController and decode reach the server's own writer.
+func (w *statusWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
 // statusRecorder captures the status and headers of the mux's error answers.
 type statusRecorder struct {
 	header http.Header
@@ -232,7 +256,12 @@ func decode(w http.ResponseWriter, r *http.Request, max int64, what string, v an
 		writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
 		return false
 	}
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, max)).Decode(v); err != nil {
+	// MaxBytesReader tells the server's own writer to close the connection once the limit is hit.
+	limited := w
+	if u, ok := w.(interface{ Unwrap() http.ResponseWriter }); ok {
+		limited = u.Unwrap()
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(limited, r.Body, max)).Decode(v); err != nil {
 		if mbe := new(http.MaxBytesError); errors.As(err, &mbe) {
 			writeError(w, http.StatusRequestEntityTooLarge, tooLarge)
 			return false
@@ -274,7 +303,13 @@ func nodeMismatch(w http.ResponseWriter, id Identity, node string) bool {
 	return true
 }
 
-func (s *Server) serveReport(w http.ResponseWriter, r *http.Request) {
+func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
+	w := &statusWriter{ResponseWriter: rw}
+	defer func() {
+		if w.status >= 400 && w.status < 500 {
+			metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected).Inc()
+		}
+	}()
 	id, ok := s.authenticate(w, r)
 	if !ok {
 		return

@@ -1,5 +1,6 @@
 // Package metrics defines ffs's bounded Prometheus metrics. Labels are limited to namespace, owner,
-// priority, feed, registry and target: never advisory IDs, package names, digests or image names.
+// priority, feed, registry, target, state and kind: never advisory IDs, package names, digests, image
+// names or node names.
 //
 // It imports only store, model and prometheus, because the engine, registry, sbom and notify
 // packages import it. The controller wires it directly.
@@ -44,6 +45,19 @@ var (
 		Name: "ffs_notify_deliveries_total",
 		Help: "Total notification delivery attempts, by alert target and result.",
 	}, []string{"target", "result"})
+
+	// AgentReports counts node agent reports by result: "applied", "duplicate" or "rejected".
+	AgentReports = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "ffs_agent_reports_total",
+		Help: "Node agent reports received, by result.",
+	}, []string{"result"})
+)
+
+// AgentReports results.
+const (
+	AgentReportApplied   = "applied"
+	AgentReportDuplicate = "duplicate"
+	AgentReportRejected  = "rejected"
 )
 
 // crsDropped is the name of the gauge the crds package defines and registers itself.
@@ -52,10 +66,15 @@ const crsDropped = "ffs_finding_crs_dropped"
 // Register registers c and every metric variable of this package on reg. The crds package registers
 // its own gauge.
 func Register(reg prometheus.Registerer, c *Collector) error {
-	for _, col := range []prometheus.Collector{c, RematchDuration, CatalogQueueDepth, CatalogFailures, RegistryBudgetRemaining, NotifyDeliveries} {
+	for _, col := range []prometheus.Collector{c, RematchDuration, CatalogQueueDepth, CatalogFailures, RegistryBudgetRemaining,
+		NotifyDeliveries, AgentReports} {
 		if err := reg.Register(col); err != nil {
 			return fmt.Errorf("metrics: register: %w", err)
 		}
+	}
+	// Every result is exported from the start, so a rate over it never starts from a missing series.
+	for _, r := range []string{AgentReportApplied, AgentReportDuplicate, AgentReportRejected} {
+		AgentReports.WithLabelValues(r)
 	}
 	return nil
 }
@@ -72,6 +91,9 @@ func Names() []string {
 		"ffs_catalog_failures_total",
 		"ffs_registry_budget_remaining",
 		"ffs_notify_deliveries_total",
+		"ffs_node_agent_nodes",
+		"ffs_node_groups",
+		"ffs_agent_reports_total",
 		crsDropped,
 	}
 }

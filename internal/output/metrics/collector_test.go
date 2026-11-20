@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -80,7 +81,8 @@ ffs_findings_open{fixable="true",kev="true",namespace="shop",owner_kind="Deploym
 func TestCollector_NoHighCardinalityLabels(t *testing.T) {
 	st := newStore(t)
 	seed(t, st)
-	c := metrics.NewCollector(st, metrics.CollectorOptions{FeedStaleAfter: map[string]time.Duration{"osv": time.Hour}, Now: func() time.Time { return t0 }})
+	c := metrics.NewCollector(st, metrics.CollectorOptions{FeedStaleAfter: map[string]time.Duration{"osv": time.Hour},
+		NodeAgentStaleAfter: time.Hour, Now: func() time.Time { return t0 }})
 	reg := prometheus.NewRegistry()
 	require.NoError(t, metrics.Register(reg, c))
 	require.NoError(t, c.Refresh(ctx))
@@ -91,7 +93,8 @@ func TestCollector_NoHighCardinalityLabels(t *testing.T) {
 	metrics.CatalogFailures.Inc()
 
 	allowed := map[string]bool{}
-	for _, l := range []string{"namespace", "owner_kind", "owner_name", "priority", "fixable", "kev", "feed", "registry", "target", "result", "source", "le"} {
+	for _, l := range []string{"namespace", "owner_kind", "owner_name", "priority", "fixable", "kev", "feed", "registry", "target",
+		"result", "source", "le", "state", "kind"} {
 		allowed[l] = true
 	}
 	var n int
@@ -148,4 +151,60 @@ func TestCollector_ServesSnapshotBetweenRefreshes(t *testing.T) {
 	assert.Equal(t, before, testutil.CollectAndCount(c, "ffs_findings_open"))
 	require.NoError(t, c.Refresh(ctx))
 	assert.Equal(t, before+1, testutil.CollectAndCount(c, "ffs_findings_open"))
+}
+
+func TestCollector_NodeAgentGauges(t *testing.T) {
+	st := newStore(t)
+	node := func(name string) model.Node {
+		return model.Node{Name: name, OS: "linux", Arch: "amd64", OSImage: "Ubuntu 26.04 LTS", KernelVersion: "7.0.0-34-generic",
+			KubeletVersion: "v1.37.1", ContainerRuntimeVersion: "containerd://2.2.1", Ready: true, UpdatedAt: t0}
+	}
+	cp1 := node("cp-1")
+	require.NoError(t, st.ReplaceNodes(ctx, []model.Node{node("worker-1"), node("worker-2"), cp1}))
+	require.NoError(t, st.PutNodesState(ctx, store.NodesState{AgentEnabled: true}))
+	for name, at := range map[string]time.Time{"worker-1": t0.Add(-time.Minute), "worker-2": t0.Add(-2 * time.Hour)} {
+		_, err := st.AcceptAgentReport(ctx, store.AgentReport{Node: name, BootID: "boot", StartedAt: t0.Add(-3 * time.Hour), Seq: 1,
+			At: at, Full: true})
+		require.NoError(t, err)
+	}
+	grpA := strings.Repeat("a", 64)
+	require.NoError(t, st.PutNodeGroup(ctx, model.NodeGroup{ID: grpA, Kind: model.NodeGroupAgent, Name: "ubuntu-26.04-k7.0.0-34",
+		Label: nodegroup.GroupLabel("ubuntu-26.04-k7.0.0-34", grpA), Digest: nodegroup.GroupDigest(grpA), Arch: "amd64"}, t0))
+	fb := nodegroup.FallbackGroups([]model.Node{cp1}, t0)
+	require.NoError(t, st.ApplyNodeGrouping(ctx, store.NodeGrouping{
+		Members:  map[string]string{"worker-1": grpA, "worker-2": grpA, "cp-1": fb[0].ID},
+		Fallback: fb, Now: t0}))
+
+	c := metrics.NewCollector(st, metrics.CollectorOptions{NodeAgentStaleAfter: 30 * time.Minute, Now: func() time.Time { return t0 }})
+	require.NoError(t, c.Refresh(ctx))
+	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP ffs_node_agent_nodes Nodes by node agent state.
+# TYPE ffs_node_agent_nodes gauge
+ffs_node_agent_nodes{state="disabled"} 0
+ffs_node_agent_nodes{state="never"} 1
+ffs_node_agent_nodes{state="reporting"} 1
+ffs_node_agent_nodes{state="stale"} 1
+# HELP ffs_node_groups Node groups by kind.
+# TYPE ffs_node_groups gauge
+ffs_node_groups{kind="agent"} 1
+ffs_node_groups{kind="nodeinfo"} 1
+`), "ffs_node_agent_nodes", "ffs_node_groups"))
+
+	c = metrics.NewCollector(st, metrics.CollectorOptions{Now: func() time.Time { return t0 }})
+	require.NoError(t, c.Refresh(ctx))
+	assert.Zero(t, testutil.CollectAndCount(c, "ffs_node_agent_nodes"), "no node-agent gauges without NodeAgentStaleAfter")
+	assert.Zero(t, testutil.CollectAndCount(c, "ffs_node_groups"))
+}
+
+func TestMetrics_NamesAndAgentReportsRegistered(t *testing.T) {
+	assert.Subset(t, metrics.Names(), []string{"ffs_node_agent_nodes", "ffs_node_groups", "ffs_agent_reports_total"})
+	reg := prometheus.NewRegistry()
+	require.NoError(t, metrics.Register(reg, metrics.NewCollector(newStore(t), metrics.CollectorOptions{})))
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
+# HELP ffs_agent_reports_total Node agent reports received, by result.
+# TYPE ffs_agent_reports_total counter
+ffs_agent_reports_total{result="applied"} 0
+ffs_agent_reports_total{result="duplicate"} 0
+ffs_agent_reports_total{result="rejected"} 0
+`), "ffs_agent_reports_total"))
 }

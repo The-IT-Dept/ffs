@@ -29,13 +29,25 @@ var (
 		"Seconds since a feed last synced successfully, or since ffs started if it never has.", []string{"feed"}, nil)
 	feedStaleDesc = prometheus.NewDesc("ffs_feed_stale_after_seconds",
 		"Seconds after which a feed counts as stale.", []string{"feed"}, nil)
+	nodeAgentNodesDesc = prometheus.NewDesc("ffs_node_agent_nodes",
+		"Nodes by node agent state.", []string{"state"}, nil)
+	nodeGroupsDesc = prometheus.NewDesc("ffs_node_groups",
+		"Node groups by kind.", []string{"kind"}, nil)
+)
+
+// agentStates and groupKinds are every value of the node-agent gauges' labels, each exported even at 0.
+var (
+	agentStates = []model.AgentState{model.AgentReporting, model.AgentStale, model.AgentNever, model.AgentDisabled}
+	groupKinds  = []model.NodeGroupKind{model.NodeGroupAgent, model.NodeGroupNodeInfo}
 )
 
 // CollectorOptions configures a Collector.
 type CollectorOptions struct {
 	FeedStaleAfter map[string]time.Duration // feed name to staleness threshold
-	Interval       time.Duration            // refresh period; default 60s
-	Now            func() time.Time         // default time.Now
+	// NodeAgentStaleAfter is when a node agent's last report counts as stale; 0 exports no node-agent gauges.
+	NodeAgentStaleAfter time.Duration
+	Interval            time.Duration    // refresh period; default 60s
+	Now                 func() time.Time // default time.Now
 }
 
 // Collector exports findings and feed freshness from the store. It reads the store on Refresh only
@@ -66,6 +78,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- feedSuccessDesc
 	ch <- feedLagDesc
 	ch <- feedStaleDesc
+	ch <- nodeAgentNodesDesc
+	ch <- nodeGroupsDesc
 }
 
 // Collect implements prometheus.Collector. It emits the last snapshot and never touches the store.
@@ -126,10 +140,45 @@ func (c *Collector) Refresh(ctx context.Context) error {
 			prometheus.MustNewConstMetric(feedLagDesc, prometheus.GaugeValue, lag.Seconds(), feed),
 			prometheus.MustNewConstMetric(feedStaleDesc, prometheus.GaugeValue, c.o.FeedStaleAfter[feed].Seconds(), feed))
 	}
+	if c.o.NodeAgentStaleAfter > 0 {
+		nodes, err := c.nodeAgentMetrics(ctx, now)
+		if err != nil {
+			return err
+		}
+		snap = append(snap, nodes...)
+	}
 	c.mu.Lock()
 	c.snap = snap
 	c.mu.Unlock()
 	return nil
+}
+
+// nodeAgentMetrics counts the nodes by node agent state and the node groups with members by kind.
+func (c *Collector) nodeAgentMetrics(ctx context.Context, now time.Time) ([]prometheus.Metric, error) {
+	statuses, err := c.st.AgentStatus(ctx, now, c.o.NodeAgentStaleAfter)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: node agent status: %w", err)
+	}
+	groups, err := c.st.NodeGroups(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("metrics: node groups: %w", err)
+	}
+	states := map[model.AgentState]int{}
+	for _, s := range statuses {
+		states[s.State]++
+	}
+	kinds := map[model.NodeGroupKind]int{}
+	for _, g := range groups {
+		kinds[g.Kind]++
+	}
+	out := make([]prometheus.Metric, 0, len(agentStates)+len(groupKinds))
+	for _, s := range agentStates {
+		out = append(out, prometheus.MustNewConstMetric(nodeAgentNodesDesc, prometheus.GaugeValue, float64(states[s]), string(s)))
+	}
+	for _, k := range groupKinds {
+		out = append(out, prometheus.MustNewConstMetric(nodeGroupsDesc, prometheus.GaugeValue, float64(kinds[k]), string(k)))
+	}
+	return out, nil
 }
 
 // Start refreshes now and then every Interval until ctx ends. A failed refresh keeps the previous

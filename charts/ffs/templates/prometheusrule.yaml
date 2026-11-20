@@ -11,4 +11,7 @@ metadata:
     {{- end }}
 spec:
   {{- .Files.Get "files/prometheusrules.yaml" | nindent 2 }}
+  {{- if .Values.nodeAgent.enabled }}
+  {{- .Files.Get "files/prometheusrules-agent.yaml" | nindent 4 }}
+  {{- end }}
 {{- end }}

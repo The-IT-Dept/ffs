@@ -20,19 +20,40 @@ Images whose credentials only the kubelet holds, through a credential-provider p
 - `registry.operatorSecret` supplies registry credentials that otherwise only the nodes hold;
 - `registry.mirrors` is a registry mirror rewrite map, so pulls go where the nodes pull from.
 
-A later node agent will catalogue these images from the node.
+The node agent closes most of the rest. When a side-loaded image, or one ffs cannot pull, is held complete in the containerd content store of a node whose pods run it, ffs asks that node's agent to catalogue it there. The image is then `catalogued` with `source` `agent`, until a registry SBOM replaces it. What remains `unresolvable`:
+- images whose layers containerd discarded after unpacking them, shown as `image layers were discarded by containerd on every node that holds the image`;
+- images on CRI-O nodes, which have no containerd content store;
+- every such image while the node agent is disabled.
 
 ### Managed control planes and node components
 
-Managed control-plane internals (etcd and scheduler versions), and the versions of runc, CNI plugins and firmware.
+Managed control-plane internals (etcd and scheduler versions), CNI plugins and firmware.
 
-**What ffs shows:** Kubernetes advisories are matched against the control-plane and kubelet versions, with low confidence on managed distributions and the note `version normalised from <version>; vendor builds may include backported fixes`. The other components are not inventoried.
+**What ffs shows:** Kubernetes advisories are matched against the control-plane and kubelet versions, with low confidence on managed distributions and the note `version normalised from <version>; vendor builds may include backported fixes`. The node agent inventories the runc, containerd, kubelet, k3s and RKE2 binaries on each node and matches their Go modules. CNI plugins, firmware and managed control-plane components are not inventoried.
 
 ### The kernel and bundled components
 
-Kernel vulnerabilities, and components bundled into k3s and RKE2 (embedded containerd, runc, flannel).
+Kernel packages that are installed but not running, components bundled into k3s and RKE2 that are not separate binaries (flannel), and nodes the node agent cannot read.
 
-**What ffs shows:** the cluster entry carries the note `kernel, runc and other bundled components (flannel) are not inventoried`. Node OS and Kubernetes versions get end-of-life status. A later node agent will cover the kernel and bundled components.
+**What ffs shows:** with the node agent, only the running kernel's distro packages are matched; a newer installed kernel shows the node as reboot pending, with `installed kernel <release> is newer than the running kernel <release>`. The embedded containerd and runc of k3s and RKE2 are matched through their Go modules. A node the agent cannot fully read shows a coverage gap instead of a clean result:
+- `no package database (image-based OS)` on Talos, Flatcar, Container-Optimized OS and Bottlerocket;
+- `node agent not reporting since <time>` or `node agent has not reported` (`node_agent_missing`);
+- `node agent cannot read <path>: permission denied`, for example under SELinux;
+- `no containerd content store on this node; side-loaded images cannot be catalogued from it`.
+
+Without the node agent, the cluster entry keeps the note `kernel, runc and other bundled components (flannel) are not inventoried`. Node OS and Kubernetes versions get end-of-life status either way.
+
+### Node inventory from a compromised node
+
+A node's agent supplies its host inventory, and the SBOMs of images catalogued from its content store. ffs accepts an image SBOM only from a node that runs the image, and records which node sent it.
+
+**What ffs shows:** a compromised node can under-report the packages of its own host and of images that only it runs, because it controls those bytes. A registry SBOM replaces an agent SBOM as soon as the registry is reachable. See [node-agent.md](node-agent.md#trust).
+
+### "Deferred" fix states
+
+Ubuntu and Debian fix states of "deferred" are not told apart from "needs triage": the vulnerability database records both as not fixed, so those findings keep their normal priority.
+
+**What ffs shows:** the finding's fix state is not fixed, as for any other unfixed vulnerability.
 
 ### Software found only by binary classifier
 
@@ -81,3 +102,5 @@ ffs supports the current upstream Kubernetes minor and the three before it.
 | Best-effort | EKS, GKE, AKS, CRI-O and OpenShift, Talos |
 
 Best-effort environments are expected to work, but have no dedicated test infrastructure. On any of them, cloud workload identity registry credentials are unsupported, so private images that depend on them show as `unresolvable`.
+
+GKE Autopilot is supported only with `nodeAgent.enabled: false`, because it does not allow the node agent's `hostPath` volumes. Node-specific platforms are covered in [node-agent.md](node-agent.md#platforms).

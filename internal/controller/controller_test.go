@@ -86,8 +86,15 @@ func TestController_StartStopFeedsDisabled(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = l.Close() }()
 
+	// A free loopback port for the agent API, and a certificate directory with no certificate yet.
+	free, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	agentAddr := free.Addr().String()
+	require.NoError(t, free.Close())
+
 	c := config.Default()
 	c.StorePath, c.DataDir, c.Catalog.Socket = filepath.Join(dir, "ffs.db"), dir, sock
+	c.NodeAgent.Listen, c.NodeAgent.CertDir = agentAddr, dir
 	disableAllFeeds(&c)
 	require.NoError(t, c.Validate())
 
@@ -113,6 +120,17 @@ func TestController_StartStopFeedsDisabled(t *testing.T) {
 			return false
 		}
 		return apimeta.IsStatusConditionTrue(got.Status.Conditions, "Ready")
+	}, 20*time.Second, 100*time.Millisecond)
+
+	// The agent API listens: agentapi.Register ran, the pod index was registered before the cache started,
+	// and the server listens before a certificate exists.
+	require.Eventually(t, func() bool {
+		conn, err := (&net.Dialer{Timeout: time.Second}).DialContext(context.Background(), "tcp", agentAddr)
+		if err != nil {
+			return false
+		}
+		_ = conn.Close()
+		return true
 	}, 20*time.Second, 100*time.Millisecond)
 
 	// Leader election wrote no core/v1 Event about its Lease (F47): the chart grants only

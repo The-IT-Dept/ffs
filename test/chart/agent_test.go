@@ -1,0 +1,570 @@
+package chart
+
+import (
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/json"
+	"encoding/pem"
+	"fmt"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"go.yaml.in/yaml/v3"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/util/intstr"
+)
+
+const (
+	containerdStore = "/var/lib/containerd/io.containerd.content.v1.content"
+	k3sStore        = "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
+	rke2Store       = "/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content"
+	// testCABundle is a CA bundle as the chart passes it through, without parsing it.
+	testCABundle = "-----BEGIN CERTIFICATE-----\nMIIBszCCAVmgAwIBAgIUZmZzLWFnZW50LWNh\n-----END CERTIFICATE-----\n"
+)
+
+func daemonSet(t *testing.T, sets ...string) appsv1.DaemonSet {
+	t.Helper()
+	return as[appsv1.DaemonSet](t, render(t, sets...).get(t, "DaemonSet", "ffs-agent"))
+}
+
+// hostMounts returns the DaemonSet's hostPath volumes, host path → hostPath type ("" when unset), after
+// asserting that each is mounted once, by the collector only, at /host<path>, read-only, without propagation.
+func hostMounts(t *testing.T, ds appsv1.DaemonSet) map[string]string {
+	t.Helper()
+	ps := ds.Spec.Template.Spec
+	require.Empty(t, ps.InitContainers)
+	out := map[string]string{}
+	for _, v := range ps.Volumes {
+		if v.HostPath == nil {
+			continue
+		}
+		typ := ""
+		if v.HostPath.Type != nil {
+			typ = string(*v.HostPath.Type)
+		}
+		out[v.HostPath.Path] = typ
+		n := 0
+		for _, c := range ps.Containers {
+			for _, m := range c.VolumeMounts {
+				if m.Name != v.Name {
+					continue
+				}
+				n++
+				require.Equal(t, "collector", c.Name, "%s is mounted by %s", v.Name, c.Name)
+				require.Equal(t, "/host"+v.HostPath.Path, m.MountPath)
+				require.True(t, m.ReadOnly, v.Name)
+				require.NotNil(t, m.MountPropagation, v.Name)
+				require.Equal(t, corev1.MountPropagationNone, *m.MountPropagation, v.Name)
+			}
+		}
+		require.Equal(t, 1, n, "%s is mounted once", v.Name)
+	}
+	return out
+}
+
+func agentContainer(t *testing.T, ds appsv1.DaemonSet, name string) corev1.Container {
+	t.Helper()
+	return container(t, ds.Spec.Template.Spec, name)
+}
+
+// copyChart copies the chart into a temporary directory, adding the given templates.
+func copyChart(t *testing.T, templates map[string]string) string {
+	t.Helper()
+	dst := filepath.Join(t.TempDir(), "ffs")
+	require.NoError(t, filepath.WalkDir(chartDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(chartDir, p)
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return os.MkdirAll(filepath.Join(dst, rel), 0o750)
+		}
+		b, err := os.ReadFile(p) //nolint:gosec // chart file walk
+		if err != nil {
+			return err
+		}
+		return os.WriteFile(filepath.Join(dst, rel), b, 0o600) //nolint:gosec // rel comes from walking the chart's own files
+	}))
+	for name, body := range templates {
+		require.NoError(t, os.WriteFile(filepath.Join(dst, "templates", name), []byte(body), 0o600))
+	}
+	return dst
+}
+
+// helperResults renders the chart copy with values and returns data.result of each ConfigMap "<prefix>-<i>".
+func helperResults(t *testing.T, dir string, values any, prefix string, n int) []string {
+	t.Helper()
+	b, err := yaml.Marshal(values)
+	require.NoError(t, err)
+	vf := filepath.Join(t.TempDir(), "values.yaml")
+	require.NoError(t, os.WriteFile(vf, b, 0o600))
+	out, err := helmTemplateChart(t, dir, "-f", vf)
+	require.NoError(t, err, out)
+	o := decodeObjs(t, out)
+	results := make([]string, n)
+	for i := range n {
+		results[i] = as[corev1.ConfigMap](t, o.get(t, "ConfigMap", fmt.Sprintf("%s-%d", prefix, i))).Data["result"]
+	}
+	return results
+}
+
+func TestChart_AgentDisabledRendersNothing(t *testing.T) {
+	o := render(t, "nodeAgent.enabled=false")
+	for _, u := range o {
+		require.False(t, strings.HasPrefix(u.GetName(), "ffs-agent"), "%s %s rendered", u.GetKind(), u.GetName())
+	}
+	ps := as[appsv1.Deployment](t, o.get(t, "Deployment", "ffs")).Spec.Template.Spec
+	ports := map[string]bool{}
+	for _, p := range container(t, ps, "controller").Ports {
+		ports[p.Name] = true
+	}
+	require.Equal(t, map[string]bool{"http": true, "metrics": true, "health": true}, ports)
+	require.NotContains(t, volumes(ps), "agent-tls")
+	require.NotContains(t, mounts(container(t, ps, "controller")), "agent-tls")
+}
+
+func TestChart_AgentSecurityPosture(t *testing.T) {
+	allowed := []string{"/etc/os-release", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/var/lib/dpkg", "/var/lib/rpm", "/lib/apk/db",
+		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", containerdStore, k3sStore, rke2Store}
+	for _, sets := range [][]string{nil, {"nodeAgent.distribution=k3s"}, {"nodeAgent.distribution=rke2"}, {"nodeAgent.distribution=crio"}} {
+		o := render(t, sets...)
+		ds := as[appsv1.DaemonSet](t, o.get(t, "DaemonSet", "ffs-agent"))
+		for p := range hostMounts(t, ds) {
+			require.Contains(t, allowed, p, sets)
+			require.NotEqual(t, "/", p)
+			require.False(t, strings.HasSuffix(p, ".sock"), p)
+			for _, bad := range []string{"/run", "/var/run", "/var/lib/kubelet", "/etc/kubernetes", "/etc/rancher"} {
+				require.False(t, strings.HasPrefix(p, bad), p)
+			}
+		}
+
+		ps := ds.Spec.Template.Spec
+		require.False(t, ps.HostNetwork)
+		require.False(t, ps.HostPID)
+		require.False(t, ps.HostIPC)
+		require.False(t, *ps.AutomountServiceAccountToken)
+		require.Equal(t, "ffs-agent", ps.ServiceAccountName)
+		require.False(t, *ps.EnableServiceLinks)
+		require.Equal(t, corev1.SeccompProfileTypeRuntimeDefault, ps.SecurityContext.SeccompProfile.Type)
+		require.EqualValues(t, 65532, *ps.SecurityContext.FSGroup)
+
+		require.Len(t, ps.Containers, 2)
+		hardened := func(c corev1.Container) {
+			t.Helper()
+			sc := c.SecurityContext
+			require.False(t, *sc.Privileged, c.Name)
+			require.False(t, *sc.AllowPrivilegeEscalation, c.Name)
+			require.Equal(t, []corev1.Capability{"ALL"}, sc.Capabilities.Drop, c.Name)
+			require.Empty(t, sc.Capabilities.Add, c.Name)
+			require.True(t, *sc.ReadOnlyRootFilesystem, c.Name)
+			require.Empty(t, c.Ports, c.Name)
+		}
+		col := agentContainer(t, ds, "collector")
+		hardened(col)
+		require.EqualValues(t, 0, *col.SecurityContext.RunAsUser)
+		require.Equal(t, []string{"/ffs", "agent", "check", "--heartbeat=/scratch/heartbeat", "--max-age=15m"},
+			col.LivenessProbe.Exec.Command)
+		cat := agentContainer(t, ds, "catalog")
+		hardened(cat)
+		require.EqualValues(t, 65532, *cat.SecurityContext.RunAsUser)
+		require.True(t, *cat.SecurityContext.RunAsNonRoot)
+		require.Equal(t, []string{"run", "scratch"}, slices.Sorted(maps.Keys(mounts(cat))), "the cataloguer has no host mounts")
+
+		token := volumes(ps)["token"]
+		require.NotNil(t, token.Projected)
+		require.Len(t, token.Projected.Sources, 1)
+		sat := token.Projected.Sources[0].ServiceAccountToken
+		require.NotNil(t, sat)
+		require.Equal(t, "ffs-agent", sat.Audience)
+		require.EqualValues(t, 3600, *sat.ExpirationSeconds)
+		require.Equal(t, "token", sat.Path)
+		require.Equal(t, corev1.VolumeMount{Name: "token", MountPath: "/var/run/secrets/ffs-agent", ReadOnly: true}, mounts(col)["token"])
+		require.NotContains(t, mounts(cat), "token")
+
+		env := map[string]corev1.EnvVar{}
+		for _, e := range col.Env {
+			env[e.Name] = e
+		}
+		require.Equal(t, "spec.nodeName", env["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
+		for _, c := range ps.Containers {
+			var limit *corev1.ResourceFieldSelector
+			for _, e := range c.Env {
+				if e.Name == "GOMEMLIMIT" {
+					limit = e.ValueFrom.ResourceFieldRef
+				}
+			}
+			require.NotNil(t, limit, c.Name)
+			require.Equal(t, c.Name, limit.ContainerName)
+			require.Equal(t, "limits.memory", limit.Resource)
+		}
+
+		for _, u := range o {
+			var subjects []rbacv1.Subject
+			switch u.GetKind() {
+			case "RoleBinding":
+				subjects = as[rbacv1.RoleBinding](t, u).Subjects
+			case "ClusterRoleBinding":
+				subjects = as[rbacv1.ClusterRoleBinding](t, u).Subjects
+			}
+			for _, s := range subjects {
+				require.False(t, s.Kind == "ServiceAccount" && s.Name == "ffs-agent", "%s %s binds the agent", u.GetKind(), u.GetName())
+			}
+		}
+		sa := as[corev1.ServiceAccount](t, o.get(t, "ServiceAccount", "ffs-agent"))
+		require.Equal(t, "ffs-agent", sa.Namespace)
+		require.False(t, *sa.AutomountServiceAccountToken)
+		ns := o.get(t, "Namespace", "ffs-agent").GetLabels()
+		for _, mode := range []string{"enforce", "audit", "warn"} {
+			require.Equal(t, "privileged", ns["pod-security.kubernetes.io/"+mode], mode)
+		}
+	}
+}
+
+func TestChart_AgentDaemonSetShape(t *testing.T) {
+	ds := daemonSet(t)
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs-agent", "app.kubernetes.io/instance": "ffs"}, ds.Spec.Selector.MatchLabels)
+	col, cat := agentContainer(t, ds, "collector"), agentContainer(t, ds, "catalog")
+	require.Equal(t, []string{"agent", "--controller=https://ffs-agent-api.ffs.svc:8444", "--ca-file=/etc/ffs-agent/ca/ca.crt",
+		"--token-file=/var/run/secrets/ffs-agent/token", "--host-root=/host", "--distribution=containerd",
+		"--content-store=/host" + containerdStore, "--scratch=/scratch/stage", "--catalog-socket=/run/ffs/catalog.sock",
+		"--heartbeat=/scratch/heartbeat", "--max-image-bytes=1073741824"}, col.Args)
+	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/scratch/catalog", "--local-root=/scratch/stage",
+		"--max-concurrent=1", "--nice=10", "--scratch-limit=2952790016"}, cat.Args) // 4Gi − 1Gi − 256Mi
+	require.Equal(t, col.Image, cat.Image)
+
+	res := func(c corev1.Container) []string {
+		return []string{c.Resources.Requests.Cpu().String(), c.Resources.Requests.Memory().String(),
+			c.Resources.Limits.Cpu().String(), c.Resources.Limits.Memory().String()}
+	}
+	require.Equal(t, []string{"10m", "32Mi", "100m", "128Mi"}, res(col))
+	require.Equal(t, []string{"10m", "32Mi", "400m", "640Mi"}, res(cat))
+
+	ps := ds.Spec.Template.Spec
+	v := volumes(ps)
+	require.Equal(t, resource.MustParse("4Gi"), *v["scratch"].EmptyDir.SizeLimit)
+	require.NotNil(t, v["run"].EmptyDir)
+	require.Equal(t, "ffs-agent-ca", v["ca"].ConfigMap.Name)
+	require.Equal(t, corev1.VolumeMount{Name: "ca", MountPath: "/etc/ffs-agent/ca", ReadOnly: true}, mounts(col)["ca"])
+	require.Equal(t, "/scratch", mounts(col)["scratch"].MountPath)
+	require.Equal(t, "/run/ffs", mounts(col)["run"].MountPath)
+
+	require.Equal(t, []corev1.Toleration{{Operator: corev1.TolerationOpExists}}, ps.Tolerations)
+	require.Equal(t, map[string]string{"kubernetes.io/os": "linux"}, ps.NodeSelector)
+	arch := func(ps corev1.PodSpec) []corev1.NodeSelectorRequirement {
+		return ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions
+	}
+	require.Equal(t, []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn,
+		Values: []string{"amd64"}}}, arch(ps))
+	require.Empty(t, ps.PriorityClassName)
+
+	ps = daemonSet(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.priorityClassName=system-node-critical").Spec.Template.Spec
+	require.Equal(t, []string{"amd64", "arm64"}, arch(ps)[0].Values)
+	require.Equal(t, "system-node-critical", ps.PriorityClassName)
+
+	_, err := renderErr(t, "nodeAgent.scratchSizeLimit=1Gi", "nodeAgent.maxImageBytes=1Gi")
+	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit (1073741824 bytes) must exceed nodeAgent.maxImageBytes (1073741824 bytes) by more than 256Mi")
+	_, err = renderErr(t, "nodeAgent.scratchSizeLimit=768Mi", "nodeAgent.maxImageBytes=64Mi")
+	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit must be at least 1Gi: host inputs are staged up to 512Mi")
+	_, err = renderErr(t, "nodeAgent.port=8443")
+	require.ErrorContains(t, err, "nodeAgent.port must not be one of the controller's other ports (8080, 8081, 8443)")
+}
+
+func TestChart_AgentMountsPerDistribution(t *testing.T) {
+	base := map[string]string{"/etc/os-release": "File", "/usr/bin": "Directory", "/usr/sbin": "Directory", "/usr/local/bin": "Directory",
+		"/var/lib/dpkg": "", "/var/lib/rpm": ""}
+	with := func(extra map[string]string, drop ...string) map[string]string {
+		m := map[string]string{}
+		for k, v := range base {
+			m[k] = v
+		}
+		for k, v := range extra {
+			m[k] = v
+		}
+		for _, k := range drop {
+			delete(m, k)
+		}
+		return m
+	}
+	for _, tc := range []struct {
+		name  string
+		sets  []string
+		want  map[string]string
+		dist  string
+		store string
+		extra string
+	}{
+		{"default", nil, with(map[string]string{containerdStore: "Directory"}), "containerd", containerdStore, ""},
+		{"k3s", []string{"nodeAgent.distribution=k3s"},
+			with(map[string]string{"/var/lib/rancher/k3s/data": "Directory", k3sStore: "Directory"}), "k3s", k3sStore, ""},
+		{"rke2", []string{"nodeAgent.distribution=rke2"},
+			with(map[string]string{"/var/lib/rancher/rke2/data": "Directory", rke2Store: "Directory"}), "rke2", rke2Store, ""},
+		{"crio", []string{"nodeAgent.distribution=crio"}, with(nil), "crio", "", ""},
+		{"apk", []string{"nodeAgent.packageDatabases={apk}"},
+			with(map[string]string{"/lib/apk/db": "Directory", containerdStore: "Directory"}, "/var/lib/dpkg", "/var/lib/rpm"), "containerd", containerdStore, ""},
+		{"image-based", []string{"nodeAgent.packageDatabases={}"},
+			with(map[string]string{containerdStore: "Directory"}, "/var/lib/dpkg", "/var/lib/rpm", "/usr/local/bin"), "containerd", containerdStore, ""},
+		{"extra bin dir", []string{"nodeAgent.hostPaths.extraBinDirs={/opt/bin}"},
+			with(map[string]string{containerdStore: "Directory", "/opt/bin": "Directory"}), "containerd", containerdStore, "/opt/bin"},
+	} {
+		ds := daemonSet(t, tc.sets...)
+		require.Equal(t, tc.want, hostMounts(t, ds), tc.name)
+		args := agentContainer(t, ds, "collector").Args
+		require.Contains(t, args, "--distribution="+tc.dist, tc.name)
+		hasStore := slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--content-store=") })
+		if tc.store == "" {
+			require.False(t, hasStore, tc.name)
+		} else {
+			require.Contains(t, args, "--content-store=/host"+tc.store, tc.name)
+		}
+		hasExtra := slices.ContainsFunc(args, func(a string) bool { return strings.HasPrefix(a, "--extra-bin-dir=") })
+		require.Equal(t, tc.extra != "", hasExtra, tc.name)
+		if tc.extra != "" {
+			require.Contains(t, args, "--extra-bin-dir="+tc.extra, tc.name)
+		}
+	}
+
+	_, err := renderErr(t, "nodeAgent.hostPaths.extraBinDirs={/var/lib/kubelet}")
+	require.ErrorContains(t, err, "nodeAgent.hostPaths.extraBinDirs: /var/lib/kubelet is not allowed; use a directory under /usr or /opt")
+	_, err = renderErr(t, "nodeAgent.hostPaths.extraBinDirs={/opt/../etc}")
+	require.ErrorContains(t, err, "nodeAgent.hostPaths.extraBinDirs: /opt/../etc is not allowed; use a directory under /usr or /opt")
+	_, err = renderErr(t, "nodeAgent.distribution=bogus")
+	require.ErrorContains(t, err, "nodeAgent.distribution must be auto, containerd, k3s, rke2 or crio")
+}
+
+func TestChart_AgentAutoDetectFromNodes(t *testing.T) {
+	dir := copyChart(t, map[string]string{"zz-detect.yaml": `{{- range $i, $c := .Values.testCases }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: detect-{{ $i }}
+data:
+  result: {{ include "ffs.agentHostFrom" (dict "nodes" $c.nodes "agent" (mergeOverwrite (deepCopy $.Values.nodeAgent) ($c.agent | default dict))) | quote }}
+{{- end }}
+`})
+	type nodeInfo = map[string]string
+	node := func(info nodeInfo) map[string]any { return map[string]any{"status": map[string]any{"nodeInfo": info}} }
+	k3s := node(nodeInfo{"kubeletVersion": "v1.37.0+k3s1", "osImage": "Ubuntu 26.04 LTS"})
+	talos := node(nodeInfo{"kubeletVersion": "v1.37.0", "osImage": "Talos (v1.12.0)"})
+	type want struct {
+		Distribution     string   `json:"distribution"`
+		PackageDatabases []string `json:"packageDatabases"`
+		ImageBased       bool     `json:"imageBased"`
+	}
+	cases := []struct {
+		nodes []map[string]any
+		agent map[string]any
+		want  want
+	}{
+		{[]map[string]any{k3s, k3s, k3s}, nil, want{"k3s", []string{"dpkg"}, false}},
+		{[]map[string]any{node(nodeInfo{"kubeletVersion": "v1.37.0+rke2r1", "osImage": "Red Hat Enterprise Linux 9.6"}),
+			node(nodeInfo{"kubeletVersion": "v1.37.0+rke2r1", "osImage": "SUSE Linux Enterprise Server 15 SP6"})}, nil,
+			want{"rke2", []string{"rpm"}, false}},
+		{[]map[string]any{node(nodeInfo{"kubeletVersion": "v1.37.0", "containerRuntimeVersion": "cri-o://1.37.0", "osImage": "Fedora CoreOS 43"})},
+			nil, want{"crio", []string{"rpm"}, false}},
+		{[]map[string]any{talos, talos}, nil, want{"containerd", []string{}, true}},
+		{[]map[string]any{talos, node(nodeInfo{"kubeletVersion": "v1.37.0", "osImage": "Debian GNU/Linux 13 (trixie)"})}, nil,
+			want{"containerd", []string{"dpkg"}, false}},
+		{[]map[string]any{node(nodeInfo{"kubeletVersion": "v1.37.0", "osImage": "Arch Linux"})}, nil,
+			want{"containerd", []string{"dpkg", "rpm"}, false}},
+		{[]map[string]any{k3s, node(nodeInfo{"kubeletVersion": "v1.37.0", "containerRuntimeVersion": "containerd://2.2.1", "osImage": "Ubuntu 26.04 LTS"})},
+			nil, want{"containerd", []string{"dpkg"}, false}},
+		{[]map[string]any{k3s}, map[string]any{"distribution": "crio"}, want{"crio", []string{"dpkg"}, false}},
+	}
+	var values []map[string]any
+	for _, c := range cases {
+		values = append(values, map[string]any{"nodes": c.nodes, "agent": c.agent})
+	}
+	results := helperResults(t, dir, map[string]any{"testCases": values}, "detect", len(cases))
+	for i, c := range cases {
+		var got want
+		require.NoError(t, json.Unmarshal([]byte(results[i]), &got), results[i])
+		require.Equal(t, c.want, got, "case %d: %s", i, results[i])
+	}
+}
+
+func TestChart_AgentTLS(t *testing.T) {
+	o := render(t)
+	sec := as[corev1.Secret](t, o.get(t, "Secret", "ffs-agent-tls"))
+	require.Equal(t, "ffs", sec.Namespace)
+	require.Equal(t, corev1.SecretTypeTLS, sec.Type)
+	block, _ := pem.Decode(sec.Data["tls.crt"])
+	require.NotNil(t, block)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	require.NoError(t, err)
+	require.Equal(t, []string{"ffs-agent-api", "ffs-agent-api.ffs", "ffs-agent-api.ffs.svc", "ffs-agent-api.ffs.svc.cluster.local"}, cert.DNSNames)
+	_, err = tls.X509KeyPair(sec.Data["tls.crt"], sec.Data["tls.key"])
+	require.NoError(t, err)
+	cm := as[corev1.ConfigMap](t, o.get(t, "ConfigMap", "ffs-agent-ca"))
+	require.Equal(t, "ffs-agent", cm.Namespace)
+	roots := x509.NewCertPool()
+	require.True(t, roots.AppendCertsFromPEM([]byte(cm.Data["ca.crt"])))
+	_, err = cert.Verify(x509.VerifyOptions{Roots: roots, DNSName: "ffs-agent-api.ffs.svc"})
+	require.NoError(t, err)
+	notAfter, err := strconv.ParseInt(sec.Annotations["ffs.theitdept.au/not-after"], 10, 64)
+	require.NoError(t, err)
+	require.InDelta(t, time.Now().Add(3650*24*time.Hour).Unix(), notAfter, float64(24*time.Hour/time.Second))
+
+	// Reuse is decided by ffs.agentTLSPair; helm template has no lookup data, so it is called directly.
+	dir := copyChart(t, map[string]string{"zz-tls.yaml": `{{- range $i, $c := .Values.tlsCases }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tls-{{ $i }}
+data:
+  result: {{ include "ffs.agentTLSPair" (dict "secret" $c.secret "configMap" $c.configMap "root" $) | quote }}
+{{- end }}
+`})
+	existing := func(notAfter string) map[string]any {
+		return map[string]any{
+			"secret": map[string]any{"metadata": map[string]any{"annotations": map[string]any{"ffs.theitdept.au/not-after": notAfter}},
+				"data": map[string]any{"tls.crt": "dGxzLWNydA", "tls.key": "dGxzLWtleQ"}},
+			"configMap": map[string]any{"data": map[string]any{"ca.crt": testCABundle}},
+		}
+	}
+	unix := func(d time.Duration) string { return strconv.FormatInt(time.Now().Add(d).Unix(), 10) }
+	kept := unix(60 * 24 * time.Hour)
+	noCM := existing(kept)
+	delete(noCM, "configMap")
+	cases := []map[string]any{existing(kept), existing(unix(10 * 24 * time.Hour)), noCM, existing("soon")}
+	results := helperResults(t, dir, map[string]any{"tlsCases": cases}, "tls", len(cases))
+	type pair struct {
+		TLSCrt   string `json:"tlsCrt"`
+		TLSKey   string `json:"tlsKey"`
+		CACrt    string `json:"caCrt"`
+		NotAfter string `json:"notAfter"`
+	}
+	var got []pair
+	for _, r := range results {
+		var p pair
+		require.NoError(t, json.Unmarshal([]byte(r), &p), r)
+		got = append(got, p)
+	}
+	require.Equal(t, pair{"dGxzLWNydA", "dGxzLWtleQ", testCABundle, kept}, got[0], "a pair with more than 30 days left is kept")
+	for i, why := range []string{"10 days left", "no ConfigMap", "an unreadable annotation"} {
+		require.NotEqual(t, "dGxzLWNydA", got[i+1].TLSCrt, "a new pair: %s", why)
+		require.NotEqual(t, testCABundle, got[i+1].CACrt, why)
+	}
+
+	ps := podSpec(t)
+	var port corev1.ContainerPort
+	for _, p := range container(t, ps, "controller").Ports {
+		if p.Name == "agent-api" {
+			port = p
+		}
+	}
+	require.Equal(t, corev1.ContainerPort{Name: "agent-api", ContainerPort: 8444, Protocol: corev1.ProtocolTCP}, port)
+	require.Equal(t, "ffs-agent-tls", volumes(ps)["agent-tls"].Secret.SecretName)
+	require.Equal(t, corev1.VolumeMount{Name: "agent-tls", MountPath: "/etc/ffs/agent-tls", ReadOnly: true},
+		mounts(container(t, ps, "controller"))["agent-tls"])
+
+	svc := as[corev1.Service](t, o.get(t, "Service", "ffs-agent-api"))
+	require.Equal(t, "ffs", svc.Namespace)
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs"}, svc.Spec.Selector)
+	require.Len(t, svc.Spec.Ports, 1)
+	require.EqualValues(t, 8444, svc.Spec.Ports[0].Port)
+	require.Equal(t, intstr.FromString("agent-api"), svc.Spec.Ports[0].TargetPort)
+
+	o = render(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer",
+		"nodeAgent.tls.certManager.issuerRef.kind=ClusterIssuer", "nodeAgent.tls.caBundle="+testCABundle)
+	crt := o.get(t, "Certificate", "ffs-agent-tls")
+	require.Equal(t, "ffs", crt.GetNamespace())
+	spec, _, err := unstructured.NestedMap(crt.Object, "spec")
+	require.NoError(t, err)
+	require.Len(t, spec, 3)
+	require.Equal(t, "ffs-agent-tls", spec["secretName"])
+	require.Equal(t, []any{"ffs-agent-api", "ffs-agent-api.ffs", "ffs-agent-api.ffs.svc", "ffs-agent-api.ffs.svc.cluster.local"}, spec["dnsNames"])
+	require.Equal(t, map[string]any{"name": "ca-issuer", "kind": "ClusterIssuer"}, spec["issuerRef"])
+	require.False(t, o.has("Secret", "ffs-agent-tls"))
+	require.Equal(t, testCABundle, as[corev1.ConfigMap](t, o.get(t, "ConfigMap", "ffs-agent-ca")).Data["ca.crt"])
+
+	_, err = renderErr(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer")
+	require.ErrorContains(t, err, "nodeAgent.tls.caBundle is required when nodeAgent.tls.certManager.enabled is true")
+}
+
+func TestChart_AgentNetworkPolicy(t *testing.T) {
+	np := as[networkingv1.NetworkPolicy](t, render(t).get(t, "NetworkPolicy", "ffs-agent-api"))
+	require.Equal(t, "ffs", np.Namespace)
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs"}, np.Spec.PodSelector.MatchLabels)
+	require.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
+	require.Len(t, np.Spec.Ingress, 2)
+	tcp := corev1.ProtocolTCP
+	port := func(name string) networkingv1.NetworkPolicyPort {
+		p := intstr.FromString(name)
+		return networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &p}
+	}
+	in := np.Spec.Ingress[0]
+	require.Len(t, in.From, 1)
+	require.Equal(t, map[string]string{"kubernetes.io/metadata.name": "ffs-agent"}, in.From[0].NamespaceSelector.MatchLabels)
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs-agent"}, in.From[0].PodSelector.MatchLabels)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{port("agent-api")}, in.Ports)
+	require.Empty(t, np.Spec.Ingress[1].From)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{port("http"), port("metrics"), port("health")}, np.Spec.Ingress[1].Ports)
+
+	require.False(t, render(t, "nodeAgent.networkPolicy.enabled=false").has("NetworkPolicy", "ffs-agent-api"))
+}
+
+func TestChart_AgentOptIns(t *testing.T) {
+	ds := daemonSet(t)
+	for _, c := range ds.Spec.Template.Spec.Containers {
+		require.Nil(t, c.SecurityContext.SELinuxOptions, c.Name)
+	}
+	ds = daemonSet(t, "nodeAgent.seLinuxType=spc_t")
+	require.Equal(t, "spc_t", agentContainer(t, ds, "collector").SecurityContext.SELinuxOptions.Type)
+	require.Nil(t, agentContainer(t, ds, "catalog").SecurityContext.SELinuxOptions)
+
+	o := render(t)
+	require.False(t, o.has("SecurityContextConstraints", "ffs-agent"))
+	require.False(t, o.has("ClusterRole", "ffs-agent-scc"))
+	require.False(t, o.has("RoleBinding", "ffs-agent-scc"))
+
+	o = render(t, "nodeAgent.openshift.scc=true")
+	scc := o.get(t, "SecurityContextConstraints", "ffs-agent").Object
+	for field, want := range map[string]any{
+		"allowHostDirVolumePlugin": true, "allowPrivilegedContainer": false, "allowPrivilegeEscalation": false,
+		"readOnlyRootFilesystem": true, "allowHostNetwork": false, "allowHostPID": false, "allowHostIPC": false, "allowHostPorts": false,
+		"requiredDropCapabilities": []any{"ALL"}, "volumes": []any{"configMap", "emptyDir", "hostPath", "projected"},
+	} {
+		require.Equal(t, want, scc[field], field)
+	}
+	cr := clusterRole(t, o, "ffs-agent-scc")
+	require.Equal(t, []rbacv1.PolicyRule{{APIGroups: []string{"security.openshift.io"}, Resources: []string{"securitycontextconstraints"},
+		ResourceNames: []string{"ffs-agent"}, Verbs: []string{"use"}}}, cr.Rules)
+	var bindings []string
+	for _, u := range o {
+		var subjects []rbacv1.Subject
+		switch u.GetKind() {
+		case "RoleBinding":
+			subjects = as[rbacv1.RoleBinding](t, u).Subjects
+		case "ClusterRoleBinding":
+			subjects = as[rbacv1.ClusterRoleBinding](t, u).Subjects
+		}
+		for _, s := range subjects {
+			if s.Kind == "ServiceAccount" && s.Name == "ffs-agent" {
+				bindings = append(bindings, u.GetKind()+"/"+u.GetName())
+			}
+		}
+	}
+	require.Equal(t, []string{"RoleBinding/ffs-agent-scc"}, bindings, "the SCC binding is the only one naming the agent")
+	rb := as[rbacv1.RoleBinding](t, o.get(t, "RoleBinding", "ffs-agent-scc"))
+	require.Equal(t, "ffs-agent", rb.Namespace)
+	require.Equal(t, rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: "ffs-agent-scc"}, rb.RoleRef)
+	require.Equal(t, []rbacv1.Subject{{Kind: "ServiceAccount", Name: "ffs-agent", Namespace: "ffs-agent"}}, rb.Subjects)
+}
