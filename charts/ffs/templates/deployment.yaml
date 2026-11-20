@@ -60,15 +60,7 @@ spec:
             - controller
             - --config=/etc/ffs/config.yaml
           env:
-            - name: GOMEMLIMIT
-              {{- with (dig "resources" "limits" "memory" "" .Values.controller) }}
-              value: {{ include "ffs.goMemLimit" . | quote }}
-              {{- else }}
-              valueFrom:
-                resourceFieldRef:
-                  containerName: controller
-                  resource: limits.memory
-              {{- end }}
+            {{- include "ffs.goMemLimitEnv" (dict "container" "controller" "path" "controller.resources" "resources" .Values.controller.resources) | nindent 12 }}
           ports:
             - {name: http, containerPort: {{ include "ffs.httpPort" . }}, protocol: TCP}
             - {name: metrics, containerPort: 8443, protocol: TCP}
@@ -109,15 +101,7 @@ spec:
             - --worker-memory-limit={{ include "ffs.workerMemLimit" (list "catalog.resources.limits.memory" . $.Values.config.catalog.concurrency) }}
             {{- end }}
           env:
-            - name: GOMEMLIMIT
-              {{- with (dig "resources" "limits" "memory" "" .Values.catalog) }}
-              value: {{ include "ffs.goMemLimitOf" (list "catalog.resources.limits.memory" .) | quote }}
-              {{- else }}
-              valueFrom:
-                resourceFieldRef:
-                  containerName: catalog
-                  resource: limits.memory
-              {{- end }}
+            {{- include "ffs.goMemLimitEnv" (dict "container" "catalog" "path" "catalog.resources" "resources" .Values.catalog.resources) | nindent 12 }}
           resources:
             {{- toYaml .Values.catalog.resources | nindent 12 }}
           securityContext:

@@ -200,11 +200,7 @@ func TestChart_AgentSecurityPosture(t *testing.T) {
 		require.Equal(t, corev1.VolumeMount{Name: "token", MountPath: "/var/run/secrets/ffs-agent", ReadOnly: true}, mounts(col)["token"])
 		require.NotContains(t, mounts(cat), "token")
 
-		env := map[string]corev1.EnvVar{}
-		for _, e := range col.Env {
-			env[e.Name] = e
-		}
-		require.Equal(t, "spec.nodeName", env["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
+		require.Equal(t, "spec.nodeName", envOf(col)["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
 		require.Equal(t, "120795955", envOf(col)["GOMEMLIMIT"].Value, "90% of the collector's 128Mi")
 		require.Equal(t, "603979776", envOf(cat)["GOMEMLIMIT"].Value, "90% of the cataloguer's 640Mi")
 
@@ -646,6 +642,81 @@ func TestChart_AgentMemoryLimits(t *testing.T) {
 	require.False(t, slices.ContainsFunc(cc.Args, func(a string) bool { return strings.HasPrefix(a, "--worker-memory-limit") }))
 }
 
+// TestChart_FractionalMemoryLimits: memory limits with a decimal fraction, as Kubernetes takes them, keep
+// rendering: 1.5Gi is 1536Mi for every container's GOMEMLIMIT and worker limit, beside the whole 2Gi.
+func TestChart_FractionalMemoryLimits(t *testing.T) {
+	for _, c := range []struct {
+		limit            string
+		goMemLimit       string // 90%
+		agentWorkerLimit string // less 128Mi
+		workerLimit      string // less 128Mi, over the default 2 jobs
+	}{
+		{"1.5Gi", "1449551462", "--worker-memory-limit=1476395008", "--worker-memory-limit=738197504"},
+		{"1536Mi", "1449551462", "--worker-memory-limit=1476395008", "--worker-memory-limit=738197504"},
+		{"2Gi", "1932735283", "--worker-memory-limit=2013265920", "--worker-memory-limit=1006632960"},
+	} {
+		o := render(t, "controller.resources.limits.memory="+c.limit, "catalog.resources.limits.memory="+c.limit,
+			"nodeAgent.resources.collector.limits.memory="+c.limit, "nodeAgent.resources.catalog.limits.memory="+c.limit)
+		ps := as[appsv1.Deployment](t, o.get(t, "Deployment", "ffs")).Spec.Template.Spec
+		ds := as[appsv1.DaemonSet](t, o.get(t, "DaemonSet", "ffs-agent"))
+		for _, ctr := range []corev1.Container{container(t, ps, "controller"), container(t, ps, "catalog"),
+			agentContainer(t, ds, "collector"), agentContainer(t, ds, "catalog")} {
+			require.Equal(t, c.goMemLimit, envOf(ctr)["GOMEMLIMIT"].Value, "%s %s", c.limit, ctr.Name)
+		}
+		require.Contains(t, container(t, ps, "catalog").Args, c.workerLimit, c.limit)
+		require.Contains(t, agentContainer(t, ds, "catalog").Args, c.agentWorkerLimit, c.limit)
+	}
+}
+
+// TestChart_BytesQuantities: ffs.bytes reads byte counts and Kubernetes quantities, whole or with up to six
+// decimal digits, rounding a fraction of a byte up as Kubernetes does, and refuses anything else.
+func TestChart_BytesQuantities(t *testing.T) {
+	dir := copyChart(t, map[string]string{"zz-bytes.yaml": `{{- range $i, $v := .Values.byteCases }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bytes-{{ $i }}
+data:
+  result: {{ include "ffs.bytes" (list "case" $v) | quote }}
+{{- end }}
+`})
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"2Gi", "2147483648"},
+		{"1.5Gi", "1610612736"},
+		{"0.5Gi", "536870912"},
+		{"1536Mi", "1610612736"},
+		{"1.05Gi", "1127428916"}, // 1127428915.2, rounded up; 05 is decimal, not octal
+		{"1.5G", "1500000000"},
+		{"0.25Ki", "256"},
+		{"0.1", "1"},
+		{"128974848", "128974848"},
+		{128974848, "128974848"},
+		{"1.000001Ti", "1099512727288"},
+	}
+	values := make([]any, len(cases))
+	for i, c := range cases {
+		values[i] = c.in
+	}
+	got := helperResults(t, dir, map[string]any{"byteCases": values}, "bytes", len(cases))
+	for i, c := range cases {
+		require.Equal(t, c.want, got[i], "%v", c.in)
+		if s, ok := c.in.(string); ok {
+			want, err := resource.ParseQuantity(s)
+			require.NoError(t, err, s)
+			require.Equal(t, strconv.FormatInt(want.Value(), 10), got[i], "%s as Kubernetes reads it", s)
+		}
+	}
+
+	for _, bad := range []string{"1.5GB", ".5Gi", "1.Gi", "1.1234567Gi", "01Gi", "1.5.0Gi", "1e9", "-1Gi"} {
+		_, err := renderErr(t, "controller.resources.limits.memory="+bad)
+		require.ErrorContains(t, err, fmt.Sprintf("controller.resources.limits.memory must be a byte count or a quantity such as 18Gi, not %q", bad), bad)
+	}
+}
+
 // TestChart_AgentScratchVolumes: nodeAgent.scratchSizeLimit is split between the collector's staging volume
 // and the cataloguer's own, and a total too small for both is refused.
 func TestChart_AgentScratchVolumes(t *testing.T) {
@@ -753,6 +824,10 @@ func TestChart_AgentValueGuards(t *testing.T) {
 		"nodeAgent.hostPaths.extraBinDirs={/usr/bin}":          "nodeAgent.hostPaths.extraBinDirs: /usr/bin is searched already; list only other directories",
 		"nodeAgent.hostPaths.extraBinDirs={/usr/sbin}":         "nodeAgent.hostPaths.extraBinDirs: /usr/sbin is searched already",
 		"nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}":    "nodeAgent.hostPaths.extraBinDirs: /usr/local/bin is searched already",
+		"nodeAgent.hostPaths.extraBinDirs={/usr/./bin}":        "nodeAgent.hostPaths.extraBinDirs: /usr/./bin is not allowed; use a directory under /usr or /opt",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/../etc}":       "nodeAgent.hostPaths.extraBinDirs: /opt/../etc is not allowed",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/tools/.}":      "nodeAgent.hostPaths.extraBinDirs: /opt/tools/. is not allowed",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/tools/..}":     "nodeAgent.hostPaths.extraBinDirs: /opt/tools/.. is not allowed",
 		"nodeAgent.architectures=null":                         "nodeAgent.architectures must list at least one node architecture",
 		"nodeAgent.architectures={}":                           "nodeAgent.architectures must list at least one node architecture",
 	} {
@@ -762,6 +837,8 @@ func TestChart_AgentValueGuards(t *testing.T) {
 	// On image-based OSes /usr/local/bin is not mounted, so it may be listed.
 	hm := hostMounts(t, daemonSet(t, "nodeAgent.packageDatabases={}", "nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}"))
 	require.Equal(t, "Directory", hm["/usr/local/bin"])
+	// A dot inside a name is not a . or .. component.
+	require.Equal(t, "Directory", hostMounts(t, daemonSet(t, "nodeAgent.hostPaths.extraBinDirs={/opt/tools..v2/bin}"))["/opt/tools..v2/bin"])
 	ps := daemonSet(t, "nodeAgent.architectures={amd64,,arm64}").Spec.Template.Spec
 	require.Equal(t, []string{"amd64", "arm64"},
 		ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values)

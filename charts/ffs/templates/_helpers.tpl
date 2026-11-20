@@ -58,8 +58,10 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- end -}}
 
 {{- /*
-ffs.bytes renders a byte count from a number or a Kubernetes quantity with no fraction ("18Gi",
-"15G"). It is called with (list "<value path>" <value>) and fails the render on anything else.
+ffs.bytes renders a byte count from a number or a Kubernetes quantity, whole or with a decimal fraction of
+up to six digits ("18Gi", "15G", "1.5Gi", "0.5Gi"). A fraction of a byte is rounded up, as Kubernetes rounds
+a memory quantity. It is called with (list "<value path>" <value>) and fails the render on anything else.
+The digits are read with atoi, which is decimal, because int64 reads a leading 0 as octal ("1.05Gi").
 */ -}}
 {{- define "ffs.bytes" -}}
 {{- $name := index . 0 -}}
@@ -68,32 +70,47 @@ ffs.bytes renders a byte count from a number or a Kubernetes quantity with no fr
 {{- int64 $v -}}
 {{- else -}}
 {{- $s := toString $v | trim -}}
-{{- if not (regexMatch "^(0|[1-9][0-9]*)(k|M|G|T|Ki|Mi|Gi|Ti)?$" $s) -}}
+{{- $re := "^(0|[1-9][0-9]*)(?:\\.([0-9]{1,6}))?(k|M|G|T|Ki|Mi|Gi|Ti)?$" -}}
+{{- if not (regexMatch $re $s) -}}
 {{- fail (printf "%s must be a byte count or a quantity such as 18Gi, not %q" $name $s) -}}
 {{- end -}}
 {{- $units := dict "" 1 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 -}}
-{{- mul (regexFind "^[0-9]+" $s | int64) (get $units (regexReplaceAll "^[0-9]+" $s "")) -}}
+{{- $unit := get $units (regexReplaceAll $re $s "${3}") | int64 -}}
+{{- $bytes := mul (regexReplaceAll $re $s "${1}" | atoi) $unit -}}
+{{- with regexReplaceAll $re $s "${2}" -}}
+{{- $scale := printf "1%s" (repeat (len .) "0") | atoi -}}
+{{- $bytes = add $bytes (div (add (mul (atoi .) $unit) (sub $scale 1)) $scale) -}}
+{{- end -}}
+{{- $bytes -}}
 {{- end -}}
 {{- end -}}
 
 {{- /*
-ffs.goMemLimit is the controller's GOMEMLIMIT in bytes: 90% of its memory limit. The rest is for
-what the Go runtime does not count: SQLite's page caches and sort buffers, which live outside the Go
-heap, and the kernel's own accounting. At 100% the container can be OOM-killed before the garbage
-collector has tried to stay under the limit.
-*/ -}}
-{{- define "ffs.goMemLimit" -}}
-{{- include "ffs.goMemLimitOf" (list "controller.resources.limits.memory" .) -}}
-{{- end -}}
-
-{{- /*
-ffs.goMemLimitOf is a GOMEMLIMIT of 90% of a memory limit, in bytes, from (list "<value path>" <limit>), for
-the same reason as ffs.goMemLimit: at 100% a container can be OOM-killed before the garbage collector has
-tried to stay under its limit.
+ffs.goMemLimitOf is a GOMEMLIMIT of 90% of a memory limit, in bytes, from (list "<value path>" <limit>). The
+rest is for what the Go runtime does not count: the controller's SQLite page caches and sort buffers, which
+live outside the Go heap, and the kernel's own accounting. At 100% a container can be OOM-killed before the
+garbage collector has tried to stay under its limit.
 */ -}}
 {{- define "ffs.goMemLimitOf" -}}
 {{- $limit := include "ffs.bytes" . | int64 -}}
 {{- div (mul $limit 9) 10 -}}
+{{- end -}}
+
+{{- /*
+ffs.goMemLimitEnv is a container's GOMEMLIMIT environment variable, from (dict "container" <container name>
+"path" "<value path of its resources>" "resources" <its resources>): ffs.goMemLimitOf its memory limit, or
+without one the limit from the downward API, which is then the node's allocatable memory.
+*/ -}}
+{{- define "ffs.goMemLimitEnv" -}}
+- name: GOMEMLIMIT
+{{- with dig "limits" "memory" "" (.resources | default dict) }}
+  value: {{ include "ffs.goMemLimitOf" (list (printf "%s.limits.memory" $.path) .) | quote }}
+{{- else }}
+  valueFrom:
+    resourceFieldRef:
+      containerName: {{ .container }}
+      resource: limits.memory
+{{- end }}
 {{- end -}}
 
 {{- /*
@@ -310,8 +327,9 @@ absolute path outside the directories the agent never mounts.
 
 {{- /*
 ffs.agentExtraBinDirs is nodeAgent.hostPaths.extraBinDirs as JSON, from (dict "root" $ "imageBased" <bool>).
-Each must be a directory under /usr or /opt, listed once, and not one the chart mounts already (/usr/bin,
-/usr/sbin, and /usr/local/bin except on image-based OSes): two mounts at one path make the DaemonSet invalid.
+Each must be a directory under /usr or /opt with no . or .. component, listed once, and not one the chart
+mounts already (/usr/bin, /usr/sbin, and /usr/local/bin except on image-based OSes): two mounts at one path
+make the DaemonSet invalid.
 */ -}}
 {{- define "ffs.agentExtraBinDirs" -}}
 {{- $builtIn := list "/usr/bin" "/usr/sbin" -}}
@@ -321,7 +339,7 @@ Each must be a directory under /usr or /opt, listed once, and not one the chart 
 {{- $dirs := list -}}
 {{- range .root.Values.nodeAgent.hostPaths.extraBinDirs -}}
 {{- $d := toString . -}}
-{{- if or (not (regexMatch "^/(usr|opt)(/[A-Za-z0-9._+-]+)+$" $d)) (contains ".." $d) -}}
+{{- if or (not (regexMatch "^/(usr|opt)(/[A-Za-z0-9._+-]+)+$" $d)) (regexMatch "(^|/)\\.\\.?(/|$)" $d) -}}
 {{- fail (printf "nodeAgent.hostPaths.extraBinDirs: %s is not allowed; use a directory under /usr or /opt" $d) -}}
 {{- end -}}
 {{- if has $d $builtIn -}}

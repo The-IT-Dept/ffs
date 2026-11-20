@@ -584,7 +584,8 @@ func TestChart_ControllerGoMemLimit(t *testing.T) {
 	require.Equal(t, "limits.memory", e.ValueFrom.ResourceFieldRef.Resource)
 	require.Equal(t, "controller", e.ValueFrom.ResourceFieldRef.ContainerName)
 
-	_, err := renderErr(t, "controller.resources.limits.memory=1.5Gi")
+	require.Equal(t, "1449551462", env("controller.resources.limits.memory=1.5Gi").Value, "a decimal fraction, as 1536Mi")
+	_, err := renderErr(t, "controller.resources.limits.memory=1.5GB")
 	require.ErrorContains(t, err, "controller.resources.limits.memory must be a byte count or a quantity such as 18Gi")
 }
 
@@ -604,6 +605,7 @@ func TestChart_ScratchLimitQuantities(t *testing.T) {
 	require.Equal(t, "19327352832", limit("catalog.scratchLimit=19327352832"))
 	require.Equal(t, "15000000000", limit("catalog.scratchLimit=15G"))
 	require.Equal(t, "1073741824", limit("catalog.scratchLimit=1Gi", "catalog.scratchSizeLimit=2Gi"))
+	require.Equal(t, "1610612736", limit("catalog.scratchLimit=1.5Gi", "catalog.scratchSizeLimit=2Gi"))
 
 	values := filepath.Join(t.TempDir(), "values.yaml")
 	require.NoError(t, os.WriteFile(values, []byte("catalog:\n  scratchLimit: 18Gi\n"), 0o600))
@@ -617,7 +619,7 @@ func TestChart_ScratchLimitQuantities(t *testing.T) {
 		{"catalog.scratchLimit=20Gi", "catalog.scratchLimit (21474836480 bytes) must be below catalog.scratchSizeLimit (21474836480 bytes)"},
 		{"catalog.scratchLimit=25Gi", "must be below catalog.scratchSizeLimit"},
 		{"catalog.scratchLimit=18GB", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
-		{"catalog.scratchLimit=1.5Gi", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
+		{"catalog.scratchLimit=1.5GiB", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
 	} {
 		_, err := renderErr(t, c.set)
 		require.ErrorContains(t, err, c.want, c.set)
