@@ -16,7 +16,7 @@ An `AlertTarget` sends findings to Slack, Discord, Microsoft Teams or a signed w
 | `spec.digest.minPriority` | `medium` | Lowest priority listed in the digest as new or escalated. |
 | `spec.digest.includeResolved` | `true` | List resolved findings in the digest. |
 | `spec.namespaces` | all | Send only findings in these namespaces. |
-| `spec.namespaceSelector` | all | Send only findings in namespaces whose labels match. Cluster-level findings (Kubernetes, container runtime) are sent only when neither filter is set. |
+| `spec.namespaceSelector` | all | Send only findings in namespaces whose labels match. Cluster-level findings (Kubernetes, container runtime) are sent only when neither filter is set. When a matching namespace is deleted, the resolutions of findings already sent from it are still sent; new findings there are not. |
 | `spec.quietHours.intervals` | none | Times when immediate alerts are held, in Alertmanager `time_intervals` form: `times` (`startTime`/`endTime` as `HH:MM`, end exclusive, `24:00` allowed), `weekdays` (`monday:friday`), `daysOfMonth` (`1:5`, `-1` for the last day), `months` (`january:march` or `1:3`), `years` (`2026:2027`) and `location` (IANA zone, default UTC). An interval matches when all of its non-empty fields match. |
 | `spec.quietHours.allowUrgent` | `true` | Send `urgent` alerts during quiet hours. |
 | `spec.notifyOnFeedStale` | `false` | Send one alert when a vulnerability feed goes stale. |
@@ -79,7 +79,7 @@ A Slack example is in [examples/alerttarget-slack.yaml](examples/alerttarget-sla
 - **Digest.** On the digest schedule, if anything changed since the last digest, one summary is sent with new findings and escalations at or above `digest.minPriority`, fixes that became available and resolved findings (when `includeResolved` is true) for findings reported at or above `digest.minPriority`, and feed health. It also lists the suggested upgrades that became available for findings already reported at or above `digest.minPriority` or `immediate.minPriority`: an immediate alert goes out before ffs has scored upgrade candidates, so this is where its upgrade arrives. Anything already sent immediately is not repeated. If nothing changed, nothing is sent.
 - **Never twice.** For each finding and target, ffs records the highest priority already sent. A finding alerts again only when it escalates above that priority or reopens (a regression, or an expired Exception). A newly available fix or upgrade is reported in the digest only.
 - **Resolutions.** When a finding the target was told about resolves, the resolution is sent immediately if the finding had been sent at or above `immediate.minPriority`. Otherwise it is listed in the next digest when `includeResolved` is true.
-- **Baseline.** When ffs first starts, or a target is first created, the findings that already exist do not each alert. The target gets one summary of what ffs is watching, with counts by priority and the top items. Normal rules apply after that. On first start the summary, and every other alert, waits until the running images are catalogued and matched and the Grype database has synced once. An image waiting to retry after a failed attempt counts as not yet catalogued. A large cluster's first catalogue can take longer than an hour, and ffs keeps waiting while it is making progress. Once an hour has passed since ffs read the cluster's workloads, alerts start anyway when cataloguing has made no progress for 30 minutes (or for the catalogue timeout plus 5 minutes, if that is longer), and the controller log says what was still pending. Feed-stale alerts never wait.
+- **Baseline.** When ffs first starts, or a target is first created, the findings that already exist do not each alert. The target gets one summary of what ffs is watching, with the number of findings, the workloads they are in and the count at each priority ("40 findings in 12 workloads: 3 urgent, 5 high, 32 medium"), and the top items. A digest's summary counts the findings it lists the same way. Normal rules apply after that. On first start the summary, and every other alert, waits until the running images are catalogued and matched and the Grype database has synced once. An image waiting to retry after a failed attempt counts as not yet catalogued. A large cluster's first catalogue can take longer than an hour, and ffs keeps waiting while it is making progress. Once an hour has passed since ffs read the cluster's workloads, alerts start anyway when cataloguing has made no progress for 30 minutes (or for the catalogue timeout plus 5 minutes, if that is longer), and the controller log says what was still pending. Feed-stale alerts never wait.
 - **Quiet hours.** During a quiet-hours interval, immediate alerts are held until the interval ends. `urgent` alerts are still sent unless `quietHours.allowUrgent` is false. Digests run on their own schedule.
 - **Feed staleness.** With `notifyOnFeedStale: true`, a feed that passes its staleness threshold sends one alert, which is not repeated until the feed recovers and goes stale again.
 - **Excepted findings** send nothing.
@@ -97,7 +97,19 @@ Webhook targets receive a POST with `Content-Type: application/cloudevents+json;
 | `time` | When the message was created. |
 | `subject` | The advisory ID, for immediate alerts. |
 | `datacontenttype` | `application/json` |
-| `data` | `kind`, `cluster`, `target`, `title`, `items` (one per advisory: `event`, `advisoryId`, `title`, `priority`, `reasons`, `owners`, `nodeGroups` (node findings: the affected node groups, at most three, then `+N more`), `packages`, `fixedIn`, `suggestion`, `published`, `observed`, `links`, `provisional`), and for summaries `summary` and `feeds`. |
+| `data` | The message: see the table below. |
+
+| `data` field | Value |
+|---|---|
+| `kind` | `immediate`, `digest`, `baseline` or `feedStale`. |
+| `cluster`, `target`, `title` | The cluster name, the AlertTarget name and the message title. |
+| `items` | One per advisory, highest priority first: `event`, `advisoryId`, `title`, `priority`, `reasons`, `owners`, `nodeGroups` (node findings: the affected node groups, at most three, then `+N more`), `packages`, `fixedIn`, `suggestion`, `published`, `observed`, `links`, `provisional`, and `truncatedOwners` and `truncatedPackages` when some owners or packages were left out (see below). |
+| `truncated` | How many items were left out of `items`, `0` when none. |
+| `summary` | Baselines and digests: `findings` (how many findings the message covers), `workloads` (how many workloads they are in) and `counts` (`urgent`, `high`, `medium`, `low`: findings at each priority). |
+| `feeds` | Digests and feed-stale alerts: `name`, `lastSuccess`, `staleAfterSeconds`, `stale`. |
+| `dashboardUrl` | `config.dashboardURL`, when set. |
+
+A message lists at most 200 items, and its payload is kept within 256 KiB. When a message would be larger, each item's `owners` and `packages` are cut, to 100, then 25, then 5, and then the last items (the lowest priority) are left out. What is left out is counted in `truncatedOwners`, `truncatedPackages` and `truncated`; the title and the summary count everything. Slack and Teams messages show at most 20 items and Discord messages 10, each with at most 10 workloads and 10 packages, and they say how many more there are.
 
 | Event type | Sent for |
 |---|---|
@@ -127,9 +139,11 @@ Any Standard Webhooks library does all of this for you.
 ## Delivery
 
 - Each request times out after 15 seconds. Redirects are not followed.
-- Failed deliveries are retried with exponential backoff and jitter: 5 seconds doubling to at most 15 minutes, for up to 12 attempts. A longer `Retry-After` from the endpoint (on 429, 408 and 5xx responses) is honoured, up to 1 hour. Messages to one target are sent in order, and while a target is backing off nothing else is sent to it.
+- Failed deliveries are retried with exponential backoff and jitter: 5 seconds doubling to at most 15 minutes. A delivery is given up when a send fails 24 hours or more after its first attempt, so an endpoint that is down for less than a day still gets every alert. A longer `Retry-After` from the endpoint (on 429, 408 and 5xx responses) is honoured, up to 1 hour. Messages to one target are sent in order, and while a target is backing off nothing else is sent to it.
+- Messages queued together go out by priority: `urgent`, `high`, `medium` and `low` (a message counts at its highest priority), then feed-stale alerts, then resolutions.
 - Other 4xx and 3xx responses fail the delivery without retrying.
 - HTTP 410 Gone disables the target; its `Ready` condition shows `EndpointGone`. Changing the AlertTarget or its Secret enables it again.
 - Every delivery and its outcome is kept in a delivery log for `retention.resolved`. Delivery is at least once, so a receiver can see the same `webhook-id` twice.
-- **SSRF guard.** Loopback, link-local, unspecified and multicast addresses, and cloud metadata endpoints, are always refused. Private (RFC 1918, IPv6 unique local) and carrier-grade NAT addresses, which include most cluster pod and Service ranges, are refused unless the target sets `allowPrivate: true`. The check applies to every address the host resolves to, and again when connecting.
-- `HTTPS_PROXY` and `NO_PROXY` are honoured.
+- **SSRF guard.** Loopback, link-local, unspecified and multicast addresses, and cloud metadata endpoints, are always refused. Private (RFC 1918, IPv6 unique local) and carrier-grade NAT addresses, the pod CIDRs of the cluster's nodes, and the ranges in [`alertTargets.blockedCIDRs`](configuration.md#ffs-configuration) are refused unless the target sets `allowPrivate: true`. Pod CIDRs that are globally routable IPv6 are covered too. The Service CIDR is not on the nodes: when it is not a private range, add it to `alertTargets.blockedCIDRs`. The check applies to every address the host resolves to, and again when connecting.
+- `HTTPS_PROXY` and `NO_PROXY` are honoured. Through a proxy, ffs does not resolve the endpoint's host itself: the proxy does, so the host need not resolve inside the cluster. The SSRF guard then checks only an endpoint given as an IP address, so limit what the proxy can reach.
+- Discord messages never mention anyone (`allowed_mentions` is empty). Text from vulnerability feeds, images and advisories is escaped in Discord and Teams messages, so markdown in it shows as written.

@@ -18,7 +18,8 @@ import (
 // When nothing qualifies, nothing is sent; the cursor still moves and resolutions are still
 // recorded in the ledger. Classifying against the ledger, which the immediate pass has already
 // updated, keeps anything sent immediately out of the digest. With holdNodes the transitions of
-// Nodes findings are passed over, as the immediate pass does.
+// Nodes findings are passed over, as the immediate pass does. A resolution in a namespace that has
+// been deleted is still in scope, so the ledger entry of a finding sent before closes.
 func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time, holdNodes bool) error {
 	fire := t.digestFire(st)
 	if !digestDue(fire, now) {
@@ -56,10 +57,13 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 	listedFP := map[string]bool{}
 	for _, fp := range r.order {
 		tr, l := r.final[fp], entry(ledger, fp)
-		if !t.cfg.allows(tr.Owner.Namespace) || (holdNodes && isNodes(tr.Owner)) {
+		if holdNodes && isNodes(tr.Owner) {
 			continue
 		}
 		ev := classify(tr, l)
+		if !t.cfg.covers(ev, tr.Owner.Namespace) {
+			continue
+		}
 		var listed bool
 		switch ev {
 		case EventDetected, EventReopened, EventEscalated:
@@ -184,11 +188,13 @@ func (e *Engine) digestMessage(ctx context.Context, t *target, r latest, byEvent
 		return Message{}, err
 	}
 	var items []Item
+	listed := make([]model.Finding, 0, len(fps))
 	for _, ev := range digestEvents {
 		fs := make([]model.Finding, 0, len(byEvent[ev]))
 		for _, fp := range byEvent[ev] {
 			fs = append(fs, views[fp])
 		}
+		listed = append(listed, fs...)
 		for _, part := range bySuggestion(ev, fs) {
 			for _, g := range b.groups(ev, part) {
 				items = append(items, g.item)
@@ -196,21 +202,15 @@ func (e *Engine) digestMessage(ctx context.Context, t *target, r latest, byEvent
 		}
 	}
 	slices.SortStableFunc(items, compareItems)
-	owners := map[string]bool{}
-	counts := map[model.Priority]int{}
 	n := map[Event]int{}
 	for _, it := range items {
-		for _, o := range it.Owners {
-			owners[o.Key()] = true
-		}
-		counts[it.Priority]++
 		n[it.Event]++
 	}
 	m := e.message(t, KindDigest, fire.Format(time.RFC3339),
 		digestTitle(e.o.Cluster, n[EventDetected]+n[EventReopened], n[EventEscalated], n[EventFixAvailable], n[EventResolved],
 			n[EventUpgradeAvailable]), now)
 	m.Items = items
-	m.Summary = &Summary{Workloads: len(owners), Counts: counts}
+	m.Summary = summarise(listed) // the findings listed, as the baseline counts its findings
 	for _, name := range slices.Sorted(maps.Keys(e.o.FeedStaleAfter)) {
 		fs, err := e.st.FeedState(ctx, name)
 		if err != nil {

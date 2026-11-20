@@ -26,7 +26,12 @@ type TargetConfig struct {
 	Digest                      DigestConfig
 	// NamespaceMatch limits the target to some namespaces; nil means all of them. Cluster-level
 	// subjects (Namespace "") pass only when it is nil.
-	NamespaceMatch          func(ns string) bool
+	NamespaceMatch func(ns string) bool
+	// NamespaceGone reports that namespace ns has been deleted, which a NamespaceMatch reading its
+	// labels can no longer match; nil means never. Resolutions in a deleted namespace still go out:
+	// the target was told about those findings while the namespace was in scope. New findings there
+	// do not.
+	NamespaceGone           func(ns string) bool
 	QuietHours              []TimeInterval
 	AllowUrgentInQuietHours bool
 	NotifyOnFeedStale       bool
@@ -36,6 +41,12 @@ type TargetConfig struct {
 // allows reports whether the target covers findings in namespace ns.
 func (c TargetConfig) allows(ns string) bool {
 	return c.NamespaceMatch == nil || (ns != "" && c.NamespaceMatch(ns))
+}
+
+// covers reports whether the target covers event ev of a finding in namespace ns: when it covers
+// the namespace, or, for a resolution, when the namespace has been deleted.
+func (c TargetConfig) covers(ev Event, ns string) bool {
+	return c.allows(ns) || (ev == EventResolved && ns != "" && c.NamespaceGone != nil && c.NamespaceGone(ns))
 }
 
 // target is a registered target: its config, sink and parsed digest schedule.

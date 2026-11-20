@@ -286,3 +286,22 @@ func TestStoreNotify_NodesBaselineAt(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, all[0].NodesBaselineAt.Equal(t1))
 }
+
+// TestStoreNotify_FirstAttemptMovesNotBefore pins the half of F58 kept in the store: the first
+// attempt moves a delivery's not_before to its time, which later attempts leave alone, so the
+// engine can give up a delivery by the time of its first attempt.
+func TestStoreNotify_FirstAttemptMovesNotBefore(t *testing.T) {
+	st := newStore(t)
+	require.NoError(t, st.PutNotifyTarget(ctx, "u1", "ops", "h1"))
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Deliveries: []Delivery{delivery("d1", t0)}}))
+	first := t0.Add(time.Hour)
+	for i, at := range []time.Time{first, first.Add(time.Minute), first.Add(2 * time.Minute)} {
+		require.NoError(t, st.RecordAttempt(ctx, DeliveryAttempt{ID: "d1", Target: "u1", At: at, State: DeliveryPending,
+			NextAttempt: at.Add(time.Minute), Error: "HTTP 503", HTTPStatus: 503}))
+		ds, err := st.ListDeliveries(ctx, "u1", 0)
+		require.NoError(t, err)
+		require.Len(t, ds, 1)
+		assert.Equal(t, i+1, ds[0].Attempts)
+		assert.Equal(t, first, ds[0].NotBefore, "attempt %d", i+1)
+	}
+}

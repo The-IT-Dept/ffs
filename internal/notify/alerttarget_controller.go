@@ -7,10 +7,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -40,6 +42,9 @@ const (
 type SinkConfig struct {
 	Name, URL, SigningSecret, Cluster string
 	AllowPrivate                      bool
+	// Blocked returns, on each send, the address ranges refused unless AllowPrivate is set, besides
+	// the built-in private ones; nil means none.
+	Blocked func(ctx context.Context) []netip.Prefix
 }
 
 // SinkFactory builds the sink for a target of type typ. Its errors must not contain the URL.
@@ -172,6 +177,9 @@ type TargetReconciler struct {
 	Namespace string
 	Cluster   string
 	NewSink   SinkFactory
+	// Blocked is passed to every sink as SinkConfig.Blocked.
+	Blocked func(ctx context.Context) []netip.Prefix
+	Log     logr.Logger
 }
 
 // Reconcile registers the AlertTarget req names, or forgets it when it is gone. A target that
@@ -229,10 +237,14 @@ func (r *TargetReconciler) register(ctx context.Context, at *ffsv1alpha1.AlertTa
 		}
 		return notReady("InvalidSpec", err.Error())
 	}
-	sc.Cluster = r.Cluster
-	sink, err := r.NewSink(at.Spec.Type, sc)
-	if err != nil {
-		return notReady("SecretInvalid", err.Error())
+	cfg.NamespaceGone = r.namespaceGone(at)
+	sc.Cluster, sc.Blocked = r.Cluster, r.Blocked
+	// A resync with nothing changed keeps the registered sink, and with it its idle connections.
+	sink, ok := r.Engine.sinkFor(cfg.UID, cfg.ConfigHash)
+	if !ok {
+		if sink, err = r.NewSink(at.Spec.Type, sc); err != nil {
+			return notReady("SecretInvalid", err.Error())
+		}
 	}
 	if err := r.Engine.Register(ctx, cfg, sink); err != nil {
 		return notReady("InvalidSpec", err.Error())
@@ -325,6 +337,19 @@ func (r *TargetReconciler) namespaceMatch(at *ffsv1alpha1.AlertTarget) func(stri
 	}
 }
 
+// namespaceGone reports, for a target with a namespace selector, that a namespace has been
+// deleted, so the resolutions of findings sent from it still reach the target; nil without a
+// selector, since spec.namespaces matches by name whether the namespace exists or not.
+func (r *TargetReconciler) namespaceGone(at *ffsv1alpha1.AlertTarget) func(string) bool {
+	if at.Spec.NamespaceSelector == nil {
+		return nil
+	}
+	return func(ns string) bool {
+		var n corev1.Namespace
+		return apierrors.IsNotFound(r.Client.Get(context.Background(), types.NamespacedName{Name: ns}, &n))
+	}
+}
+
 // SetupWithManager registers the reconciler and, on the leader, a one-off cleanup of notification
 // state belonging to AlertTargets deleted while ffs was not running.
 func (r *TargetReconciler) SetupWithManager(mgr ctrl.Manager) error {
@@ -333,16 +358,31 @@ func (r *TargetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
-			return ctx.Err()
+			return nil // shutting down
 		}
-		var list ffsv1alpha1.AlertTargetList
-		if err := r.Client.List(ctx, &list); err != nil {
-			return fmt.Errorf("listing AlertTargets: %w", err)
-		}
-		uids := make([]string, len(list.Items))
-		for i := range list.Items {
-			uids[i] = string(list.Items[i].UID)
-		}
-		return r.Engine.Retain(ctx, uids)
+		return r.startupRetain(ctx)
 	}))
+}
+
+// startupRetain deletes the stored state of AlertTargets that no longer exist, once at start. A
+// failure is logged, not returned: the state is left until the next start, which is not worth
+// stopping the manager for.
+func (r *TargetReconciler) startupRetain(ctx context.Context) error {
+	if err := r.retainLive(ctx); err != nil && ctx.Err() == nil {
+		r.Log.Error(err, "deleting the notification state of deleted AlertTargets failed")
+	}
+	return nil
+}
+
+// retainLive deletes the stored state of every target that is not a current AlertTarget.
+func (r *TargetReconciler) retainLive(ctx context.Context) error {
+	var list ffsv1alpha1.AlertTargetList
+	if err := r.Client.List(ctx, &list); err != nil {
+		return fmt.Errorf("listing AlertTargets: %w", err)
+	}
+	uids := make([]string, len(list.Items))
+	for i := range list.Items {
+		uids[i] = string(list.Items[i].UID)
+	}
+	return r.Engine.Retain(ctx, uids)
 }

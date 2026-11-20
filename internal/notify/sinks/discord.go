@@ -49,6 +49,9 @@ type discord struct {
 
 func (d *discord) Type() string { return "discord" }
 
+// CloseIdleConnections closes the idle connections of the sink's Poster.
+func (d *discord) CloseIdleConnections() { d.poster.CloseIdleConnections() }
+
 func (d *discord) Send(ctx context.Context, m notify.Message) error {
 	body, err := json.Marshal(discordPayload(m))
 	if err != nil {
@@ -69,8 +72,10 @@ func discordColor(p model.Priority) int {
 	return 0x607D8B
 }
 
+// discordPayload builds the message. Text from feeds, images and advisories is escaped, and
+// allowed_mentions is empty, so nothing in it can mention anyone, @everyone included.
 func discordPayload(m notify.Message) map[string]any {
-	items, hidden := capItems(m.Items)
+	items, hidden := capItems(m)
 	if len(items) > discordEmbedsMax {
 		hidden += len(items) - discordEmbedsMax
 		items = items[:discordEmbedsMax]
@@ -96,17 +101,18 @@ func discordPayload(m notify.Message) map[string]any {
 		e.Description = truncate(e.Description, discordTotalMax-utf8.RuneCountInString(e.Title))
 	}
 
-	content := append([]string{m.Title}, extraLines(m)...)
+	content := append([]string{escapeMarkdown(m.Title)}, extraLines(m, escapeMarkdown)...)
 	if hidden > 0 {
 		content = append(content, more(hidden, "advisory", "advisories"))
 	}
-	return map[string]any{"content": truncate(strings.Join(content, "\n"), discordContentMax), "embeds": embeds}
+	return map[string]any{"content": truncate(strings.Join(content, "\n"), discordContentMax), "embeds": embeds,
+		"allowed_mentions": map[string]any{"parse": []string{}}}
 }
 
 func discordItemEmbed(it notify.Item) discordEmbed {
-	e := discordEmbed{Title: truncate(heading(it), discordTitleMax), Color: discordColor(it.Priority)}
-	e.Description = truncate(strings.Join(itemLines(it), "\n"), discordDescMax)
-	if owners, extra := ownerLines(it); len(owners) > 0 {
+	e := discordEmbed{Title: truncate(heading(it, escapeMarkdown), discordTitleMax), Color: discordColor(it.Priority)}
+	e.Description = truncate(strings.Join(itemLines(it, escapeMarkdown), "\n"), discordDescMax)
+	if owners, extra := ownerLines(it, escapeMarkdown); len(owners) > 0 {
 		for i, o := range owners {
 			owners[i] = "• " + o
 		}

@@ -16,8 +16,11 @@ import (
 )
 
 const (
-	// MaxAttempts is the number of sends after which a delivery that keeps failing is given up.
-	MaxAttempts = 12
+	// GiveUpAfter is how long after its first attempt a delivery whose sends keep failing
+	// transiently is given up: its first failed send at or after that time fails it for good. The
+	// backoff between sends stays capped at 15m, so an endpoint that is down for less than a day
+	// still gets every queued alert.
+	GiveUpAfter = 24 * time.Hour
 
 	drainBatch  = 200 // deliveries read per target per drain
 	sendTimeout = 30 * time.Second
@@ -141,11 +144,11 @@ func (e *Engine) current(t *target) bool {
 	return cur != nil && !cur.cfg.Paused && cur.cfg.ConfigHash == t.cfg.ConfigHash
 }
 
-// drainTarget sends the target's deliveries due at now, oldest first. After a failure that is the
-// endpoint's rather than the message's (anything but Permanent or Gone), the rest wait as long as
-// the failed delivery does, so an endpoint that is down costs one send timeout per retry rather
-// than one per queued delivery. The wait is kept in memory: after a restart the target is tried
-// again at once.
+// drainTarget sends the target's deliveries due at now in outbox order: oldest pass first, and
+// within a pass by priority (see delivery). After a failure that is the endpoint's rather than the
+// message's (anything but Permanent or Gone), the rest wait as long as the failed delivery does, so
+// an endpoint that is down costs one send timeout per retry rather than one per queued delivery.
+// The wait is kept in memory: after a restart the target is tried again at once.
 func (e *Engine) drainTarget(ctx context.Context, t *target, now time.Time) error {
 	ds, err := e.st.PendingDeliveriesFor(ctx, now, []string{t.cfg.UID}, drainBatch)
 	if err != nil {
@@ -201,7 +204,8 @@ func deliveryResult(a store.DeliveryAttempt) string {
 
 // attempt classifies the outcome of sending d. retryAt is set after a failure that is not
 // Permanent or Gone: when the endpoint can be tried again, which is also when d is retried unless
-// it has used up its attempts.
+// its first attempt was GiveUpAfter or more ago. Once d has been attempted, its NotBefore is the
+// time of that first attempt (store.RecordAttempt moves it there).
 func (e *Engine) attempt(d store.Delivery, err error) (a store.DeliveryAttempt, retryAt time.Time) {
 	now := e.now()
 	a = store.DeliveryAttempt{ID: d.ID, Target: d.Target, At: now}
@@ -228,7 +232,11 @@ func (e *Engine) attempt(d store.Delivery, err error) (a store.DeliveryAttempt, 
 		retryAfter = de.RetryAfter
 	}
 	retryAt = now.Add(NextAttempt(attempts, retryAfter, e.o.Rand()))
-	if attempts >= MaxAttempts {
+	first := now
+	if d.Attempts > 0 && !d.NotBefore.IsZero() {
+		first = d.NotBefore
+	}
+	if now.Sub(first) >= GiveUpAfter {
 		a.State = store.DeliveryFailed
 	} else {
 		a.State, a.NextAttempt = store.DeliveryPending, retryAt

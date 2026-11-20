@@ -15,7 +15,7 @@ type Sink = notify.Sink
 // New builds the sink for an AlertTarget of type typ. The URL must be absolute https (http only
 // with AllowPrivate); webhooks also need a valid signing secret. Errors never contain the URL.
 func New(typ string, cfg notify.SinkConfig) (Sink, error) {
-	return newWithPoster(typ, cfg, NewPoster(cfg.AllowPrivate))
+	return newWithPoster(typ, cfg, newPoster(cfg.AllowPrivate, cfg.Blocked))
 }
 
 func newWithPoster(typ string, cfg notify.SinkConfig, p *Poster) (Sink, error) {

@@ -3,10 +3,14 @@ package notify_test
 import (
 	"context"
 	"errors"
+	"net/netip"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -340,4 +344,121 @@ func TestTargetReconciler_BrokenSecretStopsDelivery(t *testing.T) {
 	assert.Empty(t, fixed.ofKind(notify.KindBaseline), "no second baseline")
 	assert.Equal(t, []string{"CVE-2026-0001"}, advisories(fixed.sent), "the alert held back is sent from the cursor")
 	assert.Empty(t, old.ofKind(notify.KindImmediate))
+}
+
+// TestTargetReconciler_ReusesSinkWhileConfigUnchanged pins F90: the one-minute resync keeps the
+// registered sink, and its connections, while the target's config hash is unchanged. A changed
+// endpoint builds a new sink and closes the idle connections of the one it replaces, and deleting
+// the AlertTarget closes those of its last sink.
+func TestTargetReconciler_ReusesSinkWhileConfigUnchanged(t *testing.T) {
+	h := newRecHarness(t, alertTarget("slack", "s"), secretOf("s", map[string]string{"url": hookURL}))
+	for range 3 {
+		assertCondition(t, h.reconcile(t), "Ready", metav1.ConditionTrue, "Registered")
+	}
+	require.Len(t, h.factory.sinks, 1, "one sink while nothing changed")
+	first := h.factory.sinks[0]
+	assert.Zero(t, first.closedIdle())
+
+	var sec corev1.Secret
+	require.NoError(t, h.c.Get(ctx, types.NamespacedName{Namespace: "ffs", Name: "s"}, &sec))
+	sec.Data["url"] = []byte(strings.Replace(hookURL, "TOKEN", "NEWTOKEN", 1))
+	require.NoError(t, h.c.Update(ctx, &sec))
+	h.reconcile(t)
+	h.reconcile(t)
+	require.Len(t, h.factory.sinks, 2, "a new sink for the new endpoint, kept on the next resync")
+	assert.Equal(t, 1, first.closedIdle(), "the replaced sink's idle connections are closed")
+	second := h.factory.sinks[1]
+	assert.Zero(t, second.closedIdle())
+
+	var at ffsv1alpha1.AlertTarget
+	require.NoError(t, h.c.Get(ctx, types.NamespacedName{Name: "ops"}, &at))
+	require.NoError(t, h.c.Delete(ctx, &at))
+	_, err := h.r.Reconcile(ctx, ctrl.Request{NamespacedName: types.NamespacedName{Name: "ops"}})
+	require.NoError(t, err)
+	assert.Equal(t, 1, second.closedIdle())
+}
+
+// TestTargetReconciler_StartupRetainLogsErrors pins F59: the startup cleanup of state left by
+// deleted AlertTargets logs a List or store error and returns nil, so a transient error at start
+// does not stop the manager.
+func TestTargetReconciler_StartupRetainLogsErrors(t *testing.T) {
+	var logged []string
+	log := funcr.New(func(_, args string) { logged = append(logged, args) }, funcr.Options{})
+
+	h := newRecHarness(t, alertTarget("slack", "s"), secretOf("s", map[string]string{"url": hookURL}))
+	h.r.Log = log
+	h.reconcile(t)
+	require.NoError(t, h.st.PutNotifyTarget(ctx, "uid-gone", "gone", "h1"))
+	require.NoError(t, h.r.StartupRetain(ctx))
+	_, ok, err := h.st.NotifyTarget(ctx, "uid-gone")
+	require.NoError(t, err)
+	assert.False(t, ok, "the state of a deleted AlertTarget is removed")
+	_, ok, err = h.st.NotifyTarget(ctx, "uid-ops")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Empty(t, logged)
+
+	h.r.Client = interceptor.NewClient(h.c.(client.WithWatch), interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("the server is currently unable to handle the request")
+		}})
+	require.NoError(t, h.r.StartupRetain(ctx), "a List error does not stop the manager")
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "listing AlertTargets: the server is currently unable to handle the request")
+
+	closed, err := store.Open(ctx, filepath.Join(t.TempDir(), "closed.db"))
+	require.NoError(t, err)
+	require.NoError(t, closed.Close())
+	h.r.Client = h.c
+	h.r.Engine = notify.New(closed, notify.Options{})
+	require.NoError(t, h.r.StartupRetain(ctx), "a store error does not stop the manager")
+	require.Len(t, logged, 2)
+	assert.Contains(t, logged[1], "notify: retain")
+}
+
+// TestTargetReconciler_NamespaceGone pins F95's reconciler half: a target with a namespace
+// selector learns that a namespace is deleted (not found); one without a selector does not need
+// to, since spec.namespaces matches by name.
+func TestTargetReconciler_NamespaceGone(t *testing.T) {
+	h := newRecHarness(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "web", Labels: map[string]string{"team": "a"}}})
+	at := alertTarget("slack", "s")
+	assert.Nil(t, h.r.NamespaceGone(at))
+	at.Spec.Namespaces = []string{"prod"}
+	assert.Nil(t, h.r.NamespaceGone(at))
+
+	at.Spec.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "a"}}
+	gone := h.r.NamespaceGone(at)
+	require.NotNil(t, gone)
+	assert.False(t, gone("web"))
+	assert.True(t, gone("deleted"))
+}
+
+// TestBlockedRanges pins F98's ranges: the configured alertTargets.blockedCIDRs and the pod CIDRs
+// of every node in the cache, IPv4 and globally routable IPv6, with host bits cleared. A failed
+// node list leaves the configured ranges.
+func TestBlockedRanges(t *testing.T) {
+	node := func(name string, cidrs ...string) *corev1.Node {
+		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: corev1.NodeSpec{PodCIDRs: cidrs}}
+		if len(cidrs) > 0 {
+			n.Spec.PodCIDR = cidrs[0]
+		}
+		return n
+	}
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(
+		node("worker-1", "10.42.1.0/24", "2001:db8:42:1::/64"), node("cp-1", "2001:db8:42:2::5/64"), node("worker-2")).Build()
+	configured := []netip.Prefix{netip.MustParsePrefix("2001:db8:ffff::/48")}
+	got := notify.BlockedRanges(c, configured, logr.Discard())(ctx)
+	assert.ElementsMatch(t, []netip.Prefix{netip.MustParsePrefix("2001:db8:ffff::/48"), netip.MustParsePrefix("10.42.1.0/24"),
+		netip.MustParsePrefix("2001:db8:42:1::/64"), netip.MustParsePrefix("2001:db8:42:2::/64")}, got)
+
+	var logged []string
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("the server is currently unable to handle the request")
+		}})
+	got = notify.BlockedRanges(failing, configured, funcr.New(func(_, args string) { logged = append(logged, args) },
+		funcr.Options{}))(ctx)
+	assert.Equal(t, configured, got)
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "pod CIDRs")
 }

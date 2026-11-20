@@ -238,3 +238,23 @@ func TestDigest_UpgradeNotListedForUnreportedOrBelowThreshold(t *testing.T) {
 	h.process()
 	assert.Empty(t, h.sink.ofKind(notify.KindDigest))
 }
+
+// TestDigest_CountsFindingsLikeTheBaseline pins F97: the digest's summary counts findings, as the
+// baseline's does, not advisory items: three workloads with one advisory and one with another are
+// four findings in four workloads.
+func TestDigest_CountsFindingsLikeTheBaseline(t *testing.T) {
+	h := digestHarness(t, true)
+	h.at("2026-11-19T12:00+11:00")
+	for _, w := range []string{"a", "b", "c"} {
+		h.open(dep("shop", w), "CVE-A", medium)
+	}
+	h.open(dep("shop", "d"), "CVE-B", high)
+	h.at("2026-11-20T09:00+11:00")
+	h.process()
+	d := h.sink.lastOfKind(notify.KindDigest)
+	require.Len(t, d.Items, 2)
+	require.NotNil(t, d.Summary)
+	assert.Equal(t, 4, d.Summary.Findings)
+	assert.Equal(t, 4, d.Summary.Workloads)
+	assert.Equal(t, map[model.Priority]int{medium: 3, high: 1}, d.Summary.Counts)
+}

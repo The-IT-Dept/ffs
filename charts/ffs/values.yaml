@@ -372,6 +372,10 @@ config:
   retention:
     # How long resolved findings are kept.
     resolved: 2160h
+  # Alert delivery.
+  alertTargets:
+    # CIDRs alerts are not delivered to unless the AlertTarget sets allowPrivate, besides private ranges and node pod CIDRs.
+    blockedCIDRs: []
   # Image upgrade candidates.
   upgrades:
     # Enable image upgrade candidates.

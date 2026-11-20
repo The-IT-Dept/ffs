@@ -3,8 +3,11 @@ package sinks
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -133,4 +136,85 @@ func TestPoster_DialGuardRefusesLoopback(t *testing.T) {
 	p.lookup = nil // skip the resolver check: the dial guard alone must refuse
 	require.Error(t, p.Post(context.Background(), srv.URL, "application/json", nil, nil))
 	assert.Zero(t, hits.Load())
+}
+
+// TestPoster_IdleConnections pins F90: both transports drop connections idle for 90s, and
+// CloseIdleConnections, which the engine calls on a sink it replaces, closes a kept-alive
+// connection at once.
+func TestPoster_IdleConnections(t *testing.T) {
+	p := NewPoster(false)
+	for _, c := range []*http.Client{p.direct, p.proxied} {
+		tr, ok := c.Transport.(*http.Transport)
+		require.True(t, ok)
+		assert.Equal(t, 90*time.Second, tr.IdleConnTimeout)
+	}
+
+	idle, closed := make(chan struct{}, 1), make(chan struct{}, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	signal := func(c chan struct{}) {
+		select {
+		case c <- struct{}{}:
+		default:
+		}
+	}
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		switch s {
+		case http.StateIdle:
+			signal(idle)
+		case http.StateClosed:
+			signal(closed)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	tp := testPoster(srv)
+	require.NoError(t, tp.Post(context.Background(), srv.URL, "text/plain", nil, nil))
+	select {
+	case <-idle:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the connection was not kept alive")
+	}
+	tp.CloseIdleConnections()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the idle connection is still open")
+	}
+}
+
+// TestPoster_ProxySkipsLookup pins F96: through a proxy the endpoint's host is not resolved
+// first (the proxy resolves it, and the cluster may have no DNS for it); an address literal is
+// still checked. Sent directly, the host is resolved and checked first.
+func TestPoster_ProxySkipsLookup(t *testing.T) {
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		assert.Equal(t, "hooks.example.invalid", r.Host)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	p := NewPoster(false)
+	var lookups atomic.Int32
+	p.lookup = func(context.Context, string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		return nil, &net.DNSError{Err: "no such host", Name: "hooks.example.invalid", IsNotFound: true}
+	}
+	p.proxy = func(*http.Request) (*url.URL, error) { return proxyURL, nil }
+	require.NoError(t, p.Post(context.Background(), "http://hooks.example.invalid/hook", "application/json", []byte("{}"), nil))
+	assert.EqualValues(t, 1, proxied.Load())
+	assert.Zero(t, lookups.Load(), "no lookup on the proxy path")
+
+	err = p.Post(context.Background(), "http://10.0.0.1/hook", "application/json", []byte("{}"), nil)
+	require.Error(t, err)
+	assert.True(t, deliveryErr(t, err).Permanent, "an address literal is still checked")
+	assert.EqualValues(t, 1, proxied.Load())
+
+	p.proxy = func(*http.Request) (*url.URL, error) { return nil, nil } // NO_PROXY, or no proxy at all
+	err = p.Post(context.Background(), "http://hooks.example.invalid/hook", "application/json", []byte("{}"), nil)
+	require.Error(t, err)
+	assert.EqualValues(t, 1, lookups.Load(), "resolved first when sent directly")
+	assert.False(t, deliveryErr(t, err).Permanent)
 }

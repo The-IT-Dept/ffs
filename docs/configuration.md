@@ -71,6 +71,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `openReports.wgPolicy` | `false` | Also write `wgpolicyk8s.io` PolicyReports. The chart grants the extra RBAC only when this is true. |
 | `exceptions.maxDuration` | `8760h` | Longest an Exception may run, from now to its `expires`. At most `8760h` (one year). |
 | `retention.resolved` | `2160h` | How long resolved findings, their history and the alert delivery log are kept. Images that no workload runs and no upgrade suggestion holds are removed separately, a week after they fall out of use. |
+| `alertTargets.blockedCIDRs` | `[]` | Address ranges, as CIDRs, that alerts are not delivered to unless the AlertTarget sets `allowPrivate`. They add to the ranges the guard refuses already: private and carrier-grade NAT addresses and the nodes' pod CIDRs. Add the cluster's Service CIDR, and any other cluster range, when it is globally routable. See [Alerts](alerts.md#delivery). |
 | `upgrades.enabled` | `true` | Look for image upgrades that fix findings. |
 | `upgrades.maxCandidatesPerRepo` | `4` | Candidate tags scored per image repository and pass, from 1 to 4. |
 | `upgrades.dailyAt` | `03:00` | Time of the daily upgrade pass, `HH:MM` in UTC. |
