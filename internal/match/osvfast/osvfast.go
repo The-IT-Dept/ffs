@@ -38,6 +38,15 @@ const (
 // compare them the way grype does, or (GIT) they are the upstream and Kubernetes matchers' records.
 var skippedBuckets = map[string]bool{osv.BucketGIT: true, "Linux": true, "Android": true, "Azure Linux": true}
 
+// recordChunk is how many cached records MatchImage reads, parses and evaluates at a time. A
+// host's Ubuntu linux source package alone indexes thousands of kernel records averaging over
+// 400 KB, so reading a bucket's records at once can take gigabytes. A var so tests can lower it.
+var recordChunk = 256
+
+// loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
+// the batches.
+var loadRecords = (*store.Store).OSVRecordsByID
+
 // Matcher is the OSV fast-path matcher. It is safe for concurrent use.
 type Matcher struct{ st *store.Store }
 
@@ -53,8 +62,9 @@ func New(st *store.Store) *Matcher { return &Matcher{st: st} }
 func (m *Matcher) Source() model.MatchSource { return model.SourceOSV }
 
 // MatchImage implements match.Matcher. It looks up the cached records indexed under the image's
-// packages, bucket by bucket, and evaluates them against those packages. Synthetic digests get no
-// matches. Each match is observed when ffs first saw the record behind it (see evalRecord).
+// packages, bucket by bucket, and evaluates them against those packages, recordChunk records at a
+// time in id order. Synthetic digests get no matches. Each match is observed when ffs first saw the
+// record behind it (see evalRecord).
 func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
 	if match.IsSynthetic(in.Digest) {
 		return nil, nil
@@ -79,20 +89,24 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 		if err != nil {
 			return nil, err
 		}
-		recs, observed, err := m.records(ctx, ids, nil)
-		if err != nil {
-			return nil, err
-		}
 		idx := indexPackages(pkgs)
-		for _, v := range recs {
-			adv, ok := canon[v.GetId()]
-			if !ok {
-				if adv, err = m.st.Canonical(ctx, v.GetId()); err != nil {
-					return nil, err
-				}
-				canon[v.GetId()] = adv
+		// ids are sorted, so evaluating consecutive chunks visits the records in the same order as
+		// reading them all at once, and ms merges across chunks as before.
+		for chunk := range slices.Chunk(ids, recordChunk) {
+			recs, observed, err := m.records(ctx, chunk, nil)
+			if err != nil {
+				return nil, err
 			}
-			evalRecord(ctx, v, adv, observed[v.GetId()], idx, &ms)
+			for _, v := range recs {
+				adv, ok := canon[v.GetId()]
+				if !ok {
+					if adv, err = m.st.Canonical(ctx, v.GetId()); err != nil {
+						return nil, err
+					}
+					canon[v.GetId()] = adv
+				}
+				evalRecord(ctx, v, adv, observed[v.GetId()], idx, &ms)
+			}
 		}
 	}
 	return ms.list, nil
@@ -200,7 +214,7 @@ func (m *Matcher) parsed(ctx context.Context, ids []string, override map[string]
 	if len(override) > 0 {
 		ids = slices.DeleteFunc(slices.Clone(ids), func(id string) bool { _, ok := override[id]; return ok })
 	}
-	raws, err := m.st.OSVRecordsByID(ctx, ids)
+	raws, err := loadRecords(m.st, ctx, ids)
 	if err != nil {
 		return nil, err
 	}
