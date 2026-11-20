@@ -82,7 +82,7 @@ The liveness probe checks a heartbeat file the collector touches every minute wh
 
 ## Turning it off
 
-Install or upgrade with `--set nodeAgent.enabled=false`. No agent objects are installed, and the controller's agent API is not served. What you lose:
+Install or upgrade with `--set nodeAgent.enabled=false`. No agent objects are installed, and the controller's agent API is not served. The chart still creates the ffs pod's NetworkPolicy, without its agent API rule (see [Trust](#trust)). What you lose:
 
 - host package and kernel findings resolve;
 - the container runtime findings that ffs reads from node status return at once;
@@ -136,9 +136,9 @@ On Fedora, RHEL 10 and SUSE, `/var/lib/rpm` is a link to `/usr/lib/sysimage/rpm`
 - **Node groups.** Nodes share a group, and with it one stored host SBOM, only when every package field ffs matches on is the same: names, versions and architectures, the distribution, source packages, package URLs and CPEs. A host inventory that differs in any of them gets a group of its own.
 - **Residual risk.** A compromised node can under-report the packages of its own host, and of an image the controller asks it to catalogue, because it controls those bytes. Its kubelet can also claim that a pod on it runs any image, so it can be the node asked. It cannot replace an image SBOM that another node or a registry supplied, or change the host inventory of nodes that report their own.
 
-The NetworkPolicy `ffs-agent-api` (`nodeAgent.networkPolicy.enabled`) selects the ffs pod and allows:
+The NetworkPolicy `ffs` (`nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
 
-- the agent API port, only from the agent pods;
+- the agent API port, only from the agent pods, while `nodeAgent.enabled` is true;
 - the metrics and health ports, from anywhere: metrics answers only requests that pass Kubernetes authentication and authorisation, and health serves only the kubelet's probes;
 - the web UI and API port (the port of `config.listen`), only from the peers in `web.networkPolicy.from`, and only when `config.listen` is bound beyond loopback. The list is empty by default, so no other pod reaches the web UI; `kubectl port-forward` is not affected. See [Exposing the web UI](configuration.md#exposing-the-web-ui).
 
@@ -146,7 +146,7 @@ If your cluster also uses another policy engine, allow the agent namespace to re
 
 **Upgrading from 0.0.1-rc.8 or earlier.**
 
-- Release candidates rc.5 to rc.8 admitted the web UI port from every source in this NetworkPolicy, and earlier ones created no NetworkPolicy for the ffs pod. If you serve the web UI beyond `kubectl port-forward`, set `web.networkPolicy.from` to your proxy's pods before you upgrade: with `web.service.enabled` the chart refuses to render without it, and with a Service of your own the web UI stops answering other pods.
+- Release candidates rc.5 to rc.8 admitted the web UI port from every source in this NetworkPolicy, then named `ffs-agent-api` and created only with the node agent, and earlier ones created no NetworkPolicy for the ffs pod. It is now `ffs`, and the chart creates it with `nodeAgent.enabled: false` too. If you serve the web UI beyond `kubectl port-forward`, set `web.networkPolicy.from` to your proxy's pods before you upgrade: with `web.service.enabled` the chart refuses to render without it, and with a Service of your own the web UI stops answering other pods.
 - In rc.5 to rc.8, cert-manager wrote the agent API certificate to the Secret `ffs-agent-tls`. After the upgrade it issues `ffs-agent-cert-manager-tls` instead. Delete the old `ffs-agent-tls` Secret before you set `nodeAgent.tls.certManager.enabled: false`, because Helm does not take over a Secret it did not create.
 
 ## Monitoring
@@ -197,4 +197,4 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |
 | `nodeAgent.seLinuxType` | `""` | SELinux type of the collector container, for example `spc_t`. |
 | `nodeAgent.openshift.scc` | `false` | Create a SecurityContextConstraints for the agent and bind its ServiceAccount to it. |
-| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy for the ffs pod: the agent API from the agent pods, metrics and health from anywhere, and the web UI only from `web.networkPolicy.from`. See [Trust](#trust). |
+| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while `nodeAgent.enabled` is true, metrics and health from anywhere, and the web UI only from `web.networkPolicy.from`. While false, the chart refuses a non-empty `web.networkPolicy.from`. See [Trust](#trust). |

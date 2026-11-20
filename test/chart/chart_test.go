@@ -24,8 +24,8 @@ import (
 	"github.com/the-it-dept/ffs/internal/config"
 )
 
-// webPeer admits an authenticating proxy's pods to the web UI port, which a web UI Service needs while the agent
-// NetworkPolicy is rendered.
+// webPeer admits an authenticating proxy's pods to the web UI port, which a web UI Service needs while the ffs
+// pod's NetworkPolicy is rendered.
 const webPeer = "web.networkPolicy.from[0].podSelector.matchLabels.app=oauth2-proxy"
 
 func podSpec(t *testing.T, sets ...string) corev1.PodSpec {

@@ -1,12 +1,16 @@
-{{- if and .Values.nodeAgent.enabled .Values.nodeAgent.networkPolicy.enabled }}
+{{- /*
+The ffs pod's NetworkPolicy. It is created while nodeAgent.networkPolicy.enabled is true, whether or not the node
+agent runs, so web.networkPolicy.from is in force either way; the agent API rule is added only with the agent.
+*/ -}}
 {{- $webFrom := .Values.web.networkPolicy.from | default list }}
+{{- if .Values.nodeAgent.networkPolicy.enabled }}
 {{- if and .Values.web.service.enabled (not $webFrom) (not (include "ffs.listenLoopback" .)) }}
 {{- fail "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled admits the web UI port only from the peers listed there, such as your authenticating proxy's pods. Set web.networkPolicy.from, or set nodeAgent.networkPolicy.enabled=false and restrict the port with your own NetworkPolicy" }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "ffs.fullname" . }}-agent-api
+  name: {{ include "ffs.fullname" . }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "ffs.labels" . | nindent 4 }}
@@ -16,6 +20,7 @@ spec:
       {{- include "ffs.selectorLabels" . | nindent 6 }}
   policyTypes: [Ingress]
   ingress:
+    {{- if .Values.nodeAgent.enabled }}
     # The agent API, from the agent pods only.
     - from:
         - namespaceSelector:
@@ -26,6 +31,7 @@ spec:
               app.kubernetes.io/name: ffs-agent
       ports:
         - {protocol: TCP, port: agent-api}
+    {{- end }}
     # Metrics and health stay open to every source: metrics answers only requests that pass a
     # TokenReview and a SubjectAccessReview, and health serves only the kubelet's probes.
     - ports:
@@ -38,4 +44,6 @@ spec:
       ports:
         - {protocol: TCP, port: {{ include "ffs.httpPort" . }}}
     {{- end }}
+{{- else if $webFrom }}
+{{- fail "web.networkPolicy.from takes effect only through the NetworkPolicy of nodeAgent.networkPolicy.enabled, which is false: no NetworkPolicy of the chart selects the ffs pod. Restrict the web UI port with your own NetworkPolicy and unset web.networkPolicy.from, or set nodeAgent.networkPolicy.enabled=true" }}
 {{- end }}

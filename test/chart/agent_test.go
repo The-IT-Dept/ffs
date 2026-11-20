@@ -500,13 +500,15 @@ data:
 	require.ErrorContains(t, err, "nodeAgent.tls.caBundle is required when nodeAgent.tls.certManager.enabled is true")
 }
 
-// TestChart_AgentNetworkPolicy: the NetworkPolicy admits the agent API from the agent pods, metrics and health
-// from anywhere, and the web UI port only from web.networkPolicy.from on a listen address beyond loopback. A web
-// UI Service without those peers is refused, because the policy would close it.
-func TestChart_AgentNetworkPolicy(t *testing.T) {
+// TestChart_NetworkPolicy: the ffs pod's NetworkPolicy admits the agent API from the agent pods while the agent
+// runs, metrics and health from anywhere, and the web UI port only from web.networkPolicy.from on a listen address
+// beyond loopback. It renders with or without the node agent, so web.networkPolicy.from is always in force: a web
+// UI Service without those peers is refused, because the policy would close it, and peers without the policy are
+// refused, because nothing would apply them.
+func TestChart_NetworkPolicy(t *testing.T) {
 	policy := func(sets ...string) networkingv1.NetworkPolicy {
 		t.Helper()
-		return as[networkingv1.NetworkPolicy](t, render(t, sets...).get(t, "NetworkPolicy", "ffs-agent-api"))
+		return as[networkingv1.NetworkPolicy](t, render(t, sets...).get(t, "NetworkPolicy", "ffs"))
 	}
 	np := policy()
 	require.Equal(t, "ffs", np.Namespace)
@@ -522,9 +524,12 @@ func TestChart_AgentNetworkPolicy(t *testing.T) {
 	require.Equal(t, map[string]string{"kubernetes.io/metadata.name": "ffs-agent"}, in.From[0].NamespaceSelector.MatchLabels)
 	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs-agent"}, in.From[0].PodSelector.MatchLabels)
 	require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromString("agent-api"))}, in.Ports)
-	require.Empty(t, np.Spec.Ingress[1].From)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromString("metrics")), port(intstr.FromString("health"))},
-		np.Spec.Ingress[1].Ports)
+	open := networkingv1.NetworkPolicyIngressRule{Ports: []networkingv1.NetworkPolicyPort{port(intstr.FromString("metrics")), port(intstr.FromString("health"))}}
+	require.Equal(t, open, np.Spec.Ingress[1])
+	webRule := networkingv1.NetworkPolicyIngressRule{
+		From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "oauth2-proxy"}}}},
+		Ports: []networkingv1.NetworkPolicyPort{port(intstr.FromInt32(9090))}, // the port of config.listen
+	}
 
 	for _, sets := range [][]string{
 		{"web.service.enabled=true", "config.listen=0.0.0.0:9090", webPeer},
@@ -532,10 +537,7 @@ func TestChart_AgentNetworkPolicy(t *testing.T) {
 	} {
 		np = policy(sets...)
 		require.Len(t, np.Spec.Ingress, 3, sets)
-		web := np.Spec.Ingress[2]
-		require.Equal(t, []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "oauth2-proxy"}}}},
-			web.From, sets)
-		require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromInt32(9090))}, web.Ports, "the port of config.listen")
+		require.Equal(t, webRule, np.Spec.Ingress[2], sets)
 	}
 	require.Len(t, policy(webPeer).Spec.Ingress, 2, "nothing outside the pod reaches a loopback listener")
 	for _, rule := range policy("config.listen=0.0.0.0:8080").Spec.Ingress {
@@ -545,13 +547,26 @@ func TestChart_AgentNetworkPolicy(t *testing.T) {
 		}
 	}
 
-	_, err := renderErr(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
-	require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled "+
-		"admits the web UI port only from the peers listed there")
-	for _, off := range []string{"nodeAgent.networkPolicy.enabled=false", "nodeAgent.enabled=false"} {
-		o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", off)
+	// Without the node agent the policy stays, minus the agent API rule.
+	require.Equal(t, []networkingv1.NetworkPolicyIngressRule{open}, policy("nodeAgent.enabled=false").Spec.Ingress)
+	require.Equal(t, []networkingv1.NetworkPolicyIngressRule{open, webRule},
+		policy("nodeAgent.enabled=false", "web.service.enabled=true", "config.listen=0.0.0.0:9090", webPeer).Spec.Ingress)
+
+	for _, agent := range []string{"nodeAgent.enabled=true", "nodeAgent.enabled=false"} {
+		_, err := renderErr(t, agent, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
+		require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled "+
+			"admits the web UI port only from the peers listed there", agent)
+
+		off := []string{agent, "nodeAgent.networkPolicy.enabled=false"}
+		o := render(t, append(off, "web.service.enabled=true", "config.listen=0.0.0.0:8080")...)
+		require.False(t, o.has("NetworkPolicy", "ffs"), off)
 		require.False(t, o.has("NetworkPolicy", "ffs-agent-api"), off)
 		require.True(t, o.has("Service", "ffs-web"), off)
+		for _, sets := range [][]string{{webPeer}, {"web.service.enabled=true", "config.listen=0.0.0.0:8080", webPeer}} {
+			_, err = renderErr(t, append(off, sets...)...)
+			require.ErrorContains(t, err, "web.networkPolicy.from takes effect only through the NetworkPolicy of nodeAgent.networkPolicy.enabled, "+
+				"which is false", "%v %v", off, sets)
+		}
 	}
 }
 
