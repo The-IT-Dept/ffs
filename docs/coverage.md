@@ -26,6 +26,8 @@ The Coverage page and the API (`/api/v1/coverage`) report each gap with a code a
 | `node_agent_blocked` | node agent cannot read host paths | `check_host_permissions` | Allow the node agent to read its host paths (SELinux or policy). |
 | `no_package_database` | no package database (image-based OS) | `informational` | Host packages are not inventoried on image-based operating systems. |
 | `content_store_unreadable` | no containerd content store | `informational` | Side-loaded images on this node cannot be catalogued from it. |
+| `host_not_inventoried` | agent reporting, host not inventoried | `check_node_agent` | Check the node agent's logs on these nodes; the last error is shown. |
+| `node_agent_unsupported` | not scheduled by the node agent | `informational` | Its architecture or node selector excludes this node from the node agent. To cover it, add it to `nodeAgent.architectures` or `nodeAgent.nodeSelector`. |
 | `feed_stale` | feed out of date | `check_feed_access` | Check that ffs can reach the feed; the last error is shown. |
 
 ## Blind spots

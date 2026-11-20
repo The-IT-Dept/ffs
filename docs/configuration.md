@@ -89,6 +89,8 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `nodeAgent.workPerReport` | `3` | Side-loaded and unresolvable image SBOM requests handed out with each report, 0 to 10; 0 turns them off. |
 | `nodeAgent.workTimeout` | `30m` | How long a request stays with the node it was offered to. |
 | `nodeAgent.exposedNodes` | `""` | A Kubernetes node label selector, for example `node-role.example.com/edge`. Host findings on matching nodes count as exposed. Empty exposes no node. |
+| `nodeAgent.architectures` | `[amd64]` | Node architectures the agent DaemonSet schedules on; the chart sets it from `nodeAgent.architectures`. Other nodes show `node_agent_unsupported` and do not hold back the switch from node status to the agent. Empty means every node; the chart requires at least one. |
+| `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods; the chart sets it from `nodeAgent.nodeSelector`. Nodes it does not match show `node_agent_unsupported`. Empty means every node. |
 
 ## Helm-only values
 
