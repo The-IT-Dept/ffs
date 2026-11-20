@@ -28,7 +28,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `feeds.grypedb.interval` | `1h` | How often to check for a new database. New builds appear about daily. |
 | `feeds.grypedb.staleAfter` | `48h` | Age after which the feed is reported stale. Must be greater than `interval`. |
 | `feeds.osv.enabled` | `true` | Use OSV.dev, the fast path for new and changed advisories. |
-| `feeds.osv.url` | `https://osv-vulnerabilities.storage.googleapis.com` | Base URL of the OSV bucket. |
+| `feeds.osv.url` | `https://osv-vulnerabilities.storage.googleapis.com` | Base URL of the OSV bucket. A Cloud Storage bucket (`https://<bucket>.storage.googleapis.com` or `https://storage.googleapis.com/<bucket>`) is read through the Cloud Storage JSON API, because the bucket host's cache can serve objects up to an hour old. Any other URL is a mirror, read as `<url>/<ecosystem>/<file>`. |
 | `feeds.osv.interval` | `5m` | How often to poll for changed records, per ecosystem present in the inventory. |
 | `feeds.osv.staleAfter` | `2h` | Age after which the feed is reported stale. |
 | `feeds.cvelist.enabled` | `true` | Use the CVE List V5 hourly deltas for CNA severity and upstream-runtime version ranges. |

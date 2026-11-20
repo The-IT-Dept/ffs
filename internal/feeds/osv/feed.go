@@ -20,7 +20,6 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -101,7 +100,7 @@ type Options struct {
 // Feed is the OSV feed. It implements feeds.Feed.
 type Feed struct {
 	o        Options
-	base     string
+	objects  objectBase
 	gitRepos map[string]bool
 	reposKey string // fingerprint of gitRepos; a change reloads the GIT bucket
 }
@@ -117,7 +116,7 @@ func New(o Options) *Feed {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	f := &Feed{o: o, base: strings.TrimRight(o.Config.URL, "/"), gitRepos: make(map[string]bool, len(o.GitRepos))}
+	f := &Feed{o: o, objects: parseObjectBase(o.Config.URL), gitRepos: make(map[string]bool, len(o.GitRepos))}
 	for _, r := range o.GitRepos {
 		f.gitRepos[NormalizeRepo(r)] = true
 	}
@@ -1029,9 +1028,8 @@ func (f *Feed) prune(ctx context.Context) error {
 	return nil
 }
 
-func (f *Feed) bucketURL(b, file string) string {
-	return f.base + "/" + url.PathEscape(b) + "/" + url.PathEscape(file)
-}
+// bucketURL returns the URL of file in bucket b. Every object the feed reads is named through it.
+func (f *Feed) bucketURL(b, file string) string { return f.objects.url(b, file) }
 
 // setPending stores keys as the feed's pending records.
 func setPending(st *store.FeedState, keys []recKey) {
