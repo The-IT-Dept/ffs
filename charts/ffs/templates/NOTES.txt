@@ -14,3 +14,7 @@ The first Grype database download takes several minutes. Feed status is on the F
 
 Reading pull secrets is disabled. Private images that need them are shown as unresolvable.
 {{- end }}
+{{- if include "ffs.legacyNetworkPolicy" . }}
+
+nodeAgent.networkPolicy.enabled is deprecated and will be removed in v0.0.3. This release still uses it; set networkPolicy.enabled instead.
+{{- end }}

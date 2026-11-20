@@ -1,11 +1,12 @@
 {{- /*
-The ffs pod's NetworkPolicy. It is created while nodeAgent.networkPolicy.enabled is true, whether or not the node
-agent runs, so web.networkPolicy.from is in force either way; the agent API rule is added only with the agent.
+The ffs pod's NetworkPolicy. It is created while networkPolicy.enabled is true (see ffs.networkPolicy for the
+deprecated nodeAgent.networkPolicy.enabled), whether or not the node agent runs, so web.networkPolicy.from is in
+force either way; the agent API rule is added only with the agent.
 */ -}}
 {{- $webFrom := .Values.web.networkPolicy.from | default list }}
-{{- if .Values.nodeAgent.networkPolicy.enabled }}
+{{- if include "ffs.networkPolicy" . }}
 {{- if and .Values.web.service.enabled (not $webFrom) (not (include "ffs.listenLoopback" .)) }}
-{{- fail "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled admits the web UI port only from the peers listed there, such as your authenticating proxy's pods. Set web.networkPolicy.from, or set nodeAgent.networkPolicy.enabled=false and restrict the port with your own NetworkPolicy" }}
+{{- fail "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of networkPolicy.enabled admits the web UI port only from the peers listed there, such as your authenticating proxy's pods. Set web.networkPolicy.from, or set networkPolicy.enabled=false and restrict the port with your own NetworkPolicy" }}
 {{- end }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -45,5 +46,6 @@ spec:
         - {protocol: TCP, port: {{ include "ffs.httpPort" . }}}
     {{- end }}
 {{- else if $webFrom }}
-{{- fail "web.networkPolicy.from takes effect only through the NetworkPolicy of nodeAgent.networkPolicy.enabled, which is false: no NetworkPolicy of the chart selects the ffs pod. Restrict the web UI port with your own NetworkPolicy and unset web.networkPolicy.from, or set nodeAgent.networkPolicy.enabled=true" }}
+{{- $key := ternary "nodeAgent.networkPolicy.enabled" "networkPolicy.enabled" (include "ffs.legacyNetworkPolicy" . | empty | not) }}
+{{- fail (printf "web.networkPolicy.from takes effect only through the NetworkPolicy of networkPolicy.enabled, which %s=false turns off: no NetworkPolicy of the chart selects the ffs pod. Restrict the web UI port with your own NetworkPolicy and unset web.networkPolicy.from, or set networkPolicy.enabled=true" $key) }}
 {{- end }}

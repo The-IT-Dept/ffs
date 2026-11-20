@@ -136,7 +136,7 @@ On Fedora, RHEL 10 and SUSE, `/var/lib/rpm` is a link to `/usr/lib/sysimage/rpm`
 - **Node groups.** Nodes share a group, and with it one stored host SBOM, only when every package field ffs matches on is the same: names, versions and architectures, the distribution, source packages, package URLs and CPEs. A host inventory that differs in any of them gets a group of its own.
 - **Residual risk.** A compromised node can under-report the packages of its own host, and of an image the controller asks it to catalogue, because it controls those bytes. Its kubelet can also claim that a pod on it runs any image, so it can be the node asked. It cannot replace an image SBOM that another node or a registry supplied, or change the host inventory of nodes that report their own.
 
-The NetworkPolicy `ffs` (`nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
+The NetworkPolicy `ffs` (`networkPolicy.enabled`, formerly `nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
 
 - the agent API port, only from the agent pods, while `nodeAgent.enabled` is true;
 - the metrics and health ports, from anywhere: metrics answers only requests that pass Kubernetes authentication and authorisation, and health serves only the kubelet's probes;
@@ -199,4 +199,4 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |
 | `nodeAgent.seLinuxType` | `""` | SELinux type of the collector container, for example `spc_t`. |
 | `nodeAgent.openshift.scc` | `false` | Create a SecurityContextConstraints for the agent and bind its ServiceAccount to it. |
-| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while `nodeAgent.enabled` is true, metrics and health from anywhere, and the web UI only from `web.networkPolicy.from`. While false, the chart refuses a non-empty `web.networkPolicy.from`. See [Trust](#trust). |
+| `nodeAgent.networkPolicy.enabled` | unset | Deprecated: use the top-level `networkPolicy.enabled` ([configuration.md](configuration.md#helm-only-values)). When set, v0.0.2 still uses it in place of `networkPolicy.enabled` and the install notes say it is deprecated; v0.0.3 removes it. See [Trust](#trust). |

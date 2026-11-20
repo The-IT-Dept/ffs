@@ -554,20 +554,84 @@ func TestChart_NetworkPolicy(t *testing.T) {
 
 	for _, agent := range []string{"nodeAgent.enabled=true", "nodeAgent.enabled=false"} {
 		_, err := renderErr(t, agent, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
-		require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled "+
+		require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of networkPolicy.enabled "+
 			"admits the web UI port only from the peers listed there", agent)
 
-		off := []string{agent, "nodeAgent.networkPolicy.enabled=false"}
+		off := []string{agent, "networkPolicy.enabled=false"}
 		o := render(t, append(off, "web.service.enabled=true", "config.listen=0.0.0.0:8080")...)
 		require.False(t, o.has("NetworkPolicy", "ffs"), off)
 		require.False(t, o.has("NetworkPolicy", "ffs-agent-api"), off)
 		require.True(t, o.has("Service", "ffs-web"), off)
 		for _, sets := range [][]string{{webPeer}, {"web.service.enabled=true", "config.listen=0.0.0.0:8080", webPeer}} {
 			_, err = renderErr(t, append(off, sets...)...)
-			require.ErrorContains(t, err, "web.networkPolicy.from takes effect only through the NetworkPolicy of nodeAgent.networkPolicy.enabled, "+
-				"which is false", "%v %v", off, sets)
+			require.ErrorContains(t, err, "web.networkPolicy.from takes effect only through the NetworkPolicy of networkPolicy.enabled, "+
+				"which networkPolicy.enabled=false turns off", "%v %v", off, sets)
 		}
 	}
+}
+
+// TestChart_NetworkPolicyKey covers the move of nodeAgent.networkPolicy.enabled to networkPolicy.enabled (#9): the
+// new key decides alone; the old one, set explicitly, is still honoured in v0.0.2, with a deprecation line in the
+// notes; set together, the old one wins unless the new one turns the policy off while the old one keeps it on.
+func TestChart_NetworkPolicyKey(t *testing.T) {
+	const deprecated = "nodeAgent.networkPolicy.enabled is deprecated and will be removed in v0.0.3. This release still uses it; " +
+		"set networkPolicy.enabled instead."
+	for _, c := range []struct {
+		name   string
+		sets   []string
+		policy bool
+		notice bool
+	}{
+		{"default", nil, true, false},
+		{"new key on", []string{"networkPolicy.enabled=true"}, true, false},
+		{"new key off", []string{"networkPolicy.enabled=false"}, false, false},
+		{"old key on", []string{"nodeAgent.networkPolicy.enabled=true"}, true, true},
+		{"old key off", []string{"nodeAgent.networkPolicy.enabled=false"}, false, true},
+		{"both on", []string{"networkPolicy.enabled=true", "nodeAgent.networkPolicy.enabled=true"}, true, true},
+		{"both off", []string{"networkPolicy.enabled=false", "nodeAgent.networkPolicy.enabled=false"}, false, true},
+		{"old key off wins over the default", []string{"networkPolicy.enabled=true", "nodeAgent.networkPolicy.enabled=false"}, false, true},
+		{"without the agent", []string{"nodeAgent.enabled=false", "nodeAgent.networkPolicy.enabled=false"}, false, true},
+	} {
+		require.Equal(t, c.policy, render(t, c.sets...).has("NetworkPolicy", "ffs"), c.name)
+		notes := renderNotes(t, c.sets...)
+		require.Contains(t, notes, "kubectl -n ffs port-forward deploy/ffs 8080", c.name)
+		if c.notice {
+			require.Contains(t, notes, deprecated, c.name)
+		} else {
+			require.NotContains(t, notes, "deprecated", c.name)
+		}
+	}
+
+	_, err := renderErr(t, "networkPolicy.enabled=false", "nodeAgent.networkPolicy.enabled=true")
+	require.ErrorContains(t, err, "networkPolicy.enabled is false but the deprecated nodeAgent.networkPolicy.enabled is true: "+
+		"unset nodeAgent.networkPolicy.enabled and set networkPolicy.enabled only")
+	_, err = renderErr(t, "nodeAgent.networkPolicy.enabled=off")
+	require.ErrorContains(t, err, `nodeAgent.networkPolicy.enabled must be true or false, not "off"`)
+	// Peers for the web UI are refused while the old key turns the policy off, naming that key.
+	_, err = renderErr(t, "nodeAgent.networkPolicy.enabled=false", webPeer)
+	require.ErrorContains(t, err, "which nodeAgent.networkPolicy.enabled=false turns off")
+	// The old key, set on, still builds the full policy.
+	np := as[networkingv1.NetworkPolicy](t, render(t, "nodeAgent.networkPolicy.enabled=true", "config.listen=0.0.0.0:9090", webPeer).
+		get(t, "NetworkPolicy", "ffs"))
+	require.Len(t, np.Spec.Ingress, 3)
+}
+
+// renderNotes renders NOTES.txt with the values sets. helm template does not render it, so a chart copy carries it as
+// the data of a ConfigMap.
+func renderNotes(t *testing.T, sets ...string) string {
+	t.Helper()
+	notes := readFile(t, chartDir+"/templates/NOTES.txt")
+	dir := copyChart(t, map[string]string{
+		"_notes_test.tpl": `{{- define "ffs.notesTest" -}}` + notes + `{{- end -}}`,
+		"notes-test.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-test\ndata:\n  notes: {{ include \"ffs.notesTest\" . | toJson }}\n",
+	})
+	var args []string
+	for _, s := range sets {
+		args = append(args, "--set", s)
+	}
+	out, err := helmTemplateChart(t, dir, args...)
+	require.NoError(t, err, out)
+	return as[corev1.ConfigMap](t, decodeObjs(t, out).get(t, "ConfigMap", "notes-test")).Data["notes"]
 }
 
 func TestChart_AgentOptIns(t *testing.T) {

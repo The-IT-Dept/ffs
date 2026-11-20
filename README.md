@@ -43,7 +43,7 @@ Findings and advisories are also Kubernetes resources:
 kubectl get ffs -A
 ```
 
-The web UI and read-only API have no authentication. They listen on 127.0.0.1 inside the pod, so reaching them needs RBAC `pods/portforward` in the ffs namespace. To front them with your own authenticating proxy, set `config.listen: 0.0.0.0:8080`, `web.service.enabled: true`, `web.networkPolicy.from` to the proxy's pods and `config.allowedHosts` to the host name the proxy forwards; see [Exposing the web UI](docs/configuration.md#exposing-the-web-ui). The chart's NetworkPolicy for the ffs pod admits the port only from those peers. It is created while `nodeAgent.networkPolicy.enabled` is true (the default), with or without the node agent; with it false, restrict the port with a NetworkPolicy of your own.
+The web UI and read-only API have no authentication. They listen on 127.0.0.1 inside the pod, so reaching them needs RBAC `pods/portforward` in the ffs namespace. To front them with your own authenticating proxy, set `config.listen: 0.0.0.0:8080`, `web.service.enabled: true`, `web.networkPolicy.from` to the proxy's pods and `config.allowedHosts` to the host name the proxy forwards; see [Exposing the web UI](docs/configuration.md#exposing-the-web-ui). The chart's NetworkPolicy for the ffs pod admits the port only from those peers. It is created while `networkPolicy.enabled` is true (the default), with or without the node agent; with it false, restrict the port with a NetworkPolicy of your own.
 
 The API is described in [docs/api.md](docs/api.md); its OpenAPI document is served at `/api/v1/openapi.yaml`.
 
@@ -133,9 +133,16 @@ spec:
   imageRepositories:
     - docker.io/library/php
   reason: The affected extension is not built into this image. Reviewed by the platform team.
-  expires: "2027-05-31T00:00:00Z"
+  expires: "${EXPIRES}"
   vexStatus: not_affected
   justification: vulnerable_code_not_present
+```
+
+`expires` is filled in as you apply it, here 90 days out (the example is [docs/examples/exception.yaml](docs/examples/exception.yaml)):
+
+```sh
+EXPIRES=$(date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v+90d +%Y-%m-%dT%H:%M:%SZ
+sed "s/\${EXPIRES}/$EXPIRES/" docs/examples/exception.yaml | kubectl apply -f -
 ```
 
 An Exception matches on any combination of `advisories` (aliases included), `packages`, `imageRepositories` (globs) and `owners`; every list that is set must match. `reason` and `expires` are required, and `expires` can be at most one year away.
@@ -163,7 +170,7 @@ NVD and Chainguard OSV data (CC-BY-NC-ND-4.0) are off by default; NVD is not sup
 
 ## Security
 
-- **Read-mostly RBAC.** ffs reads workloads, pods, nodes, services, ingresses, Gateway API routes, RBAC objects and Flux and Argo CD metadata. It writes only its own resources, `events.k8s.io` Events, OpenReports reports and its leader-election Lease (plus PolicyReports when enabled, TokenReviews that authenticate metrics scrapers and node agents, and SubjectAccessReviews that authorise metrics scrapers). It cannot exec into pods, create workloads or write to git.
+- **Read-mostly RBAC.** ffs reads workloads, pods, nodes, services, ingresses, Gateway API routes and RBAC objects. It learns whether Flux or Argo CD manages a workload from the workload's labels and annotations, never from Flux or Argo CD resources, which can carry inline Helm values. It writes only its own resources, `events.k8s.io` Events, OpenReports reports and its leader-election Lease (plus PolicyReports when enabled, TokenReviews that authenticate metrics scrapers and node agents, and SubjectAccessReviews that authorise metrics scrapers). It cannot exec into pods, create workloads or write to git.
 - **Secrets.** Cluster-wide `get` only, never list or watch, used to read the pull secrets that pods and ServiceAccounts reference. Turn it off with `rbac.readPullSecrets: false`; ffs then reads Secrets only in its own namespace, for AlertTargets and registry credentials. Secret contents are used in memory only, and never logged, stored or returned by the API.
 - **Node agent.** It mounts a fixed list of host paths, all read-only, and has no Kubernetes API permissions, no listening ports and no container runtime socket. The collector runs as UID 0 with every capability dropped; cataloguing runs as non-root in a separate container with no host mounts. See [docs/node-agent.md](docs/node-agent.md).
 - **Runtime.** A distroless static image running as nonroot, with a read-only root filesystem, all capabilities dropped, no privilege escalation and the RuntimeDefault seccomp profile. The cataloguer runs in its own container with its own memory limit and no Kubernetes API token.

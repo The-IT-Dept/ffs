@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -114,8 +115,13 @@ func decodeFFS(t *testing.T, path, kind, doc string) {
 		require.NoError(t, yaml.UnmarshalStrict([]byte(doc), &at), "%s: %s", path, doc)
 		apiVersion = at.APIVersion
 	case "Exception":
+		// A fixed expiry would make the example invalid once it is more than a year away or past (F55): it is
+		// filled in as the example is applied.
+		require.Contains(t, doc, "\n  expires: \"${EXPIRES}\"\n", "%s: an Exception example's expires is the ${EXPIRES} placeholder", path)
+		doc = strings.ReplaceAll(doc, "${EXPIRES}", time.Now().AddDate(0, 0, 90).UTC().Format(time.RFC3339))
 		var ex apiv1alpha1.Exception
 		require.NoError(t, yaml.UnmarshalStrict([]byte(doc), &ex), "%s: %s", path, doc)
+		require.True(t, ex.Spec.Expires.After(time.Now()), "%s: expires", path)
 		apiVersion = ex.APIVersion
 	default:
 		t.Fatalf("%s: kind %q is not an ffs input kind", path, kind)
@@ -183,7 +189,7 @@ func TestDocs_NodeAgentCoversEveryValue(t *testing.T) {
 	}
 	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../charts/ffs/values.yaml")), &values))
 	paths := valuePaths("", values.NodeAgent)
-	require.Len(t, paths, 31)
+	require.Len(t, paths, 30)
 	doc := readFile(t, "../../docs/node-agent.md")
 	for _, p := range paths {
 		require.Contains(t, doc, "`nodeAgent."+p+"`", "docs/node-agent.md does not describe nodeAgent.%s", p)

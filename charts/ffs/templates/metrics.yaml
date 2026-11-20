@@ -46,6 +46,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "ffs.labels" . | nindent 4 }}
+    app.kubernetes.io/component: metrics
 spec:
   type: ClusterIP
   selector:
@@ -69,9 +70,10 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
+  # Only the metrics Service: the release's other Services carry the pod selector labels too.
   selector:
     matchLabels:
-      {{- include "ffs.selectorLabels" . | nindent 6 }}
+      {{- include "ffs.metricsSelectorLabels" . | nindent 6 }}
   namespaceSelector:
     matchNames: [{{ .Release.Namespace }}]
   endpoints:
