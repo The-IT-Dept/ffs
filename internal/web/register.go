@@ -10,16 +10,25 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/controller/deps"
 	"github.com/the-it-dept/ffs/internal/web/apiserver"
+	"github.com/the-it-dept/ffs/internal/web/live"
 	"github.com/the-it-dept/ffs/internal/web/ui"
 )
 
-// Register adds the HTTP server to m. It is not leader-only: it only reads the store.
+// Register adds the HTTP server and the live-update hub to m, and subscribes the hub to the
+// engine's changes. Neither is leader-only: they only read the store.
 func Register(m manager.Manager, d deps.Deps) error {
 	srv := apiserver.New(apiserver.Options{
 		Store: d.Store, Config: d.Config, Feeds: feedInfos(d.Feeds.StaleAfter()), EOL: d.EOL,
 		Kube: m.GetClient(), Pods: d.Inventory, Now: time.Now, Log: d.Log.WithName("api"),
 	})
-	if err := m.Add(NewServer(d.Config, Handlers{API: srv.Handler(), UI: ui.Handler(ui.Dist())}, nil)); err != nil {
+	hub := live.NewHub(live.Options{Store: d.Store, Marks: d.Store, Nodes: live.StoreNodeMarks(d.Store), Log: d.Log.WithName("live"),
+		Cluster: d.Config.ClusterName})
+	if err := m.Add(hub); err != nil {
+		return fmt.Errorf("add live hub: %w", err)
+	}
+	d.Engine.AddObserver(hub)
+	h := Handlers{API: srv.Handler(), Stream: hub, UI: ui.Handler(ui.Dist())}
+	if err := m.Add(NewServer(d.Config, h, hub.Close)); err != nil {
 		return fmt.Errorf("add web server: %w", err)
 	}
 	return nil
