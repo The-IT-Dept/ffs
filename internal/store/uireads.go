@@ -159,10 +159,11 @@ func (s *Store) BestFixes(ctx context.Context, keys []string) (map[string]FixSum
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.rdb.QueryContext(ctx, `SELECT owner_key, fix_key, fingerprint, data FROM (SELECT owner_key, fix_key, fingerprint, data,
+	// Rank each pair's findings without their JSON, then read only the winners' rows.
+	rows, err := s.rdb.QueryContext(ctx, `SELECT f.owner_key, f.fix_key, f.fingerprint, f.data FROM (SELECT rowid AS rid,
 			row_number() OVER (PARTITION BY owner_key, fix_key ORDER BY priority DESC, fingerprint) AS rn FROM findings
-			WHERE state = 'open' AND (owner_key, fix_key) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?)))
-		WHERE rn = 1`, string(pairsJSON))
+			WHERE state = 'open' AND (owner_key, fix_key) IN (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))) r
+		JOIN findings f ON f.rowid = r.rid WHERE r.rn = 1`, string(pairsJSON))
 	if err != nil {
 		return nil, fmt.Errorf("store: best fix samples: %w", err)
 	}

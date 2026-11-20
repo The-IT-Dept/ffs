@@ -416,13 +416,15 @@ func imagesCTE(q ImageQuery) (string, []any, error) {
 	if len(q.Namespaces) > 0 {
 		w.add(inCond("o.namespace", len(q.Namespaces)), anys(q.Namespaces)...)
 	}
-	// Counts read finding_digests alone when every owner counts, else only the owners in inuse.
+	// Counts read finding_digests alone when every owner counts, else only the owners in inuse: from
+	// each (digest, owner) of inuse to the owner's findings and their row for that digest, so only the
+	// scope's findings are read.
 	counts := `SELECT fd.digest, sum(fd.priority = 4) AS u, sum(fd.priority = 3) AS h, sum(fd.priority = 2) AS m, sum(fd.priority = 1) AS l,
 		sum(fd.fix_available) AS fx FROM finding_digests fd WHERE fd.state = 'open' AND fd.digest IN (SELECT digest FROM inuse) GROUP BY fd.digest`
 	if q.Scope.Kind == model.ScopeNamespace || q.Scope.Kind == model.ScopeWorkload || len(q.Namespaces) > 0 {
 		counts = `SELECT fd.digest, sum(fd.priority = 4) AS u, sum(fd.priority = 3) AS h, sum(fd.priority = 2) AS m, sum(fd.priority = 1) AS l,
-			sum(fd.fix_available) AS fx FROM finding_digests fd JOIN findings f ON f.fingerprint = fd.fingerprint
-			JOIN inuse u ON u.digest = fd.digest AND u.owner_key = f.owner_key WHERE fd.state = 'open' GROUP BY fd.digest`
+			sum(fd.fix_available) AS fx FROM inuse u CROSS JOIN findings f ON f.owner_key = u.owner_key
+			CROSS JOIN finding_digests fd ON fd.fingerprint = f.fingerprint AND fd.digest = u.digest WHERE fd.state = 'open' GROUP BY fd.digest`
 	}
 	container := func(field string) string {
 		return `(SELECT json_extract(c.value, '$.` + field + `') FROM owners o2, json_each(o2.data, '$.Containers') c
@@ -484,24 +486,25 @@ func (s *Store) ImagesPage(ctx context.Context, q ImageQuery) (ImagePage, error)
 		return ImagePage{}, err
 	}
 	w := imageWhere(q, "")
-	var page ImagePage
-	if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*) FROM im`+w.String(), slices.Concat(cteArgs, w.args)...).
-		Scan(&page.Total); err != nil {
-		return ImagePage{}, fmt.Errorf("store: count images: %w", err)
-	}
+	var kw where
 	if after != nil {
 		cond, args := keysetAfter(cols, after)
-		w.add(cond, args...)
+		kw.add(cond, args...)
 	}
 	limit := clampLimit(q.Limit)
-	rows, err := s.rdb.QueryContext(ctx, cte+` SELECT `+tupleExprs(cols)+`, `+imageCols+`, workloads, urgent, high, medium, low, fixable, cov
-		FROM im`+w.String()+orderBy(cols)+` LIMIT ?`,
-		slices.Concat(cteArgs, w.args, []any{limit + 1})...)
+	// The total is counted before the keyset predicate, in the same evaluation of im as the page.
+	rows, err := s.rdb.QueryContext(ctx, cte+`, pg AS (SELECT *, count(*) OVER () AS total FROM im`+w.String()+`)
+		SELECT `+tupleExprs(cols)+`, total, `+imageCols+`, workloads, urgent, high, medium, low, fixable, cov
+		FROM pg`+kw.String()+orderBy(cols)+` LIMIT ?`,
+		slices.Concat(cteArgs, w.args, kw.args, []any{limit + 1})...)
 	if err != nil {
 		return ImagePage{}, fmt.Errorf("store: images page: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var last []any
+	var (
+		page ImagePage
+		last []any
+	)
 	for rows.Next() {
 		if len(page.Rows) == limit {
 			page.Next = encodeCursor(tag, last)
@@ -513,8 +516,8 @@ func (s *Store) ImagesPage(ctx context.Context, q ImageQuery) (ImagePage, error)
 			cls string
 		)
 		img := &imageScan{}
-		dest := slices.Concat(tuple, img.dest(), []any{&r.Workloads, &r.Counts.Urgent, &r.Counts.High, &r.Counts.Medium, &r.Counts.Low,
-			&r.Fixable, &cls})
+		dest := slices.Concat(tuple, []any{&page.Total}, img.dest(), []any{&r.Workloads, &r.Counts.Urgent, &r.Counts.High,
+			&r.Counts.Medium, &r.Counts.Low, &r.Fixable, &cls})
 		if err := rows.Scan(dest...); err != nil {
 			return ImagePage{}, err
 		}
@@ -525,7 +528,16 @@ func (s *Store) ImagesPage(ctx context.Context, q ImageQuery) (ImagePage, error)
 		page.Rows = append(page.Rows, r)
 		last = values()
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return ImagePage{}, err
+	}
+	if len(page.Rows) == 0 && after != nil { // past the last row: count apart
+		if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*) FROM im`+w.String(), slices.Concat(cteArgs, w.args)...).
+			Scan(&page.Total); err != nil {
+			return ImagePage{}, fmt.Errorf("store: count images: %w", err)
+		}
+	}
+	return page, nil
 }
 
 // imageStatusValues are the values of the image status facet.
@@ -534,52 +546,95 @@ var imageStatusValues = []string{string(model.ImagePending), string(model.ImageC
 
 // ImageFacets counts in-use container images by status, source, coverage, namespace and priority
 // (worst open), each under q minus its own selection. An image run in two namespaces counts in each.
+// The facets share one statement over one evaluation of im; the namespace facet of a query that
+// selects namespaces has its own, since im is built without that selection.
 func (s *Store) ImageFacets(ctx context.Context, q ImageQuery, facets []string) (map[string][]FacetValue, error) {
-	out := make(map[string][]FacetValue, len(facets))
+	var shared, own []string
 	for _, f := range facets {
-		cq := q
-		if f == "namespace" {
-			cq.Namespaces = nil
+		switch {
+		case !slices.Contains([]string{"status", "source", "coverage", "namespace", "priority"}, f):
+			return nil, fmt.Errorf("store: unknown image facet %q", f)
+		case f == "namespace" && len(q.Namespaces) > 0:
+			own = append(own, f)
+		default:
+			shared = append(shared, f)
 		}
-		cte, cteArgs, err := imagesCTE(cq)
-		if err != nil {
+	}
+	counts := map[string]map[string]int{}
+	cq := q
+	cq.Namespaces = nil
+	for _, run := range []struct {
+		q      ImageQuery
+		facets []string
+	}{{q, shared}, {cq, own}} {
+		if len(run.facets) == 0 {
+			continue
+		}
+		if err := s.imageFacetCounts(ctx, run.q, q, run.facets, counts); err != nil {
 			return nil, err
 		}
-		w := imageWhere(q, f)
-		var query string
+	}
+	out := make(map[string][]FacetValue, len(facets))
+	for _, f := range facets {
 		switch f {
 		case "status":
-			query = `SELECT status, count(*) FROM im` + w.String() + ` GROUP BY status`
+			out[f] = enumFacet(imageStatusValues, counts[f])
 		case "source":
-			query = `SELECT source, count(*) FROM im` + w.String() + ` GROUP BY source`
+			out[f] = openFacet(counts[f], q.Sources, 0)
 		case "coverage":
-			query = `SELECT cov, count(*) FROM im` + w.String() + ` GROUP BY cov`
+			out[f] = enumFacet(coverageValues, counts[f])
 		case "priority":
-			query = `SELECT ` + worstName + `, count(*) FROM im` + w.String() + ` GROUP BY worst`
+			out[f] = enumFacet(priorityValues, counts[f])
 		case "namespace":
-			query = `SELECT u.namespace, count(DISTINCT u.digest) FROM inuse u WHERE u.digest IN (SELECT digest FROM im` + w.String() + `)
-				GROUP BY u.namespace`
-		default:
-			return nil, fmt.Errorf("store: unknown image facet %q", f)
-		}
-		counts, err := s.facetQuery(ctx, cte+` `+query, slices.Concat(cteArgs, w.args))
-		if err != nil {
-			return nil, fmt.Errorf("store: image %s facet: %w", f, err)
-		}
-		switch f {
-		case "status":
-			out[f] = enumFacet(imageStatusValues, counts)
-		case "source":
-			out[f] = openFacet(counts, q.Sources, 0)
-		case "coverage":
-			out[f] = enumFacet(coverageValues, counts)
-		case "priority":
-			out[f] = enumFacet(priorityValues, counts)
-		case "namespace":
-			out[f] = openFacet(counts, q.Namespaces, 0)
+			out[f] = openFacet(counts[f], q.Namespaces, 0)
 		}
 	}
 	return out, nil
+}
+
+// imageFacetCounts adds to counts the (facet, value, count) rows of facets, counted in one statement
+// over im built for cq, each under q minus the facet's own selection.
+func (s *Store) imageFacetCounts(ctx context.Context, cq, q ImageQuery, facets []string, counts map[string]map[string]int) error {
+	cte, args, err := imagesCTE(cq)
+	if err != nil {
+		return err
+	}
+	parts := make([]string, len(facets))
+	for i, f := range facets {
+		w := imageWhere(q, f)
+		label := `'` + f + `'`
+		switch f {
+		case "status", "source":
+			parts[i] = `SELECT ` + label + `, ` + f + `, count(*) FROM im` + w.String() + ` GROUP BY ` + f
+		case "coverage":
+			parts[i] = `SELECT ` + label + `, cov, count(*) FROM im` + w.String() + ` GROUP BY cov`
+		case "priority":
+			parts[i] = `SELECT ` + label + `, ` + worstName + `, count(*) FROM im` + w.String() + ` GROUP BY worst`
+		case "namespace":
+			parts[i] = `SELECT ` + label + `, u.namespace, count(DISTINCT u.digest) FROM inuse u WHERE u.digest IN (SELECT digest FROM im` +
+				w.String() + `) GROUP BY u.namespace`
+		}
+		args = append(args, w.args...)
+	}
+	rows, err := s.rdb.QueryContext(ctx, cte+` `+strings.Join(parts, ` UNION ALL `), args...)
+	if err != nil {
+		return fmt.Errorf("store: image facets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			f, v string
+			n    int
+		)
+		if err := rows.Scan(&f, &v, &n); err != nil {
+			return err
+		}
+		if counts[f] == nil {
+			counts[f] = map[string]int{}
+		}
+		counts[f][v] += n
+	}
+	return rows.Err()
 }
 
 // --- packages
@@ -621,17 +676,25 @@ var packageSorts = map[string][]keyCol{
 }
 
 // packagesCTE is pk: one row per (ecosystem, name, installed version) of the packages of q's scope
-// digests, with the digests and owners holding it and its open findings in scope.
+// digests, with the digests holding it and its open findings in scope; and so, the scope's (digest,
+// owner) pairs, which packageWorkloads counts for the rows of a page only.
+//
+// The packages are first grouped by their stored (ecosystem, name, version, epoch), which over the
+// cluster streams through the packages_explore index (055) in its order, then by installed version.
+// Two stored forms of one installed version (the epoch in the version or beside it) are rare; their
+// images are counted again across both, so an image holding both counts once.
 func packagesCTE(sc model.Scope) (string, []any, error) {
 	var (
 		digests, owners string
 		args            []any
 	)
 	cd := containerDigest("oi.digest")
+	from := `packages p`
 	switch sc.Kind {
 	case model.ScopeCluster, "":
 		digests = `SELECT DISTINCT oi.digest FROM owner_images oi WHERE ` + cd
 		owners = `SELECT DISTINCT oi.digest, oi.owner_key FROM owner_images oi WHERE ` + cd
+		from = `packages p INDEXED BY packages_explore`
 	case model.ScopeNamespace:
 		digests = `SELECT DISTINCT oi.digest FROM owner_images oi JOIN owners o ON o.key = oi.owner_key WHERE o.namespace = ? AND ` + cd
 		owners = `SELECT DISTINCT oi.digest, oi.owner_key FROM owner_images oi JOIN owners o ON o.key = oi.owner_key WHERE o.namespace = ? AND ` + cd
@@ -656,16 +719,27 @@ func packagesCTE(sc model.Scope) (string, []any, error) {
 		inScope = ` AND fp.fingerprint IN (SELECT fingerprint FROM findings` + fw.String() + `)`
 	}
 	args = append(args, fw.args...)
-	cte := `WITH sd AS (` + digests + `), so AS (` + owners + `),
-	pk0 AS (SELECT p.ecosystem, p.name, ` + installedExpr("p") + ` AS version, count(DISTINCT p.digest) AS images,
-		count(DISTINCT so.owner_key) AS workloads, max(p.classifier) AS classifier
-		FROM packages p LEFT JOIN so ON so.digest = p.digest WHERE p.digest IN (SELECT digest FROM sd) GROUP BY 1, 2, 3),
+	cte := `WITH sd AS (` + digests + `), so AS MATERIALIZED (` + owners + `),
+	pkv AS (SELECT p.ecosystem, p.name, p.version, p.epoch, count(DISTINCT p.digest) AS images, max(p.classifier) AS classifier
+		FROM ` + from + ` WHERE p.digest IN (SELECT digest FROM sd) GROUP BY p.ecosystem, p.name, p.version, p.epoch),
+	pkm AS (SELECT pkv.ecosystem, pkv.name, ` + installedExpr("pkv") + ` AS version, count(*) AS forms, sum(pkv.images) AS images,
+		max(pkv.classifier) AS classifier FROM pkv GROUP BY 1, 2, 3),
+	pk0 AS (SELECT ecosystem, name, version, CASE WHEN forms = 1 THEN images ELSE (SELECT count(DISTINCT p3.digest) FROM packages p3
+		WHERE p3.ecosystem = pkm.ecosystem AND p3.name = pkm.name AND ` + installedExpr("p3") + ` = pkm.version
+		AND p3.digest IN (SELECT digest FROM sd)) END AS images, classifier FROM pkm),
 	fc AS (SELECT fp.ecosystem, fp.name, fp.version, sum(fp.priority = 4) AS u, sum(fp.priority = 3) AS h, sum(fp.priority = 2) AS m,
 		sum(fp.priority = 1) AS l FROM finding_packages fp WHERE fp.state = 'open'` + inScope + ` GROUP BY 1, 2, 3),
 	pk1 AS (SELECT pk0.*, coalesce(fc.u, 0) AS urgent, coalesce(fc.h, 0) AS high, coalesce(fc.m, 0) AS medium, coalesce(fc.l, 0) AS low
 		FROM pk0 LEFT JOIN fc ON fc.ecosystem = pk0.ecosystem AND fc.name = pk0.name AND fc.version = pk0.version),
 	pk AS (SELECT *, ` + worstSQL + ` AS worst FROM pk1)`
 	return cte, args, nil
+}
+
+// packageWorkloads counts the scope's owners (so, materialized once) running a digest that holds
+// the package of the pk row aliased a; packages_explore serves the lookup by name.
+func packageWorkloads(a string) string {
+	return `(SELECT count(DISTINCT so.owner_key) FROM packages p2 INDEXED BY packages_explore JOIN so ON so.digest = p2.digest
+		WHERE p2.ecosystem = ` + a + `.ecosystem AND p2.name = ` + a + `.name AND ` + installedExpr("p2") + ` = ` + a + `.version)`
 }
 
 // packageWhere returns q's predicates over pk, without facet omit's selection.
@@ -683,7 +757,9 @@ func packageWhere(q PackageEntityQuery, omit string) where {
 	return w
 }
 
-// PackagesPage returns one keyset page of the packages q matches.
+// PackagesPage returns one keyset page of the packages q matches. The total and the page come
+// from one evaluation of pk: the total is counted before the keyset predicate, and counted apart
+// only when a page after a cursor comes back empty.
 func (s *Store) PackagesPage(ctx context.Context, q PackageEntityQuery) (PackagePage, error) {
 	sort := cmp.Or(q.Sort, "-risk")
 	cols, ok := packageSorts[sort]
@@ -700,24 +776,26 @@ func (s *Store) PackagesPage(ctx context.Context, q PackageEntityQuery) (Package
 		return PackagePage{}, err
 	}
 	w := packageWhere(q, "")
-	var page PackagePage
-	if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*) FROM pk`+w.String(), slices.Concat(cteArgs, w.args)...).
-		Scan(&page.Total); err != nil {
-		return PackagePage{}, fmt.Errorf("store: count packages: %w", err)
-	}
+	var kw where
 	if after != nil {
 		cond, args := keysetAfter(cols, after)
-		w.add(cond, args...)
+		kw.add(cond, args...)
 	}
 	limit := clampLimit(q.Limit)
-	rows, err := s.rdb.QueryContext(ctx, cte+` SELECT `+tupleExprs(cols)+`, ecosystem, name, version, images, workloads,
-		urgent, high, medium, low, worst, coalesce(classifier, '') FROM pk`+w.String()+orderBy(cols)+` LIMIT ?`,
-		slices.Concat(cteArgs, w.args, []any{limit + 1})...)
+	// Workloads are counted for the page's rows only, after the LIMIT.
+	rows, err := s.rdb.QueryContext(ctx, cte+`, pg AS (SELECT *, count(*) OVER () AS total FROM pk`+w.String()+`),
+		pl AS (SELECT * FROM pg`+kw.String()+orderBy(cols)+` LIMIT ?)
+		SELECT `+tupleExprs(cols)+`, total, ecosystem, name, version, images, `+packageWorkloads("pl")+`,
+		urgent, high, medium, low, worst, coalesce(classifier, '') FROM pl`+orderBy(cols),
+		slices.Concat(cteArgs, w.args, kw.args, []any{limit + 1})...)
 	if err != nil {
 		return PackagePage{}, fmt.Errorf("store: packages page: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var last []any
+	var (
+		page PackagePage
+		last []any
+	)
 	for rows.Next() {
 		if len(page.Rows) == limit {
 			page.Next = encodeCursor(tag, last)
@@ -728,7 +806,7 @@ func (s *Store) PackagesPage(ctx context.Context, q PackageEntityQuery) (Package
 			r     PackageRow
 			worst int
 		)
-		if err := rows.Scan(slices.Concat(tuple, []any{&r.Ecosystem, &r.Name, &r.Version, &r.Images, &r.Workloads,
+		if err := rows.Scan(slices.Concat(tuple, []any{&page.Total, &r.Ecosystem, &r.Name, &r.Version, &r.Images, &r.Workloads,
 			&r.Counts.Urgent, &r.Counts.High, &r.Counts.Medium, &r.Counts.Low, &worst, &r.Classifier})...); err != nil {
 			return PackagePage{}, err
 		}
@@ -736,36 +814,72 @@ func (s *Store) PackagesPage(ctx context.Context, q PackageEntityQuery) (Package
 		page.Rows = append(page.Rows, r)
 		last = values()
 	}
-	return page, rows.Err()
+	if err := rows.Err(); err != nil {
+		return PackagePage{}, err
+	}
+	if len(page.Rows) == 0 && after != nil {
+		if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*) FROM pk`+w.String(), slices.Concat(cteArgs, w.args)...).
+			Scan(&page.Total); err != nil {
+			return PackagePage{}, fmt.Errorf("store: count packages: %w", err)
+		}
+	}
+	return page, nil
 }
 
 // PackageFacets counts packages by ecosystem and priority (worst open), each under q minus its own
-// selection.
+// selection, in one statement over one evaluation of pk.
 func (s *Store) PackageFacets(ctx context.Context, q PackageEntityQuery, facets []string) (map[string][]FacetValue, error) {
 	out := make(map[string][]FacetValue, len(facets))
+	if len(facets) == 0 {
+		return out, nil
+	}
 	cte, cteArgs, err := packagesCTE(q.Scope)
 	if err != nil {
 		return nil, err
 	}
+	var (
+		parts []string
+		args  = slices.Clone(cteArgs)
+	)
 	for _, f := range facets {
 		w := packageWhere(q, f)
-		var query string
 		switch f {
 		case "ecosystem":
-			query = `SELECT ecosystem, count(*) FROM pk` + w.String() + ` GROUP BY ecosystem`
+			parts = append(parts, `SELECT 'ecosystem', ecosystem, count(*) FROM pk`+w.String()+` GROUP BY ecosystem`)
 		case "priority":
-			query = `SELECT ` + worstName + `, count(*) FROM pk` + w.String() + ` GROUP BY worst`
+			parts = append(parts, `SELECT 'priority', `+worstName+`, count(*) FROM pk`+w.String()+` GROUP BY worst`)
 		default:
 			return nil, fmt.Errorf("store: unknown package facet %q", f)
 		}
-		counts, err := s.facetQuery(ctx, cte+` `+query, slices.Concat(cteArgs, w.args))
-		if err != nil {
-			return nil, fmt.Errorf("store: package %s facet: %w", f, err)
+		args = append(args, w.args...)
+	}
+	rows, err := s.rdb.QueryContext(ctx, cte+` `+strings.Join(parts, ` UNION ALL `), args...)
+	if err != nil {
+		return nil, fmt.Errorf("store: package facets: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	counts := map[string]map[string]int{}
+	for rows.Next() {
+		var (
+			f, v string
+			n    int
+		)
+		if err := rows.Scan(&f, &v, &n); err != nil {
+			return nil, err
 		}
+		if counts[f] == nil {
+			counts[f] = map[string]int{}
+		}
+		counts[f][v] += n
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for _, f := range facets {
 		if f == "ecosystem" {
-			out[f] = openFacet(counts, q.Ecosystems, 0)
+			out[f] = openFacet(counts[f], q.Ecosystems, 0)
 		} else {
-			out[f] = enumFacet(priorityValues, counts)
+			out[f] = enumFacet(priorityValues, counts[f])
 		}
 	}
 	return out, nil

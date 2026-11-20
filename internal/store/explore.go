@@ -208,11 +208,23 @@ func findingPageStmt(q FindingQuery) (pageStmt, error) {
 		w.add(cond, args...)
 	}
 	limit := clampLimit(q.Limit)
-	return pageStmt{
-		stmt: stmt{query: `SELECT ` + tupleExprs(cols) + `, fingerprint, data FROM ` + findingsFrom(q, false) + w.String() + orderBy(cols) + ` LIMIT ?`,
-			args: append(w.args, limit+1)},
-		tag: string(sort), cols: cols, limit: limit,
-	}, nil
+	query := `SELECT ` + tupleExprs(cols) + `, fingerprint, data FROM ` + findingsFrom(q, false) + w.String() + orderBy(cols) + ` LIMIT ?`
+	if groupsIndexed(q) {
+		// Rank on findings_groups alone, then read the rows of the page only.
+		r := qualified(cols, "r")
+		query = `SELECT ` + tupleExprs(r) + `, f.fingerprint, f.data FROM (SELECT rowid AS rid, ` + tupleExprs(cols) + ` FROM ` + groupsFrom(q) +
+			w.String() + orderBy(cols) + ` LIMIT ?) r JOIN findings f ON f.rowid = r.rid` + orderBy(r)
+	}
+	return pageStmt{stmt: stmt{query: query, args: append(w.args, limit+1)}, tag: string(sort), cols: cols, limit: limit}, nil
+}
+
+// qualified returns cols with each expression, a column name, qualified by alias.
+func qualified(cols []keyCol, alias string) []keyCol {
+	out := make([]keyCol, len(cols))
+	for i, c := range cols {
+		out[i] = keyCol{alias + "." + c.expr, c.desc, c.kind}
+	}
+	return out
 }
 
 // FindingGroups returns one keyset page of the groups of the findings q matches. Fix groups are
@@ -225,15 +237,16 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 		return GroupPage{}, err
 	}
 	const fields = `owner_key, advisory_id, priority, fix_available, signals`
+	from := groupsFrom(q)
 	var source, key string
 	switch g {
 	case GroupPackage:
-		source = `(SELECT fingerprint, ` + fields + ` FROM ` + findingsFrom(q, false) + w.String() + `) f JOIN finding_packages p ON p.fingerprint = f.fingerprint`
+		source = `(SELECT fingerprint, ` + fields + ` FROM ` + from + w.String() + `) f JOIN finding_packages p ON p.fingerprint = f.fingerprint`
 		key = `p.ecosystem || '/' || p.name || '@' || p.version`
 	case GroupAdvisory, GroupWorkload, GroupImage, GroupNamespace, GroupFix:
 		col := map[FindingGroup]string{GroupAdvisory: "advisory_id", GroupWorkload: "owner_key", GroupImage: "image_repo",
 			GroupNamespace: "namespace", GroupFix: "fix_key"}[g]
-		source, key = `(SELECT `+fields+`, `+col+` AS gkey FROM `+findingsFrom(q, false)+w.String()+`) f`, `f.gkey`
+		source, key = `(SELECT `+fields+`, `+col+` AS gkey FROM `+from+w.String()+`) f`, `f.gkey`
 	default:
 		return GroupPage{}, fmt.Errorf("store: unknown finding group %q", g)
 	}
@@ -257,11 +270,6 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 		return GroupPage{}, err
 	}
 
-	var page GroupPage
-	if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*), coalesce(sum(findings), 0) FROM t`, w.args...).
-		Scan(&page.Groups, &page.Findings); err != nil {
-		return GroupPage{}, fmt.Errorf("store: count finding groups: %w", err)
-	}
 	var kw where
 	if after != nil {
 		cond, args := keysetAfter(cols, after)
@@ -269,13 +277,19 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 	}
 	limit := clampLimit(q.Limit)
 	args := slices.Concat(w.args, kw.args, []any{limit + 1})
-	rows, err := s.rdb.QueryContext(ctx, cte+` SELECT key, findings, distinct_n, urgent, high, medium, low, fixable, exploited, worst, tail
-		FROM t`+kw.String()+orderBy(cols)+` LIMIT ?`, args...)
+	// The group and finding totals are taken before the keyset predicate, in the same evaluation of g
+	// as the page.
+	rows, err := s.rdb.QueryContext(ctx, cte+`, tt AS (SELECT *, count(*) OVER () AS groups_n, sum(findings) OVER () AS findings_n FROM t)
+		SELECT groups_n, findings_n, key, findings, distinct_n, urgent, high, medium, low, fixable, exploited, worst, tail
+		FROM tt`+kw.String()+orderBy(cols)+` LIMIT ?`, args...)
 	if err != nil {
 		return GroupPage{}, fmt.Errorf("store: finding groups: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	var last []any
+	var (
+		page GroupPage
+		last []any
+	)
 	for rows.Next() {
 		if len(page.Rows) == limit {
 			page.Next = encodeCursor(tag, last)
@@ -286,7 +300,8 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 			urgent, high, findings, worst, tl  int64
 			medium, low, fixable, exploited, d int64
 		)
-		if err := rows.Scan(&r.Key, &findings, &d, &urgent, &high, &medium, &low, &fixable, &exploited, &worst, &tl); err != nil {
+		if err := rows.Scan(&page.Groups, &page.Findings, &r.Key, &findings, &d, &urgent, &high, &medium, &low, &fixable, &exploited,
+			&worst, &tl); err != nil {
 			return GroupPage{}, err
 		}
 		r.Label, r.Findings, r.Distinct = r.Key, int(findings), int(d)
@@ -301,6 +316,12 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 	if err := rows.Err(); err != nil {
 		return GroupPage{}, err
 	}
+	if len(page.Rows) == 0 && after != nil { // past the last group: count apart
+		if err := s.rdb.QueryRowContext(ctx, cte+` SELECT count(*), coalesce(sum(findings), 0) FROM t`, w.args...).
+			Scan(&page.Groups, &page.Findings); err != nil {
+			return GroupPage{}, fmt.Errorf("store: count finding groups: %w", err)
+		}
+	}
 	if g == GroupFix && len(page.Rows) > 0 {
 		if err := s.fixSamples(ctx, q, w, page.Rows); err != nil {
 			return GroupPage{}, err
@@ -310,6 +331,7 @@ func (s *Store) FindingGroups(ctx context.Context, q FindingQuery, g FindingGrou
 }
 
 // fixSamples sets each fix group's Sample to its highest-priority finding under w, the predicate of q.
+// The samples are ranked on the statement's index columns; only the winners' rows are read.
 func (s *Store) fixSamples(ctx context.Context, q FindingQuery, w where, groups []GroupRow) error {
 	keys := make([]string, len(groups))
 	for i, g := range groups {
@@ -317,9 +339,9 @@ func (s *Store) fixSamples(ctx context.Context, q FindingQuery, w where, groups 
 	}
 	sw := where{conds: slices.Clone(w.conds), args: slices.Clone(w.args)}
 	sw.add(`fix_key IN (SELECT value FROM json_each(?))`, idList(keys))
-	st := stmt{query: `SELECT fix_key, fingerprint, data FROM (SELECT fix_key, fingerprint, data,
-		row_number() OVER (PARTITION BY fix_key ORDER BY priority DESC, fingerprint) AS rn FROM ` + findingsFrom(q, false) + sw.String() + `)
-		WHERE rn = 1`, args: sw.args}
+	st := stmt{query: `SELECT f.fix_key, f.fingerprint, f.data FROM (SELECT rowid AS rid,
+		row_number() OVER (PARTITION BY fix_key ORDER BY priority DESC, fingerprint) AS rn FROM ` + groupsFrom(q) + sw.String() + `) r
+		JOIN findings f ON f.rowid = r.rid WHERE r.rn = 1`, args: sw.args}
 	rows, err := s.rdb.QueryContext(ctx, st.query, st.args...)
 	if err != nil {
 		return fmt.Errorf("store: fix group samples: %w", err)
@@ -535,6 +557,28 @@ func findingsFrom(q FindingQuery, coverable bool) string {
 		return `findings INDEXED BY findings_fix`
 	}
 	return `findings`
+}
+
+// groupsIndexed reports whether the group and page statements of q read findings_groups (055),
+// which holds every column they filter, group or sort on: when q is not narrowed by a workload, an
+// image or node group, an advisory or a package, whose indexes the planner reads instead, and holds
+// no resolved state, whose resolved_at the index lacks.
+func groupsIndexed(q FindingQuery) bool {
+	switch q.Scope.Kind {
+	case model.ScopeCluster, "", model.ScopeNamespace, model.ScopeControlPlane:
+	default:
+		return false
+	}
+	return q.Advisory == "" && q.Package == "" && !slices.Contains(findingStates(q), model.StateResolved)
+}
+
+// groupsFrom is the FROM of FindingGroups' statements: findings_groups when groupsIndexed, else as
+// findingsFrom.
+func groupsFrom(q FindingQuery) string {
+	if groupsIndexed(q) {
+		return `findings INDEXED BY findings_groups`
+	}
+	return findingsFrom(q, false)
 }
 
 // coverable reports whether the statements of q, minus facet omit's selection, read only columns of
