@@ -43,7 +43,7 @@ func roundTrip[T any](t *testing.T, v T) {
 func TestWire_JSONKeys(t *testing.T) {
 	at := time.Date(2026, 11, 20, 1, 2, 3, 0, time.UTC)
 	full := Report{
-		Node: "worker-1", AgentVersion: "v0.0.1", BootID: "b1", StartedAt: at, Seq: 7, Kind: KindFull,
+		Node: "worker-1", AgentVersion: "v0.0.1", BootID: "b1", Instance: "0123456789abcdef0123456789abcdef", StartedAt: at, Seq: 7, Kind: KindFull,
 		CollectedAt: at.Add(time.Minute), KernelRelease: "7.0.0-34-generic", Arch: "amd64",
 		Host: &Host{
 			PackageDB: "dpkg",
@@ -58,7 +58,7 @@ func TestWire_JSONKeys(t *testing.T) {
 	}
 	b, err := json.Marshal(full)
 	require.NoError(t, err)
-	require.Equal(t, `{"node":"worker-1","agentVersion":"v0.0.1","bootID":"b1","startedAt":"2026-11-20T01:02:03Z","seq":7,`+
+	require.Equal(t, `{"node":"worker-1","agentVersion":"v0.0.1","bootID":"b1","instance":"0123456789abcdef0123456789abcdef","startedAt":"2026-11-20T01:02:03Z","seq":7,`+
 		`"kind":"full","collectedAt":"2026-11-20T01:03:03Z","kernelRelease":"7.0.0-34-generic","arch":"amd64",`+
 		`"host":{"packageDB":"dpkg","binaries":[{"name":"containerd","path":"/usr/bin/containerd","size":12}],"syftJSON":{"artifacts":[]}},`+
 		`"images":{"contentStore":true,"digests":[{"digest":"sha256:aa","mediaType":"application/vnd.oci.image.index.v1+json",`+
@@ -66,7 +66,7 @@ func TestWire_JSONKeys(t *testing.T) {
 		`"problems":[{"code":"permission_denied","path":"/var/lib/rpm","detail":"permission denied"}]}`, string(b))
 	roundTrip(t, full)
 
-	require.Equal(t, []string{"node", "agentVersion", "bootID", "startedAt", "seq", "kind", "collectedAt", "kernelRelease", "arch"},
+	require.Equal(t, []string{"node", "agentVersion", "bootID", "instance", "startedAt", "seq", "kind", "collectedAt", "kernelRelease", "arch"},
 		keysOf(t, Report{}), "host, images and problems are omitted when empty")
 	require.Equal(t, []string{"packageDB", "binaries", "syftJSON"}, keysOf(t, Host{}))
 	require.Equal(t, []string{"name", "path", "size"}, keysOf(t, Binary{}))
@@ -80,7 +80,11 @@ func TestWire_JSONKeys(t *testing.T) {
 		Work:    []WorkRequest{{ID: "w1", Digest: "sha256:aa", Platform: "linux/amd64", Deadline: at}},
 		Config:  AgentConfig{ReportIntervalSeconds: 21600, ImageListIntervalSeconds: 300, JitterPercent: 10, MaxImageBytes: 1, MaxReportBytes: 2},
 	}
-	require.Equal(t, []string{"applied", "work", "config"}, keysOf(t, resp))
+	require.Equal(t, []string{"applied", "work", "config"}, keysOf(t, resp), "hostRetry is omitted when false")
+	retry := resp
+	retry.HostRetry = true
+	require.Equal(t, []string{"applied", "hostRetry", "work", "config"}, keysOf(t, retry))
+	roundTrip(t, retry)
 	require.Equal(t, []string{"id", "digest", "platform", "deadline"}, keysOf(t, resp.Work[0]))
 	require.Equal(t, []string{"reportIntervalSeconds", "imageListIntervalSeconds", "jitterPercent", "maxImageBytes", "maxReportBytes"},
 		keysOf(t, resp.Config))
