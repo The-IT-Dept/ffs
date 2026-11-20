@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"context"
+	"maps"
 	"slices"
 
 	openapi_types "github.com/oapi-codegen/runtime/types"
@@ -107,24 +108,36 @@ func (s *Server) advisorySeverities(ctx context.Context, adv model.Advisory) ([]
 }
 
 // advisoryPackages lists the package versions the advisory's open findings are on, with the fixed
-// versions its open and excepted findings name.
+// versions its open and excepted findings name. It reads every one of those findings: they come in
+// priority order, so a single page would drop the fixed versions of lower-priority packages.
 func (s *Server) advisoryPackages(ctx context.Context, id string) ([]apigen.AdvisoryPackage, error) {
 	groups, err := s.o.Store.FindingGroups(ctx, store.FindingQuery{Advisory: id, Limit: maxLimit}, store.GroupPackage)
 	if err != nil {
 		return nil, err
 	}
-	page, err := s.o.Store.FindingsPage(ctx, store.FindingQuery{Advisory: id,
-		States: []model.FindingState{model.StateOpen, model.StateExcepted}, Limit: maxLimit})
-	if err != nil {
-		return nil, err
-	}
 	type pkgKey struct{ ecosystem, name, installed string }
-	fixed := map[pkgKey][]string{}
-	for _, f := range page.Rows {
-		for _, p := range f.Packages {
-			k := pkgKey{p.Ecosystem, p.Name, p.Installed}
-			fixed[k] = append(fixed[k], p.Fixed...)
+	fixed := map[pkgKey]map[string]bool{}
+	q := store.FindingQuery{Advisory: id, States: []model.FindingState{model.StateOpen, model.StateExcepted}, Limit: maxLimit}
+	for {
+		page, err := s.o.Store.FindingsPage(ctx, q)
+		if err != nil {
+			return nil, err
 		}
+		for _, f := range page.Rows {
+			for _, p := range f.Packages {
+				k := pkgKey{p.Ecosystem, p.Name, p.Installed}
+				for _, v := range p.Fixed {
+					if fixed[k] == nil {
+						fixed[k] = map[string]bool{}
+					}
+					fixed[k][v] = true
+				}
+			}
+		}
+		if page.Next == "" {
+			break
+		}
+		q.After = page.Next
 	}
 	out := make([]apigen.AdvisoryPackage, 0, len(groups.Rows))
 	for _, r := range groups.Rows {
@@ -132,10 +145,8 @@ func (s *Server) advisoryPackages(ctx context.Context, id string) ([]apigen.Advi
 		if !ok {
 			continue
 		}
-		fx := slices.Clone(fixed[pkgKey{eco, name, version}])
-		slices.Sort(fx)
-		out = append(out, apigen.AdvisoryPackage{Name: name, Ecosystem: eco, Installed: version, Fixed: nz(slices.Compact(fx)),
-			Findings: r.Findings})
+		fx := slices.Sorted(maps.Keys(fixed[pkgKey{eco, name, version}]))
+		out = append(out, apigen.AdvisoryPackage{Name: name, Ecosystem: eco, Installed: version, Fixed: nz(fx), Findings: r.Findings})
 	}
 	return out, nil
 }
