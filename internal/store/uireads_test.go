@@ -166,6 +166,10 @@ func TestBestFixes_MostUrgentThenHigh(t *testing.T) {
 	none, err := s.BestFixes(ctx, nil)
 	require.NoError(t, err)
 	require.Empty(t, none)
+
+	// the aggregate reads only findings_fix: no row read and no JSON decoded per finding
+	requireIndexOnly(t, s, "findings_fix", stmt{query: bestFixesQuery, args: []any{idList(keysOf(exWeb, exAPI, exWorker, exBackup))}},
+		"best fixes")
 }
 
 func TestCoverage_ScopesAndImages(t *testing.T) {

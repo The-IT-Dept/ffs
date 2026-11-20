@@ -510,44 +510,48 @@ func TestFindingFacets_ExcludeOwnSelection(t *testing.T) {
 	require.True(t, slices.IsSortedFunc(nsVals, func(a, b FacetValue) int { return b.Count - a.Count }))
 }
 
+// requireIndexOnly asserts that st reads findings only through index: its plan names the index,
+// and its EXPLAIN bytecode has no Column read on a cursor opened on the findings table's root page
+// and no json_extract call.
+func requireIndexOnly(t *testing.T, s *Store, index string, st stmt, name string) {
+	t.Helper()
+	var root int64
+	require.NoError(t, s.rdb.QueryRowContext(ctx, `SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'findings'`).Scan(&root))
+	require.Contains(t, queryPlan(t, s, st.query, st.args...), "INDEX "+index, name)
+	rows, err := s.rdb.QueryContext(ctx, `EXPLAIN `+st.query, st.args...)
+	require.NoError(t, err)
+	defer func() { _ = rows.Close() }()
+	type op struct {
+		opcode string
+		p1, p2 int64
+		p4     string
+	}
+	var ops []op
+	for rows.Next() {
+		var (
+			addr, p1, p2, p3 int64
+			opcode           string
+			p4, p5, comment  any
+		)
+		require.NoError(t, rows.Scan(&addr, &opcode, &p1, &p2, &p3, &p4, &p5, &comment))
+		ops = append(ops, op{opcode, p1, p2, fmt.Sprint(p4)})
+	}
+	require.NoError(t, rows.Err())
+	tables := map[int64]bool{}
+	for _, o := range ops {
+		if o.opcode == "OpenRead" && o.p2 == root {
+			tables[o.p1] = true
+		}
+	}
+	for _, o := range ops {
+		require.False(t, o.opcode == "Column" && tables[o.p1], "%s reads a findings column: %s", name, st.query)
+		require.NotContains(t, o.p4, "json_extract", name)
+	}
+}
+
 func TestFindingFacets_UseCoveringIndex(t *testing.T) {
 	s := newStore(t)
 	seedFindingsExplorer(t, s)
-	var root int64
-	require.NoError(t, s.rdb.QueryRowContext(ctx, `SELECT rootpage FROM sqlite_schema WHERE type = 'table' AND name = 'findings'`).Scan(&root))
-	requireIndexOnly := func(st stmt, name string) {
-		t.Helper()
-		require.Contains(t, queryPlan(t, s, st.query, st.args...), "INDEX findings_explore", name)
-		rows, err := s.rdb.QueryContext(ctx, `EXPLAIN `+st.query, st.args...)
-		require.NoError(t, err)
-		defer func() { _ = rows.Close() }()
-		type op struct {
-			opcode string
-			p1, p2 int64
-			p4     string
-		}
-		var ops []op
-		for rows.Next() {
-			var (
-				addr, p1, p2, p3 int64
-				opcode           string
-				p4, p5, comment  any
-			)
-			require.NoError(t, rows.Scan(&addr, &opcode, &p1, &p2, &p3, &p4, &p5, &comment))
-			ops = append(ops, op{opcode, p1, p2, fmt.Sprint(p4)})
-		}
-		require.NoError(t, rows.Err())
-		tables := map[int64]bool{}
-		for _, o := range ops {
-			if o.opcode == "OpenRead" && o.p2 == root {
-				tables[o.p1] = true
-			}
-		}
-		for _, o := range ops {
-			require.False(t, o.opcode == "Column" && tables[o.p1], "%s reads a findings column: %s", name, st.query)
-			require.NotContains(t, o.p4, "json_extract", name)
-		}
-	}
 	web := model.Scope{Kind: model.ScopeWorkload, Value: "Deployment/shop/web"}
 	for name, q := range map[string]FindingQuery{
 		"default": {},
@@ -561,7 +565,7 @@ func TestFindingFacets_UseCoveringIndex(t *testing.T) {
 		cnt, err := findingCountStmt(q)
 		require.NoError(t, err)
 		require.True(t, cnt.indexOnly, name)
-		requireIndexOnly(cnt, name+" count")
+		requireIndexOnly(t, s, "findings_explore", cnt, name+" count")
 		var notIndexOnly []string
 		for _, f := range []FindingFacet{FacetState, FacetPriority, FacetFix, FacetSignal, FacetEcosystem, FacetNamespace, FacetKind} {
 			stmts, err := findingFacetStmts(q, f)
@@ -571,7 +575,7 @@ func TestFindingFacets_UseCoveringIndex(t *testing.T) {
 					notIndexOnly = append(notIndexOnly, string(f)+": "+st.query)
 					continue
 				}
-				requireIndexOnly(st, name+" "+string(f))
+				requireIndexOnly(t, s, "findings_explore", st, name+" "+string(f))
 			}
 		}
 		require.Len(t, notIndexOnly, 1, name)

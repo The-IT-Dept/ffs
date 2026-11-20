@@ -117,6 +117,16 @@ type FixSummary struct {
 	Sample   model.Finding
 }
 
+// bestFixesQuery groups the open findings of the owners in the JSON key list by fix action and
+// picks each owner's best group. It reads only the findings_fix index: a fix_key other than none
+// and wontfix is an upgrade or a rebuild or package action, which Build sets only with a fixed
+// version, so it needs no fix_class test (fix_class is not in the index and reads the row).
+const bestFixesQuery = `WITH g AS (SELECT owner_key, fix_key, sum(priority = 4) AS u, sum(priority = 3) AS h, sum(priority = 2) AS m,
+		sum(priority = 1) AS l, count(*) AS n FROM findings WHERE state = 'open' AND owner_key IN (SELECT value FROM json_each(?))
+		AND fix_key NOT IN ('none', 'wontfix') GROUP BY owner_key, fix_key),
+	r AS (SELECT *, row_number() OVER (PARTITION BY owner_key ORDER BY u DESC, h DESC, n DESC, fix_key) AS rn FROM g)
+	SELECT owner_key, fix_key, u, h, m, l, n FROM r WHERE rn = 1`
+
 // BestFixes returns, per owner of keys, the fix clearing the most urgent, then high, then open
 // findings, ties by key, among open findings with an upgrade or a fixed version. Owners with no
 // such finding are absent.
@@ -134,11 +144,7 @@ func (s *Store) BestFixes(ctx context.Context, keys []string) (map[string]FixSum
 		f := &p.fix
 		err := r.Scan(&p.owner, &f.Key, &f.Clears.Urgent, &f.Clears.High, &f.Clears.Medium, &f.Clears.Low, &f.Findings)
 		return p, err
-	}, `WITH g AS (SELECT owner_key, fix_key, sum(priority = 4) AS u, sum(priority = 3) AS h, sum(priority = 2) AS m, sum(priority = 1) AS l,
-			count(*) AS n FROM findings WHERE state = 'open' AND owner_key IN (SELECT value FROM json_each(?))
-			AND fix_class IN ('upgrade', 'fixed') AND fix_key NOT IN ('none', 'wontfix') GROUP BY owner_key, fix_key),
-		r AS (SELECT *, row_number() OVER (PARTITION BY owner_key ORDER BY u DESC, h DESC, n DESC, fix_key) AS rn FROM g)
-		SELECT owner_key, fix_key, u, h, m, l, n FROM r WHERE rn = 1`, idList(keys))
+	}, bestFixesQuery, idList(keys))
 	if err != nil {
 		return nil, fmt.Errorf("store: best fixes: %w", err)
 	}
