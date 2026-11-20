@@ -121,16 +121,60 @@ func trimStatuses(ss []corev1.ContainerStatus) []corev1.ContainerStatus {
 	return out
 }
 
+// trimTemplate keeps a template's labels and annotations, its trimmed pod spec, and the scheduling
+// constraints on the node platform (see trimPlatformPins), which pick the platform a workload that is
+// not running is resolved at.
 func trimTemplate(t corev1.PodTemplateSpec) corev1.PodTemplateSpec {
 	m := trimMeta(t.ObjectMeta)
+	spec := trimPodSpec(t.Spec)
+	spec.NodeSelector, spec.Affinity = trimPlatformPins(t.Spec)
 	return corev1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{Labels: m.Labels, Annotations: m.Annotations},
-		Spec:       trimPodSpec(t.Spec),
+		Spec:       spec,
 	}
 }
 
+// platformLabels are the node labels a pod spec can pin its platform with.
+var platformLabels = []string{corev1.LabelArchStable, corev1.LabelOSStable}
+
+// trimPlatformPins returns the part of s's nodeSelector, and of its required node affinity, on the
+// kubernetes.io/arch and kubernetes.io/os labels; nil for each when there is none. Affinity terms keep
+// their place, emptied of other expressions, so a term that does not constrain the platform still
+// lets it be anything.
+func trimPlatformPins(s corev1.PodSpec) (map[string]string, *corev1.Affinity) {
+	var sel map[string]string
+	for _, k := range platformLabels {
+		if v, ok := s.NodeSelector[k]; ok {
+			if sel == nil {
+				sel = map[string]string{}
+			}
+			sel[k] = v
+		}
+	}
+	if s.Affinity == nil || s.Affinity.NodeAffinity == nil || s.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		return sel, nil
+	}
+	pinned := false
+	terms := s.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms
+	out := make([]corev1.NodeSelectorTerm, len(terms))
+	for i, term := range terms {
+		for _, e := range term.MatchExpressions {
+			if slices.Contains(platformLabels, e.Key) {
+				out[i].MatchExpressions = append(out[i].MatchExpressions,
+					corev1.NodeSelectorRequirement{Key: e.Key, Operator: e.Operator, Values: slices.Clone(e.Values)})
+				pinned = true
+			}
+		}
+	}
+	if !pinned {
+		return sel, nil
+	}
+	return sel, &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+		RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: out}}}
+}
+
 // transformWorkload keeps metadata, the trimmed pod template, the scale and suspend fields, and
-// status replicas, desiredNumberScheduled and active.
+// status replicas, desiredNumberScheduled and active, and a Job's Complete and Failed conditions.
 func transformWorkload(in any) (any, error) {
 	switch w := in.(type) {
 	case *appsv1.Deployment:
@@ -146,9 +190,15 @@ func transformWorkload(in any) (any, error) {
 			Spec:   appsv1.DaemonSetSpec{Template: trimTemplate(w.Spec.Template)},
 			Status: appsv1.DaemonSetStatus{DesiredNumberScheduled: w.Status.DesiredNumberScheduled}}, nil
 	case *batchv1.Job:
+		var conds []batchv1.JobCondition
+		for _, c := range w.Status.Conditions {
+			if c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed {
+				conds = append(conds, batchv1.JobCondition{Type: c.Type, Status: c.Status})
+			}
+		}
 		return &batchv1.Job{TypeMeta: w.TypeMeta, ObjectMeta: trimMeta(w.ObjectMeta),
 			Spec:   batchv1.JobSpec{Suspend: w.Spec.Suspend, Template: trimTemplate(w.Spec.Template)},
-			Status: batchv1.JobStatus{Active: w.Status.Active}}, nil
+			Status: batchv1.JobStatus{Active: w.Status.Active, Conditions: conds}}, nil
 	case *batchv1.CronJob:
 		return &batchv1.CronJob{TypeMeta: w.TypeMeta, ObjectMeta: trimMeta(w.ObjectMeta),
 			Spec: batchv1.CronJobSpec{Suspend: w.Spec.Suspend, JobTemplate: batchv1.JobTemplateSpec{

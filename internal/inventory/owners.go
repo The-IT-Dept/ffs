@@ -108,7 +108,18 @@ func (inv *Inventory) workloadOwner(ctx context.Context, kind, ns, name string) 
 type workload struct {
 	meta metav1.Object
 	tmpl *corev1.PodTemplateSpec
-	idle bool // scaled to zero, a CronJob, a suspended Job, or a DaemonSet scheduled nowhere
+	idle bool // scaled to zero, a CronJob, a suspended or finished Job, or a DaemonSet scheduled nowhere
+}
+
+// jobFinished reports whether j has completed or failed for good. With its pods gone (deleted by a TTL
+// or by hand) it runs nothing until it is deleted.
+func jobFinished(j *batchv1.Job) bool {
+	for _, c := range j.Status.Conditions {
+		if (c.Type == batchv1.JobComplete || c.Type == batchv1.JobFailed) && c.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
 }
 
 func (inv *Inventory) getWorkload(ctx context.Context, kind, ns, name string) (*workload, error) {
@@ -128,7 +139,9 @@ func (inv *Inventory) getWorkload(ctx context.Context, kind, ns, name string) (*
 		obj, read = d, func() workload { return workload{d, &d.Spec.Template, d.Status.DesiredNumberScheduled == 0} }
 	case "Job":
 		j := &batchv1.Job{}
-		obj, read = j, func() workload { return workload{j, &j.Spec.Template, ptr.Deref(j.Spec.Suspend, false)} }
+		obj, read = j, func() workload {
+			return workload{j, &j.Spec.Template, ptr.Deref(j.Spec.Suspend, false) || jobFinished(j)}
+		}
 	case "CronJob":
 		c := &batchv1.CronJob{}
 		obj, read = c, func() workload { return workload{c, &c.Spec.JobTemplate.Spec.Template, true} }

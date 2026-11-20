@@ -43,7 +43,7 @@ func (r *Resolver) serviceAccountPower(ctx context.Context, ns, sa string) ([]st
 	}
 	for i := range crbs.Items {
 		b := &crbs.Items[i]
-		if !appliesTo(b.Subjects, ns, sa) {
+		if !appliesTo(b.Subjects, "", ns, sa) {
 			continue
 		}
 		rules, admin, err := r.rulesOf(ctx, "", b.RoleRef)
@@ -61,7 +61,7 @@ func (r *Resolver) serviceAccountPower(ctx context.Context, ns, sa string) ([]st
 	}
 	for i := range rbs.Items {
 		b := &rbs.Items[i]
-		if !appliesTo(b.Subjects, ns, sa) {
+		if !appliesTo(b.Subjects, b.Namespace, ns, sa) {
 			continue
 		}
 		rules, admin, err := r.rulesOf(ctx, ns, b.RoleRef)
@@ -84,12 +84,23 @@ func (r *Resolver) serviceAccountPower(ctx context.Context, ns, sa string) ([]st
 	return out, nil
 }
 
-// appliesTo reports whether any subject is the service account or a group it belongs to.
-func appliesTo(subjects []rbacv1.Subject, ns, sa string) bool {
+// appliesTo reports whether any subject of a binding in bindingNS ("" for a ClusterRoleBinding) is the
+// service account sa in ns, as the API server's authorizer matches subjects (appliesToUser in
+// k8s.io/kubernetes rbac/validation): a ServiceAccount subject, whose namespace defaults to the
+// binding's; the User system:serviceaccount:<ns>:<sa>; or a group the service account belongs to.
+func appliesTo(subjects []rbacv1.Subject, bindingNS, ns, sa string) bool {
 	for _, s := range subjects {
 		switch s.Kind {
 		case rbacv1.ServiceAccountKind:
-			if s.Name == sa && s.Namespace == ns {
+			saNS := s.Namespace
+			if saNS == "" {
+				saNS = bindingNS
+			}
+			if saNS != "" && saNS == ns && s.Name == sa {
+				return true
+			}
+		case rbacv1.UserKind:
+			if s.Name == "system:serviceaccount:"+ns+":"+sa {
 				return true
 			}
 		case rbacv1.GroupKind:

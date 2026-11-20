@@ -5,6 +5,7 @@ import (
 	"slices"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
@@ -150,4 +151,54 @@ func TestRegister_ReferenceGrantsNeedAccess(t *testing.T) {
 	_, grants = r.readKinds()
 	require.Len(t, grants, 1)
 	require.Equal(t, []string{"HTTPRoute/v1"}, routeVersions(r), "a kind is set up once")
+}
+
+// lockedMapper is a REST mapper whose served kinds may change while discovery reads it.
+type lockedMapper struct {
+	meta.RESTMapper // only RESTMapping is used
+	mu              sync.Mutex
+	m               *meta.DefaultRESTMapper
+}
+
+func (l *lockedMapper) add(gvk schema.GroupVersionKind) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.m.Add(gvk, meta.RESTScopeNamespace)
+}
+
+func (l *lockedMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*meta.RESTMapping, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.m.RESTMapping(gk, versions...)
+}
+
+// TestRediscover_LateGatewayKinds (F83): Gateway API kinds installed after ffs started are found by
+// the periodic discovery and get their change handlers without a restart.
+func TestRediscover_LateGatewayKinds(t *testing.T) {
+	s := testScheme(t, true)
+	fi := &informertest.FakeInformers{Scheme: s}
+	lm := &lockedMapper{m: servedMapper()}
+	var ch changes
+	r := New(nil, config.ExposureConfig{})
+	d := discovery{cache: fi, mapper: lm, reader: newClient(t, s), onChange: ch.on}
+	require.NoError(t, r.register(context.Background(), d))
+	require.Empty(t, routeVersions(r), "no Gateway API at start")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.rediscover(ctx, d, 10*time.Millisecond)
+	}()
+	lm.add(gwKind("v1", "Gateway"))
+	lm.add(gwKind("v1", "HTTPRoute"))
+	require.Eventually(t, func() bool { return slices.Equal(routeVersions(r), []string{"HTTPRoute/v1"}) }, 5*time.Second,
+		5*time.Millisecond)
+	cancel()
+	<-done
+
+	informer(t, fi, &gatewayv1.HTTPRoute{}).Add(crossRoute(parent("public", "edge")))
+	require.Equal(t, []string{"edge", "netbox"}, ch.take())
+	informer(t, fi, &gatewayv1.Gateway{}).Add(gw("public", "edge", "cilium"))
+	require.Equal(t, []string{""}, ch.take())
 }

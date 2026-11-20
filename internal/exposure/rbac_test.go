@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -106,5 +107,38 @@ func TestServiceAccountPower_DefaultName(t *testing.T) {
 	got, err := New(c, config.ExposureConfig{}).Context(context.Background(), w)
 	if err != nil || !got.PowerfulSA {
 		t.Fatalf("got %+v, err %v", got, err)
+	}
+}
+
+// TestServiceAccountPower_SubjectForms (F78): subjects match the service account as the API server's
+// authorizer matches them: a RoleBinding's ServiceAccount subject without a namespace is in the
+// binding's namespace (a ClusterRoleBinding's is no one), and the User system:serviceaccount:<ns>:<sa>
+// is the service account.
+func TestServiceAccountPower_SubjectForms(t *testing.T) {
+	pods := clusterRole("r", rule([]string{"create"}, []string{""}, []string{"pods"}))
+	noNS := saSubject("", "web")
+	user := func(name string) rbacv1.Subject { return rbacv1.Subject{Kind: rbacv1.UserKind, Name: name} }
+	for _, tc := range []struct {
+		name string
+		objs []client.Object
+		want []string
+	}{
+		{"RB ServiceAccount without namespace", append(rb("r", noNS), pods), []string{"service account can create pods in namespace apps"}},
+		{"RB ServiceAccount without namespace, other name", append(rb("r", saSubject("", "other")), pods), nil},
+		{"CRB ServiceAccount without namespace", append(crb("r", noNS), pods), nil},
+		{"CRB User form", append(crb("r", user("system:serviceaccount:apps:web")), pods), []string{"service account can create pods"}},
+		{"RB User form", append(rb("r", user("system:serviceaccount:apps:web")), pods), []string{"service account can create pods in namespace apps"}},
+		{"User form, other namespace", append(crb("r", user("system:serviceaccount:other:web")), pods), nil},
+		{"User form, other name", append(crb("r", user("system:serviceaccount:apps:other")), pods), nil},
+		{"plain User", append(crb("r", user("web")), pods), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := fake.NewClientBuilder().WithScheme(testScheme(t, false)).WithObjects(tc.objs...).Build()
+			w := workload()
+			w.Ref.Namespace, w.ServiceAccount = "apps", "web"
+			got, err := New(c, config.ExposureConfig{}).Context(context.Background(), w)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got.SAReasons)
+		})
 	}
 }

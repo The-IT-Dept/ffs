@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/google/go-containerregistry/pkg/authn"
 	kauth "github.com/google/go-containerregistry/pkg/authn/kubernetes"
 	corev1 "k8s.io/api/core/v1"
@@ -70,21 +71,38 @@ func (c *Client) keychain(ctx context.Context, cs CredSet) (authn.Keychain, erro
 }
 
 // operatorKeychain reads the operator-level dockerconfigjson secret. A configured but missing secret
-// contributes nothing, the same as a missing pod pull secret.
+// contributes nothing, the same as a missing pod pull secret, and is logged when it is first found
+// missing (again after it has been seen to exist).
 func (c *Client) operatorKeychain(ctx context.Context) (authn.Keychain, error) {
 	what := fmt.Sprintf("reading operator secret %s/%s", c.namespace, c.cfg.OperatorSecret)
 	s, err := c.kube.CoreV1().Secrets(c.namespace).Get(ctx, c.cfg.OperatorSecret, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
+		c.operatorSecretSeen(ctx, false)
 		return nil, nil
 	}
 	if err != nil {
 		return nil, secretError(what, err)
 	}
+	c.operatorSecretSeen(ctx, true)
 	kc, err := kauth.NewFromPullSecrets(ctx, []corev1.Secret{*s})
 	if err != nil {
 		return nil, secretError(what, err)
 	}
 	return kc, nil
+}
+
+// operatorSecretSeen records whether the configured operator secret exists, and logs the change to
+// missing. Only the reference configured in registry.operatorSecret is logged, never anything read
+// from a secret.
+func (c *Client) operatorSecretSeen(ctx context.Context, exists bool) {
+	c.mu.Lock()
+	logIt := !exists && !c.operatorMissing
+	c.operatorMissing = !exists
+	c.mu.Unlock()
+	if logIt {
+		logr.FromContextOrDiscard(ctx).WithName("registry").Info("the configured operator registry secret does not exist; "+
+			"registries are accessed without it", "secret", c.namespace+"/"+c.cfg.OperatorSecret)
+	}
 }
 
 // secretError keeps Kubernetes API and network errors (forbidden, timeouts) for diagnosis. Anything

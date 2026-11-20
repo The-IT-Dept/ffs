@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -101,14 +102,43 @@ type discovery struct {
 	onChange func(namespace string)
 }
 
+// rediscoverEvery is how often the served Gateway API kinds are checked again, so kinds installed
+// after ffs started get change handlers without a restart.
+const rediscoverEvery = 5 * time.Minute
+
 // Register adds change handlers to the informers the resolver reads. A change queues the owners of
 // the object's namespace through onChange; cluster-scoped objects (IngressClass, Gateway,
 // GatewayClass, ClusterRole, ClusterRoleBinding) queue "" (every owner), and a route also queues the
-// namespaces of its backend Services. Gateway API kinds the cluster does not serve are skipped.
-// ReferenceGrants are read only when ffs is allowed to list them.
+// namespaces of its backend Services. Gateway API kinds the cluster does not serve are skipped, and
+// checked for again every rediscoverEvery while the manager runs; a kind found later gets its handlers
+// then, and its existing objects queue their owners as they enter the cache. ReferenceGrants are read
+// only when ffs is allowed to list them.
 func (r *Resolver) Register(ctx context.Context, mgr manager.Manager, onChange func(namespace string)) error {
-	return r.register(ctx, discovery{cache: mgr.GetCache(), mapper: mgr.GetRESTMapper(), reader: mgr.GetAPIReader(),
-		onChange: onChange})
+	d := discovery{cache: mgr.GetCache(), mapper: mgr.GetRESTMapper(), reader: mgr.GetAPIReader(), onChange: onChange}
+	if err := r.register(ctx, d); err != nil {
+		return err
+	}
+	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+		r.rediscover(ctx, d, rediscoverEvery)
+		return nil
+	}))
+}
+
+// rediscover runs discover every interval until ctx is done; a failure is logged and retried at the
+// next interval.
+func (r *Resolver) rediscover(ctx context.Context, d discovery, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.discover(ctx, d); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("exposure").Error(err, "checking for Gateway API kinds installed since start failed")
+			}
+		}
+	}
 }
 
 func (r *Resolver) register(ctx context.Context, d discovery) error {

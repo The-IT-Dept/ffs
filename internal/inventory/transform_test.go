@@ -119,6 +119,49 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		require.Len(t, got.Spec.Template.Spec.Volumes, 2)
 		require.Equal(t, appsv1.DeploymentStatus{Replicas: 2}, got.Status)
 
+		// A template keeps only its platform pins of the scheduling constraints (F84).
+		pinned := d.DeepCopy()
+		pinned.Spec.Template.Spec.NodeSelector = map[string]string{corev1.LabelArchStable: "arm64", "pool": "general"}
+		pinned.Spec.Template.Spec.Tolerations = []corev1.Toleration{{Operator: corev1.TolerationOpExists}}
+		pinned.Spec.Template.Spec.Affinity = &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{MatchExpressions: []corev1.NodeSelectorRequirement{
+						{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}},
+						{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}},
+					}},
+					{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"b"}}}},
+				}}},
+			PodAntiAffinity: &corev1.PodAntiAffinity{},
+		}
+		out, err = transformWorkload(pinned)
+		require.NoError(t, err)
+		spec := out.(*appsv1.Deployment).Spec.Template.Spec
+		require.Equal(t, map[string]string{corev1.LabelArchStable: "arm64"}, spec.NodeSelector)
+		require.Nil(t, spec.Tolerations)
+		require.Equal(t, &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+			NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: corev1.LabelOSStable, Operator: corev1.NodeSelectorOpIn, Values: []string{"linux"}}}},
+				{},
+			}}}}, spec.Affinity)
+		unpinned := d.DeepCopy()
+		unpinned.Spec.Template.Spec.Affinity = &corev1.Affinity{NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{NodeSelectorTerms: []corev1.NodeSelectorTerm{
+				{MatchExpressions: []corev1.NodeSelectorRequirement{{Key: "zone", Operator: corev1.NodeSelectorOpIn, Values: []string{"a"}}}}}}}}
+		out, err = transformWorkload(unpinned)
+		require.NoError(t, err)
+		require.Nil(t, out.(*appsv1.Deployment).Spec.Template.Spec.Affinity, "no platform pin, no affinity kept")
+
+		// A Job keeps its Complete and Failed conditions, type and status only (F77).
+		job := &batchv1.Job{Status: batchv1.JobStatus{Active: 1, Succeeded: 2, Conditions: []batchv1.JobCondition{
+			{Type: batchv1.JobSuspended, Status: corev1.ConditionFalse},
+			{Type: batchv1.JobComplete, Status: corev1.ConditionTrue, Reason: "Done", Message: "finished"},
+		}}}
+		out, err = transformWorkload(job)
+		require.NoError(t, err)
+		require.Equal(t, batchv1.JobStatus{Active: 1, Conditions: []batchv1.JobCondition{{Type: batchv1.JobComplete,
+			Status: corev1.ConditionTrue}}}, out.(*batchv1.Job).Status)
+
 		cj := &batchv1.CronJob{Spec: batchv1.CronJobSpec{Schedule: "@daily", JobTemplate: batchv1.JobTemplateSpec{
 			Spec: batchv1.JobSpec{Template: corev1.PodTemplateSpec{Spec: in.Spec}}}}}
 		out, err = transformWorkload(cj)

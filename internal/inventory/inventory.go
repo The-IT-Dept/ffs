@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"sync"
@@ -222,7 +223,7 @@ func (inv *Inventory) NeedLeaderElection() bool { return true }
 // (refreshTemplates); every VersionPoll it re-reads the control-plane version; every RetryPoll it
 // flushes the owners of images whose quarantine has ended, which hands those images back to the
 // acquirer or the normaliser, and the owners of images catalogued from a node agent's SBOM, which
-// asks the registry to supersede them.
+// asks the registry to supersede them, and forgets the hand-offs of images no owner uses any more.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -260,6 +261,9 @@ func (inv *Inventory) Start(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-retries.C:
+			if err := inv.pruneHandedOff(ctx); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "listing the images in use")
+			}
 			keys, err := inv.o.Store.OwnersOfExpiredQuarantine(ctx, inv.now())
 			if err != nil {
 				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images due a retry")
@@ -279,6 +283,29 @@ func (inv *Inventory) Start(ctx context.Context) error {
 			inv.batch.Add(clusterKey)
 		}
 	}
+}
+
+// pruneHandedOff forgets the digests handed to the acquirer, or asked to be superseded, that no owner
+// uses any more: an image whose workloads left the cluster is not held in memory for the life of the
+// process. If an owner uses it again, it is handed off again as any new image would be.
+func (inv *Inventory) pruneHandedOff(ctx context.Context) error {
+	inv.flushMu.Lock()
+	defer inv.flushMu.Unlock()
+	if len(inv.enqueued) == 0 && len(inv.superseded) == 0 {
+		return nil
+	}
+	inUse, err := inv.o.Store.DigestsInUse(ctx)
+	if err != nil {
+		return err
+	}
+	used := make(map[string]bool, len(inUse))
+	for _, d := range inUse {
+		used[d] = true
+	}
+	for _, m := range []map[string]time.Time{inv.enqueued, inv.superseded} {
+		maps.DeleteFunc(m, func(d string, _ time.Time) bool { return !used[d] })
+	}
+	return nil
 }
 
 // refreshTemplates flushes the template-backed owners now, looking every recorded tag up again however
@@ -365,7 +392,7 @@ type flushState struct {
 	now      time.Time
 	nodes    map[string]model.Node
 	nodeList []model.Node // sorted by name
-	platform NodePlatform // majority Ready-node platform, for owners with no running pods
+	platform NodePlatform // majority Ready-node platform, for owners with no running pods and no platform pins
 	reqs     []sbom.Request
 	changed  []string
 }
@@ -609,13 +636,14 @@ func (inv *Inventory) flushOwner(ctx context.Context, f *flushState, key string)
 	running := len(archs) > 0
 	fromTemplate := !running && tmpl != nil
 	if fromTemplate {
-		if uses, err = inv.templateUses(ctx, tmpl, ns, f.platform, prev); err != nil {
+		platform := templatePlatform(&tmpl.Spec, f.nodeList, f.platform)
+		if uses, err = inv.templateUses(ctx, tmpl, ns, platform, prev); err != nil {
 			if uses == nil {
 				return err
 			}
 			pending = append(pending, err)
 		}
-		archs[f.platform.Arch] = true
+		archs[platform.Arch] = true
 	}
 	for _, u := range uses {
 		if err := inv.recordImage(ctx, f, u); err != nil {

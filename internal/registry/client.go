@@ -64,6 +64,8 @@ type Client struct {
 
 	mu        sync.Mutex
 	keychains map[string]cachedKeychain
+	// operatorMissing is set while the configured operator secret was last read as missing.
+	operatorMissing bool
 }
 
 // platformKey identifies an index's platform pick; the index digest pins its content.
