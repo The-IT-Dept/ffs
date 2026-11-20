@@ -1,5 +1,7 @@
 {{define "content"}}
 <h2>Excepted findings</h2>
+<p>{{plural .Total "excepted finding" "excepted findings"}}{{if .Findings}}; showing {{.First}}–{{.Last}}{{end}}.</p>
+{{if or .HasPrev .HasNext}}<p>{{if .HasPrev}}<a href="/excepted?offset={{.Prev}}">Previous</a>{{end}}{{if and .HasPrev .HasNext}} · {{end}}{{if .HasNext}}<a href="/excepted?offset={{.Next}}">Next</a>{{end}}</p>{{end}}
 <table>
 <thead><tr><th>Advisory</th><th>Owner</th><th>Excepted by</th><th>Published / seen / matched</th></tr></thead>
 <tbody>

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -357,13 +358,36 @@ func (d *Dashboard) node(w http.ResponseWriter, r *http.Request) {
 	d.render(w, r, http.StatusOK, "node", "Node "+n.Name, n)
 }
 
+// exceptedPageSize is how many excepted findings one Excepted page lists.
+const exceptedPageSize = 500
+
+// exceptedPage is one page of the excepted findings, with their total, and every Exception.
 type exceptedPage struct {
 	Findings   []api.FindingView
 	Exceptions []api.ExceptionView
+	Total      int
+	Offset     int
 }
 
+// First and Last number the page's findings from 1.
+func (p exceptedPage) First() int { return p.Offset + 1 }
+func (p exceptedPage) Last() int  { return p.Offset + len(p.Findings) }
+
+// Prev and Next are the offsets of the neighbouring pages; HasPrev and HasNext say they exist.
+func (p exceptedPage) HasPrev() bool { return p.Offset > 0 }
+func (p exceptedPage) Prev() int     { return max(p.Offset-exceptedPageSize, 0) }
+func (p exceptedPage) HasNext() bool { return p.Last() < p.Total }
+func (p exceptedPage) Next() int     { return p.Offset + exceptedPageSize }
+
+// excepted is the audit view of silenced findings. It pages through them with their total, so a
+// large cluster's list is never cut short without saying so.
 func (d *Dashboard) excepted(w http.ResponseWriter, r *http.Request) {
-	pg, err := d.svc.Findings(r.Context(), api.FindingQuery{States: []model.FindingState{model.StateExcepted}, Limit: 1000})
+	offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	pg, err := d.svc.Findings(r.Context(), api.FindingQuery{States: []model.FindingState{model.StateExcepted},
+		Limit: exceptedPageSize, Offset: offset})
 	if err != nil {
 		d.fail(w, r, err)
 		return
@@ -373,7 +397,7 @@ func (d *Dashboard) excepted(w http.ResponseWriter, r *http.Request) {
 		d.fail(w, r, err)
 		return
 	}
-	d.render(w, r, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es})
+	d.render(w, r, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es, Total: pg.Total, Offset: offset})
 }
 
 type feedsPage struct {

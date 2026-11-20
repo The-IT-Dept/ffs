@@ -1,6 +1,7 @@
 package dashboard_test
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -331,4 +332,40 @@ func TestDashboard_FindingTimes(t *testing.T) {
 	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0002", Published: webtest.Now.Add(-48 * time.Hour)}))
 	contains(t, get(t, srv, "/vulnerabilities/CVE-2026-0002", 200), "Published 2026-11-17 00:00 UTC; first seen by ffs 2026-11-19 00:00 UTC.")
 	contains(t, get(t, srv, "/", 200), "Published / seen / matched", "Matched 2026-11-19 00:00 UTC")
+}
+
+// TestDashboard_ExceptedPagesWithTotal is the regression test for F49: the Excepted page read one
+// page of 1,000 findings with no total and no paging, so it truncated silently.
+func TestDashboard_ExceptedPagesWithTotal(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	ref := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "batch"}
+	var fs []model.Finding
+	for i := range 1203 {
+		adv := fmt.Sprintf("CVE-2025-%05d", i)
+		fs = append(fs, model.Finding{Fingerprint: model.FindingFingerprint("test", ref, "ghcr.io/example/batch", adv), Owner: ref,
+			ImageRepo: "ghcr.io/example/batch", AdvisoryID: adv, Severity: model.SeverityLow, Priority: model.PriorityLow,
+			State: model.StateExcepted, ExceptedBy: "ffs/accept-low", Matched: webtest.Now, LastSeen: webtest.Now})
+	}
+	require.NoError(t, st.ApplyFindings(t.Context(), fs, nil))
+	srv := serve(t, svc)
+
+	body := get(t, srv, "/excepted", 200)
+	contains(t, body, "1204 excepted findings; showing 1–500.", `href="/excepted?offset=500"`)
+	require.NotContains(t, body, "Previous")
+	const row = `<tr><td><a href="/vulnerabilities/`
+	require.Equal(t, 500, strings.Count(body, row))
+
+	body = get(t, srv, "/excepted?offset=1000", 200)
+	contains(t, body, "1204 excepted findings; showing 1001–1204.", `href="/excepted?offset=500"`, "Previous")
+	require.NotContains(t, body, "Next")
+	require.Equal(t, 204, strings.Count(body, row))
+
+	var all string
+	for off := 0; off < 1204; off += 500 {
+		all += get(t, srv, fmt.Sprintf("/excepted?offset=%d", off), 200)
+	}
+	for _, adv := range []string{"CVE-2025-00000", "CVE-2025-01202", "CVE-2026-0005"} {
+		require.Contains(t, all, adv, "every excepted finding is reachable")
+	}
+	contains(t, get(t, srv, "/excepted?offset=junk", 200), "showing 1–500")
 }
