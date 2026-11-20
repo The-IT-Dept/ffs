@@ -50,8 +50,6 @@ func ownerEntityDest(e *OwnerEntity) ([]any, func() error) {
 }
 
 // scanOwnerEntity reads ownerEntityCols.
-//
-//nolint:unused // the rail reads (OwnerEntities, OwnerEntityOf) call it
 func scanOwnerEntity(r scanner) (OwnerEntity, error) {
 	var e OwnerEntity
 	dest, done := ownerEntityDest(&e)
