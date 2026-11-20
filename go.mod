@@ -2,6 +2,8 @@ module github.com/the-it-dept/ffs
 
 go 1.27.0
 
+ignore ./ui
+
 require (
 	github.com/anchore/grype v0.122.1
 	github.com/anchore/stereoscope v0.4.2

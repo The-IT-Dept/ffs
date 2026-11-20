@@ -7,3 +7,9 @@ docs/research/
 *.test
 cover.out
 /.cache/
+/internal/web/ui/dist/*
+!/internal/web/ui/dist/.keep
+/ui/node_modules/
+/ui/test-results/
+/ui/playwright-report/
+/ui/e2e/screenshots/
