@@ -13,9 +13,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -30,6 +32,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/the-it-dept/ffs/api/v1alpha1"
+	"github.com/the-it-dept/ffs/internal/web"
 	"github.com/the-it-dept/ffs/test/e2e/webhookrx"
 )
 
@@ -78,6 +81,7 @@ func TestE2E(t *testing.T) {
 	}{
 		{"baseline", s.baseline},
 		{"catalogued", s.catalogued},
+		{"ui-loads", s.uiLoads},
 		{"detected", s.detected},
 		{"exposed", s.exposed},
 		{"kev-immediate", s.kevImmediate},
@@ -278,6 +282,27 @@ func (s *suite) catalogued(t *testing.T) {
 		}
 		return true, ""
 	})
+}
+
+var assetRef = regexp.MustCompile(`(?:src|href)="(/assets/[^"]+\.js)"`)
+
+// uiLoads checks the embedded web UI over the port-forward: the SPA shell for / and for a client route,
+// then one hashed asset with immutable caching.
+func (s *suite) uiLoads(t *testing.T) {
+	base := portForward(t)
+	code, hdr, body := fetch(t, base+"/")
+	require.Equal(t, http.StatusOK, code)
+	require.True(t, strings.HasPrefix(hdr.Get("Content-Type"), "text/html"), hdr.Get("Content-Type"))
+	require.Equal(t, web.CSP, hdr.Get("Content-Security-Policy"))
+	require.Contains(t, string(body), `id="root"`)
+	m := assetRef.FindSubmatch(body)
+	require.NotNil(t, m, "index.html references no /assets/*.js:\n%s", body)
+	code, hdr, _ = fetch(t, base+string(m[1]))
+	require.Equal(t, http.StatusOK, code)
+	require.Equal(t, "public, max-age=31536000, immutable", hdr.Get("Cache-Control"))
+	code, _, body = fetch(t, base+"/vulnerabilities")
+	require.Equal(t, http.StatusOK, code)
+	require.Contains(t, string(body), `id="root"`)
 }
 
 func (s *suite) detected(t *testing.T) {
