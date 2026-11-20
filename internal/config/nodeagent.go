@@ -9,6 +9,12 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 )
 
+// NodeAgentReportBudget is the most bytes of agent reports the controller reads and handles at once. SBOM
+// results have a budget of their own (64 MiB), so the agent API holds at most 256 MiB of request bodies. A
+// report takes at most the whole budget, so MaxReportBytes may not exceed it: a larger report would be read
+// beyond the budget.
+const NodeAgentReportBudget = 192 << 20
+
 // NodeAgentConfig configures the node agent and the controller's agent API. The chart sets these keys
 // from the top-level nodeAgent Helm values.
 type NodeAgentConfig struct {
@@ -62,8 +68,8 @@ func (n NodeAgentConfig) validate(bad func(format string, a ...any)) {
 	if _, _, err := net.SplitHostPort(n.Listen); err != nil {
 		bad("nodeAgent.listen: %v", err)
 	}
-	if n.MaxReportBytes < 1<<20 || n.MaxReportBytes > 256<<20 {
-		bad("nodeAgent.maxReportBytes: must be in [1 MiB, 256 MiB]")
+	if n.MaxReportBytes < 1<<20 || n.MaxReportBytes > NodeAgentReportBudget {
+		bad("nodeAgent.maxReportBytes: must be in [1 MiB, 192 MiB], the most the controller reads of reports at once")
 	}
 	for _, d := range []struct {
 		key string

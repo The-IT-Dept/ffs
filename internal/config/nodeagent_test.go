@@ -63,7 +63,7 @@ func TestNodeAgent_Validate(t *testing.T) {
 	}{
 		"listen without port":     {func(n *NodeAgentConfig) { n.Listen = "8444" }, "nodeAgent.listen"},
 		"report cap below 1 MiB":  {func(n *NodeAgentConfig) { n.MaxReportBytes = 1<<20 - 1 }, "nodeAgent.maxReportBytes"},
-		"report cap over 256 MiB": {func(n *NodeAgentConfig) { n.MaxReportBytes = 256<<20 + 1 }, "nodeAgent.maxReportBytes"},
+		"report cap of 256 MiB":   {func(n *NodeAgentConfig) { n.MaxReportBytes = 256 << 20 }, "nodeAgent.maxReportBytes"},
 		"zero report interval":    {func(n *NodeAgentConfig) { n.ReportInterval = 0 }, "nodeAgent.reportInterval"},
 		"zero image interval":     {func(n *NodeAgentConfig) { n.ImageListInterval = 0 }, "nodeAgent.imageListInterval"},
 		"zero stale":              {func(n *NodeAgentConfig) { n.StaleAfter = 0 }, "nodeAgent.staleAfter"},
@@ -73,6 +73,8 @@ func TestNodeAgent_Validate(t *testing.T) {
 		"stale under two checks":  {func(n *NodeAgentConfig) { n.StaleAfter = 9 * time.Minute }, "nodeAgent.staleAfter"},
 		"work outlasts stale": {func(n *NodeAgentConfig) { n.WorkTimeout = 25 * time.Minute },
 			"nodeAgent.workTimeout: workTimeout (25m0s) plus imageListInterval (5m0s) must be shorter than staleAfter (30m0s)"},
+		"report cap over the report budget": {func(n *NodeAgentConfig) { n.MaxReportBytes = NodeAgentReportBudget + 1 },
+			"nodeAgent.maxReportBytes: must be in [1 MiB, 192 MiB], the most the controller reads of reports at once"},
 		"too much work":         {func(n *NodeAgentConfig) { n.WorkPerReport = 11 }, "nodeAgent.workPerReport"},
 		"negative work":         {func(n *NodeAgentConfig) { n.WorkPerReport = -1 }, "nodeAgent.workPerReport"},
 		"bad selector":          {func(n *NodeAgentConfig) { n.ExposedNodes = "zone in (dmz" }, "nodeAgent.exposedNodes: "},
@@ -85,7 +87,10 @@ func TestNodeAgent_Validate(t *testing.T) {
 		tc.mut(&c.NodeAgent)
 		require.ErrorContains(t, c.Validate(), tc.want, name)
 	}
+	require.Equal(t, int64(192<<20), int64(NodeAgentReportBudget))
 	c := Default()
+	c.NodeAgent.MaxReportBytes = NodeAgentReportBudget // a report of the whole report budget
+	require.NoError(t, c.Validate())
 	c.NodeAgent.MaxReportBytes, c.NodeAgent.WorkPerReport = 1<<20, 0
 	c.NodeAgent.StaleAfter = 10 * time.Minute                // exactly twice imageListInterval
 	c.NodeAgent.WorkTimeout = 4*time.Minute + 59*time.Second // with imageListInterval, just under staleAfter

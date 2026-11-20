@@ -553,6 +553,20 @@ func TestServer_SBOMWaitEndsWithItsRequest(t *testing.T) {
 	require.Equal(t, held, inFlight())
 }
 
+// TestServer_DefaultBudgets: reports and SBOM results have 192 and 64 MiB, 256 MiB in all, and the configuration
+// refuses a report larger than the report budget, so a report's share of it is always its whole size.
+func TestServer_DefaultBudgets(t *testing.T) {
+	srv := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}})
+	require.Equal(t, int64(192<<20), srv.o.IngestBudget)
+	require.Equal(t, int64(64<<20), srv.o.SBOMBudget)
+	require.Equal(t, int64(config.NodeAgentReportBudget), srv.o.IngestBudget)
+	c := config.Default()
+	c.NodeAgent.MaxReportBytes = srv.o.IngestBudget
+	require.NoError(t, c.Validate())
+	c.NodeAgent.MaxReportBytes++
+	require.ErrorContains(t, c.Validate(), "nodeAgent.maxReportBytes")
+}
+
 // TestServer_SBOMWaitStaysBelowTheAgentTimeout: however long its request takes a result, a result waits for
 // the SBOM budget at most a minute less than the agent's client timeout, so the agent sees the 503 and can
 // send it again; a result that waited that long leaves its request unread.

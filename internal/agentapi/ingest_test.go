@@ -841,7 +841,7 @@ func TestIngest_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
 	ing := NewIngester(IngesterOptions{Store: st, Acquirer: gate, Nodes: nodes, Config: config.Default().NodeAgent,
 		Now: newClock(t0).Now, Log: logr.Discard()})
 	joined := make(chan struct{})
-	ing.stored = func(node string) {
+	ing.flightJoined = func(node string) {
 		if node == "worker-2" {
 			close(joined)
 		}

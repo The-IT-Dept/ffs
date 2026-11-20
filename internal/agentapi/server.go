@@ -42,8 +42,9 @@ const (
 	// defaultIngestBudget caps the bytes of report bodies being read and handled at once, the host part's
 	// preparation included: a rollout's herd of full reports waits or is deferred instead of taking the
 	// controller past its memory limit. SBOM results have a budget of their own (ServerOptions.SBOMBudget),
-	// so a large result waiting for its share never holds up reports, nor reports results.
-	defaultIngestBudget = 192 << 20
+	// so a large result waiting for its share never holds up reports, nor reports results. The config refuses
+	// a nodeAgent.maxReportBytes above it, so a report's share is always its size.
+	defaultIngestBudget = config.NodeAgentReportBudget
 	// defaultSBOMBudget caps the bytes of SBOM result bodies being read and handled at once. A body's share
 	// is capped at the budget, so a result of the largest size takes all of it.
 	defaultSBOMBudget = 64 << 20
