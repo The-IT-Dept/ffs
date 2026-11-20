@@ -8,6 +8,9 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -54,8 +57,11 @@ var funcs = template.FuncMap{
 		p, _ := model.ParsePriority(name)
 		return m[p]
 	},
-	"join":     strings.Join,
-	"refLabel": func(kind, ns, name string) string { return keyLabel(kind + "/" + ns + "/" + name) },
+	"join":      strings.Join,
+	"imagePath": imagePath,
+	"plural":    plural,
+	"shortDur":  shortDur,
+	"refLabel":  func(kind, ns, name string) string { return keyLabel(kind + "/" + ns + "/" + name) },
 }
 
 func formatDate(t *time.Time) string {
@@ -77,6 +83,36 @@ func statusLabel(s string) string {
 		return "Catalogue failed"
 	}
 	return s
+}
+
+// plural is "1 image" or "3 images": n, then one or many.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// shortDur renders a Go duration string without zero minutes and seconds: "24h0m0s" is "24h".
+func shortDur(s string) string {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return s
+	}
+	if d >= time.Hour && d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", d/time.Hour)
+	}
+	return d.String()
+}
+
+// imagePath is an image ID as a path below /images/: each segment escaped, the slashes of a
+// placeholder ID ("unknown:ghcr.io/org/app:1.0") kept, so the rest wildcard reads it back whole.
+func imagePath(id string) string {
+	segs := strings.Split(id, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
 }
 
 // keyPath turns an owner key ("Deployment/shop/web", "Cluster//test") into its URL path.
@@ -120,7 +156,7 @@ func New(svc *api.Service) (*Dashboard, error) {
 		"/{$}":                              d.attention,
 		"/workloads":                        d.workloads,
 		"/images":                           d.images,
-		"/images/{digest}":                  d.image,
+		"/images/{digest...}":               d.image, // placeholder IDs ("unknown:<repo>:<tag>") hold slashes
 		"/owners/{kind}/{namespace}/{name}": d.owner,
 		"/vulnerabilities":                  d.vulnerabilities,
 		"/vulnerabilities/{id}":             d.vulnerability,
@@ -183,22 +219,38 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	owners, err := d.svc.Owners(ctx)
+	var keys []string
+	for _, f := range fs {
+		if !slices.Contains(keys, f.Owner) {
+			keys = append(keys, f.Owner)
+		}
+	}
+	byKey, err := d.svc.OwnerViews(ctx, keys) // only the owners on the page
 	if err != nil {
 		d.fail(w, r, err)
 		return
-	}
-	byKey := make(map[string]api.OwnerView, len(owners))
-	for _, o := range owners {
-		byKey[o.ID] = o
 	}
 	sgs, err := d.svc.Suggestions(ctx)
 	if err != nil {
 		d.fail(w, r, err)
 		return
 	}
-	d.render(w, r, http.StatusOK, "attention", "Needs attention", Attention(fs, byKey, sgs))
+	health, err := d.svc.Health(ctx)
+	if err != nil {
+		d.fail(w, r, err)
+		return
+	}
+	d.render(w, r, http.StatusOK, "attention", "Needs attention", attentionPage{Groups: Attention(fs, byKey, sgs), Health: health})
 }
+
+// attentionPage leads with what limits ffs's view, so an empty list never reads as all clear.
+type attentionPage struct {
+	Groups []AttentionGroup
+	Health api.HealthView
+}
+
+// InUse is the number of container images in use.
+func (p attentionPage) InUse() int { return p.Health.ImagesCatalogued + p.Health.ImagesUncatalogued }
 
 func (d *Dashboard) workloads(w http.ResponseWriter, r *http.Request) {
 	os, err := d.svc.Owners(r.Context())
@@ -306,13 +358,36 @@ func (d *Dashboard) node(w http.ResponseWriter, r *http.Request) {
 	d.render(w, r, http.StatusOK, "node", "Node "+n.Name, n)
 }
 
+// exceptedPageSize is how many excepted findings one Excepted page lists.
+const exceptedPageSize = 500
+
+// exceptedPage is one page of the excepted findings, with their total, and every Exception.
 type exceptedPage struct {
 	Findings   []api.FindingView
 	Exceptions []api.ExceptionView
+	Total      int
+	Offset     int
 }
 
+// First and Last number the page's findings from 1.
+func (p exceptedPage) First() int { return p.Offset + 1 }
+func (p exceptedPage) Last() int  { return p.Offset + len(p.Findings) }
+
+// Prev and Next are the offsets of the neighbouring pages; HasPrev and HasNext say they exist.
+func (p exceptedPage) HasPrev() bool { return p.Offset > 0 }
+func (p exceptedPage) Prev() int     { return max(p.Offset-exceptedPageSize, 0) }
+func (p exceptedPage) HasNext() bool { return p.Last() < p.Total }
+func (p exceptedPage) Next() int     { return p.Offset + exceptedPageSize }
+
+// excepted is the audit view of silenced findings. It pages through them with their total, so a
+// large cluster's list is never cut short without saying so.
 func (d *Dashboard) excepted(w http.ResponseWriter, r *http.Request) {
-	pg, err := d.svc.Findings(r.Context(), api.FindingQuery{States: []model.FindingState{model.StateExcepted}, Limit: 1000})
+	offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	pg, err := d.svc.Findings(r.Context(), api.FindingQuery{States: []model.FindingState{model.StateExcepted},
+		Limit: exceptedPageSize, Offset: offset})
 	if err != nil {
 		d.fail(w, r, err)
 		return
@@ -322,7 +397,7 @@ func (d *Dashboard) excepted(w http.ResponseWriter, r *http.Request) {
 		d.fail(w, r, err)
 		return
 	}
-	d.render(w, r, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es})
+	d.render(w, r, http.StatusOK, "excepted", "Excepted", exceptedPage{Findings: pg.Items, Exceptions: es, Total: pg.Total, Offset: offset})
 }
 
 type feedsPage struct {

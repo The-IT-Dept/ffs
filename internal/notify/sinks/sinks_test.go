@@ -211,3 +211,17 @@ func TestNew_URLRules(t *testing.T) {
 	_, err = New("pagerduty", good)
 	assert.Error(t, err)
 }
+
+// TestFormat_TierNoneHasNoSuggestedLine is the chat side of F39: a tier-none suggestion has no
+// target, and used to render "Suggested: …:1.30.6 →  (none), fixes none, introduces none".
+func TestFormat_TierNoneHasNoSuggestedLine(t *testing.T) {
+	it := item("CVE-2026-0001", 1)
+	it.Suggestion = &model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", Tier: model.TierNone,
+		Alternatives: []model.Suggestion{{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "2.0.0", Tier: model.TierMajor}}}
+	for _, l := range itemLines(it) {
+		assert.NotContains(t, l, "Suggested:")
+		assert.NotContains(t, l, "(none)")
+	}
+	it = item("CVE-2026-0001", 1)
+	assert.Contains(t, itemLines(it), "Suggested: docker.io/x/app:1.0 → 1.1 (patch), fixes 2 high, 1 medium, introduces none")
+}

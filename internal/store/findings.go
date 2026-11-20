@@ -32,7 +32,8 @@ const defaultTransitionsLimit = 1000
 // ApplyFindings upserts findings by fingerprint and appends transitions in slice order, all in one
 // transaction. Transition IDs come from an AUTOINCREMENT key (t.ID is ignored), so an ID is never
 // reused after a prune. Each upsert's Suggestion is replaced by the stored suggestion for its owner
-// and image repository, or nil, so a recompute never overwrites one.
+// and image repository when that suggestion fixes its advisory, else nil, so a recompute never
+// overwrites one.
 func (s *Store) ApplyFindings(ctx context.Context, upserts []model.Finding, ts []model.Transition) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		sugs := &suggestionCache{tx: tx, seen: map[SuggestionKey]*model.Suggestion{}}
@@ -41,7 +42,7 @@ func (s *Store) ApplyFindings(ctx context.Context, upserts []model.Finding, ts [
 			if err != nil {
 				return fmt.Errorf("store: suggestion for %q: %w", f.Fingerprint, err)
 			}
-			f.Suggestion = sg
+			f.Suggestion = suggestionFor(sg, f.AdvisoryID)
 			data, err := jsonText(f)
 			if err != nil {
 				return err

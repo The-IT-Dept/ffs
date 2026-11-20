@@ -122,16 +122,28 @@ func TierBetween(cur, cand TagVersion) model.Tier {
 	return model.TierPatch
 }
 
-// FloatingVersion derives a version for a floating tag from its version annotation.
+// channelTags are floating tags that name a release channel rather than a variant: they carry no
+// compatibility key of their own.
+var channelTags = map[string]bool{"latest": true, "stable": true, "mainline": true, "lts": true, "current": true}
+
+// FloatingVersion derives a version for a floating tag from its version annotation. The
+// compatibility key (spec §6.7.1) is the annotation's own suffix when it has one ("7.4.1-alpine"),
+// else the text after the tag's first '-' ("stable-alpine" → "alpine"), else the whole tag when it
+// is a variant rather than a channel ("alpine", "slim"), so a variant is never offered another
+// base image's tags.
 func FloatingVersion(tag, annotation string) (TagVersion, bool) {
 	v, ok := ParseTag(annotation)
 	if !ok {
 		return TagVersion{}, false
 	}
 	v.Tag = tag
-	v.Suffix = ""
+	if v.Suffix != "" {
+		return v, true
+	}
 	if _, after, found := strings.Cut(tag, "-"); found {
 		v.Suffix = after
+	} else if tag != "" && !channelTags[tag] {
+		v.Suffix = tag
 	}
 	return v, true
 }

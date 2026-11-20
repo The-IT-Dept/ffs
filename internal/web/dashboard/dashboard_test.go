@@ -1,15 +1,18 @@
 package dashboard_test
 
 import (
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web"
 	"github.com/the-it-dept/ffs/internal/web/api"
 	"github.com/the-it-dept/ffs/internal/web/dashboard"
@@ -62,7 +65,7 @@ func TestDashboard_NeedsAttention(t *testing.T) {
 }
 
 func TestDashboard_NeedsAttentionEmpty(t *testing.T) {
-	contains(t, get(t, serve(t, webtest.Empty(t)), "/", 200), "Nothing needs attention.")
+	contains(t, get(t, serve(t, webtest.Empty(t)), "/", 200), "No urgent or high findings in 0 catalogued images.")
 }
 
 func TestDashboard_Workloads(t *testing.T) {
@@ -200,7 +203,169 @@ func TestDashboard_StaticAssetAndReadOnly(t *testing.T) {
 	require.Equal(t, "text/css; charset=utf-8", res.Header.Get("Content-Type"))
 
 	rec := httptest.NewRecorder()
-	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec,
-		httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil))
+	post := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", nil)
+	post.Host = "localhost:8080"
+	web.NewServer(config.Default(), http.NotFoundHandler(), d).Server.Handler.ServeHTTP(rec, post)
 	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+}
+
+// TestDashboard_TierNoneSuggestion is the regression test for F39: a suggestion with tier none has
+// no target, and the landing page rendered "<strong></strong> … 1.30.6 to" and "fixes none" while
+// the major alternative that does fix the findings appeared nowhere.
+func TestDashboard_TierNoneSuggestion(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	const repo = "docker.io/library/nginx"
+	require.NoError(t, st.PutSuggestion(t.Context(), webtest.Web.Key(), model.Suggestion{
+		Repo: repo, FromTag: "1.30.6", Tier: model.TierNone, EOL: "debian 12 reached end of life 2026-06-10",
+		Notes: []string{"no upgrade path in this repository"}, ComputedAt: webtest.Now,
+		Alternatives: []model.Suggestion{{Repo: repo, FromTag: "1.30.6", ToTag: "2.0.0", Tier: model.TierMajor,
+			Fixes:    map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityHigh: 1},
+			FixedIDs: []string{"CVE-2026-0001", "CVE-2026-0002"}}},
+	}, nil))
+	srv := serve(t, svc)
+	for _, p := range []string{"/", "/owners/Deployment/shop/web"} {
+		body := get(t, srv, p, 200)
+		require.NotContains(t, body, "<strong></strong>", p)
+		require.NotContains(t, body, "1.30.6 to <", p)
+		require.NotContains(t, body, "fixes none", p)
+		contains(t, body, "No upgrade in the current line fixes these findings", "debian 12 reached end of life 2026-06-10",
+			"no upgrade path in this repository", "nginx:2.0.0", "major", "fixes 1 urgent, 1 high; introduces none")
+	}
+}
+
+func TestDashboard_SeedTierNoneOnOwnerPage(t *testing.T) {
+	body := get(t, seeded(t), "/owners/Deployment/shop/worker", 200)
+	contains(t, body, "No upgrade in the current line fixes these findings", "ghcr.io/example/worker:3.0.0", "fixes 1 medium; introduces none")
+	require.NotContains(t, body, "<strong></strong>")
+}
+
+// TestDashboard_PlaceholderImage is the regression test for F45: placeholder IDs contain "/", and
+// the single-segment route answered "That page does not exist" for exactly the blind-spot images.
+func TestDashboard_PlaceholderImage(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.SeedPlaceholder(t, st)
+	srv := serve(t, svc)
+	href := `href="/images/` + webtest.DigestPlaceholder + `"`
+	contains(t, get(t, srv, "/images", 200), href)
+	contains(t, get(t, srv, "/owners/CronJob/ops/report", 200), href)
+	body := get(t, srv, "/images/"+webtest.DigestPlaceholder, 200)
+	contains(t, body, "Unresolvable", "registry refused the tag lookup", "CronJob ops/report")
+	require.NotContains(t, body, "does not exist")
+}
+
+// TestDashboard_PagesDecodeOnlyWhatTheyShow is the dashboard side of F37: the landing page,
+// Workloads and Vulnerabilities used to decode every open finding on each load.
+func TestDashboard_PagesDecodeOnlyWhatTheyShow(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	srv := serve(t, svc)
+	webtest.ExecSQL(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE advisory_id = 'CVE-2026-0004'`)
+	webtest.ExecSQL(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
+	contains(t, get(t, srv, "/", 200), "CVE-2026-0001")
+	contains(t, get(t, srv, "/workloads", 200), "shop/worker")
+	contains(t, get(t, srv, "/vulnerabilities", 200), "CVE-2026-0004")
+	contains(t, get(t, srv, "/images", 200), "Partial coverage")
+}
+
+// TestDashboard_NeverReadsAllClearWhenBlind is the regression test for F38: with feeds stale or
+// never synced and images not catalogued, every page used to read as if nothing were wrong.
+func TestDashboard_NeverReadsAllClearWhenBlind(t *testing.T) {
+	// a fresh install: three feeds that never synced, nothing catalogued
+	body := get(t, serve(t, webtest.Empty(t)), "/", 200)
+	require.NotContains(t, body, "Nothing needs attention")
+	contains(t, body, "Incomplete data", "Feed eol has never synced", "Feed kev has never synced", "Feed osv has never synced",
+		`href="/feeds"`, "No urgent or high findings in 0 catalogued images.")
+
+	// the seed: kev is 30 h old against 24 h, and three of the five container images are not catalogued
+	svc, st := webtest.Seed(t)
+	webtest.SeedPlaceholder(t, st)
+	srv := serve(t, svc)
+	body = get(t, srv, "/", 200)
+	contains(t, body, "Feed kev last synced 2026-11-17 18:00 UTC, more than 24h ago", "3 of 5 images in use are not catalogued",
+		`href="/images"`)
+	require.NotContains(t, body, "Feed osv")
+	require.Less(t, strings.Index(body, "Incomplete data"), strings.Index(body, "Deployment shop/web"), "health leads the page")
+
+	// only the healthy part remains: the all-clear names how many images it covers
+	webtest.ExecSQL(t, st, `UPDATE findings SET state = 'resolved' WHERE priority >= 3`)
+	contains(t, get(t, srv, "/", 200), "No urgent or high findings in 2 catalogued images.")
+
+	// a pending image and a digest with no image row are named on the owner page
+	webtest.ExecSQL(t, st, `UPDATE images SET status = 'pending' WHERE digest = ?`, webtest.DigestWorker)
+	require.NoError(t, st.UpsertOwner(t.Context(), model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "fresh"},
+		Containers: []model.ContainerUse{{Name: "app", Kind: model.ContainerRegular, ImageRef: "ghcr.io/example/fresh:1.0",
+			Repo: "ghcr.io/example/fresh", Digest: "sha256:" + strings.Repeat("f", 64)}}}))
+	body = get(t, srv, "/owners/Deployment/shop/fresh", 200)
+	contains(t, body, "image not catalogued yet: ghcr.io/example/fresh", "No open findings; see Coverage for what was not inventoried.")
+	contains(t, get(t, srv, "/owners/Deployment/shop/worker", 200), "image not catalogued yet: ghcr.io/example/worker")
+
+	// Workloads shows how many of each workload's images are catalogued
+	body = get(t, srv, "/workloads", 200)
+	contains(t, body, "Images catalogued")
+	row := func(name string) string {
+		t.Helper()
+		i := strings.Index(body, name)
+		require.GreaterOrEqual(t, i, 0, name)
+		return body[i : i+strings.Index(body[i:], "</tr>")]
+	}
+	require.Contains(t, row("shop/fresh"), "0 of 1")
+	require.Contains(t, row("shop/worker"), "0 of 2")
+	require.Contains(t, row("shop/web"), "1 of 1")
+
+	// an advisory with no open finding carries the caveat
+	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0099", Title: "Not matched anywhere", Observed: webtest.Now}))
+	body = get(t, srv, "/vulnerabilities/CVE-2026-0099", 200)
+	contains(t, body, "No open findings for this advisory in the catalogued images.", "5 images in use are not catalogued, so this answer may be incomplete.")
+}
+
+// TestDashboard_FindingTimes is the regression test for F44: G3 says every finding shows when the
+// advisory was published, when ffs saw it and when it matched; no dashboard page showed them.
+func TestDashboard_FindingTimes(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.ExecSQL(t, st, `UPDATE findings SET state = 'excepted', data = json_set(data, '$.State', 'excepted') WHERE advisory_id = 'CVE-2026-0001'`)
+	srv := serve(t, svc)
+	times := []string{"Published / seen / matched", "Published 2026-10-01 00:00 UTC", "Seen by ffs 2026-11-18 21:00 UTC",
+		"Matched 2026-11-18 22:00 UTC"}
+	contains(t, get(t, srv, "/owners/Deployment/shop/web", 200), times...)
+	contains(t, get(t, srv, "/vulnerabilities/CVE-2026-0002", 200), "Published / seen / matched", "Matched 2026-11-19 00:00 UTC")
+	contains(t, get(t, srv, "/excepted", 200), times...)
+	// the advisory header: published, and first seen by ffs
+	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0002", Published: webtest.Now.Add(-48 * time.Hour)}))
+	contains(t, get(t, srv, "/vulnerabilities/CVE-2026-0002", 200), "Published 2026-11-17 00:00 UTC; first seen by ffs 2026-11-19 00:00 UTC.")
+	contains(t, get(t, srv, "/", 200), "Published / seen / matched", "Matched 2026-11-19 00:00 UTC")
+}
+
+// TestDashboard_ExceptedPagesWithTotal is the regression test for F49: the Excepted page read one
+// page of 1,000 findings with no total and no paging, so it truncated silently.
+func TestDashboard_ExceptedPagesWithTotal(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	ref := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "batch"}
+	var fs []model.Finding
+	for i := range 1203 {
+		adv := fmt.Sprintf("CVE-2025-%05d", i)
+		fs = append(fs, model.Finding{Fingerprint: model.FindingFingerprint("test", ref, "ghcr.io/example/batch", adv), Owner: ref,
+			ImageRepo: "ghcr.io/example/batch", AdvisoryID: adv, Severity: model.SeverityLow, Priority: model.PriorityLow,
+			State: model.StateExcepted, ExceptedBy: "ffs/accept-low", Matched: webtest.Now, LastSeen: webtest.Now})
+	}
+	require.NoError(t, st.ApplyFindings(t.Context(), fs, nil))
+	srv := serve(t, svc)
+
+	body := get(t, srv, "/excepted", 200)
+	contains(t, body, "1204 excepted findings; showing 1–500.", `href="/excepted?offset=500"`)
+	require.NotContains(t, body, "Previous")
+	const row = `<tr><td><a href="/vulnerabilities/`
+	require.Equal(t, 500, strings.Count(body, row))
+
+	body = get(t, srv, "/excepted?offset=1000", 200)
+	contains(t, body, "1204 excepted findings; showing 1001–1204.", `href="/excepted?offset=500"`, "Previous")
+	require.NotContains(t, body, "Next")
+	require.Equal(t, 204, strings.Count(body, row))
+
+	var all string
+	for off := 0; off < 1204; off += 500 {
+		all += get(t, srv, fmt.Sprintf("/excepted?offset=%d", off), 200)
+	}
+	for _, adv := range []string{"CVE-2025-00000", "CVE-2025-01202", "CVE-2026-0005"} {
+		require.Contains(t, all, adv, "every excepted finding is reachable")
+	}
+	contains(t, get(t, srv, "/excepted?offset=junk", 200), "showing 1–500")
 }

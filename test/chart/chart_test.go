@@ -531,3 +531,61 @@ func TestChart_ServiceMonitorHonorsLabels(t *testing.T) {
 	require.Len(t, eps, 1)
 	require.Equal(t, true, eps[0].(map[string]any)["honorLabels"])
 }
+
+// TestChart_ScratchLimitQuantities is the regression test for F16: a quantity such as 18Gi used to
+// render --scratch-limit=0, which the cataloguer reads as unlimited.
+func TestChart_ScratchLimitQuantities(t *testing.T) {
+	limit := func(sets ...string) string {
+		t.Helper()
+		for _, a := range container(t, podSpec(t, sets...), "catalog").Args {
+			if v, ok := strings.CutPrefix(a, "--scratch-limit="); ok {
+				return v
+			}
+		}
+		t.Fatal("no --scratch-limit argument")
+		return ""
+	}
+	require.Equal(t, "19327352832", limit(), "the default byte count")
+	require.Equal(t, "19327352832", limit("catalog.scratchLimit=18Gi"))
+	require.Equal(t, "19327352832", limit("catalog.scratchLimit=19327352832"))
+	require.Equal(t, "15000000000", limit("catalog.scratchLimit=15G"))
+	require.Equal(t, "1073741824", limit("catalog.scratchLimit=1Gi", "catalog.scratchSizeLimit=2Gi"))
+
+	values := filepath.Join(t.TempDir(), "values.yaml")
+	require.NoError(t, os.WriteFile(values, []byte("catalog:\n  scratchLimit: 18Gi\n"), 0o600))
+	args := []string{"template", "ffs", chartDir, "-n", "ffs", "--kube-version", kubeVersion, "-f", values}
+	out, err := exec.CommandContext(t.Context(), "helm", args...).CombinedOutput() //nolint:gosec // helm with a values file this test wrote
+	require.NoError(t, err, string(out))
+	require.Contains(t, string(out), "--scratch-limit=19327352832", "a quantity in a values file")
+
+	for _, c := range []struct{ set, want string }{
+		{"catalog.scratchLimit=0", "catalog.scratchLimit must be greater than 0"},
+		{"catalog.scratchLimit=20Gi", "catalog.scratchLimit (21474836480 bytes) must be below catalog.scratchSizeLimit (21474836480 bytes)"},
+		{"catalog.scratchLimit=25Gi", "must be below catalog.scratchSizeLimit"},
+		{"catalog.scratchLimit=18GB", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
+		{"catalog.scratchLimit=1.5Gi", "catalog.scratchLimit must be a byte count or a quantity such as 18Gi"},
+	} {
+		_, err := renderErr(t, c.set)
+		require.ErrorContains(t, err, c.want, c.set)
+	}
+}
+
+// TestChart_WebServiceLoopbackGuardAndHosts covers the F11 chart side: the loopback guard knows
+// localhost and [::1], and a dashboard Service adds its own DNS names to config.allowedHosts so a
+// proxy that forwards the Service name is answered.
+func TestChart_WebServiceLoopbackGuardAndHosts(t *testing.T) {
+	for _, listen := range []string{"localhost:8080", "[::1]:8080", "127.0.0.2:8080"} {
+		_, err := renderErr(t, "web.service.enabled=true", "config.listen="+listen)
+		require.ErrorContains(t, err, "web.service.enabled needs config.listen bound beyond loopback", listen)
+	}
+	var c config.Config
+	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, render(t))), &c))
+	require.Empty(t, c.AllowedHosts)
+
+	o := render(t, "web.service.enabled=true", "config.listen=0.0.0.0:8080", "config.allowedHosts={ffs.example.com}")
+	require.NoError(t, yaml.Unmarshal([]byte(renderedConfig(t, o)), &c))
+	require.Equal(t, []string{"ffs.example.com", "ffs-web", "ffs-web.ffs", "ffs-web.ffs.svc", "ffs-web.ffs.svc.cluster.local"}, c.AllowedHosts)
+	path := writeTemp(t, renderedConfig(t, o))
+	_, err := config.Load(path)
+	require.NoError(t, err)
+}

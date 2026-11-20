@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/the-it-dept/ffs/internal/model"
 )
@@ -31,10 +32,14 @@ type SuggestionKey struct{ OwnerKey, Repo string }
 
 // The suggestions table is the only source of Finding.Suggestion: PutSuggestion and
 // DeleteSuggestions rewrite the owner's findings on the repository in the same transaction, and
-// ApplyFindings takes each upsert's Suggestion from it.
+// ApplyFindings takes each upsert's Suggestion from it. A finding carries the suggestion only when
+// the suggestion fixes its advisory (see suggestionFor), so a tier-none suggestion, or one that
+// leaves a won't-fix advisory open, is never shown as that finding's upgrade.
 const (
-	setFindingSuggestion = `UPDATE findings SET data = json_set(data, '$.Suggestion', json(?)) WHERE owner_key = ? AND json_extract(data, '$.ImageRepo') = ?`
-	inList               = ` IN (SELECT value FROM json_each(?))`
+	setFindingSuggestion = `UPDATE findings SET data = json_set(data, '$.Suggestion',
+		CASE WHEN advisory_id IN (SELECT value FROM json_each(?)) THEN json(?) END)
+		WHERE owner_key = ? AND json_extract(data, '$.ImageRepo') = ?`
+	inList = ` IN (SELECT value FROM json_each(?))`
 
 	deleteOwnerSuggestions = `DELETE FROM suggestions WHERE owner_key = ?`
 	deleteOwnerCandidates  = `DELETE FROM candidates WHERE owner_key = ?`
@@ -72,9 +77,26 @@ func (s *Store) PutSuggestion(ctx context.Context, ownerKey string, sg model.Sug
 				return fmt.Errorf("store: candidate %s %s:%s: %w", ownerKey, sg.Repo, c.Tag, err)
 			}
 		}
-		_, err := tx.ExecContext(ctx, setFindingSuggestion, data, ownerKey, sg.Repo)
+		_, err := tx.ExecContext(ctx, setFindingSuggestion, idList(fixedIDs(sg)), data, ownerKey, sg.Repo)
 		return err
 	})
+}
+
+// fixedIDs are the advisories whose findings carry sg: none for a tier-none suggestion.
+func fixedIDs(sg model.Suggestion) []string {
+	if sg.Tier == model.TierNone {
+		return nil
+	}
+	return sg.FixedIDs
+}
+
+// suggestionFor is the Suggestion of a finding on advisoryID given the stored suggestion for its
+// owner and repository: sg when it fixes that advisory, else nil.
+func suggestionFor(sg *model.Suggestion, advisoryID string) *model.Suggestion {
+	if sg == nil || !slices.Contains(fixedIDs(*sg), advisoryID) {
+		return nil
+	}
+	return sg
 }
 
 // DeleteSuggestions deletes the owner's suggestions on repos, with their candidates, and clears the

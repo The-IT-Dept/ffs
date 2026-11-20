@@ -3,9 +3,13 @@ package webtest
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/glebarez/go-sqlite" // the driver the store uses, for ExecSQL
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,12 +61,34 @@ func service(t testing.TB, st *store.Store, kube client.Reader) *api.Service {
 	return api.NewService(api.Options{Store: st, Config: cfg, Feeds: feedInfos, EOL: ev, Kube: kube, Now: func() time.Time { return Now }})
 }
 
+// dbPaths records the database file of every store openStore opened, for ExecSQL.
+var dbPaths sync.Map // *store.Store → string
+
 func openStore(t testing.TB) *store.Store {
 	t.Helper()
-	st, err := store.Open(context.Background(), t.TempDir()+"/ffs.db")
+	path := t.TempDir() + "/ffs.db"
+	st, err := store.Open(context.Background(), path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	dbPaths.Store(st, path)
+	t.Cleanup(func() { dbPaths.Delete(st); require.NoError(t, st.Close()) })
 	return st
+}
+
+// ExecSQL runs a raw SQL statement against the database behind st, which Seed or Empty opened, and
+// requires it to change a row: for states the store API cannot produce, such as a row it cannot
+// decode, which proves a page never reads that row.
+func ExecSQL(t testing.TB, st *store.Store, query string, args ...any) {
+	t.Helper()
+	path, ok := dbPaths.Load(st)
+	require.True(t, ok, "store not opened by webtest")
+	db, err := sql.Open("sqlite", path.(string))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	res, err := db.ExecContext(context.Background(), query, args...)
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Positive(t, n, query)
 }
 
 func scheme(t testing.TB) *runtime.Scheme {
@@ -79,7 +105,8 @@ func Empty(t testing.TB) *api.Service {
 }
 
 // Seed builds the seeded fixture for cluster "test": five owners, their images, packages,
-// advisories, findings, one suggestion, feed states, end-of-life cycles, a node, and one Exception.
+// advisories, findings, two suggestions (a patch, and a tier none whose only fix is the next
+// major), feed states, end-of-life cycles, a node, and one Exception.
 func Seed(t testing.TB) (*api.Service, *store.Store) {
 	t.Helper()
 	ctx := context.Background()
@@ -168,6 +195,7 @@ func Seed(t testing.TB) (*api.Service, *store.Store) {
 	f1 := finding(Web, repoNginx, "CVE-2026-0001", model.SeverityCritical, model.PriorityUrgent, model.StateOpen,
 		model.FindingPackage{Name: "openssl", Ecosystem: "deb", Installed: "3.0.15-1~deb12u1", Fixed: []string{"3.0.16-1~deb12u1"}})
 	f1.Reasons = []string{"actively exploited (CISA KEV, added 2026-11-02)", "exposed via HTTPRoute shop/web on Gateway public/edge"}
+	f1.Published, f1.Observed, f1.Matched = date(2026, 10, 1), Now.Add(-3*time.Hour), Now.Add(-2*time.Hour)
 	f2 := finding(Web, repoNginx, "CVE-2026-0002", model.SeverityHigh, model.PriorityHigh, model.StateOpen,
 		model.FindingPackage{Name: "php-cli", Ecosystem: "binary", Installed: "8.3.14", Fixed: []string{"8.3.15"}})
 	f3 := finding(Worker, repoWorker, "CVE-2026-0004", model.SeverityMedium, model.PriorityMedium, model.StateOpen,
@@ -183,6 +211,12 @@ func Seed(t testing.TB) (*api.Service, *store.Store) {
 		Repo: repoNginx, FromTag: "1.30.6", ToTag: "1.30.7", Tier: model.TierPatch,
 		Fixes:    map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityHigh: 1},
 		FixedIDs: []string{"CVE-2026-0001", "CVE-2026-0002"}, ComputedAt: Now,
+	}, nil))
+	// Nothing in the worker's 2.x line fixes its finding; only the next major does.
+	must(st.PutSuggestion(ctx, Worker.Key(), model.Suggestion{
+		Repo: repoWorker, FromTag: "2.1.0", Tier: model.TierNone, ComputedAt: Now,
+		Alternatives: []model.Suggestion{{Repo: repoWorker, FromTag: "2.1.0", ToTag: "3.0.0", Tier: model.TierMajor,
+			Fixes: map[model.Priority]int{model.PriorityMedium: 1}, FixedIDs: []string{"CVE-2026-0004"}, ComputedAt: Now}},
 	}, nil))
 
 	for _, f := range []struct {
@@ -234,4 +268,24 @@ func SeedGoStdlib(t testing.TB, st *store.Store) {
 		})
 	}
 	must(st.ApplyFindings(ctx, fs, nil))
+}
+
+// DigestPlaceholder is the ID inventory gives an image whose tag could not be resolved: it holds
+// the reference, slashes included.
+const DigestPlaceholder = "unknown:ghcr.io/example/private:1.0"
+
+// Report is the owner SeedPlaceholder adds.
+var Report = model.OwnerRef{Kind: "CronJob", Namespace: "ops", Name: "report"}
+
+// SeedPlaceholder adds owner CronJob/ops/report running the unresolvable placeholder image
+// DigestPlaceholder.
+func SeedPlaceholder(t testing.TB, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	must := func(err error) { t.Helper(); require.NoError(t, err) }
+	const repo = "ghcr.io/example/private"
+	must(st.UpsertOwner(ctx, model.Owner{Ref: Report, NotRunning: true, UpdatedAt: Now, Containers: []model.ContainerUse{
+		{Name: "report", Kind: model.ContainerRegular, ImageRef: repo + ":1.0", Repo: repo, Digest: DigestPlaceholder}}}))
+	must(st.UpsertImage(ctx, model.Image{Digest: DigestPlaceholder, Repo: repo, Status: model.ImageUnresolvable,
+		StatusReason: "registry refused the tag lookup"}))
 }

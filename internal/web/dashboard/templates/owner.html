@@ -7,7 +7,7 @@
 <table>
 <thead><tr><th>Container</th><th>Kind</th><th>Image</th><th>Digest</th></tr></thead>
 <tbody>
-{{range .Containers}}<tr><td>{{.Name}}</td><td>{{.Kind}}</td><td>{{.Image}}</td><td>{{if .Digest}}<a href="/images/{{.Digest}}">{{.Digest}}</a>{{end}}</td></tr>{{end}}
+{{range .Containers}}<tr><td>{{.Name}}</td><td>{{.Kind}}</td><td>{{.Image}}</td><td>{{if .Digest}}<a href="/images/{{imagePath .Digest}}">{{.Digest}}</a>{{end}}</td></tr>{{end}}
 </tbody>
 </table>
 <h2>Findings</h2>
@@ -19,7 +19,7 @@
 {{template "findingRows" .Rest}}
 </tbody>
 </table>
-{{else}}<p>No open findings. See Coverage for what was not inventoried.</p>{{end}}
+{{else}}<p>No open findings{{if .CoverageNotes}}; see Coverage for what was not inventoried{{end}}.</p>{{end}}
 {{if .Suggestions}}<h2>Upgrade suggestions</h2>{{range .Suggestions}}{{template "suggestion" .}}{{end}}{{end}}
 {{template "coverage" .CoverageNotes}}
 {{end}}

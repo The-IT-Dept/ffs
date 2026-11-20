@@ -23,6 +23,7 @@ type Config struct {
 	StorePath      string            `yaml:"storePath"`
 	DataDir        string            `yaml:"dataDir"`
 	Listen         string            `yaml:"listen"`
+	AllowedHosts   []string          `yaml:"allowedHosts"` // Host names served besides localhost and IP literals (proxy mode)
 	DashboardURL   string            `yaml:"dashboardURL"`
 	Catalog        CatalogConfig     `yaml:"catalog"`
 	Registry       RegistryConfig    `yaml:"registry"`
@@ -190,6 +191,11 @@ func (c Config) Validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		bad("listen: %v", err)
 	}
+	for i, h := range c.AllowedHosts {
+		if !hostName.MatchString(h) {
+			bad("allowedHosts[%d]: %q must be a host name, without scheme, port or path", i, h)
+		}
+	}
 	if c.DashboardURL != "" && !absHTTP(c.DashboardURL) {
 		bad("dashboardURL: must be an absolute http(s) URL")
 	}
@@ -274,6 +280,9 @@ func (c Config) Validate() error {
 	}
 	return errors.Join(errs...)
 }
+
+// hostName is a DNS host name, any case, with an optional trailing dot.
+var hostName = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*\.?$`)
 
 func absHTTP(s string) bool {
 	u, err := url.Parse(s)

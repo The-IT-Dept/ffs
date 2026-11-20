@@ -1,6 +1,6 @@
 # Coverage
 
-ffs never reports an image as clean when it could not see inside it. Every image has a status (`pending`, `catalogued`, `unresolvable` or `catalogFailed`) with a reason, and images with known gaps are marked partial coverage and list coverage notes. The API returns these as `status`, `statusReason`, `partialCoverage` and `coverage.notes`; the dashboard shows them on the Images page and on each workload.
+ffs never reports an image as clean when it could not see inside it. Every image has a status (`pending`, `catalogued`, `unresolvable` or `catalogFailed`) with a reason, and images with known gaps are marked partial coverage and list coverage notes. The API returns these as `status`, `statusReason`, `partialCoverage` and `coverage.notes`; the dashboard shows them on the Images page and on each workload. The dashboard's landing page starts with any feed that is stale or has never synced and the number of images in use that are not catalogued, the Workloads page shows how many of each workload's images are catalogued, and an advisory page with no findings says when images are not catalogued.
 
 This page lists what ffs cannot see, and what it shows when it meets it.
 

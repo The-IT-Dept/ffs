@@ -55,10 +55,10 @@ func TestStore_SuggestionFollowsFindings(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, fs, 3)
 	for _, f := range fs {
-		if f.ImageRepo == repo {
+		if f.ImageRepo == repo && f.AdvisoryID == "CVE-2026-0001" {
 			require.Equal(t, &sg, f.Suggestion, f.Fingerprint)
 		} else {
-			require.Nil(t, f.Suggestion, f.Fingerprint)
+			require.Nil(t, f.Suggestion, "%s: the suggestion does not fix it", f.Fingerprint)
 		}
 	}
 
@@ -218,4 +218,54 @@ func TestStore_PruneImages(t *testing.T) {
 
 	_, err = s.PruneImages(ctx, time.Time{}, week)
 	require.Error(t, err)
+}
+
+// TestStore_SuggestionOnlyOnFixedFindings is the regression test for F40 (and the finding side of
+// F39): a stored suggestion is a finding's Suggestion only when the upgrade fixes that finding's
+// advisory, so a finding no tag fixes never shows a target, and a tier-none suggestion is on none.
+func TestStore_SuggestionOnlyOnFixedFindings(t *testing.T) {
+	s := newStore(t)
+	const key, repo = "Deployment/netbox/netbox", "ghcr.io/x"
+	fixed := fd("fp-fixed", model.StateOpen, model.PriorityHigh)
+	wontFix := fd("fp-wontfix", model.StateOpen, model.PriorityHigh)
+	wontFix.AdvisoryID = "CVE-2026-0009"
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fixed, wontFix}, nil))
+	byFP := func() map[string]*model.Suggestion {
+		t.Helper()
+		fs, err := s.FindingsForOwner(ctx, key)
+		require.NoError(t, err)
+		out := map[string]*model.Suggestion{}
+		for _, f := range fs {
+			out[f.Fingerprint] = f.Suggestion
+		}
+		return out
+	}
+
+	sg := model.Suggestion{Repo: repo, FromTag: "1.27.3", ToTag: "1.27.4", Tier: model.TierPatch,
+		Fixes: map[model.Priority]int{model.PriorityHigh: 1}, FixedIDs: []string{"CVE-2026-0001"}, ComputedAt: t0}
+	require.NoError(t, s.PutSuggestion(ctx, key, sg, nil))
+	require.Equal(t, map[string]*model.Suggestion{"fp-fixed": &sg, "fp-wontfix": nil}, byFP())
+
+	// a recompute keeps it that way
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fixed, wontFix}, nil))
+	require.Equal(t, map[string]*model.Suggestion{"fp-fixed": &sg, "fp-wontfix": nil}, byFP())
+
+	// a new suggestion that fixes the other advisory moves to it
+	other := sg
+	other.ToTag, other.FixedIDs = "1.28.0", []string{"CVE-2026-0009"}
+	require.NoError(t, s.PutSuggestion(ctx, key, other, nil))
+	require.Equal(t, map[string]*model.Suggestion{"fp-fixed": nil, "fp-wontfix": &other}, byFP())
+
+	// nothing in the line fixes anything: the owner-level suggestion is stored, no finding carries it
+	none := model.Suggestion{Repo: repo, FromTag: "1.27.3", Tier: model.TierNone, Notes: []string{"no upgrade path in this repository"},
+		Alternatives: []model.Suggestion{{Repo: repo, FromTag: "1.27.3", ToTag: "2.0.0", Tier: model.TierMajor,
+			FixedIDs: []string{"CVE-2026-0001"}}}, ComputedAt: t0}
+	require.NoError(t, s.PutSuggestion(ctx, key, none, nil))
+	require.Equal(t, map[string]*model.Suggestion{"fp-fixed": nil, "fp-wontfix": nil}, byFP())
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fixed, wontFix}, nil))
+	require.Equal(t, map[string]*model.Suggestion{"fp-fixed": nil, "fp-wontfix": nil}, byFP())
+	got, ok, err := s.GetSuggestion(ctx, key, repo)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, model.TierNone, got.Suggestion.Tier)
 }

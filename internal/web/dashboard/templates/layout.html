@@ -34,14 +34,19 @@
 <td>{{range .Packages}}<div>{{.Name}} {{.Installed}}{{if .Fixed}} (fixed in {{join .Fixed ", "}}){{end}}</div>{{end}}</td>
 <td>{{.Severity}}</td>
 <td>{{if .Reasons}}<ul>{{range .Reasons}}<li>{{.}}</li>{{end}}</ul>{{end}}</td>
+{{template "times" .}}
 </tr>{{end}}{{end}}
 {{define "stdlibRows"}}{{range .}}<tr>
 <td><span class="badge {{priorityClass .Highest}}">{{.Highest}}</span></td>
-<td colspan="4"><strong>{{.Title}}</strong><div class="sub">{{join .AdvisoryIDs ", "}}</div></td>
+<td colspan="5"><strong>{{.Title}}</strong><div class="sub">{{join .AdvisoryIDs ", "}}</div></td>
 </tr>{{end}}{{end}}
-{{define "findingHead"}}<thead><tr><th>Priority</th><th>Advisory</th><th>Package</th><th>Severity</th><th>Why</th></tr></thead>{{end}}
-{{define "suggestion"}}<div class="suggestion"><strong>{{.Target}}</strong> <span class="sub">{{.Repo}} {{.FromTag}} to {{.ToTag}}</span>
+{{define "findingHead"}}<thead><tr><th>Priority</th><th>Advisory</th><th>Package</th><th>Severity</th><th>Why</th><th>Published / seen / matched</th></tr></thead>{{end}}
+{{define "times"}}<td class="sub">{{with .Published}}<div>Published {{date .}}</div>{{end}}{{with .Observed}}<div>Seen by ffs {{date .}}</div>{{end}}{{with .Matched}}<div>Matched {{date .}}</div>{{end}}</td>{{end}}
+{{define "suggestion"}}<div class="suggestion">{{if eq (print .Tier) "none"}}<strong>No upgrade in the current line fixes these findings</strong> <span class="sub">{{.Repo}}{{if .FromTag}} {{.FromTag}}{{end}}</span>
+{{else}}<strong>{{.Target}}</strong> <span class="sub">{{.Repo}} {{.FromTag}} to {{.ToTag}}</span>
 <div>{{.NetChange}}</div>
-{{if .EOL}}<div class="note">{{.EOL}}</div>{{end}}
-{{range .Notes}}<div class="note">{{.}}</div>{{end}}</div>{{end}}
+{{end}}{{if .EOL}}<div class="note">{{.EOL}}</div>{{end}}
+{{range .Notes}}<div class="note">{{.}}</div>{{end}}
+{{if .Alternatives}}<div class="sub">{{if eq (print .Tier) "none"}}Upgrades that fix them{{else}}Further upgrades that fix more{{end}}:</div>
+<ul>{{range .Alternatives}}<li><strong>{{.Target}}</strong> ({{.Tier}}): {{.NetChange}}</li>{{end}}</ul>{{end}}</div>{{end}}
 {{define "coverage"}}{{if .}}<h2>Coverage</h2><ul class="coverage">{{range .}}<li>{{.}}</li>{{end}}</ul>{{end}}{{end}}

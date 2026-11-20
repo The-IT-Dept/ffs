@@ -50,7 +50,7 @@ catalog:
       memory: 2Gi
   # Size limit of the catalog scratch emptyDir.
   scratchSizeLimit: 20Gi
-  # Scratch bytes a catalog job may use (18 GiB); keep below scratchSizeLimit.
+  # Scratch the catalog jobs may use, in bytes or as a quantity such as 18Gi; must be below scratchSizeLimit.
   scratchLimit: 19327352832
 
 # Persistent storage for the store and feed data.
@@ -131,6 +131,8 @@ config:
   dataDir: /var/lib/ffs
   # Dashboard and API listen address.
   listen: 127.0.0.1:8080
+  # Host names the dashboard answers besides localhost and IP addresses; web.service.enabled adds the Service's names.
+  allowedHosts: []
   # External dashboard URL used in links.
   dashboardURL: ""
   # Cataloguer socket and limits.
