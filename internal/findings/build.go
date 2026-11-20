@@ -188,21 +188,26 @@ func digestRepos(cs []model.ContainerUse) map[string][]string {
 	return out
 }
 
-// precedence decides what stands for one triple (spec §6.5, §13.3). Grype has an opinion only
-// through a DB built after ffs observed the other matches on the triple; then its match wins, and
-// its not-affected verdict removes the triple. Otherwise the non-grype matches stand, merged.
+// precedence decides what stands for one triple (spec §6.5, §13.3). Grype takes precedence only
+// over OSV matches: the upstream-runtime map (CNA ranges and OSV GIT records) and Kubernetes matches
+// are the authority on what they match, so a grype match beside one of them, such as an NVD CPE
+// match on a binary built from source, never replaces their verdict or fix versions. Over OSV
+// matches grype has an opinion only through a DB built after ffs observed them; then its match wins,
+// and its not-affected verdict removes the triple. Otherwise the non-grype matches stand, merged.
 func precedence(ms []model.Match) (model.Match, bool) {
 	var grype *model.Match
 	var others []model.Match
+	osvOnly := true
 	for i, m := range ms {
 		switch {
 		case m.Source != model.SourceGrype:
 			others = append(others, m)
+			osvOnly = osvOnly && m.Source == model.SourceOSV
 		case grype == nil || m.DBBuilt.After(grype.DBBuilt):
 			grype = &ms[i]
 		}
 	}
-	if grype != nil && (len(others) == 0 || grype.DBBuilt.After(earliestObserved(others))) {
+	if grype != nil && (len(others) == 0 || (osvOnly && grype.DBBuilt.After(earliestObserved(others)))) {
 		return *grype, grype.FixState != model.FixNotAffected
 	}
 	return merge(others), true

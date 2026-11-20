@@ -140,3 +140,47 @@ func TestRekeyFindings(t *testing.T) {
 	require.Len(t, ts, 1)
 	require.Equal(t, "fp-ghsa", ts[0].Fingerprint) // history keeps the old fingerprint
 }
+
+func TestRekeyFindings_LedgerKeepsTheHigherPriority(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.PutNotifyTarget(ctx, "uid-a", "a", ""))
+	require.NoError(t, s.PutNotifyTarget(ctx, "uid-b", "b", ""))
+	entry := func(target, fp string, p model.Priority, st model.FindingState, at time.Time) LedgerEntry {
+		return LedgerEntry{Target: target, Fingerprint: fp, MaxPriority: p, LastState: st, UpdatedAt: at}
+	}
+	// Target a was told urgent about the new fingerprint and high about the old one; target b high
+	// about the new one, later, and urgent about the old one.
+	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-a", Ledger: []LedgerEntry{
+		entry("uid-a", "fp-new", model.PriorityUrgent, model.StateOpen, t0.Add(-2*time.Hour)),
+		entry("uid-a", "fp-old", model.PriorityHigh, model.StateResolved, t0.Add(-time.Hour)),
+	}}))
+	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-b", Ledger: []LedgerEntry{
+		entry("uid-b", "fp-new", model.PriorityHigh, model.StateOpen, t0.Add(-time.Hour)),
+		entry("uid-b", "fp-old", model.PriorityUrgent, model.StateResolved, t0.Add(-2*time.Hour)),
+		entry("uid-b", "fp-only-old", model.PriorityMedium, model.StateOpen, t0),
+	}}))
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{fd("fp-old", model.StateOpen, model.PriorityHigh),
+		fd("fp-new", model.StateOpen, model.PriorityHigh), fd("fp-only-old", model.StateOpen, model.PriorityHigh)}, nil))
+
+	require.NoError(t, s.RekeyFindings(ctx, []FindingRekey{
+		{OldFingerprint: "fp-old", NewFingerprint: "fp-new", AdvisoryID: "CVE-2026-0001"},
+		{OldFingerprint: "fp-only-old", NewFingerprint: "fp-moved", AdvisoryID: "CVE-2026-0001"},
+	}))
+
+	a, err := s.Ledger(ctx, "uid-a", []string{"fp-old", "fp-new"})
+	require.NoError(t, err)
+	require.Len(t, a, 1, "the old row merged into the new one")
+	require.Equal(t, model.PriorityUrgent, a["fp-new"].MaxPriority, "a re-key never lowers what a target was told")
+	require.Equal(t, model.StateResolved, a["fp-new"].LastState, "the state of the row updated last")
+	require.True(t, a["fp-new"].UpdatedAt.Equal(t0.Add(-time.Hour)))
+
+	b, err := s.Ledger(ctx, "uid-b", []string{"fp-old", "fp-new", "fp-only-old", "fp-moved"})
+	require.NoError(t, err)
+	require.Len(t, b, 2)
+	require.Equal(t, model.PriorityUrgent, b["fp-new"].MaxPriority, "the old row's higher priority is kept")
+	require.Equal(t, model.StateOpen, b["fp-new"].LastState)
+	require.True(t, b["fp-new"].UpdatedAt.Equal(t0.Add(-time.Hour)))
+	require.Equal(t, entry("uid-b", "fp-moved", model.PriorityMedium, model.StateOpen, b["fp-moved"].UpdatedAt), b["fp-moved"],
+		"a row with nothing to merge with moves as it was")
+	require.True(t, b["fp-moved"].UpdatedAt.Equal(t0))
+}

@@ -61,6 +61,11 @@ func TestDiff_Transitions(t *testing.T) {
 		{"de-escalation", f(open, urgent), f(open, medium), inv, open, prioCh, false, nil},
 		{"fix appeared", f(open, medium), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
 		{"fix appeared, same priority", f(open, high), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
+		{"confirmed", prov(f(open, high)), f(open, high), newAdv, open, newAdv, false, nil},
+		{"confirmed by a rollout's match", prov(f(open, high)), f(open, high), inv, open, inv, false, nil},
+		{"confirmed and escalated", prov(f(open, high)), f(open, urgent), newAdv, open, prioCh, false, nil},
+		{"still provisional", prov(f(open, high)), prov(f(open, high)), newAdv, "", "", true, nil},
+		{"confirmed while excepted", prov(f(excepted, high)), f(excepted, high), newAdv, "", "", true, nil},
 		{"unchanged", f(open, high), f(open, high), newAdv, "", "", true, nil},
 		{"fix still there", fixed(f(open, high)), fixed(f(open, high)), newAdv, "", "", true, nil},
 		{"excepted, priority moved", f(excepted, high), f(excepted, medium), prioCh, "", "", true, nil},
@@ -157,4 +162,29 @@ func TestDiff_Upserts(t *testing.T) {
 	created := got["e-new"]
 	assert.Equal(t, now, created.Matched)
 	assert.Nil(t, created.Suggestion)
+}
+
+func TestDiff_ObservedTakesTheEarliestNonZero(t *testing.T) {
+	t0, t1 := now.Add(-48*time.Hour), now.Add(-time.Hour)
+	ref := api().Ref
+	fnd := func(fp string, observed time.Time) model.Finding {
+		return model.Finding{Fingerprint: fp, Owner: ref, AdvisoryID: "CVE-" + fp, State: model.StateOpen,
+			Priority: model.PriorityHigh, Observed: observed}
+	}
+	ups, _ := Diff(
+		[]model.Finding{fnd("a-zero-stored", time.Time{}), fnd("b-later-stored", t1), fnd("c-earlier-stored", t0),
+			fnd("d-zero-built", t0)},
+		[]model.Finding{fnd("a-zero-stored", t1), fnd("b-later-stored", t0), fnd("c-earlier-stored", t1),
+			fnd("d-zero-built", time.Time{})},
+		Withdrawals{}, now, model.TriggerNewAdvisory)
+	got := map[string]time.Time{}
+	for _, u := range ups {
+		got[u.Fingerprint] = u.Observed
+	}
+	assert.Equal(t, map[string]time.Time{
+		"a-zero-stored":    t1, // the advisory was not stored when the finding was first built
+		"b-later-stored":   t0, // an alias merge moved the advisory's first sighting earlier
+		"c-earlier-stored": t0,
+		"d-zero-built":     t0,
+	}, got)
 }

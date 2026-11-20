@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	v6 "github.com/anchore/grype/grype/db/v6"
 	"github.com/anchore/grype/grype/db/v6/name"
@@ -88,6 +89,9 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 		return nil, err
 	}
 	for _, a := range r.advisoryList() {
+		if a, err = m.fillOnly(ctx, a); err != nil {
+			return nil, err
+		}
 		if err := m.st.UpsertAdvisory(ctx, a); err != nil {
 			return nil, fmt.Errorf("grype: store advisory %s: %w", a.ID, err)
 		}
@@ -96,6 +100,26 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 		return nil, fmt.Errorf("grype: store search keys of %s: %w", in.Digest, err)
 	}
 	return r.list(), nil
+}
+
+// fillOnly drops a's Title and Published where the stored advisory already has one: grype's
+// description and record date only fill in an advisory no other source has described, and never
+// replace an OSV summary or a CNA title (UpsertAdvisory overwrites with any non-zero field).
+func (m *Matcher) fillOnly(ctx context.Context, a model.Advisory) (model.Advisory, error) {
+	if a.Title == "" && a.Published.IsZero() {
+		return a, nil
+	}
+	stored, ok, err := m.st.GetAdvisory(ctx, a.ID)
+	if err != nil {
+		return a, fmt.Errorf("grype: advisory %s: %w", a.ID, err)
+	}
+	if ok && stored.Title != "" {
+		a.Title = ""
+	}
+	if ok && !stored.Published.IsZero() {
+		a.Published = time.Time{}
+	}
+	return a, nil
 }
 
 // matchImage runs grype over the image and adds the opinions, under the read lock.
@@ -404,17 +428,68 @@ func (r *results) add(p model.Package, v vulnerability.Vulnerability, fix model.
 	r.ids[p.ID][v.ID] = true
 	for _, rel := range v.RelatedVulnerabilities {
 		if rel.ID != "" && rel.ID != v.ID {
-			a.Aliases = append(a.Aliases, rel.ID)
 			r.ids[p.ID][rel.ID] = true
 		}
 	}
+	a.Aliases = append(a.Aliases, relatedAliases(v)...)
 	if v.Metadata != nil {
 		for _, l := range append([]string{v.Metadata.DataSource}, v.Metadata.URLs...) {
 			if l != "" {
 				a.Links = append(a.Links, l)
 			}
 		}
+		// by-CVE normalisation renames a vendor record to its CVE but keeps the record's metadata,
+		// which then describes the vendor advisory, not the CVE
+		if a.Title == "" && v.Metadata.ID == v.ID {
+			a.Title = descriptionTitle(v.Metadata.Description)
+		}
 	}
+	if h, ok := v.Internal.(*v6.VulnerabilityHandle); ok && h != nil && h.Name == v.ID && h.PublishedDate != nil && a.Published.IsZero() {
+		a.Published = h.PublishedDate.UTC()
+	}
+}
+
+// relatedAliases returns the related ids of v that are its aliases: every id that is not a CVE,
+// and a CVE only when it is the one CVE v relates to. A vendor advisory (ALAS, ELSA) that lists
+// several CVEs is related to each of them, but they are distinct advisories: aliasing them all would
+// merge them into one canonical advisory for good (the store never splits an alias group).
+func relatedAliases(v vulnerability.Vulnerability) []string {
+	var ids, cves []string
+	for _, rel := range v.RelatedVulnerabilities {
+		switch {
+		case rel.ID == "" || rel.ID == v.ID:
+		case isCVE(rel.ID):
+			if !slices.Contains(cves, rel.ID) {
+				cves = append(cves, rel.ID)
+			}
+		default:
+			ids = append(ids, rel.ID)
+		}
+	}
+	if len(cves) == 1 {
+		ids = append(ids, cves[0])
+	}
+	return ids
+}
+
+func isCVE(id string) bool { return strings.HasPrefix(strings.ToUpper(id), "CVE-") }
+
+// maxTitleRunes bounds a title taken from a grype record's description.
+const maxTitleRunes = 200
+
+// descriptionTitle returns the first sentence of a grype record's description, without its full
+// stop and cut to 200 runes: the title of an advisory only grype knows (a RHEL or Amazon Linux
+// advisory), which alerts and the dashboard otherwise show as a bare id.
+func descriptionTitle(desc string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(desc), "\n")
+	if i := strings.Index(line, ". "); i >= 0 {
+		line = line[:i]
+	}
+	line = strings.TrimSuffix(strings.TrimSpace(line), ".")
+	if utf8.RuneCountInString(line) > maxTitleRunes {
+		line = string([]rune(line)[:maxTitleRunes])
+	}
+	return strings.TrimSpace(line)
 }
 
 // matched reports whether p has a match on any of ids, directly or through an alias.
