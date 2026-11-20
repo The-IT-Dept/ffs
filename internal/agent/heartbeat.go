@@ -1,7 +1,6 @@
 package agent
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -10,7 +9,7 @@ import (
 	"time"
 )
 
-// heartbeatEvery is how often the heartbeat is touched while a full report or a job runs; tests shorten it.
+// heartbeatEvery is how often the heartbeat is touched while the run loop is healthy; tests shorten it.
 var heartbeatEvery = time.Minute
 
 // touchHeartbeat creates or truncates the heartbeat file and sets its mtime to now. The liveness probe
@@ -42,9 +41,30 @@ func CheckHeartbeat(path string, maxAge time.Duration, now time.Time) error {
 	return nil
 }
 
-// keepAlive touches the heartbeat every heartbeatEvery until ctx ends or the returned stop is called, so a
-// long full report or job does not look like a wedged agent. Bounding ctx keeps a truly wedged one stale.
-func (a *agent) keepAlive(ctx context.Context) (stop func()) {
+// pulse is the run loop's lease on the heartbeat. Before each step (a sleep, a report, a job) the loop renews
+// the lease for as long as that step may take; a ticker touches the heartbeat every heartbeatEvery while the
+// lease holds. A loop wedged past its lease stops the touches, and the liveness probe restarts the collector.
+type pulse struct {
+	mu    sync.Mutex
+	until time.Time
+}
+
+// lease marks the loop healthy for d more, plus two heartbeat periods.
+func (a *agent) lease(d time.Duration) {
+	a.pulse.mu.Lock()
+	defer a.pulse.mu.Unlock()
+	a.pulse.until = time.Now().Add(max(d, 0) + 2*heartbeatEvery)
+}
+
+// healthy reports whether the loop's lease holds at now.
+func (a *agent) healthy(now time.Time) bool {
+	a.pulse.mu.Lock()
+	defer a.pulse.mu.Unlock()
+	return now.Before(a.pulse.until)
+}
+
+// startPulse touches the heartbeat every heartbeatEvery while the loop's lease holds, until stop is called.
+func (a *agent) startPulse() (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Go(func() {
@@ -53,10 +73,10 @@ func (a *agent) keepAlive(ctx context.Context) (stop func()) {
 		for {
 			select {
 			case <-t.C:
-				a.touch()
+				if a.healthy(time.Now()) {
+					a.touch()
+				}
 			case <-done:
-				return
-			case <-ctx.Done():
 				return
 			}
 		}

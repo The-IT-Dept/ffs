@@ -53,9 +53,12 @@ type fakeController struct {
 	reports chan wire.Report
 	sboms   chan wire.SBOMResult
 
-	mu     sync.Mutex
-	config func() (int, wire.AgentConfig)
-	answer func(r wire.Report) (int, wire.ReportResponse)
+	mu      sync.Mutex
+	config  func() (int, wire.AgentConfig)
+	answer  func(r wire.Report) (int, wire.ReportResponse)
+	headers func(r wire.Report) http.Header // extra headers of the report answer; nil: none
+	events  []string                        // "config", the report kinds and "sbom:<id>", in arrival order
+	times   []time.Time                     // when each event arrived
 }
 
 func newFakeController(t *testing.T, caFile string) *fakeController {
@@ -74,6 +77,7 @@ func newFakeController(t *testing.T, caFile string) *fakeController {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET "+wire.PathConfig, func(w http.ResponseWriter, _ *http.Request) {
 		c.mu.Lock()
+		c.record("config")
 		code, cfg := c.config()
 		c.mu.Unlock()
 		reply(w, code, cfg)
@@ -84,11 +88,17 @@ func newFakeController(t *testing.T, caFile string) *fakeController {
 			reply(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
-		c.reports <- rep
 		c.mu.Lock()
-		answer := c.answer
+		c.record(rep.Kind)
+		answer, headers := c.answer, c.headers
 		c.mu.Unlock()
+		c.reports <- rep
 		code, resp := answer(rep)
+		if headers != nil {
+			for k, v := range headers(rep) {
+				w.Header()[k] = v
+			}
+		}
 		reply(w, code, resp)
 	})
 	mux.HandleFunc("POST "+wire.PathSBOM, func(w http.ResponseWriter, r *http.Request) {
@@ -97,6 +107,9 @@ func newFakeController(t *testing.T, caFile string) *fakeController {
 			reply(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
+		c.mu.Lock()
+		c.record("sbom:" + res.ID)
+		c.mu.Unlock()
 		c.sboms <- res
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -112,6 +125,25 @@ func reply(w http.ResponseWriter, code int, v any) {
 		return
 	}
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// record notes an event; c.mu is held.
+func (c *fakeController) record(event string) {
+	c.events = append(c.events, event)
+	c.times = append(c.times, time.Now())
+}
+
+// log returns the events so far and when each arrived.
+func (c *fakeController) log() ([]string, []time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.events), slices.Clone(c.times)
+}
+
+func (c *fakeController) setHeaders(f func(r wire.Report) http.Header) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.headers = f
 }
 
 func (c *fakeController) setAnswer(f func(r wire.Report) (int, wire.ReportResponse)) {
@@ -437,12 +469,12 @@ func TestRun_HostSBOMOverLimit(t *testing.T) {
 			Detail: fmt.Sprintf("host SBOM of %d bytes exceeds the report limit 1024", len(big))})
 		require.NotNil(t, r.Images)
 	})
-	t.Run("config unavailable", func(t *testing.T) {
+	t.Run("config without intervals", func(t *testing.T) {
 		e := newEnv(t)
 		e.runner.setFn(func(context.Context, sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
 			return &sbom.CatalogResponse{SyftJSON: json.RawMessage(big)}, nil
 		})
-		e.ctl.setConfig(func() (int, wire.AgentConfig) { return http.StatusInternalServerError, wire.AgentConfig{} })
+		e.ctl.setConfig(func() (int, wire.AgentConfig) { return http.StatusOK, wire.AgentConfig{MaxReportBytes: 1024} })
 		e.startCataloguer(t)
 		e.run(t)
 		r := e.ctl.next(t)
@@ -550,4 +582,47 @@ func TestRun_RequiresNodeName(t *testing.T) {
 	require.EqualError(t, err, "node name is required (--node-name or NODE_NAME)")
 	err = Run(context.Background(), Options{Controller: "http://ffs-agent-api", NodeName: "worker-1"})
 	require.EqualError(t, err, "controller URL must be https")
+}
+
+func TestRun_ScanErrorSendsImagesUnchanged(t *testing.T) {
+	e := newEnv(t)
+	blobs := filepath.Join(e.storeDir(), "blobs", "sha256")
+	require.NoError(t, os.RemoveAll(blobs))
+	writeTestFile(t, blobs, []byte("not a directory")) // an error that says nothing about the cached images
+	e.startCataloguer(t)
+	e.run(t)
+	r := e.ctl.next(t)
+	require.Equal(t, wire.KindFull, r.Kind)
+	require.Nil(t, r.Images, "the controller keeps the list it has, rather than reading the store as gone")
+	i := slices.IndexFunc(r.Problems, func(p wire.Problem) bool { return p.Code == "content_store" })
+	require.GreaterOrEqual(t, i, 0, "%v", r.Problems)
+	require.Equal(t, storeHostPath, r.Problems[i].Path)
+	require.NotNil(t, r.Host)
+}
+
+func TestNewAgent_ScratchDirReadableByCataloguer(t *testing.T) {
+	e := newEnv(t)
+	require.NoError(t, os.Chmod(e.scratch, 0o700)) //nolint:gosec // G302: as a restrictive umask would leave it
+	_, err := newAgent(e.opts)
+	require.NoError(t, err)
+	fi, err := os.Stat(e.scratch)
+	require.NoError(t, err)
+	require.Equal(t, fs.FileMode(0o755), fi.Mode().Perm())
+}
+
+func TestCollectHost_ScratchFailureIsAScratchProblem(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to read-only dirs")
+	}
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	require.NoError(t, os.Chmod(e.scratch, 0o500))       //nolint:gosec // G302: a scratch dir the collector cannot write
+	t.Cleanup(func() { _ = os.Chmod(e.scratch, 0o700) }) //nolint:gosec // G302: let the test clean up
+	inv, problems, retry := a.collectHost(context.Background())
+	require.Nil(t, inv)
+	require.True(t, retry)
+	require.Len(t, problems, 1)
+	require.Equal(t, "scratch", problems[0].Code, "never permission_denied: the host is not what refused")
+	require.True(t, strings.HasPrefix(problems[0].Detail, "host inputs not staged: "), problems[0].Detail)
 }

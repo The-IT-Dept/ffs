@@ -67,7 +67,7 @@ func workDirs(t *testing.T, scratch string) []string {
 // newTestAgent builds the agent Run would, for driving jobs directly.
 func newTestAgent(t *testing.T, e *env) *agent {
 	t.Helper()
-	a, err := newAgent(context.Background(), e.opts)
+	a, err := newAgent(e.opts)
 	require.NoError(t, err)
 	return a
 }
@@ -137,7 +137,7 @@ func TestWork_UnavailableAndFailures(t *testing.T) {
 		return wire.WorkRequest{ID: "w1", Digest: digest, Platform: platform, Deadline: time.Now().Add(5 * time.Minute)}
 	}
 
-	a.runJob(ctx, work("sha256:"+strings.Repeat("0", 64)))
+	a.runJob(ctx, work("sha256:"+strings.Repeat("0", 64)), time.Now())
 	require.Equal(t, wire.UnavailableNotFound, e.ctl.nextSBOM(t).Unavailable)
 
 	discarded := testImage(t, runtime.GOARCH)
@@ -147,13 +147,13 @@ func TestWork_UnavailableAndFailures(t *testing.T) {
 	ld, err := layers[0].Digest()
 	require.NoError(t, err)
 	contentstoretest.RemoveBlob(t, e.storeDir(), ld.String())
-	a.runJob(ctx, work(dm))
+	a.runJob(ctx, work(dm), time.Now())
 	res := e.ctl.nextSBOM(t)
 	require.Equal(t, wire.UnavailableLayersDiscarded, res.Unavailable)
 	require.Equal(t, dm, res.Digest)
 
 	a.o.MaxImageBytes = 1
-	a.runJob(ctx, work(e.manifest))
+	a.runJob(ctx, work(e.manifest), time.Now())
 	require.Equal(t, wire.UnavailableTooLarge, e.ctl.nextSBOM(t).Unavailable)
 	a.o.MaxImageBytes = 1 << 30
 
@@ -167,7 +167,7 @@ func TestWork_UnavailableAndFailures(t *testing.T) {
 			"scratch-full: image unpacked beyond the scratch limit"},
 	} {
 		e.runner.setFn(func(context.Context, sbom.CatalogRequest) (*sbom.CatalogResponse, error) { return nil, tc.err })
-		a.runJob(ctx, work(e.manifest))
+		a.runJob(ctx, work(e.manifest), time.Now())
 		res := e.ctl.nextSBOM(t)
 		require.Equal(t, tc.unavailable, res.Unavailable, tc.err.Kind)
 		require.Equal(t, tc.failure, res.Failure, tc.err.Kind)
@@ -177,18 +177,82 @@ func TestWork_UnavailableAndFailures(t *testing.T) {
 	e.runner.setFn(func(context.Context, sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
 		return nil, &catalog.WorkError{Kind: sbom.KindBusy, Msg: "cataloguer is busy"}
 	})
-	a.runJob(ctx, work(e.manifest))
+	a.runJob(ctx, work(e.manifest), time.Now())
 	e.ctl.noSBOM(t)
 
 	calls := len(e.runner.requests())
 	past := work(e.manifest)
 	past.Deadline = time.Now().Add(-time.Second)
-	a.runJob(ctx, past)
+	a.runJob(ctx, past, time.Now())
 	e.ctl.noSBOM(t)
 	require.Len(t, e.runner.requests(), calls, "work past its deadline is not started")
 
 	require.Empty(t, workDirs(t, e.scratch))
 	require.Equal(t, int32(1), e.runner.maxActive.Load())
+}
+
+func TestWork_SkipsJobWithTooLittleTimeLeft(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	platform := "linux/" + runtime.GOARCH
+	now := time.Now()
+
+	// Offered 11 minutes ago with a minute left: queued behind a long job, it would likely time out.
+	late := wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: platform, Deadline: now.Add(time.Minute)}
+	a.runJob(ctx, late, now.Add(-10*time.Minute))
+	e.ctl.noSBOM(t)
+	require.Empty(t, e.runner.requests(), "a job with less than a quarter of its time left is not started")
+
+	// The same minute left of a 3-minute offer is more than a quarter: the job runs.
+	a.runJob(ctx, wire.WorkRequest{ID: "w2", Digest: e.manifest, Platform: platform, Deadline: now.Add(time.Minute)},
+		now.Add(-2*time.Minute))
+	res := e.ctl.nextSBOM(t)
+	require.Equal(t, "w2", res.ID)
+	require.Empty(t, res.Failure)
+}
+
+func TestWork_ScratchFailuresAreNotTheImages(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	work := wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: "linux/" + runtime.GOARCH, Deadline: time.Now().Add(5 * time.Minute)}
+
+	// The SBOM cannot be spooled: its scratch path is taken.
+	require.NoError(t, os.MkdirAll(filepath.Join(e.scratch, "sbom-work-w1.json", "x"), 0o750))
+	a.runJob(ctx, work, time.Now())
+	require.Len(t, e.runner.requests(), 1, "the image was catalogued")
+	e.ctl.noSBOM(t)
+	require.NoError(t, os.RemoveAll(filepath.Join(e.scratch, "sbom-work-w1.json")))
+
+	// The image cannot be staged: a blob path in its stage dir is taken.
+	require.NoError(t, os.MkdirAll(filepath.Join(e.scratch, "work-w1", "blobs", "sha256", strings.TrimPrefix(e.manifest, "sha256:")), 0o750))
+	a.runJob(ctx, work, time.Now())
+	require.Len(t, e.runner.requests(), 1, "nothing was staged to catalogue")
+	e.ctl.noSBOM(t)
+
+	// Neither is the image's failure: nothing was sent, so nothing counts toward its quarantine.
+	a.runJob(ctx, work, time.Now())
+	res := e.ctl.nextSBOM(t)
+	require.Empty(t, res.Failure)
+	require.NotEmpty(t, res.SyftJSON)
+	require.Empty(t, spooled(t, e.scratch))
+	require.Empty(t, workDirs(t, e.scratch))
+}
+
+func TestCollectHost_SpoolFailureIsAScratchProblem(t *testing.T) {
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	require.NoError(t, os.MkdirAll(filepath.Join(e.scratch, "sbom-host-1.json", "x"), 0o750))
+	inv, problems, retry := a.collectHost(context.Background())
+	require.Nil(t, inv)
+	require.True(t, retry, "retried on the full backoff, not the report interval")
+	require.Len(t, problems, 1)
+	require.Equal(t, "scratch", problems[0].Code, "not a catalog problem: the cataloguer did its job")
+	require.True(t, strings.HasPrefix(problems[0].Detail, "host SBOM not spooled: "), problems[0].Detail)
 }
 
 func TestWork_UnsafeIDStaysInScratch(t *testing.T) {
@@ -244,7 +308,7 @@ func TestWork_RealSyftOnStagedLayout(t *testing.T) {
 	a := newTestAgent(t, e)
 	_, cfg := contentstoretest.WriteImage(t, e.storeDir(), debianImage(t, runtime.GOARCH))
 
-	a.runJob(ctx, wire.WorkRequest{ID: "w1", Digest: cfg, Platform: "linux/" + runtime.GOARCH, Deadline: time.Now().Add(5 * time.Minute)})
+	a.runJob(ctx, wire.WorkRequest{ID: "w1", Digest: cfg, Platform: "linux/" + runtime.GOARCH, Deadline: time.Now().Add(5 * time.Minute)}, time.Now())
 	res := e.ctl.nextSBOM(t)
 	require.Empty(t, res.Failure)
 	require.Empty(t, res.Unavailable)

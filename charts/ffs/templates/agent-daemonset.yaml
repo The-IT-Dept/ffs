@@ -3,11 +3,20 @@
 {{- $fullname := include "ffs.fullname" . }}
 {{- $host := include "ffs.agentHost" . | fromJson }}
 {{- $dist := $host.distribution }}
-{{- $store := include "ffs.agentContentStore" $dist }}
-{{- $extra := include "ffs.agentExtraBinDirs" . | fromJsonArray }}
+{{- $store := include "ffs.agentContentStore" (dict "dist" $dist "root" $na.hostPaths.containerdRoot) }}
+{{- $extra := include "ffs.agentExtraBinDirs" (dict "root" . "imageBased" $host.imageBased) | fromJsonArray }}
+{{- $archs := include "ffs.agentArchitectures" . | fromJsonArray }}
 {{- $port := include "ffs.agentPort" . }}
 {{- $maxImage := include "ffs.bytes" (list "nodeAgent.maxImageBytes" $na.maxImageBytes) }}
-{{- $scratchLimit := include "ffs.agentScratchLimit" . }}
+{{- $scratch := include "ffs.agentScratch" . | fromJson }}
+{{- $collectorResources := deepCopy ($na.resources.collector | default dict) }}
+{{- with $na.scratchRequest }}
+{{- $requests := get $collectorResources "requests" | default dict }}
+{{- if not (hasKey $requests "ephemeral-storage") }}
+{{- $_ := set $requests "ephemeral-storage" . }}
+{{- end }}
+{{- $_ := set $collectorResources "requests" $requests }}
+{{- end }}
 {{- /* Host volumes: every one read-only at /host<path>, on the collector only (docs/node-agent.md). */}}
 {{- $vols := list (dict "name" "host-os-release" "path" "/etc/os-release" "type" "File")
   (dict "name" "host-usr-bin" "path" "/usr/bin" "type" "Directory")
@@ -24,8 +33,14 @@
 {{- if has "apk" $host.packageDatabases }}
 {{- $vols = append $vols (dict "name" "host-apk" "path" "/lib/apk/db" "type" "Directory") }}
 {{- end }}
-{{- if eq $dist "k3s" "rke2" }}
-{{- $vols = append $vols (dict "name" (printf "host-%s-data" $dist) "path" (printf "/var/lib/rancher/%s/data" $dist) "type" "Directory") }}
+{{- if eq $dist "k3s" }}
+{{- $vols = append $vols (dict "name" "host-k3s-data" "path" "/var/lib/rancher/k3s/data" "type" "Directory") }}
+{{- end }}
+{{- if eq $dist "rke2" }}
+{{- /* RKE2's link to the bin dir of its current data dir, followed when the container starts. RKE2 makes it before
+it starts the kubelet. The data dirs are not mounted: the agent searches them only when the link is missing, and
+without the link this mount, like the content store's, keeps the pod from starting. */}}
+{{- $vols = append $vols (dict "name" "host-rke2-bin" "path" "/var/lib/rancher/rke2/bin" "type" "Directory") }}
 {{- end }}
 {{- if $store }}
 {{- $vols = append $vols (dict "name" "host-content-store" "path" $store "type" "Directory") }}
@@ -44,6 +59,10 @@ spec:
   selector:
     matchLabels:
       {{- include "ffs.agentSelectorLabels" . | nindent 6 }}
+  {{- with $na.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   template:
     metadata:
       labels:
@@ -84,7 +103,7 @@ spec:
             {{- end }}
             - --scratch=/scratch/stage
             - --catalog-socket=/run/ffs/catalog.sock
-            - --heartbeat=/scratch/heartbeat
+            - --heartbeat=/run/ffs-agent/heartbeat
             - --max-image-bytes={{ $maxImage }}
             {{- range $extra }}
             - --extra-bin-dir={{ . }}
@@ -95,19 +114,23 @@ spec:
                 fieldRef:
                   fieldPath: spec.nodeName
             - name: GOMEMLIMIT
+              {{- with (dig "resources" "collector" "limits" "memory" "" $na) }}
+              value: {{ include "ffs.goMemLimitOf" (list "nodeAgent.resources.collector.limits.memory" .) | quote }}
+              {{- else }}
               valueFrom:
                 resourceFieldRef:
                   containerName: collector
                   resource: limits.memory
+              {{- end }}
           livenessProbe:
             exec:
-              command: [/ffs, agent, check, --heartbeat=/scratch/heartbeat, --max-age=15m]
+              command: [/ffs, agent, check, --heartbeat=/run/ffs-agent/heartbeat, --max-age=15m]
             initialDelaySeconds: 60
             periodSeconds: 60
             timeoutSeconds: 10
             failureThreshold: 3
           resources:
-            {{- toYaml $na.resources.collector | nindent 12 }}
+            {{- toYaml $collectorResources | nindent 12 }}
           securityContext:
             runAsUser: 0
             runAsGroup: 0
@@ -125,7 +148,10 @@ spec:
             {{- range $vols }}
             - {name: {{ .name }}, mountPath: /host{{ .path }}, readOnly: true, mountPropagation: None}
             {{- end }}
-            - {name: scratch, mountPath: /scratch}
+            # The collector stages into its own volume, which the cataloguer only reads, and keeps its heartbeat
+            # where the cataloguer cannot reach it.
+            - {name: stage, mountPath: /scratch/stage}
+            - {name: heartbeat, mountPath: /run/ffs-agent}
             - {name: run, mountPath: /run/ffs}
             - {name: token, mountPath: /var/run/secrets/ffs-agent, readOnly: true}
             - {name: ca, mountPath: /etc/ffs-agent/ca, readOnly: true}
@@ -139,13 +165,20 @@ spec:
             - --local-root=/scratch/stage
             - --max-concurrent=1
             - --nice=10
-            - --scratch-limit={{ $scratchLimit }}
+            - --scratch-limit={{ $scratch.limit | int64 }}
+            {{- with (dig "resources" "catalog" "limits" "memory" "" $na) }}
+            - --worker-memory-limit={{ include "ffs.workerMemLimit" (list "nodeAgent.resources.catalog.limits.memory" . 1) }}
+            {{- end }}
           env:
             - name: GOMEMLIMIT
+              {{- with (dig "resources" "catalog" "limits" "memory" "" $na) }}
+              value: {{ include "ffs.goMemLimitOf" (list "nodeAgent.resources.catalog.limits.memory" .) | quote }}
+              {{- else }}
               valueFrom:
                 resourceFieldRef:
                   containerName: catalog
                   resource: limits.memory
+              {{- end }}
           resources:
             {{- toYaml $na.resources.catalog | nindent 12 }}
           securityContext:
@@ -158,7 +191,9 @@ spec:
             capabilities:
               drop: [ALL]
           volumeMounts:
-            - {name: scratch, mountPath: /scratch}
+            - {name: stage, mountPath: /scratch/stage, readOnly: true}
+            # Its own scratch, where jobs unpack images; the workers' TMPDIR.
+            - {name: catalog-scratch, mountPath: /scratch/catalog}
             - {name: run, mountPath: /run/ffs}
       volumes:
         {{- range $vols }}
@@ -167,9 +202,15 @@ spec:
             path: {{ .path }}
             type: {{ .type | quote }}
         {{- end }}
-        - name: scratch
+        - name: stage
           emptyDir:
-            sizeLimit: {{ $na.scratchSizeLimit }}
+            sizeLimit: {{ $scratch.stage | int64 }}
+        - name: catalog-scratch
+          emptyDir:
+            sizeLimit: {{ $scratch.catalog | int64 }}
+        - name: heartbeat
+          emptyDir:
+            sizeLimit: 1Mi
         - name: run
           emptyDir: {}
         - name: token
@@ -198,5 +239,5 @@ spec:
                   - key: kubernetes.io/arch
                     operator: In
                     values:
-                      {{- toYaml $na.architectures | nindent 22 }}
+                      {{- toYaml $archs | nindent 22 }}
 {{- end }}

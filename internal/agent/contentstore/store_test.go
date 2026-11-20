@@ -14,6 +14,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/empty"
 	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
+	"github.com/google/go-containerregistry/pkg/v1/static"
 	"github.com/google/go-containerregistry/pkg/v1/types"
 	"github.com/stretchr/testify/require"
 
@@ -292,4 +293,74 @@ func TestResolve_ConfigPrefersCompleteManifest(t *testing.T) {
 func TestResolve_MissingStoreIsNotFound(t *testing.T) {
 	_, err := Open(t.TempDir()+"/nope").Resolve(context.Background(), "sha256:"+string(bytes.Repeat([]byte{'a'}, 64)), "")
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+// attestationImage is an attestation manifest as BuildKit writes it: an OCI image manifest with an OCI image
+// config for os/arch (unknown/unknown from BuildKit) and one in-toto statement layer.
+func attestationImage(t *testing.T, os, arch string) v1.Image {
+	t.Helper()
+	stmt := static.NewLayer([]byte(`{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://spdx.dev/Document"}`),
+		"application/vnd.in-toto+json")
+	img, err := mutate.Append(empty.Image, mutate.Addendum{Layer: stmt,
+		Annotations: map[string]string{"in-toto.io/predicate-type": "https://spdx.dev/Document"}})
+	require.NoError(t, err)
+	cf, err := img.ConfigFile()
+	require.NoError(t, err)
+	cf = cf.DeepCopy()
+	cf.OS, cf.Architecture = os, arch
+	img, err = mutate.ConfigFile(img, cf)
+	require.NoError(t, err)
+	return mutate.ConfigMediaType(mutate.MediaType(img, types.OCIManifestSchema1), types.OCIConfigJSON)
+}
+
+func TestScan_SkipsBuildKitAttestations(t *testing.T) {
+	ctx := context.Background()
+	annotations := func(subject string) map[string]string {
+		return map[string]string{"vnd.docker.reference.type": "attestation-manifest", "vnd.docker.reference.digest": subject}
+	}
+	unknown := &v1.Platform{OS: "unknown", Architecture: "unknown"}
+	for name, tc := range map[string]struct {
+		configOS, configArch string
+		platform             *v1.Platform
+		annotated            bool
+	}{
+		"as BuildKit writes it": {"unknown", "unknown", unknown, true},
+		"by annotation":         {"linux", "amd64", nil, true},
+		"by index platform":     {"linux", "amd64", unknown, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := filepath.Join(t.TempDir(), "io.containerd.content.v1.content")
+			amd := describe(t, platformImage(t, "linux", "amd64", "", types.OCIManifestSchema1))
+			att := describe(t, attestationImage(t, tc.configOS, tc.configArch))
+			desc := v1.Descriptor{Platform: tc.platform}
+			if tc.annotated {
+				desc.Annotations = annotations(amd.manifest)
+			}
+			index := contentstoretest.WriteIndex(t, dir, mutate.IndexMediaType(mutate.AppendManifests(empty.Index,
+				mutate.IndexAddendum{Add: amd.img, Descriptor: v1.Descriptor{Platform: &v1.Platform{OS: "linux", Architecture: "amd64"}}},
+				mutate.IndexAddendum{Add: att.img, Descriptor: desc},
+			), types.OCIImageIndex))
+
+			s := Open(dir)
+			got, err := s.Scan(ctx)
+			require.NoError(t, err)
+			want := []wire.CachedImage{
+				{Digest: index, MediaType: string(types.OCIImageIndex), Manifests: []string{amd.manifest, att.manifest}, Size: amd.size, Complete: true},
+				{Digest: amd.manifest, MediaType: string(types.OCIManifestSchema1), ConfigDigest: amd.config, Platform: "linux/amd64",
+					Size: amd.size, Complete: true},
+			}
+			sortImages(want)
+			require.Equal(t, want, got, "the attestation is not a cached image")
+
+			for _, d := range []string{att.manifest, att.config} {
+				_, err = s.Resolve(ctx, d, "")
+				require.ErrorIs(t, err, ErrNotFound, d)
+			}
+			_, err = s.Resolve(ctx, index, "unknown/unknown")
+			require.ErrorIs(t, err, ErrNotFound)
+			tg, err := s.Resolve(ctx, index, "linux/amd64")
+			require.NoError(t, err)
+			require.Equal(t, amd.manifest, tg.Manifest)
+		})
+	}
 }

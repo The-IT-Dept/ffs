@@ -3,6 +3,7 @@ package contentstore
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -144,4 +145,49 @@ func TestStage_StopsWhenCancelled(t *testing.T) {
 	require.ErrorIs(t, s.Stage(ctx, target, dst, 1<<30), context.Canceled)
 	_, err = os.Stat(dst)
 	require.ErrorIs(t, err, fs.ErrNotExist)
+}
+
+func TestStage_ScratchErrorsAreNotTheImages(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	s := Open(f.dir)
+	target, err := s.Resolve(ctx, f.amd64.manifest, "")
+	require.NoError(t, err)
+
+	t.Run("blob path taken", func(t *testing.T) {
+		dst := filepath.Join(t.TempDir(), "work-1")
+		require.NoError(t, os.MkdirAll(filepath.Join(dst, "blobs", "sha256", strings.TrimPrefix(target.Manifest, "sha256:")), 0o750))
+		require.ErrorIs(t, s.Stage(ctx, target, dst, 1<<30), ErrScratch)
+		_, err := os.Stat(dst)
+		require.ErrorIs(t, err, fs.ErrNotExist)
+	})
+	t.Run("write fails", func(t *testing.T) {
+		file, err := os.CreateTemp(t.TempDir(), "blob")
+		require.NoError(t, err)
+		require.NoError(t, file.Close())
+		_, err = io.Copy(scratchWriter{file}, strings.NewReader("layer bytes"))
+		require.ErrorIs(t, err, ErrScratch)
+	})
+	t.Run("not writable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root writes to read-only dirs")
+		}
+		parent := t.TempDir()
+		require.NoError(t, os.Chmod(parent, 0o500))       //nolint:gosec // G302: a scratch dir the collector cannot write
+		t.Cleanup(func() { _ = os.Chmod(parent, 0o700) }) //nolint:gosec // G302: let the test clean up
+		err := s.Stage(ctx, target, filepath.Join(parent, "work-1"), 1<<30)
+		require.ErrorIs(t, err, ErrScratch)
+		require.ErrorIs(t, err, fs.ErrPermission)
+	})
+	t.Run("content store unreadable", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root reads unreadable files")
+		}
+		layer := filepath.Join(f.dir, "blobs", "sha256", strings.TrimPrefix(f.amd64.layers[0], "sha256:"))
+		require.NoError(t, os.Chmod(layer, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(layer, 0o600) })
+		err := s.Stage(ctx, target, filepath.Join(t.TempDir(), "work-1"), 1<<30)
+		require.ErrorIs(t, err, fs.ErrPermission)
+		require.NotErrorIs(t, err, ErrScratch, "reading the content store is not a scratch failure")
+	})
 }

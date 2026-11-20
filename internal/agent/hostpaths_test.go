@@ -13,20 +13,23 @@ func TestPathsFor(t *testing.T) {
 	for _, tc := range []struct {
 		dist         Distribution
 		binDirs      []string
+		fallbacks    map[string]string
 		contentStore string
 	}{
-		{DistContainerd, base, "/var/lib/containerd/io.containerd.content.v1.content"},
+		{DistContainerd, base, map[string]string{}, "/var/lib/containerd/io.containerd.content.v1.content"},
 		{DistK3s, append(append([]string(nil), base...), "/var/lib/rancher/k3s/data/current/bin", "/var/lib/rancher/k3s/data/current/bin/aux"),
-			"/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"},
-		{DistRKE2, append(append([]string(nil), base...), "/var/lib/rancher/rke2/data/*/bin"),
+			map[string]string{}, "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"},
+		{DistRKE2, append(append([]string(nil), base...), "/var/lib/rancher/rke2/bin"),
+			map[string]string{"/var/lib/rancher/rke2/bin": "/var/lib/rancher/rke2/data/*/bin"},
 			"/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content"},
-		{DistCRIO, base, ""},
+		{DistCRIO, base, map[string]string{}, ""},
 	} {
 		t.Run(string(tc.dist), func(t *testing.T) {
 			p := PathsFor(tc.dist)
 			require.Equal(t, []string{"/etc/os-release"}, p.OSRelease)
 			require.Equal(t, dbs, p.PackageDBs)
 			require.Equal(t, tc.binDirs, p.BinDirs)
+			require.Equal(t, tc.fallbacks, p.Fallbacks)
 			require.Equal(t, names, p.BinaryNames)
 			require.Equal(t, tc.contentStore, p.ContentStore)
 		})

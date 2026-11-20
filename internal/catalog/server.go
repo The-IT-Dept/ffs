@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -475,7 +476,10 @@ func dirSize(dir string) int64 {
 }
 
 // execOptions are the ExecRunner options.
-type execOptions struct{ nice int }
+type execOptions struct {
+	nice     int
+	memLimit int64
+}
 
 // ExecOption configures ExecRunner.
 type ExecOption func(*execOptions)
@@ -483,6 +487,11 @@ type ExecOption func(*execOptions)
 // WithNice runs each worker at nice value n (0 to 19), so cataloguing yields the CPU to the node's
 // workloads. 0 leaves the priority alone.
 func WithNice(n int) ExecOption { return func(o *execOptions) { o.nice = n } }
+
+// WithMemoryLimit sets each worker's GOMEMLIMIT to n bytes, in place of the server's own, which the
+// worker would otherwise inherit. The worker shares the container's memory limit with the server, so
+// it gets that limit less what the server needs. 0 leaves the worker the server's GOMEMLIMIT.
+func WithMemoryLimit(n int64) ExecOption { return func(o *execOptions) { o.memLimit = n } }
 
 // ExecRunner runs each job as `self catalog worker` in its own process group, with TMPDIR set to the
 // job directory. The request (credentials included) goes on stdin, never in argv or the
@@ -501,6 +510,9 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		var out bytes.Buffer
 		cmd := exec.CommandContext(ctx, self, "catalog", "worker") //nolint:gosec // G204: self is this binary
 		cmd.Env = append(os.Environ(), "TMPDIR="+jobDir)
+		if o.memLimit > 0 {
+			cmd.Env = append(cmd.Env, "GOMEMLIMIT="+strconv.FormatInt(o.memLimit, 10))
+		}
 		cmd.Stdin = bytes.NewReader(in)
 		cmd.Stdout = &out
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

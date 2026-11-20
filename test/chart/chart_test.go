@@ -73,7 +73,8 @@ func TestChart_DeploymentShape(t *testing.T) {
 	ctl, cat := ps.Containers[0], ps.Containers[1]
 	require.Equal(t, ctl.Image, cat.Image)
 	require.Equal(t, []string{"controller", "--config=/etc/ffs/config.yaml"}, ctl.Args)
-	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/tmp", "--scratch-limit=19327352832", "--max-concurrent=2"}, cat.Args)
+	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/tmp", "--scratch-limit=19327352832", "--max-concurrent=2",
+		"--worker-memory-limit=1006632960"}, cat.Args) // (2Gi − 128Mi) / 2
 
 	cm := mounts(ctl)
 	require.Equal(t, "/etc/ffs", cm["config"].MountPath)
@@ -100,9 +101,7 @@ func TestChart_DeploymentShape(t *testing.T) {
 		require.Equal(t, "GOMEMLIMIT", c.Env[0].Name)
 	}
 	require.Equal(t, "966367641", ctl.Env[0].Value, "90% of the controller's 1Gi limit")
-	ref := cat.Env[0].ValueFrom.ResourceFieldRef
-	require.Equal(t, "catalog", ref.ContainerName)
-	require.Equal(t, "limits.memory", ref.Resource)
+	require.Equal(t, "1932735283", cat.Env[0].Value, "90% of the cataloguer's 2Gi limit")
 	reqs := func(c corev1.Container) (string, string, string, bool) {
 		return c.Resources.Requests.Cpu().String(), c.Resources.Requests.Memory().String(),
 			c.Resources.Limits.Memory().String(), c.Resources.Limits.Cpu().IsZero()
@@ -627,7 +626,7 @@ func TestChart_NodeAgentConfig(t *testing.T) {
 	require.Equal(t, config.NodeAgentConfig{Enabled: false, Listen: ":9444", CertDir: "/etc/ffs/agent-tls",
 		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
 		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
-		WorkTimeout: 30 * time.Minute, ExposedNodes: "node-role.example.com/edge"}, c.NodeAgent)
+		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge"}, c.NodeAgent)
 
 	o = render(t, "config.nodeAgent.listen=:1") // the top-level nodeAgent values win
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))

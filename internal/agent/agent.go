@@ -2,16 +2,21 @@ package agent
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -30,16 +35,23 @@ const MaxHostBytes = 512 << 20
 const (
 	// startJitter spreads the first full reports of a DaemonSet rollout.
 	startJitter = 30 * time.Second
-	// configTimeout bounds the start-up config fetch.
+	// configTimeout bounds the config probe that precedes each full report.
 	configTimeout = 10 * time.Second
 	// catalogClientTimeout bounds one cataloguer call; each job is bounded by its own deadline first.
 	catalogClientTimeout = 31 * time.Minute
 	// hostCatalogTimeout is the cataloguer's limit for the host SBOM.
 	hostCatalogTimeout = 10 * time.Minute
-	// fullReportTimeout bounds building and sending one full report, so a wedged one lets the heartbeat go stale.
+	// fullReportTimeout bounds building and sending one full report.
 	fullReportTimeout = 25 * time.Minute
+	// imagesReportTimeout bounds scanning the content store and sending one images report.
+	imagesReportTimeout = clientTimeout + time.Minute
 	// maxBackoff caps the failed-report backoff.
 	maxBackoff = 5 * time.Minute
+	// backoffJitterPercent spreads each backoff, and each wait for a Retry-After, so nodes that failed together do
+	// not retry together.
+	backoffJitterPercent = 20
+	// unappliedLogEvery is how many reports in a row the controller leaves unapplied before the agent says so.
+	unappliedLogEvery = 3
 )
 
 var (
@@ -78,19 +90,41 @@ type agent struct {
 	storeHost    string              // host path of the content store
 	paths        HostPaths
 	bootID       string
+	instance     string // random per process: orders this process's reports after any earlier one's
 	kernel       string
 	started      time.Time
 	cfg          wire.AgentConfig
 	seq          uint64
 	acceptedHash [sha256.Size]byte // hash of the last Images the controller applied
 	accepted     bool
-	hostBackoff  time.Duration
+	host         *hostInventory // the last host inventory collected, until the controller stores a host part
+	lastContact  time.Time      // when the controller last answered
+	unapplied    int            // reports in a row the controller did not apply
+	pulse        pulse
+}
+
+// hostInventory is a collected host inventory: what staging found and the host SBOM in a scratch file. It is
+// kept until the controller has stored a host part, so a full report that failed is resent without staging and
+// cataloguing the host again.
+type hostInventory struct {
+	packageDB string
+	binaries  []wire.Binary
+	problems  []wire.Problem
+	sbom      sbomFile
+	collected time.Time
+}
+
+// schedule is when each kind of report is next due and how far each has backed off. The two backoffs are
+// separate: images reports that succeed never cut short the backoff of failing full reports.
+type schedule struct {
+	nextFull, nextImages       time.Time
+	fullBackoff, imagesBackoff time.Duration
 }
 
 // Run sends reports until ctx ends: a full report at start (after up to 30s of jitter) and then every
 // report interval, an images report every image-list interval, and the work the controller hands back.
 func Run(ctx context.Context, o Options) error {
-	a, err := newAgent(ctx, o)
+	a, err := newAgent(o)
 	if err != nil {
 		return err
 	}
@@ -98,7 +132,7 @@ func Run(ctx context.Context, o Options) error {
 	return nil
 }
 
-func newAgent(ctx context.Context, o Options) (*agent, error) {
+func newAgent(o Options) (*agent, error) {
 	if o.NodeName == "" {
 		return nil, errors.New("node name is required (--node-name or NODE_NAME)")
 	}
@@ -117,7 +151,9 @@ func newAgent(ctx context.Context, o Options) (*agent, error) {
 			return time.Duration(rand.Int64N(int64(max) + 1)) //nolint:gosec // G404: schedule jitter
 		}
 	}
-	a := &agent{o: o, client: client, cat: catalog.NewSocketClient(o.CatalogSocket, catalogClientTimeout), started: o.Now()}
+	a := &agent{o: o, client: client, cat: catalog.NewSocketClient(o.CatalogSocket, catalogClientTimeout), started: o.Now(),
+		instance: newInstance(), cfg: fallbackConfig}
+	a.lastContact = a.started
 	if a.bootID, err = BootID(); err != nil {
 		return nil, err
 	}
@@ -141,20 +177,24 @@ func newAgent(ctx context.Context, o Options) (*agent, error) {
 		return nil, err
 	}
 	a.touch()
-	cctx, cancel := context.WithTimeout(ctx, configTimeout)
-	defer cancel()
-	a.cfg = fallbackConfig
-	if cfg, err := client.Config(cctx); err != nil {
-		o.Log.Error(err, "fetching the agent config; using defaults until the controller answers")
-	} else {
-		a.adopt(cfg)
-	}
 	return a, nil
 }
 
-// cleanScratch creates the scratch dir and removes the stage dirs a previous run left.
+// newInstance is 32 random hex characters.
+func newInstance() string {
+	b := make([]byte, 16)
+	_, _ = crand.Read(b) // never fails
+	return hex.EncodeToString(b)
+}
+
+// cleanScratch creates the scratch dir, readable by the non-root cataloguer whatever the umask, and removes the
+// stage dirs and spooled SBOMs a previous run left.
 func (a *agent) cleanScratch() error {
 	if err := os.MkdirAll(a.o.Scratch, 0o755); err != nil { //nolint:gosec // G301: the non-root cataloguer reads staged files
+		return err
+	}
+	// MkdirAll's mode is filtered by the umask and leaves an existing dir as it is.
+	if err := os.Chmod(a.o.Scratch, 0o755); err != nil { //nolint:gosec // G302: the non-root cataloguer reads staged files
 		return err
 	}
 	entries, err := os.ReadDir(a.o.Scratch)
@@ -162,8 +202,8 @@ func (a *agent) cleanScratch() error {
 		return err
 	}
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), "host-") || strings.HasPrefix(e.Name(), "work-") {
-			if err := os.RemoveAll(filepath.Join(a.o.Scratch, e.Name())); err != nil {
+		if n := e.Name(); strings.HasPrefix(n, "host-") || strings.HasPrefix(n, "work-") || strings.HasPrefix(n, "sbom-") {
+			if err := os.RemoveAll(filepath.Join(a.o.Scratch, n)); err != nil {
 				return err
 			}
 		}
@@ -201,58 +241,37 @@ func (a *agent) maxImageBytes() int64 {
 }
 
 func (a *agent) loop(ctx context.Context) {
-	nextFull := a.o.Now().Add(a.o.Jitter(startJitter))
-	nextImages := nextFull.Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter))
-	var backoff time.Duration
+	stop := a.startPulse()
+	defer stop()
+	defer a.dropHost()
+	s := &schedule{nextFull: a.o.Now().Add(a.o.Jitter(startJitter))}
+	s.nextImages = s.nextFull.Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter))
 	for {
-		due := nextImages
-		if nextFull.Before(due) || nextFull.Equal(due) {
-			due = nextFull
+		due := s.nextImages
+		if !s.nextFull.After(due) {
+			due = s.nextFull
 		}
+		a.lease(due.Sub(a.o.Now()))
 		if !a.sleepUntil(ctx, due) {
 			return
 		}
-		now := a.o.Now()
-		kind := wire.KindImages
-		if !now.Before(nextFull) {
-			kind = wire.KindFull
+		var work []queuedJob
+		if !a.o.Now().Before(s.nextFull) {
+			work = a.enqueue(nil, a.fullReport(ctx, s))
+		} else {
+			work = a.enqueue(nil, a.imagesReport(ctx, s))
 		}
-		resp, sent, hostRetry, err := a.send(ctx, kind)
-		a.touch()
+		for len(work) > 0 && ctx.Err() == nil {
+			j := work[0]
+			work = work[1:]
+			a.runJob(ctx, j.w, j.received)
+			// A job can outlast the image-list interval: report between jobs, so the node does not look stale.
+			if ctx.Err() == nil && !a.o.Now().Before(s.nextImages) {
+				work = a.enqueue(work, a.imagesReport(ctx, s))
+			}
+		}
 		if ctx.Err() != nil {
 			return
-		}
-		now = a.o.Now()
-		if err != nil {
-			backoff = nextBackoff(backoff)
-			a.o.Log.Error(err, "sending a report", "kind", kind, "seq", a.seq, "retryIn", backoff)
-			if kind == wire.KindFull {
-				nextFull = now.Add(backoff)
-			} else {
-				nextImages = now.Add(backoff)
-			}
-			continue
-		}
-		backoff = 0
-		a.adopt(resp.Config)
-		if kind == wire.KindFull {
-			if hostRetry {
-				a.hostBackoff = nextBackoff(a.hostBackoff)
-				nextFull = now.Add(a.hostBackoff)
-			} else {
-				a.hostBackoff = 0
-				nextFull = now.Add(jittered(a.reportInterval(), a.cfg.JitterPercent, a.o.Jitter))
-			}
-		}
-		nextImages = now.Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter))
-		if resp.Applied && sent.Images != nil {
-			a.acceptedHash, a.accepted = imagesHash(sent.Images), true
-		}
-		for _, w := range resp.Work {
-			if ctx.Err() != nil {
-				return
-			}
-			a.runJob(ctx, w)
 		}
 	}
 }
@@ -273,64 +292,221 @@ func (a *agent) sleepUntil(ctx context.Context, t time.Time) bool {
 	}
 }
 
-// send builds one report of kind and posts it. It returns the report as sent and, for a full report, whether
-// the host part failed for a reason worth retrying soon.
-func (a *agent) send(ctx context.Context, kind string) (wire.ReportResponse, wire.Report, bool, error) {
+// newReport starts the next report of kind.
+func (a *agent) newReport(kind string) wire.Report {
 	a.seq++
-	r := wire.Report{
-		Node: a.o.NodeName, AgentVersion: version.Version, BootID: a.bootID, StartedAt: a.started, Seq: a.seq,
-		Kind: kind, CollectedAt: a.o.Now(), KernelRelease: a.kernel, Arch: runtime.GOARCH,
+	return wire.Report{
+		Node: a.o.NodeName, AgentVersion: version.Version, BootID: a.bootID, Instance: a.instance, StartedAt: a.started,
+		Seq: a.seq, Kind: kind, CollectedAt: a.o.Now(), KernelRelease: a.kernel, Arch: runtime.GOARCH,
 	}
-	hostRetry := false
-	if kind == wire.KindFull {
-		fctx, cancel := context.WithTimeout(ctx, fullReportTimeout)
-		defer cancel()
-		stop := a.keepAlive(fctx)
-		defer stop()
-		ctx = fctx
-		var problems []wire.Problem
-		r.Host, problems, hostRetry = a.collectHost(ctx)
-		r.Images, r.Problems = a.scanImages(ctx)
-		r.Problems = append(problems, r.Problems...)
-		if r.Host != nil && a.cfg.MaxReportBytes > 0 {
-			body, err := encodeReport(r)
-			if err != nil {
-				return wire.ReportResponse{}, r, false, err
-			}
-			if body.size() > a.cfg.MaxReportBytes {
-				r.Problems = append(r.Problems, wire.Problem{Code: wire.ProblemCatalog,
-					Detail: fmt.Sprintf("host SBOM of %d bytes exceeds the report limit %d", len(r.Host.SyftJSON), a.cfg.MaxReportBytes)})
-				r.Host = nil
-			}
-		}
-	} else if imgs, _ := a.scanImages(ctx); !a.accepted || imagesHash(imgs) != a.acceptedHash {
-		r.Images = imgs
-	}
-	resp, err := a.client.Report(ctx, r)
-	return resp, r, hostRetry, err
 }
 
-// collectHost stages the host inputs, has the cataloguer catalogue them and removes the stage. Host is nil when
-// either step failed; retry is true when the failure is worth retrying before the next report interval.
-func (a *agent) collectHost(ctx context.Context) (host *wire.Host, problems []wire.Problem, retry bool) {
-	dir := filepath.Join(a.o.Scratch, fmt.Sprintf("host-%d", a.seq))
+// fullReport sends a full report and schedules the next reports; it returns the work the controller handed back.
+// It first probes the controller's config, and skips the report when the controller does not answer. The host
+// inventory is the one kept from an earlier attempt while that is younger than the report interval, so retries
+// never stage or catalogue the host again; it is dropped once the controller has stored a host part.
+func (a *agent) fullReport(parent context.Context, s *schedule) []wire.WorkRequest {
+	a.lease(fullReportTimeout)
+	ctx, cancel := context.WithTimeout(parent, fullReportTimeout)
+	defer cancel()
+	if err := a.probe(ctx); err != nil {
+		if parent.Err() != nil {
+			return nil
+		}
+		wait := a.retryIn(err, &s.fullBackoff)
+		s.nextFull = a.o.Now().Add(wait)
+		a.logFailure(err, "the controller did not answer; the full report waits", "retryIn", wait)
+		return nil
+	}
+	if next := a.o.Now().Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter)); next.Before(s.nextImages) {
+		s.nextImages = next // the controller's image-list interval is shorter than the one assumed so far
+	}
+	inv, problems, retry := a.hostInventory(ctx)
+	r := a.newReport(wire.KindFull)
+	var imageProblems []wire.Problem
+	r.Images, imageProblems = a.scanImages(ctx)
+	r.Problems = append(problems, imageProblems...)
+	var doc *sbomFile
+	if inv != nil {
+		r.Host = &wire.Host{PackageDB: inv.packageDB, Binaries: inv.binaries}
+		r.Problems = append(slices.Clone(inv.problems), r.Problems...)
+		doc = &inv.sbom
+		if body, err := encodeReport(r, doc); err == nil && a.cfg.MaxReportBytes > 0 && body.size() > a.cfg.MaxReportBytes {
+			r.Problems = append(r.Problems, wire.Problem{Code: wire.ProblemCatalog,
+				Detail: fmt.Sprintf("host SBOM of %d bytes exceeds the report limit %d", inv.sbom.size, a.cfg.MaxReportBytes)})
+			r.Host, doc = nil, nil
+			a.dropHost()
+		}
+	}
+	resp, err := a.client.Report(ctx, r, doc)
+	a.touch()
+	if parent.Err() != nil {
+		return nil
+	}
+	now := a.o.Now()
+	if err != nil {
+		wait := a.retryIn(err, &s.fullBackoff)
+		s.nextFull = now.Add(wait)
+		a.logFailure(err, "sending a full report", "seq", r.Seq, "retryIn", wait)
+		return nil
+	}
+	a.answered(now, r, resp)
+	if retry || (resp.HostRetry && r.Host != nil) {
+		// The host part was not collected, or not stored: resend it soon, with the inventory kept.
+		s.nextFull = now.Add(a.retryIn(nil, &s.fullBackoff))
+	} else {
+		// Stored. Or not applied without HostRetry: a duplicate or out-of-order report, whose host part the
+		// controller does not want again. Kept, the inventory would serve only the next scheduled report, and
+		// only when its jitter lands it early, as a host nearly a report interval old.
+		a.dropHost()
+		s.fullBackoff = 0
+		s.nextFull = now.Add(jittered(a.reportInterval(), a.cfg.JitterPercent, a.o.Jitter))
+	}
+	s.imagesBackoff = 0
+	s.nextImages = now.Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter))
+	return resp.Work
+}
+
+// imagesReport sends an images report, with the cached images only when they changed since the last list the
+// controller applied, and schedules the next one; it returns the work the controller handed back.
+func (a *agent) imagesReport(parent context.Context, s *schedule) []wire.WorkRequest {
+	a.lease(imagesReportTimeout)
+	ctx, cancel := context.WithTimeout(parent, imagesReportTimeout)
+	defer cancel()
+	r := a.newReport(wire.KindImages)
+	if imgs, _ := a.scanImages(ctx); imgs != nil && (!a.accepted || imagesHash(imgs) != a.acceptedHash) {
+		r.Images = imgs
+	}
+	resp, err := a.client.Report(ctx, r, nil)
+	a.touch()
+	if parent.Err() != nil {
+		return nil
+	}
+	now := a.o.Now()
+	if err != nil {
+		wait := a.retryIn(err, &s.imagesBackoff)
+		s.nextImages = now.Add(wait)
+		a.logFailure(err, "sending an images report", "seq", r.Seq, "retryIn", wait)
+		return nil
+	}
+	a.answered(now, r, resp)
+	s.imagesBackoff = 0
+	s.nextImages = now.Add(jittered(a.imageInterval(), a.cfg.JitterPercent, a.o.Jitter))
+	return resp.Work
+}
+
+// probe fetches the agent config: a cheap check that the controller is answering, before the host is staged and
+// catalogued.
+func (a *agent) probe(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, configTimeout)
+	defer cancel()
+	cfg, err := a.client.Config(ctx)
+	if err != nil {
+		return err
+	}
+	a.lastContact = a.o.Now()
+	a.adopt(cfg)
+	return nil
+}
+
+// answered records the controller's answer to r.
+func (a *agent) answered(now time.Time, r wire.Report, resp wire.ReportResponse) {
+	a.lastContact = now
+	a.adopt(resp.Config)
+	if resp.Applied && r.Images != nil {
+		a.acceptedHash, a.accepted = imagesHash(r.Images), true
+	}
+	if resp.Applied {
+		a.unapplied = 0
+		return
+	}
+	a.unapplied++
+	if a.unapplied%unappliedLogEvery == 0 {
+		a.o.Log.Info("the controller has not applied this agent's last reports", "count", a.unapplied, "kind", r.Kind,
+			"seq", r.Seq, "instance", a.instance)
+	}
+}
+
+// retryIn is how long to wait before retrying after err: at least the controller's Retry-After when it answered
+// 429 with one, and otherwise the next step of *backoff. Either is spread by backoffJitterPercent.
+func (a *agent) retryIn(err error, backoff *time.Duration) time.Duration {
+	var se *StatusError
+	if errors.As(err, &se) && se.Code == http.StatusTooManyRequests && se.RetryAfter > 0 {
+		return se.RetryAfter + a.o.Jitter(se.RetryAfter*backoffJitterPercent/100)
+	}
+	*backoff = nextBackoff(*backoff)
+	return jittered(*backoff, backoffJitterPercent, a.o.Jitter)
+}
+
+// logFailure logs a failed exchange with the controller. While the controller is starting, restarting or
+// shedding load (connection refused, 503, 429), it is logged at Info until a report interval has passed since
+// the controller last answered; anything else is an error.
+func (a *agent) logFailure(err error, msg string, kv ...any) {
+	if controllerUnavailable(err) && a.o.Now().Sub(a.lastContact) < a.reportInterval() {
+		a.o.Log.Info(msg, append(kv, "reason", err.Error())...)
+		return
+	}
+	a.o.Log.Error(err, msg, kv...)
+}
+
+// controllerUnavailable reports whether err means the controller is not (yet) taking reports.
+func controllerUnavailable(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code == http.StatusServiceUnavailable || se.Code == http.StatusTooManyRequests
+	}
+	return errors.Is(err, syscall.ECONNREFUSED)
+}
+
+// hostInventory returns the kept host inventory while it is younger than the report interval, and otherwise
+// collects a new one. retry is true when collection failed for a reason worth retrying before the next report
+// interval.
+func (a *agent) hostInventory(ctx context.Context) (inv *hostInventory, problems []wire.Problem, retry bool) {
+	if a.host != nil && a.o.Now().Sub(a.host.collected) < a.reportInterval() {
+		return a.host, nil, false
+	}
+	a.dropHost()
+	return a.collectHost(ctx)
+}
+
+// dropHost removes the kept host inventory and its spooled SBOM.
+func (a *agent) dropHost() {
+	if a.host != nil {
+		_ = os.Remove(a.host.sbom.path)
+		a.host = nil
+	}
+}
+
+// collectHost stages the host inputs, has the cataloguer catalogue them into a spooled SBOM and removes the stage.
+// The inventory is nil when either step failed; retry is true when the failure is worth retrying before the
+// next report interval.
+func (a *agent) collectHost(ctx context.Context) (inv *hostInventory, problems []wire.Problem, retry bool) {
+	n := a.seq + 1 // the seq of the report it is collected for
+	dir := filepath.Join(a.o.Scratch, fmt.Sprintf("host-%d", n))
 	in, err := StageHost(ctx, a.o.HostRoot, a.paths, dir, MaxHostBytes)
 	if err != nil {
 		a.o.Log.Error(err, "staging host inputs")
 		return nil, []wire.Problem{{Code: wire.ProblemScratch, Detail: "host inputs not staged: " + err.Error()}}, true
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	problems = in.Problems
-	resp, err := a.cat.Catalog(ctx, sbom.CatalogRequest{Source: sbom.CatalogSourceHostDir, Path: dir, MaxBytes: MaxHostBytes,
-		TimeoutSeconds: int(hostCatalogTimeout / time.Second)})
+	doc, err := a.cat.Catalog(ctx, sbom.CatalogRequest{Source: sbom.CatalogSourceHostDir, Path: dir, MaxBytes: MaxHostBytes,
+		TimeoutSeconds: int(hostCatalogTimeout / time.Second)}, filepath.Join(a.o.Scratch, fmt.Sprintf("sbom-host-%d.json", n)))
 	_ = os.RemoveAll(dir)
+	var se *catalog.ScratchError
+	if errors.As(err, &se) {
+		a.o.Log.Error(err, "spooling the host SBOM to scratch")
+		return nil, append(in.Problems, wire.Problem{Code: wire.ProblemScratch, Detail: "host SBOM not spooled: " + se.Err.Error()}),
+			true
+	}
 	if err != nil {
 		kind, msg := workErrorOf(err)
 		a.o.Log.Error(err, "cataloguing host inputs", "kind", kind)
-		return nil, append(problems, wire.Problem{Code: wire.ProblemCatalog, Detail: failureDetail(kind, msg)}),
+		return nil, append(in.Problems, wire.Problem{Code: wire.ProblemCatalog, Detail: failureDetail(kind, msg)}),
 			kind == sbom.KindBusy || kind == sbom.KindTimeout
 	}
-	return &wire.Host{PackageDB: in.PackageDB, Binaries: in.Binaries, SyftJSON: resp.SyftJSON}, problems, false
+	a.host = &hostInventory{packageDB: in.PackageDB, binaries: in.Binaries, problems: in.Problems,
+		sbom: sbomFile{path: doc.Path, size: doc.Size}, collected: a.o.Now()}
+	return a.host, nil, false
 }
 
 // workErrorOf returns the kind and message of a cataloguer error. An error that is not a WorkError (the job's
@@ -346,7 +522,8 @@ func workErrorOf(err error) (string, string) {
 // failureDetail formats a cataloguer failure for a catalog problem or an SBOM result's Failure.
 func failureDetail(kind, msg string) string { return kind + ": " + msg }
 
-// scanImages lists the content store. Images is never nil; ContentStore is false when it could not be read.
+// scanImages lists the content store. Images is nil (unchanged since the last list) when an unexpected error
+// stopped the scan, and has ContentStore false when there is no content store or it cannot be read.
 func (a *agent) scanImages(ctx context.Context) (*wire.Images, []wire.Problem) {
 	if a.store == nil {
 		return &wire.Images{}, []wire.Problem{{Code: wire.ProblemContentStore, Detail: "no containerd content store (CRI-O)"}}
@@ -361,8 +538,9 @@ func (a *agent) scanImages(ctx context.Context) (*wire.Images, []wire.Problem) {
 	case errors.Is(err, fs.ErrPermission):
 		return &wire.Images{}, []wire.Problem{{Code: wire.ProblemPermissionDenied, Path: a.storeHost, Detail: "permission denied"}}
 	}
+	// Not a statement about the content store: the controller keeps the list it has.
 	a.o.Log.Error(err, "scanning the content store")
-	return &wire.Images{}, []wire.Problem{{Code: wire.ProblemContentStore, Path: a.storeHost, Detail: err.Error()}}
+	return nil, []wire.Problem{{Code: wire.ProblemContentStore, Path: a.storeHost, Detail: err.Error()}}
 }
 
 // imagesHash identifies a cached-image list for change detection.

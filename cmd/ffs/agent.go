@@ -47,7 +47,7 @@ func newAgentCmd() *cobra.Command {
 	f.StringVar(&o.Scratch, "scratch", "/scratch/stage", "directory shared with the cataloguer for staged inputs")
 	f.StringVar(&o.CatalogSocket, "catalog-socket", "/run/ffs/catalog.sock", "unix socket of the cataloguer")
 	f.Int64Var(&o.MaxImageBytes, "max-image-bytes", 1073741824, "largest image catalogued from the content store")
-	f.StringVar(&o.Heartbeat, "heartbeat", "/scratch/heartbeat", "file touched after every report; the liveness probe reads it")
+	f.StringVar(&o.Heartbeat, "heartbeat", "/run/ffs-agent/heartbeat", "file touched every minute while the agent makes progress; the liveness probe reads it")
 	f.StringArrayVar(&o.ExtraBinDirs, "extra-bin-dir", nil, "extra host directory searched for known binaries (repeatable)")
 
 	check := &cobra.Command{
@@ -59,7 +59,7 @@ func newAgentCmd() *cobra.Command {
 			return agent.CheckHeartbeat(heartbeat, checkMaxAge, time.Now())
 		},
 	}
-	check.Flags().StringVar(&heartbeat, "heartbeat", "/scratch/heartbeat", "heartbeat file the agent touches")
+	check.Flags().StringVar(&heartbeat, "heartbeat", "/run/ffs-agent/heartbeat", "heartbeat file the agent touches")
 	check.Flags().DurationVar(&checkMaxAge, "max-age", 15*time.Minute, "oldest heartbeat that counts as alive")
 	cmd.AddCommand(check)
 	return cmd
