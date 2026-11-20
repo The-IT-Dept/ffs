@@ -718,10 +718,12 @@ func packagesCTE(sc model.Scope) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	// Over the cluster, only findings on container images count: a host package or the cluster's
-	// own Kubernetes package at the same version is not one of these packages.
-	inScope := ` AND fp.fingerprint IN (SELECT fd.fingerprint FROM finding_digests fd WHERE fd.state = 'open' AND ` +
-		containerDigest("fd.digest") + `)`
+	// Over the cluster, only the findings of workloads count, which are the findings on container
+	// images: a host package or the cluster's own Kubernetes package at the same version is not one
+	// of these packages. The cluster-level owners are few, and their findings are found through
+	// findings_fix.
+	inScope := ` AND fp.fingerprint NOT IN (SELECT f.fingerprint FROM findings f WHERE f.state = 'open'
+		AND f.owner_key IN (SELECT owner_key FROM owner_stats WHERE namespace = ''))`
 	if len(fw.conds) > 0 {
 		inScope = ` AND fp.fingerprint IN (SELECT fingerprint FROM findings` + fw.String() + `)`
 	}
@@ -1032,4 +1034,42 @@ func (s *Store) InstalledVersions(ctx context.Context, digests []string, names [
 		out[digest] = append(out[digest], v)
 	}
 	return out, rows.Err()
+}
+
+// EntityCounts are the entity explorers' totals for a scope, counted without their pages.
+type EntityCounts struct{ Workloads, Images, Packages int }
+
+// EntityCounts counts the workloads, in-use container images and package versions of a cluster or
+// namespace scope: the totals WorkloadsPage, ImagesPage and PackagesPage give with no other
+// filter, without their findings, owners or a second pass.
+func (s *Store) EntityCounts(ctx context.Context, sc model.Scope) (EntityCounts, error) {
+	var (
+		owners, images, digests string
+		args                    []any
+	)
+	cd := containerDigest("oi.digest")
+	switch sc.Kind {
+	case model.ScopeCluster, "":
+		owners = `SELECT count(*) FROM owners WHERE namespace != ''`
+		images = `SELECT count(DISTINCT oi.digest) FROM owner_images oi JOIN owners o ON o.key = oi.owner_key WHERE ` + cd
+		digests = `SELECT DISTINCT oi.digest FROM owner_images oi WHERE ` + cd
+	case model.ScopeNamespace:
+		owners = `SELECT count(*) FROM owners WHERE namespace != '' AND namespace = ?`
+		images = `SELECT count(DISTINCT oi.digest) FROM owner_images oi JOIN owners o ON o.key = oi.owner_key WHERE o.namespace = ? AND ` + cd
+		digests = `SELECT DISTINCT oi.digest FROM owner_images oi JOIN owners o ON o.key = oi.owner_key WHERE o.namespace = ? AND ` + cd
+		args = []any{sc.Value, sc.Value, sc.Value}
+	default:
+		return EntityCounts{}, scopeErr(sc)
+	}
+	from := `packages p`
+	if sc.Kind != model.ScopeNamespace {
+		from = `packages p INDEXED BY packages_explore`
+	}
+	var c EntityCounts
+	err := s.rdb.QueryRowContext(ctx, `SELECT (`+owners+`), (`+images+`), (SELECT count(*) FROM (SELECT DISTINCT p.ecosystem, p.name, `+
+		installedExpr("p")+` FROM `+from+` WHERE p.digest IN (`+digests+`)))`, args...).Scan(&c.Workloads, &c.Images, &c.Packages)
+	if err != nil {
+		return EntityCounts{}, fmt.Errorf("store: entity counts of %s: %w", sc, err)
+	}
+	return c, nil
 }

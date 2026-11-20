@@ -599,3 +599,53 @@ func TestInstalledVersions_ByDigestAndName(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, empty)
 }
+
+// The rail's count-only reads give the explorers' totals, two stored forms of one installed
+// version counting once.
+func TestEntityCounts_MatchExplorerTotals(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	put(t, s, "sha256:web", model.Package{Ecosystem: "deb", Name: "libc6", Epoch: "1", Version: "2.36-9"}, deb("openssl", ""))
+	put(t, s, "sha256:worker", model.Package{Ecosystem: "deb", Name: "libc6", Version: "1:2.36-9"}, deb("zlib1g", ""))
+	put(t, s, "sha256:api", deb("openssl", ""))
+	put(t, s, "nodegroup:g1", deb("kmod", ""))
+	for _, sc := range []model.Scope{{Kind: model.ScopeCluster}, {Kind: model.ScopeNamespace, Value: "shop"},
+		{Kind: model.ScopeNamespace, Value: "payments"}, {Kind: model.ScopeNamespace, Value: "ops"}, {Kind: model.ScopeNamespace, Value: "none"}} {
+		got, err := s.EntityCounts(ctx, sc)
+		require.NoError(t, err)
+		wl, err := s.WorkloadsPage(ctx, WorkloadQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		im, err := s.ImagesPage(ctx, ImageQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		pk, err := s.PackagesPage(ctx, PackageEntityQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		require.Equal(t, EntityCounts{Workloads: wl.Total, Images: im.Total, Packages: pk.Total}, got, sc.String())
+	}
+	cluster, err := s.EntityCounts(ctx, model.Scope{Kind: model.ScopeCluster})
+	require.NoError(t, err)
+	require.Equal(t, EntityCounts{Workloads: 7, Images: 7, Packages: 3}, cluster, "libc6 once, openssl, zlib1g; the host's kmod is not counted")
+	_, err = s.EntityCounts(ctx, model.Scope{Kind: model.ScopeWorkload, Value: exWeb.Key()})
+	require.ErrorIs(t, err, ErrScope)
+}
+
+// The image gap tally counts what CoverageImages lists: one gap for an image not seen into, one per
+// partial-coverage reason, and hands back the classifier-found packages of the catalogued images.
+func TestImageGapTally_CountsCodes(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	redis := model.Package{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary", Path: "/usr/local/bin/redis-server"}
+	put(t, s, "sha256:worker", redis)
+	put(t, s, "sha256:node-exporter", redis) // pending: its packages are not counted
+	tally, err := s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeCluster})
+	require.NoError(t, err)
+	// api (attestation), node-exporter (pending), the placeholder (unresolvable), norow (no row)
+	require.Equal(t, 4, tally.Codes)
+	require.Len(t, tally.Classified, 1)
+	require.Equal(t, []string{"redis-server"}, names(tally.Classified["sha256:worker"]))
+
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:worker", t0))
+	tally, err = s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"})
+	require.NoError(t, err)
+	require.Equal(t, 1, tally.Codes, "worker is pending until its first match")
+	require.Empty(t, tally.Classified)
+}

@@ -140,12 +140,13 @@ func intp(n int) *int { return &n }
 func (r *rail) cluster(ctx context.Context) error {
 	s, sc := r.s, r.sc
 	var (
-		ci                       model.ClusterInfo
-		nodes                    []model.Node
-		nss                      []store.NamespaceStat
-		stats                    store.OwnerStats
-		reach, wl, im, pk, ngaps int
-		agents                   *agentView
+		ci           model.ClusterInfo
+		nodes        []model.Node
+		nss          []store.NamespaceStat
+		stats        store.OwnerStats
+		counts       store.EntityCounts
+		reach, ngaps int
+		agents       *agentView
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { ci, _, err = s.o.Store.GetClusterInfo(gctx); return err })
@@ -153,26 +154,8 @@ func (r *rail) cluster(ctx context.Context) error {
 	g.Go(func() (err error) { nss, err = s.o.Store.NamespaceStats(gctx); return err })
 	g.Go(func() (err error) { stats, err = s.o.Store.ScopeStats(gctx, sc); return err })
 	g.Go(func() (err error) { reach, _, err = s.reachable(gctx, sc); return err })
-	g.Go(func() error {
-		p, err := s.o.Store.WorkloadsPage(gctx, store.WorkloadQuery{Scope: sc, Limit: 1})
-		wl = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.ImagesPage(gctx, store.ImageQuery{Scope: sc, Limit: 1})
-		im = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.PackagesPage(gctx, store.PackageEntityQuery{Scope: sc, Limit: 1})
-		pk = p.Total
-		return err
-	})
-	g.Go(func() error {
-		gaps, err := s.scopeGaps(gctx, sc)
-		ngaps = len(gaps)
-		return err
-	})
+	g.Go(func() (err error) { counts, err = s.o.Store.EntityCounts(gctx, sc); return err })
+	g.Go(func() (err error) { ngaps, err = s.scopeGapCount(gctx, sc); return err })
 	g.Go(func() (err error) { agents, err = s.agentView(gctx); return err })
 	if err := g.Wait(); err != nil {
 		return err
@@ -189,9 +172,9 @@ func (r *rail) cluster(ctx context.Context) error {
 	}
 	r.view(apigen.ViewIdExposure, intp(reach), false)
 	r.view(apigen.ViewIdVulnerabilities, intp(stats.Open), r.covGap())
-	r.view(apigen.ViewIdWorkloads, intp(wl), false)
-	r.view(apigen.ViewIdImages, intp(im), r.covGap())
-	r.view(apigen.ViewIdPackages, intp(pk), r.covGap())
+	r.view(apigen.ViewIdWorkloads, intp(counts.Workloads), false)
+	r.view(apigen.ViewIdImages, intp(counts.Images), r.covGap())
+	r.view(apigen.ViewIdPackages, intp(counts.Packages), r.covGap())
 	r.view(apigen.ViewIdNodes, intp(len(nodes)), nodesGap)
 	r.view(apigen.ViewIdCoverage, intp(ngaps), ngaps > 0)
 
@@ -237,25 +220,17 @@ func (r *rail) cluster(ctx context.Context) error {
 func (r *rail) namespace(ctx context.Context) error {
 	s, sc := r.s, r.sc
 	var (
-		nss           []store.NamespaceStat
-		stats         store.OwnerStats
-		reach, im, pk int
-		owners        []store.OwnerEntity
+		nss    []store.NamespaceStat
+		stats  store.OwnerStats
+		reach  int
+		counts store.EntityCounts
+		owners []store.OwnerEntity
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { nss, err = s.o.Store.NamespaceStats(gctx); return err })
 	g.Go(func() (err error) { stats, err = s.o.Store.ScopeStats(gctx, sc); return err })
 	g.Go(func() (err error) { reach, _, err = s.reachable(gctx, sc); return err })
-	g.Go(func() error {
-		p, err := s.o.Store.ImagesPage(gctx, store.ImageQuery{Scope: sc, Limit: 1})
-		im = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.PackagesPage(gctx, store.PackageEntityQuery{Scope: sc, Limit: 1})
-		pk = p.Total
-		return err
-	})
+	g.Go(func() (err error) { counts, err = s.o.Store.EntityCounts(gctx, sc); return err })
 	g.Go(func() (err error) { owners, err = s.o.Store.OwnerEntities(gctx, sc); return err })
 	if err := g.Wait(); err != nil {
 		return err
@@ -268,8 +243,8 @@ func (r *rail) namespace(ctx context.Context) error {
 		fmt.Sprintf("%d exposed", ns.Exposed)}, " · ")
 	r.view(apigen.ViewIdExposure, intp(reach), false)
 	r.view(apigen.ViewIdVulnerabilities, intp(stats.Open), r.covGap())
-	r.view(apigen.ViewIdImages, intp(im), r.covGap())
-	r.view(apigen.ViewIdPackages, intp(pk), r.covGap())
+	r.view(apigen.ViewIdImages, intp(counts.Images), r.covGap())
+	r.view(apigen.ViewIdPackages, intp(counts.Packages), r.covGap())
 	items, err := s.workloadItems(ctx, owners, "")
 	if err != nil {
 		return err

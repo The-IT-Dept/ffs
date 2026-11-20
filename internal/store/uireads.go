@@ -727,3 +727,47 @@ func (s *Store) OwnerExists(ctx context.Context, key string) (bool, error) {
 	}
 	return ok, nil
 }
+
+// ImageGapTally is what a scope's image coverage gaps number, read without listing them: Codes
+// counts the gap codes of its in-use container images other than cpe_only_classifier (one for an
+// image not seen into, one per partial-coverage reason of a catalogued one), and Classified holds
+// the classifier-found packages of its catalogued images, by digest, from which the caller counts
+// the cpe_only_classifier gaps.
+type ImageGapTally struct {
+	Codes      int
+	Classified map[string][]model.Package
+}
+
+// ImageGapTally tallies the image coverage gaps of a cluster, namespace or workload scope, as
+// CoverageImages lists them, with an image whose first match has not run counted as pending.
+func (s *Store) ImageGapTally(ctx context.Context, sc model.Scope) (ImageGapTally, error) {
+	var w where
+	w.add(containerDigest("oi.digest"))
+	switch sc.Kind {
+	case model.ScopeCluster, "":
+	case model.ScopeNamespace:
+		w.add(`o.namespace = ?`, sc.Value)
+	case model.ScopeWorkload:
+		w.add(`oi.owner_key = ?`, sc.Value)
+	default:
+		return ImageGapTally{}, scopeErr(sc)
+	}
+	inuse := `WITH inuse AS (SELECT DISTINCT oi.digest FROM owner_images oi JOIN owners o ON o.key = oi.owner_key` + w.String() + `)`
+	t := ImageGapTally{Classified: map[string][]model.Package{}}
+	err := s.rdb.QueryRowContext(ctx, inuse+` SELECT coalesce(sum(CASE WHEN i.digest IS NULL OR NOT `+seenSQL("i", "u.digest")+` THEN 1
+		ELSE (i.source = 'attestation') + (i.cov_unattributed > 0) + (i.cov_rust > 0) END), 0)
+		FROM inuse u LEFT JOIN images i ON i.digest = u.digest`, w.args...).Scan(&t.Codes)
+	if err != nil {
+		return ImageGapTally{}, fmt.Errorf("store: image gaps of %s: %w", sc, err)
+	}
+	pkgs, err := queryAll(ctx, s.rdb, scanPackage, inuse+` SELECT `+prefixedCols("p.", packageCols, "")+` FROM inuse u
+		JOIN images i ON i.digest = u.digest CROSS JOIN packages p ON p.digest = u.digest
+		WHERE p.classifier != '' AND `+seenSQL("i", "u.digest")+` ORDER BY p.digest, p.name, p.version, p.id`, w.args...)
+	if err != nil {
+		return ImageGapTally{}, fmt.Errorf("store: classified packages of %s: %w", sc, err)
+	}
+	for _, p := range pkgs {
+		t.Classified[p.ImageDigest] = append(t.Classified[p.ImageDigest], p)
+	}
+	return t, nil
+}
