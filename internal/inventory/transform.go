@@ -220,7 +220,8 @@ func transformNode(in any) (any, error) {
 		TypeMeta: n.TypeMeta,
 		ObjectMeta: metav1.ObjectMeta{Name: n.Name, UID: n.UID, ResourceVersion: n.ResourceVersion,
 			Labels: n.Labels},
-		Spec:   corev1.NodeSpec{Taints: n.Spec.Taints},
+		// Taints decide where the node agent can run; pod CIDRs feed the alert-target guard.
+		Spec:   corev1.NodeSpec{Taints: n.Spec.Taints, PodCIDR: n.Spec.PodCIDR, PodCIDRs: slices.Clone(n.Spec.PodCIDRs)},
 		Status: corev1.NodeStatus{NodeInfo: n.Status.NodeInfo},
 	}
 	if n.Status.Images != nil {

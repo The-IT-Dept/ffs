@@ -174,7 +174,8 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		n := &corev1.Node{
 			ObjectMeta: metav1.ObjectMeta{Name: "n1", Annotations: map[string]string{"flannel": "x"},
 				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}}},
-			Spec: corev1.NodeSpec{PodCIDR: "10.42.0.0/24", ProviderID: "k3s://n1", Unschedulable: true, Taints: taints},
+			Spec: corev1.NodeSpec{PodCIDR: "10.42.0.0/24", PodCIDRs: []string{"10.42.0.0/24", "fd00:42::/64"}, ProviderID: "k3s://n1",
+				Unschedulable: true, Taints: taints},
 			Status: corev1.NodeStatus{
 				NodeInfo: corev1.NodeSystemInfo{Architecture: "arm64", KubeletVersion: "v1.35.2+k3s1"},
 				Images: []corev1.ContainerImage{{Names: []string{"docker.io/library/nginx@sha256:" + strings.Repeat("e", 64),
@@ -190,6 +191,7 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		require.Equal(t, n.Status.Images, got.Status.Images)
 		require.Equal(t, n.Status.NodeInfo, got.Status.NodeInfo)
 		require.Equal(t, []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}, got.Status.Conditions)
-		require.Equal(t, corev1.NodeSpec{Taints: taints}, got.Spec, "of the spec, only the taints (#11)")
+		require.Equal(t, corev1.NodeSpec{Taints: taints, PodCIDR: "10.42.0.0/24", PodCIDRs: []string{"10.42.0.0/24", "fd00:42::/64"}}, got.Spec,
+			"of the spec, only the taints (#11) and the pod CIDRs (alert-target guard)")
 	})
 }
