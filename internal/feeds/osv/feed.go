@@ -5,6 +5,8 @@
 // A cached GIT record that stops referencing the GitRepos repositories is handed off once more
 // and then dropped from the cache. A weekly set-diff withdraws records that left the bucket, and
 // records outside Go and GIT are pruned after 14 days unless the osv source still matches them.
+// Malicious-package records (MAL-) are the exception: the Grype DB carries none, so each language
+// bucket loads all of its MAL- records once and keeps them.
 package osv
 
 import (
@@ -51,6 +53,7 @@ const (
 	metaGeneration  = "gen."  // + bucket: x-goog-generation of modified_id.csv when last read
 	metaBootstrap   = "boot." // + bucket (Go, GIT): when all.zip was loaded
 	metaRecordBytes = "size." // + bucket: average uncompressed size of its records, measured
+	metaMalicious   = "mal."  // + language bucket: when all of its MAL- records were loaded
 	metaGitRepos    = "repos.GIT"
 	metaSetDiff     = "setdiff"
 )
@@ -156,6 +159,9 @@ func (f *Feed) Sync(ctx context.Context) error {
 		} else {
 			err = f.poll(ctx, &st, b)
 		}
+		if err == nil && needsMalicious(st, b) {
+			err = f.loadMalicious(ctx, &st, b)
+		}
 		if err != nil {
 			errs = append(errs, fmt.Errorf("osv: bucket %s: %w", b, err))
 			if len(feeds.Pending(st)) > 0 {
@@ -193,6 +199,47 @@ func (f *Feed) needsBootstrap(st store.FeedState, b string) bool {
 		return st.Meta[metaBootstrap+b] == "" || st.Meta[metaGitRepos] != f.reposKey
 	}
 	return false
+}
+
+// needsMalicious reports whether b is a language bucket whose MAL- records have not been loaded.
+// Go is loaded whole by its bootstrap.
+func needsMalicious(st store.FeedState, b string) bool {
+	return b != BucketGo && languageBuckets[bucketSyftTypes[b]] == b && st.Meta[metaMalicious+b] == ""
+}
+
+// loadMalicious caches every MAL- record that b's modified_id.csv lists and the cache lacks, and
+// hands them off. Polls only reach back to the first poll's window and other records are pruned, but
+// a known-malicious package version stays dangerous however old its record is (spec §6.4), and the
+// Grype DB has no MAL- records. It runs once per bucket; pruning keeps MAL- records.
+func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string) error {
+	listed, err := listIDs(ctx, f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
+	if err != nil {
+		return err
+	}
+	cached, err := f.o.Store.OSVRecordIDs(ctx, b)
+	if err != nil {
+		return err
+	}
+	have := make(map[string]bool, len(cached))
+	for _, id := range cached {
+		have[id] = true
+	}
+	var ids []string
+	for id := range listed {
+		if strings.HasPrefix(id, "MAL-") && !have[id] {
+			ids = append(ids, id)
+		}
+	}
+	slices.Sort(ids)
+	changed, takeErr := f.take(ctx, st, b, ids)
+	if err := f.handOff(ctx, st, changed); err != nil {
+		return errors.Join(takeErr, err)
+	}
+	if takeErr != nil { // not marked loaded: the next Sync takes the rest
+		return errors.Join(takeErr, f.save(ctx, st))
+	}
+	st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
+	return f.save(ctx, st)
 }
 
 func (f *Feed) save(ctx context.Context, st *store.FeedState) error {
@@ -864,7 +911,7 @@ func withdraw(raw []byte, now time.Time) ([]byte, error) {
 }
 
 // prune drops records older than the retention from every bucket except Go and GIT, whose cache is
-// loaded whole and kept.
+// loaded whole and kept. The store keeps MAL- records (see loadMalicious).
 func (f *Feed) prune(ctx context.Context) error {
 	cutoff := f.o.Now().UTC().Add(-retention)
 	for _, b := range knownBuckets() {
