@@ -1,8 +1,11 @@
 package apiserver_test
 
 import (
+	"fmt"
 	"net/http"
 	"net/url"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -138,6 +141,54 @@ func TestScope_RailPerKind(t *testing.T) {
 
 	wantProblem(t, get(t, h, "/api/v1/scope?scope=image:"+webtest.DigestWeb+"&from=namespace:shop"), 400, apigen.ProblemCodeInvalidScope)
 	wantProblem(t, get(t, h, "/api/v1/scope?scope=workload:Deployment/shop/missing"), 404, apigen.ProblemCodeNotFound)
+}
+
+// memberDetails maps a card's members items by label to their detail and gap.
+func memberDetails(t *testing.T, c apigen.ScopeCard) map[string]string {
+	t.Helper()
+	i := slices.IndexFunc(c.Related, func(r apigen.RelatedSection) bool { return r.Id == apigen.RelatedSectionIdMembers })
+	require.GreaterOrEqual(t, i, 0, "members section")
+	out := map[string]string{}
+	for _, it := range c.Related[i].Items {
+		require.Nil(t, it.Count, "a member has no count")
+		require.NotNil(t, it.Detail)
+		out[it.Label] = fmt.Sprintf("%s gap=%t", *it.Detail, it.Gap)
+	}
+	return out
+}
+
+// TestScope_NodeRailCachedImagesAndMembers pins the node rail's cachedImages count (the node's
+// cached images only while its agent is reporting or stale, else 0 with a gap, as on the node
+// page) and the members items' "agent <state>" detail.
+func TestScope_NodeRailCachedImagesAndMembers(t *testing.T) {
+	f, h := newAPI(t)
+
+	cached := func(c apigen.ScopeCard) string {
+		v := viewOf(t, c, apigen.ViewIdCachedImages)
+		require.NotNil(t, v.Count)
+		return fmt.Sprintf("%d gap=%t", *v.Count, v.Gap)
+	}
+
+	c := scopeCard(t, h, "?scope=node:worker-1")
+	require.Equal(t, "1 gap=false", cached(c), "a reporting agent's cached image")
+	require.Equal(t, map[string]string{"worker-2": "agent stale gap=true"}, memberDetails(t, c))
+
+	cachedNginx := []model.NodeImage{{Digest: webtest.DigestWeb, Names: []string{"docker.io/library/nginx:1.30.6"}, Kind: "manifest",
+		Source: "status"}}
+	require.NoError(t, f.Store.ReplaceNodeImages(t.Context(), "worker-2", cachedNginx))
+	c = scopeCard(t, h, "?scope=node:worker-2")
+	require.Equal(t, "1 gap=false", cached(c), "a stale agent's cache is still shown")
+	require.Equal(t, map[string]string{"worker-1": "agent reporting gap=false"}, memberDetails(t, c))
+
+	// cp-1's agent never reported, so a cached-image row it holds is not shown, as on the node page.
+	require.NoError(t, f.Store.ReplaceNodeImages(t.Context(), "cp-1", cachedNginx))
+	c = scopeCard(t, h, "?scope=node:cp-1")
+	require.True(t, strings.HasSuffix(c.Summary, " · Ready · agent never"), c.Summary)
+	require.Equal(t, "0 gap=true", cached(c), "no live agent: zero and a gap")
+	require.Empty(t, ok[apigen.NodeDetail](t, get(t, h, "/api/v1/nodes/cp-1")).CachedImages, "the node page agrees")
+
+	c = scopeCard(t, h, "?scope=nodegroup:"+webtest.AgentGroupID)
+	require.Equal(t, map[string]string{"worker-1": "agent reporting gap=false", "worker-2": "agent stale gap=true"}, memberDetails(t, c))
 }
 
 type totaled struct {
