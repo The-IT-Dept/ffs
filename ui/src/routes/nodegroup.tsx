@@ -5,10 +5,12 @@ import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState } from '@/components/layout/EmptyState'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
-import { AgentGate } from '@/components/nodes/AgentGate'
+import { AgentGate, AgentMissing } from '@/components/nodes/AgentGate'
+import { NodeGapLines, NodeGapNotice, nodeGapsOf } from '@/components/nodes/NodeGaps'
 import { NodeImagesTable } from '@/components/nodes/NodeImagesTable'
 import { PackageTable } from '@/components/sbom/PackageTable'
 import { Mono } from '@/components/signals/Mono'
@@ -54,7 +56,7 @@ function Subsection({ title, children }: { title: string; children: ReactNode })
 function HostPackagesView({ digest }: { digest: string }) {
   // The node group route keeps no q param, so the host package search is page state here.
   const [q, setQ] = useState<string | undefined>()
-  return <PackageTable digest={digest} q={q} onQ={setQ} />
+  return <PackageTable digest={digest} q={q} onQ={setQ} empty={<EmptyState message={copy.emptyList.hostPackages} />} />
 }
 
 function KernelView({ d }: { d: Detail }) {
@@ -82,7 +84,7 @@ function KernelView({ d }: { d: Detail }) {
         <dd>{g.packageDb ? `${g.packageDb} · ${formatCount(g.packageCount)}` : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
       </dl>
       <div className="mt-4">
-        <AgentGate agentData={d.agentData}>
+        <AgentGate agentData={d.agentData} agents={d.members.map((m) => m.agent)}>
           {g.kernel ? (
             <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
               <dt className="text-muted-foreground">{copy.nodes.kernelFields.release}</dt>
@@ -203,7 +205,7 @@ function CompareView({ compare }: { compare: S<'NodeDriftDetail'> }) {
         </>
       ) : (
         <div className="mt-4">
-          <EmptyState message={copy.agentMissing} />
+          <EmptyState message={copy.nodes.notCompared} />
         </div>
       )}
     </div>
@@ -291,6 +293,7 @@ function MembersView({ d, id }: { d: Detail; id: string }) {
 }
 
 function NodeGroupPage() {
+  // id is the group's stable name, as the app links groups, or its ID; the API resolves both.
   const { id } = nodeGroupRoute.useParams()
   const search = revalidate(parseNodeGroupSearch, nodeGroupRoute.useSearch())
   const navigate = nodeGroupRoute.useNavigate()
@@ -299,18 +302,34 @@ function NodeGroupPage() {
     // Keep the page while compare changes, but never show another group's data.
     placeholderData: (prev, prevQuery) => ((prevQuery?.queryKey[2] as { path?: { id?: string } } | undefined)?.path?.id === id ? prev : undefined),
   })
+  const trust = useScopeTrust({ kind: 'nodegroup', value: id })
   const missing = q.error instanceof ApiProblem && q.error.code === 'not_found'
   useEffect(() => {
-    // Groups re-key when their packages change; a stale link lands on the list instead.
-    if (missing) void navigate({ to: '/nodes', replace: true })
+    // A group no longer listed under this name or ID lands on the list instead, with a notice.
+    if (missing) void navigate({ to: '/nodes', replace: true, state: goneState('nodegroup') })
   }, [missing, navigate])
 
   const d = q.data
   const g = d?.group
   const view = search.view ?? 'findings'
-  // Without agent data the group's host packages were never inventoried, so no findings is not
-  // proof that nothing needs attention.
-  const findingsEmpty = d && !d.agentData ? <EmptyState message={copy.agentMissing} /> : undefined
+  // Queries scope by the group's current ID, which the detail resolved from the URL.
+  const scope = g ? `nodegroup:${g.id}` : ''
+  const agents = d ? d.members.map((m) => m.agent) : []
+  // What the agents cannot see on any member leads the page: under the header, and ahead of the
+  // findings and host packages, because no findings is not proof that nothing needs attention.
+  const gaps = d ? nodeGapsOf(agents, { inventoried: d.agentData }) : []
+  const notice = <NodeGapNotice gaps={gaps} total={agents.length} />
+  const findingsEmpty = d ? (
+    d.agentData ? (
+      <EmptyState
+        coverage={trust?.coverage}
+        feeds={trust?.feeds}
+        lead={gaps.length > 0 ? <NodeGapLines gaps={gaps} total={agents.length} /> : undefined}
+      />
+    ) : (
+      <AgentMissing agents={agents} />
+    )
+  ) : undefined
   const sub = g ? (
     <span className="inline-flex flex-wrap items-center gap-x-1.5">
       {[
@@ -328,6 +347,7 @@ function NodeGroupPage() {
   return (
     <div>
       <PageHeader kind={copy.page.nodegroup} title={g?.label ?? id} sub={sub} />
+      <NodeGapLines gaps={gaps} total={agents.length} compact className="-mt-2 mb-3 text-[11.5px] text-muted-foreground" />
       {d ? (
         <Tabs value={view} onValueChange={(v) => void navigate({ to: '.', search: { ...search, view: v === 'findings' ? undefined : (v as View) } })}>
           <TabsList variant="line">
@@ -338,18 +358,19 @@ function NodeGroupPage() {
             ))}
           </TabsList>
           <TabsContent value="findings">
-            <FixGroupFindings scope={`nodegroup:${id}`} empty={findingsEmpty} />
+            <FixGroupFindings scope={scope} empty={findingsEmpty} notice={notice} />
           </TabsContent>
           <TabsContent value="hostPackages">
-            <AgentGate agentData={d.agentData}>
-              <HostPackagesView key={id} digest={`nodegroup:${id}`} />
+            <AgentGate agentData={d.agentData} agents={agents}>
+              {notice}
+              <HostPackagesView key={scope} digest={scope} />
             </AgentGate>
           </TabsContent>
           <TabsContent value="kernel">
             <KernelView d={d} />
           </TabsContent>
           <TabsContent value="cachedImages">
-            <AgentGate agentData={d.agentData}>
+            <AgentGate agentData={d.agentData} agents={agents}>
               <NodeImagesTable images={d.cachedImages} />
             </AgentGate>
           </TabsContent>

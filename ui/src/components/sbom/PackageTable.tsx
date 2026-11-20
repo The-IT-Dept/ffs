@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { useEffect, useRef, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { type Column, ExplorerTable } from '@/components/explorer/ExplorerTable'
@@ -31,8 +31,9 @@ const columns: Column<Row>[] = [
 ]
 
 // PackageTable is an image's (or a node group's) package list, searched and paged on the server.
-// The search box writes q through onQ, debounced, so the query lives in the page's URL.
-export function PackageTable({ digest, q, onQ }: { digest: string; q?: string; onQ: (q: string | undefined) => void }) {
+// The search box writes q through onQ, debounced, so the query lives in the page's URL. An empty
+// list shows empty (the page knows why it may be empty), and an empty search says so.
+export function PackageTable({ digest, q, onQ, empty }: { digest: string; q?: string; onQ: (q: string | undefined) => void; empty?: ReactNode }) {
   const [input, setInput] = useState(q ?? '')
   const typed = useDebounced(input.trim(), SEARCH_DEBOUNCE_MS)
   const latest = useRef({ q, onQ })
@@ -62,7 +63,11 @@ export function PackageTable({ digest, q, onQ }: { digest: string; q?: string; o
       />
       {list.data ? (
         list.data.total === 0 ? (
-          <EmptyState filtered={Boolean(q)} />
+          q ? (
+            <EmptyState filtered />
+          ) : (
+            (empty ?? <EmptyState message={copy.emptyList.packages} />)
+          )
         ) : (
           <>
             <ExplorerTable columns={columns} rows={list.data.rows} rowKey={(r) => `${r.ecosystem}/${r.name}@${r.version}:${r.path ?? ''}`} busy={list.isPlaceholderData} />

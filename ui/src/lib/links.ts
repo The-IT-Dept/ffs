@@ -1,4 +1,5 @@
 import type { S, SearchHit, ViewId } from '@/api/types'
+import { copy } from './copy'
 import { EXPLORERS, type ExplorerKind, type ExplorerSearch, stringifySearchParams } from './query'
 import { formatScope, parseScope, type Scope } from './scope'
 
@@ -30,9 +31,51 @@ export function nodePath(name: string): string {
   return `/nodes/${enc(name)}`
 }
 
-function ownerPath(key: string): string {
+// nodeGroupLinkIds is the path ID of each listed node group: its stable name, which survives the
+// package updates that re-key the group, unless another listed group shares that name; then its ID.
+export function nodeGroupLinkIds(groups: readonly { id: string; name: string }[]): Map<string, string> {
+  const named = new Map<string, number>()
+  for (const g of groups) if (g.name) named.set(g.name, (named.get(g.name) ?? 0) + 1)
+  return new Map(groups.map((g) => [g.id, g.name && named.get(g.name) === 1 ? g.name : g.id]))
+}
+
+export interface OwnerLike {
+  kind: string
+  namespace: string
+  name: string
+}
+
+const CLUSTER_LEVEL_KINDS = ['Cluster', 'ContainerRuntime', 'Nodes']
+
+// isClusterLevel mirrors the server's OwnerRef.ClusterLevel: the synthetic owners of Kubernetes,
+// container runtime and host package findings, which have no namespace. A namespaced custom
+// resource of kind Cluster is a workload.
+export function isClusterLevel(o: { kind: string; namespace: string }): boolean {
+  return o.namespace === '' && CLUSTER_LEVEL_KINDS.includes(o.kind)
+}
+
+// ownerHref is where an owner links: cluster-level owners to their own pages (Kubernetes and the
+// container runtime to the control plane, host packages to the nodes), every other owner to its
+// workload page. Every link to an owner is built here.
+export function ownerHref(o: OwnerLike): string {
+  if (isClusterLevel(o)) return o.kind === 'Nodes' ? '/nodes' : '/controlplane'
+  return workloadPath(o.kind, o.namespace, o.name)
+}
+
+// ownerLabel is how an owner is named in a list: cluster-level owners by what they hold.
+export function ownerLabel(o: OwnerLike): string {
+  if (isClusterLevel(o)) return o.kind === 'Nodes' ? copy.owner.nodes : copy.owner.controlPlane
+  return o.name
+}
+
+// ownerOfKey splits an owner key, "Kind/Namespace/Name".
+export function ownerOfKey(key: string): OwnerLike {
   const [kind = '', namespace = '', name = ''] = key.split('/')
-  return workloadPath(kind, namespace, name)
+  return { kind, namespace, name }
+}
+
+function ownerPath(key: string): string {
+  return ownerHref(ownerOfKey(key))
 }
 
 // scopePath is the page of a scope.
@@ -96,7 +139,10 @@ const explorerOfView: Partial<Record<ViewId, ExplorerKind>> = {
   packages: 'packages',
 }
 
-function coverageHref(scope: Scope): string {
+// coverageHref is the coverage page of a scope. The page covers the cluster, a namespace or a
+// workload; any other scope opens the cluster's.
+export function coverageHref(scope?: Scope): string {
+  if (!scope || (scope.kind !== 'namespace' && scope.kind !== 'workload')) return '/coverage'
   return `/coverage${stringifySearchParams({ scope: formatScope(scope) })}`
 }
 

@@ -4,6 +4,7 @@ import { EmptyState } from '@/components/layout/EmptyState'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { RelativeTime } from '@/components/signals/RelativeTime'
+import { priorityTone } from '@/components/signals/tone'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
@@ -11,15 +12,27 @@ import { cn } from '@/lib/utils'
 
 type Suggestion = S<'Suggestion'>
 
-const total = (c: S<'PriorityCounts'>) => c.urgent + c.high + c.medium + c.low
+const order = ['urgent', 'high', 'medium', 'low'] as const
 
-// netOf is the signed change in open findings the upgrade makes: what it introduces less what it
-// fixes. The server's own wording is the cell's title.
-function netOf(s: Suggestion): string {
-  const n = total(s.introduces) - total(s.fixes)
-  if (n > 0) return `+${formatCount(n)}`
-  if (n < 0) return `−${formatCount(-n)}`
-  return '0'
+// NetChange is the change in open findings the upgrade makes, per priority: what it introduces less
+// what it fixes, e.g. "+1 urgent · −3 low". Priorities are never summed into one figure, so an
+// upgrade that trades low findings for an urgent one never reads as a gain. An introduced urgent or
+// high finding takes its colour. The server's own wording is the cell's title.
+function NetChange({ s }: { s: Suggestion }) {
+  const parts = order.map((p) => ({ p, n: s.introduces[p] - s.fixes[p] })).filter((x) => x.n !== 0)
+  if (parts.length === 0) return <span className="text-muted-foreground">{copy.upgrades.noChange}</span>
+  return (
+    <span className="tabular-nums">
+      {parts.map(({ p, n }, i) => (
+        <Fragment key={p}>
+          {i > 0 ? <span className="text-muted-foreground"> · </span> : null}
+          <span className={n > 0 && (p === 'urgent' || p === 'high') ? priorityTone[p].text : undefined}>
+            {n > 0 ? `+${formatCount(n)}` : `−${formatCount(-n)}`} {p}
+          </span>
+        </Fragment>
+      ))}
+    </span>
+  )
 }
 
 function UpgradeRow({ s, alternative }: { s: Suggestion; alternative?: boolean }) {
@@ -41,8 +54,8 @@ function UpgradeRow({ s, alternative }: { s: Suggestion; alternative?: boolean }
       <TableCell className="py-0">
         <PriorityCountsText counts={s.introduces} />
       </TableCell>
-      <TableCell className="py-0 text-right tabular-nums" title={s.netChange}>
-        {netOf(s)}
+      <TableCell className="py-0" title={s.netChange}>
+        <NetChange s={s} />
       </TableCell>
       <TableCell className="py-0">{s.eol || <span className="text-muted-foreground">{copy.noValue}</span>}</TableCell>
       <TableCell className="py-0">
@@ -63,7 +76,7 @@ export function UpgradeTable({ suggestions }: { suggestions: Suggestion[] }) {
       <TableHeader>
         <TableRow className="h-[30px] hover:bg-transparent">
           {headers.map((h) => (
-            <TableHead key={h} className={cn('h-[30px] py-0 text-[11px] font-medium text-muted-foreground', h === c.net && 'text-right')}>
+            <TableHead key={h} className="h-[30px] py-0 text-[11px] font-medium text-muted-foreground">
               {h}
             </TableHead>
           ))}

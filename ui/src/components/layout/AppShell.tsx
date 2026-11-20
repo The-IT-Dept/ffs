@@ -4,6 +4,7 @@ import { Rail } from '@/components/rail/Rail'
 import { RailDrawer } from '@/components/rail/RailDrawer'
 import { useMediaQuery, WIDE } from '@/lib/hooks'
 import { AppLink } from './AppLink'
+import { GoneNotice } from './GoneNotice'
 import { ThemeToggle } from './ThemeToggle'
 
 // AppShell is the top bar, the rail and the page. From the lg breakpoint the rail sits inline and
@@ -29,7 +30,10 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Rail />
           </aside>
         ) : null}
-        <main className="min-w-0 flex-1 px-4 py-4 sm:px-6 lg:overflow-y-auto">{children}</main>
+        <main className="min-w-0 flex-1 px-4 py-4 sm:px-6 lg:overflow-y-auto">
+          <GoneNotice />
+          {children}
+        </main>
       </div>
     </div>
   )

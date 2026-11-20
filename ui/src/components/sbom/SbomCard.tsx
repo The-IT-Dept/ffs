@@ -3,7 +3,8 @@ import { AppLink } from '@/components/layout/AppLink'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy, facetValueLabel } from '@/lib/copy'
-import { workloadPath } from '@/lib/links'
+import { ownerHref, ownerLabel } from '@/lib/links'
+import { cn } from '@/lib/utils'
 import { EcosystemBreakdown } from './EcosystemBreakdown'
 
 function Heading({ children }: { children: string }) {
@@ -19,11 +20,32 @@ function Gap({ label, todo }: { label: string; todo?: string }) {
   )
 }
 
+// hasImageGaps reports whether ImageGaps has anything to list for an image.
+export function hasImageGaps(image: S<'ImageDetail'>): boolean {
+  const c = image.coverage
+  return c.unattributedExecutables > 0 || c.rustWithoutAuditable > 0 || c.gaps.length > 0 || c.cpeOnly.length > 0
+}
+
+// ImageGaps lists what ffs cannot see in an image, hatched, with what to do about each gap.
+export function ImageGaps({ image, className }: { image: S<'ImageDetail'>; className?: string }) {
+  const { coverage } = image
+  const cpe = coverage.cpeOnly.join(', ')
+  return (
+    <ul className={cn('flex flex-col gap-1', className)}>
+      {coverage.unattributedExecutables > 0 ? <Gap label={copy.image.unattributed(coverage.unattributedExecutables)} /> : null}
+      {coverage.rustWithoutAuditable > 0 ? <Gap label={copy.image.rust(coverage.rustWithoutAuditable)} /> : null}
+      {coverage.gaps.map((g) => (
+        <Gap key={g} label={copy.gaps[g].gap} todo={copy.gaps[g].todo.replace('{names}', cpe)} />
+      ))}
+      {coverage.cpeOnly.length > 0 && !coverage.gaps.includes('cpe_only_classifier') ? <Gap label={`${copy.gaps.cpe_only_classifier.gap}: ${cpe}`} /> : null}
+    </ul>
+  )
+}
+
 // SbomCard is where an image's package list came from and what it cannot see: the SBOM source,
 // coverage gaps (hatched), notes, the ecosystem breakdown, lifecycle and the workloads using it.
 export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
   const { sbom, coverage } = image
-  const cpe = coverage.cpeOnly.join(', ')
   return (
     <div className="max-w-3xl text-[12px]">
       <p>{copy.image.sbom(sbom.source, sbom.tool, sbom.toolVersion)}</p>
@@ -33,16 +55,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
         </p>
       ) : null}
       <p className="mt-1">{copy.workload.coverage(facetValueLabel('coverage', coverage.class, 0))}</p>
-      <ul className="mt-2 flex flex-col gap-1">
-        {coverage.unattributedExecutables > 0 ? <Gap label={copy.image.unattributed(coverage.unattributedExecutables)} /> : null}
-        {coverage.rustWithoutAuditable > 0 ? <Gap label={copy.image.rust(coverage.rustWithoutAuditable)} /> : null}
-        {coverage.gaps.map((g) => (
-          <Gap key={g} label={copy.gaps[g].gap} todo={copy.gaps[g].todo.replace('{names}', cpe)} />
-        ))}
-        {coverage.cpeOnly.length > 0 && !coverage.gaps.includes('cpe_only_classifier') ? (
-          <Gap label={`${copy.gaps.cpe_only_classifier.gap}: ${cpe}`} />
-        ) : null}
-      </ul>
+      <ImageGaps image={image} className="mt-2" />
       {coverage.notes.length > 0 ? (
         <ul className="mt-2 list-disc pl-4 text-muted-foreground">
           {coverage.notes.map((n) => (
@@ -70,8 +83,8 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           <ul className="flex flex-wrap gap-x-3 gap-y-1">
             {image.usedBy.map((w) => (
               <li key={w.scope}>
-                <AppLink href={workloadPath(w.kind, w.namespace, w.name)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
-                  {w.name}
+                <AppLink href={ownerHref(w)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+                  {ownerLabel(w)}
                 </AppLink>{' '}
                 <span className="text-muted-foreground">{w.namespace}</span>
               </li>

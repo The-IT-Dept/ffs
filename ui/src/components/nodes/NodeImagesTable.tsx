@@ -12,7 +12,7 @@ import { cn } from '@/lib/utils'
 // NodeImagesTable lists the images a node (or node group) holds in its content store or reports
 // in its status. An image ffs has a record of links to its page.
 export function NodeImagesTable({ images }: { images: S<'NodeImage'>[] }) {
-  if (images.length === 0) return <EmptyState />
+  if (images.length === 0) return <EmptyState message={copy.emptyList.cachedImages} />
   const c = copy.nodes.imageCols
   const yesNo = (b: boolean) => (b ? copy.nodes.yes : copy.nodes.no)
   const heads = [

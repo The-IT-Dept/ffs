@@ -28,7 +28,7 @@ function NamespaceView({ namespace }: { namespace: string }) {
   if (exposure.data) {
     table =
       exposure.data.rows.length === 0 ? (
-        <EmptyState coverage={summary.data?.coverage} />
+        <EmptyState coverage={summary.data?.coverage} feeds={summary.data?.feeds} scope={scopeOf} />
       ) : (
         <ExposureTable table={exposure.data} expand={expand} onToggle={(id) => setExpand((e) => toggleExpand(e, id))} />
       )
@@ -41,7 +41,7 @@ function NamespaceView({ namespace }: { namespace: string }) {
   return (
     <div>
       <PageHeader kind={copy.scopeKind(scopeOf)} title={namespace} />
-      <CoverageFirstLine coverage={summary.data?.coverage} className="mb-3 text-[12px] text-muted-foreground" />
+      <CoverageFirstLine coverage={summary.data?.coverage} scope={scopeOf} className="mb-3 text-[12px] text-muted-foreground" />
       {table}
       <Footnote />
     </div>

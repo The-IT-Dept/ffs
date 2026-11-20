@@ -12,7 +12,7 @@ import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import type { FixGroupKind } from '@/components/fix/FixGroupList'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState } from '@/components/layout/EmptyState'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { CoverageMark } from '@/components/signals/CoverageMark'
@@ -27,7 +27,7 @@ import { copy, facetValueLabel } from '@/lib/copy'
 import { shortDigest } from '@/lib/format'
 import { advisoryPath, imagePath, namespacePath, scopePath } from '@/lib/links'
 import { parseWorkloadSearch, revalidate, type WorkloadSearch } from '@/lib/query'
-import { formatScope, workloadScope } from '@/lib/scope'
+import { formatScope, type Scope, workloadScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 import { rootRoute } from './root'
 
@@ -131,7 +131,8 @@ function Containers({ d, scope }: { d: Detail; scope: string }) {
   )
 }
 
-function FindingsView({ scope, group, coverage, onGroup }: { scope: string; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
+function FindingsView({ scope, group, coverage, onGroup }: { scope: Scope; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
+  const trust = useScopeTrust(scope)
   // The request always groups (by fix unless the URL says otherwise); the URL leaves the default out.
   return (
     <div className="flex flex-col gap-2">
@@ -141,7 +142,7 @@ function FindingsView({ scope, group, coverage, onGroup }: { scope: string; grou
         options={GROUPS.map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
         onChange={(v) => onGroup(v as FixGroupKind)}
       />
-      <FixGroupFindings scope={scope} group={group} empty={<EmptyState coverage={coverage} />} />
+      <FixGroupFindings scope={formatScope(scope)} group={group} empty={<EmptyState coverage={coverage} feeds={trust?.feeds} scope={scope} />} />
     </div>
   )
 }
@@ -245,7 +246,7 @@ function HistoryView({ scope }: { scope: string }) {
   const q = useQuery({ ...apiQuery('/transitions', { query: { scope, ...(cursor ? { cursor } : {}) } }), placeholderData: keepPreviousData })
   if (q.error && !q.data) return <ProblemNotice error={q.error} />
   if (!q.data) return <Skeleton className="h-24" />
-  if (q.data.rows.length === 0) return <EmptyState />
+  if (q.data.rows.length === 0) return <EmptyState message={copy.emptyList.history} />
   const next = q.data.next
   return (
     <>
@@ -313,7 +314,7 @@ function WorkloadPage() {
             </TabsList>
             <TabsContent value="findings">
               <FindingsView
-                scope={scope}
+                scope={scopeObj}
                 group={group}
                 coverage={d.coverage}
                 onGroup={(g) => void navigate({ to: '.', search: { ...search, group: g === 'fix' ? undefined : g } })}

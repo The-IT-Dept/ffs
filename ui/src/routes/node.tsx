@@ -65,12 +65,12 @@ function NodePage() {
             <span className="text-muted-foreground">· {copy.workload.fixable(d.fixable)}</span>
           </div>
           <Section title={copy.nodes.memberCols.agent}>
-            <AgentGate agentData={hasAgentData(d.agent)}>
+            <AgentGate agentData={hasAgentData(d.agent)} agents={[d.agent]}>
               <AgentStatusView agent={d.agent} />
             </AgentGate>
           </Section>
           <Section title={copy.view('cachedImages', 'node')}>
-            <AgentGate agentData={hasAgentData(d.agent)}>
+            <AgentGate agentData={hasAgentData(d.agent)} agents={[d.agent]}>
               <NodeImagesTable images={d.cachedImages} />
             </AgentGate>
           </Section>

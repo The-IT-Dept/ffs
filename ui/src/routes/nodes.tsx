@@ -1,5 +1,6 @@
 import { useQuery } from '@tanstack/react-query'
 import { createRoute } from '@tanstack/react-router'
+import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { AppLink } from '@/components/layout/AppLink'
@@ -7,22 +8,47 @@ import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { ControlPlaneBlock } from '@/components/nodes/ControlPlaneBlock'
+import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCount } from '@/components/signals/PriorityCount'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { nodeGroupPath } from '@/lib/links'
+import { nodeGroupLinkIds, nodeGroupPath } from '@/lib/links'
 import { cn } from '@/lib/utils'
 import { rootRoute } from './root'
+
+type Group = S<'NodeGroupRow'>
 
 function Count({ n }: { n: number }) {
   return <span className={n === 0 ? 'text-muted-foreground' : undefined}>{formatCount(n)}</span>
 }
 
-function GroupsTable({ list }: { list: S<'NodeGroupsList'> }) {
-  if (list.groups.length === 0) return <EmptyState />
+// gappedGroups is the set of node groups ffs cannot fully see into: groups with no host inventory
+// (nodeinfo), groups with members whose agent is not reporting, and groups the cluster rail marks
+// with a gap (an agent that cannot read the host, an image-based OS). The rail is asked anyway on
+// this page, so its marks cost no request; it lists groups by ID or by stable name.
+function gappedGroups(groups: Group[], rail?: S<'ScopeCard'>): Set<string> {
+  const marked = new Set((rail?.related.find((r) => r.id === 'nodegroups')?.items ?? []).filter((i) => i.gap && i.scope).map((i) => i.scope))
+  return new Set(
+    groups
+      .filter((g) => g.kind !== 'agent' || g.agents.reporting < g.members || marked.has(`nodegroup:${g.id}`) || (g.name !== '' && marked.has(`nodegroup:${g.name}`)))
+      .map((g) => g.id),
+  )
+}
+
+// Figure is a group's count: hatched where ffs cannot see all of the group, and "—" for a group
+// whose host packages were never inventoried, where a zero would read as clean.
+function Figure({ g, gap, children }: { g: Group; gap: boolean; children: ReactNode }) {
+  if (g.kind !== 'agent') return <CoverageMark title={copy.gaps.node_agent_missing.gap}>{copy.noValue}</CoverageMark>
+  return gap ? <CoverageMark title={copy.nodes.groupGap}>{children}</CoverageMark> : <>{children}</>
+}
+
+function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'ScopeCard'> }) {
+  if (list.groups.length === 0) return <EmptyState message={copy.emptyList.nodeGroups} />
+  const gapped = gappedGroups(list.groups, rail)
+  const linkIds = nodeGroupLinkIds(list.groups)
   const c = copy.nodes.groupCols
   const heads: { label: string; right?: boolean }[] = [
     { label: c.group },
@@ -55,12 +81,12 @@ function GroupsTable({ list }: { list: S<'NodeGroupsList'> }) {
         {list.groups.map((g) => (
           <TableRow key={g.id} className="h-[30px]">
             <TableCell className="py-0">
-              <AppLink href={nodeGroupPath(g.id)} className="hover:underline">
+              <AppLink href={nodeGroupPath(linkIds.get(g.id) ?? g.id)} className="hover:underline">
                 {g.label}
                 {g.name && g.name !== g.label ? <span className="ml-1.5 text-muted-foreground">{g.name}</span> : null}
               </AppLink>
             </TableCell>
-            <TableCell className="py-0">{g.kind}</TableCell>
+            <TableCell className="py-0">{copy.nodes.kind[g.kind]}</TableCell>
             <TableCell className="max-w-[14rem] truncate py-0">{g.osImage}</TableCell>
             <TableCell className="py-0">
               <Mono>{g.kernelRelease}</Mono>
@@ -77,13 +103,19 @@ function GroupsTable({ list }: { list: S<'NodeGroupsList'> }) {
               <Count n={g.exposedNodes} />
             </TableCell>
             <TableCell className="py-0 text-right">
-              <PriorityCount priority="urgent" n={g.counts.urgent} />
+              <Figure g={g} gap={gapped.has(g.id)}>
+                <PriorityCount priority="urgent" n={g.counts.urgent} />
+              </Figure>
             </TableCell>
             <TableCell className="py-0 text-right">
-              <PriorityCount priority="high" n={g.counts.high} />
+              <Figure g={g} gap={gapped.has(g.id)}>
+                <PriorityCount priority="high" n={g.counts.high} />
+              </Figure>
             </TableCell>
             <TableCell className="py-0 text-right tabular-nums">
-              <Count n={g.fixable} />
+              <Figure g={g} gap={gapped.has(g.id)}>
+                <Count n={g.fixable} />
+              </Figure>
             </TableCell>
             {list.agentEnabled ? (
               <>
@@ -108,6 +140,8 @@ function GroupsTable({ list }: { list: S<'NodeGroupsList'> }) {
 
 function NodesPage() {
   const q = useQuery(apiQuery('/nodegroups', {}))
+  // The cluster rail, asked with the rail's own key.
+  const rail = useQuery(apiQuery('/scope', { query: {} }))
   return (
     <div>
       <PageHeader title={copy.page.nodes} />
@@ -119,7 +153,7 @@ function NodesPage() {
             </div>
           ) : null}
           <ControlPlaneBlock controlPlane={q.data.controlPlane} link />
-          <GroupsTable list={q.data} />
+          <GroupsTable list={q.data} rail={rail.data} />
         </>
       ) : q.error ? (
         <ProblemNotice error={q.error} />

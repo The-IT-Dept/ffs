@@ -2,6 +2,7 @@ import { createRoute } from '@tanstack/react-router'
 import type { S } from '@/api/types'
 import { ExplorerPage } from '@/components/explorer/ExplorerPage'
 import type { Column } from '@/components/explorer/ExplorerTable'
+import { OwnerCell } from '@/components/explorer/OwnerCell'
 import { PriorityCell } from '@/components/explorer/PriorityCell'
 import { AppLink } from '@/components/layout/AppLink'
 import { FixLabel } from '@/components/signals/FixLabel'
@@ -9,7 +10,7 @@ import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy } from '@/lib/copy'
 import { formatPercent } from '@/lib/format'
-import { advisoryPath, workloadPath } from '@/lib/links'
+import { advisoryPath } from '@/lib/links'
 import { explorerSearchFor } from '@/lib/query'
 import { rootRoute } from './root'
 
@@ -40,14 +41,7 @@ const columns: Column<Row>[] = [
     id: 'workload',
     header: copy.col.workload,
     sort: 'workload',
-    cell: (r) => (
-      <span className="inline-flex items-center gap-1.5">
-        <AppLink href={workloadPath(r.workload.kind, r.workload.namespace, r.workload.name)} className="hover:underline">
-          {r.workload.name}
-        </AppLink>
-        {r.workload.namespace ? <span className="text-muted-foreground">{r.workload.namespace}</span> : null}
-      </span>
-    ),
+    cell: (r) => <OwnerCell owner={r.workload} nodeGroups={r.nodeGroups} />,
   },
   {
     id: 'package',

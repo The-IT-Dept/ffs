@@ -5,11 +5,11 @@ import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
-import { EmptyState } from '@/components/layout/EmptyState'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { PackageTable } from '@/components/sbom/PackageTable'
-import { SbomCard } from '@/components/sbom/SbomCard'
+import { hasImageGaps, ImageGaps, SbomCard } from '@/components/sbom/SbomCard'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { Badge } from '@/components/ui/badge'
@@ -30,6 +30,35 @@ function imageCoverage(d: S<'ImageDetail'>): S<'CoverageFigure'> {
   return { inUse: 1, seenInto: d.status === 'catalogued' ? 1 : 0, full: d.coverage.class === 'full' ? 1 : 0 }
 }
 
+// PackagesEmpty is an image's empty package list. An image ffs has not catalogued, or catalogued
+// with gaps, leads with why it may list nothing; only a fully seen image says its SBOM is empty.
+function PackagesEmpty({ d }: { d: S<'ImageDetail'> }) {
+  const status = d.status !== 'catalogued' ? <StatusLine d={d} /> : null
+  if (!status && !hasImageGaps(d)) return <EmptyState message={copy.emptyList.packages} />
+  return (
+    <EmptyState
+      lead={
+        <>
+          {status}
+          <ImageGaps image={d} />
+        </>
+      }
+    />
+  )
+}
+
+// StatusLine says why an image is not catalogued, hatched.
+function StatusLine({ d }: { d: S<'ImageDetail'> }) {
+  return (
+    <p>
+      <CoverageMark title={d.statusReason || undefined}>
+        {facetValueLabel('status', d.status, 0)}
+        {d.statusReason ? `: ${d.statusReason}` : ''}
+      </CoverageMark>
+    </p>
+  )
+}
+
 function ImagePage() {
   const { digest } = imageRoute.useParams()
   const search = revalidate(parseImageSearch, imageRoute.useSearch())
@@ -37,6 +66,7 @@ function ImagePage() {
   const scopeObj = { kind: 'image' as const, value: digest }
   const scope = formatScope(scopeObj)
   const detail = useQuery(apiQuery('/images/{digest}', { path: { digest } }))
+  const trust = useScopeTrust(scopeObj)
   const d = detail.data
   const view = search.view ?? 'findings'
 
@@ -76,12 +106,9 @@ function ImagePage() {
       {d ? (
         <>
           {d.status !== 'catalogued' ? (
-            <p className="mb-2 text-[12px]">
-              <CoverageMark title={d.statusReason || undefined}>
-                {facetValueLabel('status', d.status, 0)}
-                {d.statusReason ? `: ${d.statusReason}` : ''}
-              </CoverageMark>
-            </p>
+            <div className="mb-2 text-[12px]">
+              <StatusLine d={d} />
+            </div>
           ) : null}
           <div className="mb-2 flex flex-wrap items-center gap-1.5">
             {d.counts.urgent > 0 ? (
@@ -105,10 +132,16 @@ function ImagePage() {
               ))}
             </TabsList>
             <TabsContent value="findings">
-              <FixGroupFindings scope={scope} empty={<EmptyState coverage={imageCoverage(d)} />} />
+              <FixGroupFindings scope={scope} empty={<EmptyState coverage={imageCoverage(d)} feeds={trust?.feeds} scope={scopeObj} />} />
             </TabsContent>
             <TabsContent value="packages">
-              <PackageTable key={digest} digest={digest} q={search.q} onQ={(q) => void navigate({ to: '.', search: { ...search, q }, replace: true })} />
+              <PackageTable
+                key={digest}
+                digest={digest}
+                q={search.q}
+                onQ={(q) => void navigate({ to: '.', search: { ...search, q }, replace: true })}
+                empty={<PackagesEmpty d={d} />}
+              />
             </TabsContent>
             <TabsContent value="upgrades">
               <UpgradeTable suggestions={d.upgrades} />

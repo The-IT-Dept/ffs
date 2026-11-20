@@ -8,7 +8,7 @@ import { FixLabel } from '@/components/signals/FixLabel'
 import { PriorityCount } from '@/components/signals/PriorityCount'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { workloadPath } from '@/lib/links'
+import { ownerHref, ownerLabel } from '@/lib/links'
 import { explorerSearchFor } from '@/lib/query'
 import { rootRoute } from './root'
 
@@ -44,8 +44,8 @@ const columns: Column<Row>[] = [
     sort: 'name',
     cell: (r) => (
       <span className="inline-flex items-center gap-1.5">
-        <AppLink href={workloadPath(r.workload.kind, r.workload.namespace, r.workload.name)} className="hover:underline">
-          {r.workload.name}
+        <AppLink href={ownerHref(r.workload)} className="hover:underline">
+          {ownerLabel(r.workload)}
         </AppLink>
         <span className="text-muted-foreground">{r.workload.kind}</span>
       </span>

@@ -2,7 +2,7 @@ import { act, screen, waitFor, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
 import { imagePath } from '@/lib/links'
 import { mockApi } from '@/test/api'
-import { coverageFigure, feedFreshness, scopeCard } from '@/test/fixtures'
+import { coverageFigure, feedFreshness, scopeCard, workloadsPage } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
 
 const shop = scopeCard({
@@ -58,7 +58,7 @@ test('rebuilds around the destination after navigation', async () => {
 })
 
 test('filters a related section through its explorer, server-side', async () => {
-  mockApi().on('/scope', shop)
+  mockApi().on('/scope', shop).on('/workloads', workloadsPage())
   const { router, user } = renderApp('/namespaces/shop')
   await user.type(await screen.findByRole('searchbox', { name: 'Filter Workloads' }), 'wor{Enter}')
   expect(router.state.location.href).toBe('/workloads?scope=namespace:shop&q=wor')

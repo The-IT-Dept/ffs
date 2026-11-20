@@ -6,23 +6,14 @@ import { PriorityCount } from '@/components/signals/PriorityCount'
 import { PriorityDot } from '@/components/signals/PriorityDot'
 import { copy, countsLine } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { advisoryPath, explorerHref, namespacePath, scopePath } from '@/lib/links'
+import { advisoryPath, explorerHref, isClusterLevel, namespacePath, ownerHref, ownerLabel, ownerOfKey } from '@/lib/links'
 import { type ExplorerSearch, parsePackageKey } from '@/lib/query'
-import { parseScope } from '@/lib/scope'
 import { type Column, ExplorerTable } from './ExplorerTable'
 
 type Row = S<'FindingGroupRow'>
 
 function narrowed(search: ExplorerSearch, extra: ExplorerSearch): string {
   return explorerHref('findings', { ...search, ...extra, group: undefined, cursor: undefined })
-}
-
-function workloadHref(key: string): string | undefined {
-  try {
-    return scopePath(parseScope(`workload:${key}`))
-  } catch {
-    return undefined
-  }
 }
 
 function groupCell(group: string, row: Row, search: ExplorerSearch) {
@@ -37,13 +28,13 @@ function groupCell(group: string, row: Row, search: ExplorerSearch) {
         </span>
       )
     case 'workload': {
-      const href = workloadHref(row.key)
-      return href ? (
-        <AppLink href={href} className="hover:underline">
-          {row.label}
+      // The key is the owner key, "Kind/Namespace/Name"; cluster-level owners open their own pages.
+      const owner = ownerOfKey(row.key)
+      if (!owner.kind || !owner.name) return <span>{row.label}</span>
+      return (
+        <AppLink href={ownerHref(owner)} className="hover:underline">
+          {isClusterLevel(owner) ? ownerLabel(owner) : row.label}
         </AppLink>
-      ) : (
-        <span>{row.label}</span>
       )
     }
     case 'image':

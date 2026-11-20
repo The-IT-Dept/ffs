@@ -25,7 +25,7 @@ function What({ gap }: { gap: S<'Gap'> }) {
 // GapsTable lists what ffs cannot see and what to do about it. The API sends codes; the copy
 // lives in lib/copy.ts.
 export function GapsTable({ gaps, totalGaps }: { gaps: S<'Gap'>[]; totalGaps: number }) {
-  if (gaps.length === 0) return <EmptyState />
+  if (gaps.length === 0) return <EmptyState message={copy.emptyList.gaps} />
   return (
     <>
       <Table className="text-[12px]">

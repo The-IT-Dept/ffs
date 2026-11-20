@@ -1,7 +1,22 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
+import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
-import { counts, fixAction, imagesPage, packagesPage, workloadRow, workloadsPage } from '@/test/fixtures'
+import {
+  counts,
+  coverageFigure,
+  feedFreshness,
+  findingRow,
+  findingsPage,
+  fixAction,
+  groupRow,
+  imagesPage,
+  packagesPage,
+  scopeCard,
+  workloadRef,
+  workloadRow,
+  workloadsPage,
+} from '@/test/fixtures'
 import { renderApp } from '@/test/render'
 
 test('the images explorer links a placeholder image as one path segment and hatches what it cannot see', async () => {
@@ -67,4 +82,64 @@ test('explorers never send parameters their endpoint does not take', async () =>
   expect(sp.has('state')).toBe(false)
   expect(sp.has('group')).toBe(false)
   expect(sp.get('kind')).toBe('Deployment')
+})
+
+test('the explorer header puts full detail first and seen-into second', async () => {
+  mockApi()
+    .on('/findings', findingsPage({ total: 1, findings: 1, rows: [findingRow()] }))
+    .on('/scope', scopeCard({ trust: { feeds: feedFreshness(), coverage: coverageFigure({ inUse: 6, seenInto: 5, full: 4 }), settings: true } }))
+  renderApp('/vulnerabilities')
+  const main = await screen.findByRole('main')
+  const sub = await within(main).findByText(/images in full detail/)
+  await waitFor(() => expect(sub.parentElement?.textContent).toBe('1 finding · 4/6 images in full detail · 5 seen into'))
+})
+
+test('an empty explorer leads with a stale matching feed from the scope trust', async () => {
+  mockApi()
+    .on('/findings', findingsPage())
+    .on('/scope', scopeCard({ trust: { feeds: feedFreshness({ fresh: false, stale: ['grypedb'], oldestSuccess: null }), coverage: coverageFigure(), settings: true } }))
+  renderApp('/vulnerabilities')
+  expect(await screen.findByText('feed out of date: grypedb')).toBeInTheDocument()
+  expect(screen.getByRole('link', { name: 'Feeds' })).toHaveAttribute('href', '/feeds')
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('host and control-plane findings link to their own pages and name the node groups a host finding affects', async () => {
+  mockApi().on(
+    '/findings',
+    findingsPage({
+      total: 2,
+      findings: 2,
+      rows: [
+        findingRow({
+          id: 'f1',
+          workload: workloadRef('Nodes', '', 'test'),
+          nodeGroups: [
+            { id: 'ubuntu-24.04-k6.8', label: 'ubuntu-24.04-k6.8-3f9c1a', nodes: 3, versions: [{ package: 'openssl', version: '3.0.13-0ubuntu3' }] },
+            { id: 'debian-13-k6.12', label: 'debian-13-k6.12-a1b2c3', nodes: 1, versions: [{ package: 'openssl', version: '3.5.1-1' }] },
+          ],
+        }),
+        findingRow({ id: 'f2', workload: workloadRef('Cluster', '', 'test') }),
+      ],
+    }),
+  )
+  renderApp('/vulnerabilities')
+  const host = await screen.findByRole('link', { name: 'Nodes (host packages)' })
+  expect(host).toHaveAttribute('href', '/nodes')
+  const row = host.closest('tr')!
+  expect(within(row).getByRole('link', { name: 'ubuntu-24.04-k6.8-3f9c1a' })).toHaveAttribute('href', '/nodegroups/ubuntu-24.04-k6.8')
+  expect(within(row).getByText('3 nodes')).toBeInTheDocument()
+  expect(within(row).getByText('3.0.13-0ubuntu3')).toBeInTheDocument()
+  expect(within(row).getByRole('link', { name: 'debian-13-k6.12-a1b2c3' })).toHaveAttribute('href', '/nodegroups/debian-13-k6.12')
+  expect(screen.getByRole('link', { name: 'Control plane' })).toHaveAttribute('href', '/controlplane')
+  expect(screen.queryByRole('link', { name: 'test' })).toBeNull()
+})
+
+test('grouped by workload, a cluster-level owner opens its own page', async () => {
+  mockApi().on(
+    '/findings',
+    findingsPage({ total: 1, groups: 1, findings: 4, groupRows: [groupRow({ key: 'Nodes//test', label: 'test', findings: 4, distinct: 2 })] }),
+  )
+  renderApp('/vulnerabilities?group=workload')
+  expect(await screen.findByRole('link', { name: 'Nodes (host packages)' })).toHaveAttribute('href', '/nodes')
 })

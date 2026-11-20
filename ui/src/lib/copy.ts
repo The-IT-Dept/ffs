@@ -98,7 +98,24 @@ export const copy = {
   empty: 'Nothing needs attention.',
   emptyFiltered: 'Nothing matches these filters.',
   coverageFirst: (n: number, m: number) => `ffs cannot see into ${formatCount(n)} of ${formatCount(m)} images yet, so this may not be everything.`,
+  // Leads an empty view when a feed ffs matches images against (grypedb, osv) is stale or has never
+  // synced; the stale feed names sit in the hatched mark before it.
+  feedFirst: (n: number) =>
+    n === 1 ? 'ffs matches images against this feed, so this may not be everything.' : 'ffs matches images against these feeds, so this may not be everything.',
   agentMissing: 'Enable the node agent to see host packages, the running kernel and cached images.',
+  // Empty lists that are not findings: an empty list here says nothing about what needs attention.
+  emptyList: {
+    packages: 'The SBOM lists no packages.',
+    hostPackages: 'The host inventory lists no packages.',
+    cachedImages: 'The node agent reports no cached images.',
+    nodeGroups: 'No nodes are known yet.',
+    gaps: 'No coverage gaps.',
+    history: 'No finding changes are recorded yet.',
+  },
+  // A page whose object no longer exists hands over to its list with this notice.
+  gone: (kind: ScopeKind) => `That ${scopeKindLabel[kind].toLowerCase()} no longer exists.`,
+  // Cluster-level owners have their own pages, not workload pages.
+  owner: { controlPlane: 'Control plane', nodes: 'Nodes (host packages)' },
   notFound: 'That page does not exist.',
   facetTitle: {
     state: 'State',
@@ -352,6 +369,8 @@ export const copy = {
   },
   fixList: {
     more: (n: number) => `+ ${formatCount(n)} more`,
+    showing: (n: number, m: number) => `Showing ${formatCount(n)} of ${formatCount(m)}`,
+    openExplorer: 'Open in Vulnerabilities',
     cols: { advisory: 'Advisory', workload: 'Workload', priority: 'Priority', package: 'Package', installed: 'Installed', why: 'Why', seen: 'Seen' },
   },
   upgrades: {
@@ -368,6 +387,7 @@ export const copy = {
       checked: 'Checked',
     },
     nothing: 'none',
+    noChange: 'no change',
   },
   image: {
     // "SBOM from attestation · syft 1.57.0"; without a tool, "SBOM from attestation".
@@ -395,6 +415,8 @@ export const copy = {
     timeline: { published: 'Published', observed: 'Observed by ffs', firstMatched: 'First matched' },
     uncatalogued: (n: number) => `${plural(n, 'image', 'images')} not seen into`,
     cols: { source: 'Source', severity: 'Severity', package: 'Package', ecosystem: 'Ecosystem', installed: 'Installed', fixed: 'Fixed', findings: 'Findings' },
+    nodeGroups: 'Affected node groups',
+    nodeGroupCols: { group: 'Node group', nodes: 'Nodes', installed: 'Installed' },
   },
   agentState: { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>,
   nodes: {
@@ -407,6 +429,12 @@ export const copy = {
     kubernetes: 'Kubernetes',
     compare: (label: string) => `Compare with ${label}`,
     nodesCount: (n: number) => plural(n, 'node', 'nodes'),
+    // "2 of 3 nodes": how many of a group's nodes have a gap.
+    gapNodes: (n: number, m: number) => `${formatCount(n)} of ${plural(m, 'node', 'nodes')}`,
+    // A stale agent has no gap code of its own: its last report may be out of date.
+    agentStale: 'node agent stopped reporting',
+    groupGap: 'ffs cannot see all of this group',
+    kind: { agent: 'node agent', nodeinfo: 'node status' } satisfies Record<S<'NodeGroupKind'>, string>,
     groupCols: {
       group: 'Group',
       kind: 'Kind',
@@ -439,6 +467,7 @@ export const copy = {
     changedTitle: 'Changed packages',
     onlyThere: 'Only in the other group',
     onlyHere: 'Only in this group',
+    notCompared: 'Packages are compared only between node groups the node agent has inventoried.',
     imageCols: { image: 'Image', size: 'Size', complete: 'Complete', inUse: 'In use', nodes: 'Nodes', status: 'Status' },
     agentFields: { state: 'State', version: 'Agent version', lastReport: 'Last report', lastFullReport: 'Last full report', kernel: 'Kernel' },
   },

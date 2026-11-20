@@ -66,3 +66,22 @@ test('the SBOM view shows source, tool and hatched coverage gaps', async () => {
   expect(screen.getByText('deb')).toBeInTheDocument()
   expect(screen.getByText('120')).toBeInTheDocument()
 })
+
+test('an image with no packages leads with why it may list none', async () => {
+  const d = 'sha256:' + 'e'.repeat(64)
+  mockApi()
+    .on('/images/{digest}', imageDetail({ digest: d, status: 'pending', coverage: { class: 'none', unattributedExecutables: 0, rustWithoutAuditable: 0, notes: [], cpeOnly: [], gaps: ['pending'] } }))
+    .on('/images/{digest}/packages', imagePackagesPage())
+  renderApp(`${imagePath(d)}?view=packages`)
+  expect((await screen.findByText(copy.gaps.pending.gap)).closest('.hatched')).not.toBeNull()
+  expect(screen.queryByText(copy.emptyList.packages)).toBeNull()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('a fully seen image with no packages says its SBOM lists none', async () => {
+  const d = 'sha256:' + 'f'.repeat(64)
+  mockApi().on('/images/{digest}', imageDetail({ digest: d })).on('/images/{digest}/packages', imagePackagesPage())
+  renderApp(`${imagePath(d)}?view=packages`)
+  expect(await screen.findByText(copy.emptyList.packages)).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})

@@ -3,6 +3,7 @@ import { createRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
@@ -24,6 +25,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function ControlPlanePage() {
   const list = useQuery(apiQuery('/nodegroups', {}))
+  const trust = useScopeTrust({ kind: 'controlplane', value: '' })
   return (
     <div>
       <PageHeader title={copy.page.controlplane} />
@@ -40,7 +42,7 @@ function ControlPlanePage() {
         <Skeleton className="h-24" />
       )}
       <Section title={copy.view('findings', 'controlplane')}>
-        <FixGroupFindings scope={SCOPE} />
+        <FixGroupFindings scope={SCOPE} empty={<EmptyState coverage={trust?.coverage} feeds={trust?.feeds} />} />
       </Section>
     </div>
   )

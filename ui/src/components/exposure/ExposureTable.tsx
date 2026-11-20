@@ -5,7 +5,7 @@ import { SignalCells } from '@/components/signals/SignalCells'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { scopePath, workloadPath } from '@/lib/links'
+import { ownerHref, ownerLabel, scopePath } from '@/lib/links'
 import { parseScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 
@@ -56,8 +56,8 @@ function Hostname({ row }: { row: Row }) {
       {row.workloads.map((w, i) => (
         <Fragment key={w.scope}>
           {i > 0 ? <span className="text-muted-foreground">,</span> : null}
-          <AppLink href={workloadPath(w.kind, w.namespace, w.name)} className="hover:underline">
-            {w.name}
+          <AppLink href={ownerHref(w)} className="hover:underline">
+            {ownerLabel(w)}
           </AppLink>
         </Fragment>
       ))}

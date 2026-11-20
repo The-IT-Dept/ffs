@@ -1,9 +1,11 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useNavigate } from '@tanstack/react-router'
 import { SlidersHorizontal } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef } from 'react'
 import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { EmptyState } from '@/components/layout/EmptyState'
+import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { CoverageFigureText } from '@/components/signals/CoverageFigureText'
@@ -113,8 +115,9 @@ export function ExplorerPage<K extends ExplorerKind>({
   const q = useQuery({ ...explorerQuery(kind, search), placeholderData: keepPreviousData })
   const settings = useQuery(apiQuery('/settings', {}))
   const epssBump = settings.data?.priority.epssBump ?? 0.1
+  const scope = scopeOf(search)
   // The same key the rail asks, so the coverage beside the count costs no request.
-  const card = useQuery(apiQuery('/scope', { query: scopeParam(scopeOf(search)) }))
+  const card = useQuery(apiQuery('/scope', { query: scopeParam(scope) }))
   const pages = useCursorPages(JSON.stringify(toApiQuery(withoutCursor(search), [])), search.cursor)
 
   const rejected = q.error instanceof ApiProblem && q.error.code === 'invalid_cursor' && search.cursor !== undefined
@@ -124,11 +127,20 @@ export function ExplorerPage<K extends ExplorerKind>({
     if (rejected) latest.current.onSearch(withoutCursor(latest.current.search), { replace: true })
   }, [rejected])
 
+  // A scope that no longer exists (a node group re-keyed by a package update, a deleted workload)
+  // answers 404 not_found; its list takes over, with the notice the node group page gives.
+  const navigate = useNavigate()
+  const gone = q.error instanceof ApiProblem && q.error.code === 'not_found' && scope.kind !== 'cluster' ? scope.kind : undefined
+  useEffect(() => {
+    if (gone) void navigate({ to: gone === 'nodegroup' || gone === 'node' ? '/nodes' : '/workloads', replace: true, state: goneState(gone) })
+  }, [gone, navigate])
+
   const chips = chipsOf(search, epssBump)
   const data = q.data
   const grouped = kind === 'findings' && search.group !== undefined
   const findingsData = kind === 'findings' ? (data as S<'FindingsPage'> | undefined) : undefined
   const coverage = card.data?.trust.coverage
+  const feeds = card.data?.trust.feeds
 
   let countLine: string | undefined
   if (data) {
@@ -144,16 +156,17 @@ export function ExplorerPage<K extends ExplorerKind>({
       {coverage ? (
         <>
           {' · '}
-          <CoverageFigureText figure={coverage} secondary /> <span>{copy.headline.coverage}</span>
+          <CoverageFigureText figure={coverage} /> <span>{copy.headline.coverage}</span>
+          {coverage.inUse > 0 ? <span> · {copy.headline.seenInto(coverage.seenInto)}</span> : null}
         </>
       ) : null}
     </>
   ) : undefined
 
   let body
-  if (rejected || (!data && !q.error)) body = <TableSkeleton />
+  if (rejected || gone || (!data && !q.error)) body = <TableSkeleton />
   else if (q.error && !data) body = <ProblemNotice error={q.error} />
-  else if (data && data.total === 0) body = <EmptyState coverage={coverage} filtered={chips.length > 0} />
+  else if (data && data.total === 0) body = <EmptyState coverage={coverage} feeds={feeds} scope={scope} filtered={chips.length > 0} />
   else if (data && grouped && findingsData && search.group)
     body = <GroupTable group={search.group} rows={findingsData.groupRows} search={search} />
   else if (data)

@@ -4,6 +4,7 @@ import { useState } from 'react'
 import type { S } from '@/api/types'
 import type { Column } from '@/components/explorer/ExplorerTable'
 import { ExplorerTable } from '@/components/explorer/ExplorerTable'
+import { OwnerCell } from '@/components/explorer/OwnerCell'
 import { findingsQuery } from '@/components/explorer/params'
 import { PriorityCell } from '@/components/explorer/PriorityCell'
 import { AppLink } from '@/components/layout/AppLink'
@@ -13,7 +14,7 @@ import { RelativeTime } from '@/components/signals/RelativeTime'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy, countsLine, fixGroupHeader } from '@/lib/copy'
-import { advisoryPath, explorerHref, workloadPath } from '@/lib/links'
+import { advisoryPath, explorerHref } from '@/lib/links'
 import { type ExplorerSearch, parsePackageKey } from '@/lib/query'
 
 export type FixGroupKind = 'fix' | 'advisory' | 'package'
@@ -60,11 +61,7 @@ function GroupFindings({ row, group, base }: { row: Row; group: FixGroupKind; ba
           {
             id: 'workload',
             header: copy.fixList.cols.workload,
-            cell: (r: S<'FindingRow'>) => (
-              <AppLink href={workloadPath(r.workload.kind, r.workload.namespace, r.workload.name)} className="hover:underline">
-                {r.workload.name}
-              </AppLink>
-            ),
+            cell: (r: S<'FindingRow'>) => <OwnerCell owner={r.workload} nodeGroups={r.nodeGroups} namespace={false} />,
           },
         ]),
     { id: 'priority', header: copy.fixList.cols.priority, cell: (r) => <PriorityCell finding={r} /> },
