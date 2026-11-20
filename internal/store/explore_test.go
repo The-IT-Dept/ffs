@@ -565,7 +565,7 @@ func TestFindingFacets_UseCoveringIndex(t *testing.T) {
 		cnt, err := findingCountStmt(q)
 		require.NoError(t, err)
 		require.True(t, cnt.indexOnly, name)
-		requireIndexOnly(t, s, "findings_explore", cnt, name+" count")
+		requireIndexOnly(t, s, "findings_groups", cnt, name+" count")
 		var notIndexOnly []string
 		for _, f := range []FindingFacet{FacetState, FacetPriority, FacetFix, FacetSignal, FacetEcosystem, FacetNamespace, FacetKind} {
 			stmts, err := findingFacetStmts(q, f)
@@ -575,14 +575,14 @@ func TestFindingFacets_UseCoveringIndex(t *testing.T) {
 					notIndexOnly = append(notIndexOnly, string(f)+": "+st.query)
 					continue
 				}
-				requireIndexOnly(t, s, "findings_explore", st, name+" "+string(f))
+				requireIndexOnly(t, s, "findings_groups", st, name+" "+string(f))
 			}
 		}
 		require.Len(t, notIndexOnly, 1, name)
 		require.True(t, strings.HasPrefix(notIndexOnly[0], "state: SELECT 'resolved'"), notIndexOnly[0])
 	}
 
-	// not coverable: the planner chooses, and findings_explore is not named
+	// not coverable: the planner chooses, and findings_groups is not named
 	for _, q := range []FindingQuery{{Q: "web"}, {Repo: "ghcr.io/example/web"}, {Package: "openssl"}, {FixKey: "none"},
 		{Scope: model.Scope{Kind: model.ScopeImage, Value: "sha256:web"}}, {States: []model.FindingState{model.StateResolved}}} {
 		cnt, err := findingCountStmt(q)
@@ -653,4 +653,12 @@ func TestTransitionsPage_ScopesNewestFirst(t *testing.T) {
 	require.Equal(t, 1, n)
 	_, err = s.TransitionCount(ctx, scope("nodegroup:g1"), t0)
 	require.ErrorIs(t, err, ErrScope)
+}
+
+func TestFindingsExploreIndexIsDropped(t *testing.T) {
+	s := newStore(t)
+	var n int
+	require.NoError(t, s.rdb.QueryRowContext(ctx,
+		`SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name IN ('findings_explore', 'findings_groups')`).Scan(&n))
+	require.Equal(t, 1, n, "findings_groups serves what findings_explore did (060)")
 }

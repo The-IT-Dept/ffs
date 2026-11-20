@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 // unusedImageRetention is how long an image no owner runs and no suggestion holds is kept: long
@@ -37,14 +39,24 @@ func (e *Engine) CheckExceptionExpiry(ctx context.Context) error {
 	return nil
 }
 
-// Prune deletes resolved findings, and their history, older than the retention period, then the
-// images no owner has run and no upgrade suggestion has held for a week (superseded rollout digests
-// and stale candidates). It returns the number of findings deleted.
+// Prune deletes resolved findings, and their history, older than the retention period, and the
+// transitions of the findings that stay older than it, except each one's latest
+// store.TransitionsKept. It then deletes the images no owner has run and no upgrade suggestion has
+// held for a week (superseded rollout digests and stale candidates). It returns the number of
+// findings deleted.
 func (e *Engine) Prune(ctx context.Context) (int, error) {
 	now := e.now()
-	n, err := e.o.Store.PruneResolved(ctx, now.Add(-e.o.Config.Retention.Resolved))
+	cutoff := now.Add(-e.o.Config.Retention.Resolved)
+	n, err := e.o.Store.PruneResolved(ctx, cutoff)
 	if err != nil {
 		return 0, fmt.Errorf("engine: prune resolved findings: %w", err)
+	}
+	ts, err := e.o.Store.PruneTransitions(ctx, cutoff, store.TransitionsKept)
+	if err != nil {
+		return n, fmt.Errorf("engine: prune transitions: %w", err)
+	}
+	if ts > 0 {
+		e.o.Log.Info("pruned the history of long-lived findings", "transitions", ts)
 	}
 	images, err := e.o.Store.PruneImages(ctx, now, unusedImageRetention)
 	if err != nil {

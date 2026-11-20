@@ -51,6 +51,7 @@ type Store interface {
 	UnmatchedDigests(ctx context.Context, digests []string) ([]string, error)
 	MarkMatched(ctx context.Context, digest string) error
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
+	PruneTransitions(ctx context.Context, olderThan time.Time, keep int) (int, error)
 	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
 	GrypeDBBuilds(ctx context.Context) ([]time.Time, error)
