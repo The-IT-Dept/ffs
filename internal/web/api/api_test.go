@@ -425,3 +425,16 @@ func TestAPI_EmptyService(t *testing.T) {
 		require.NotContains(t, body, "null", p)
 	}
 }
+
+// TestAPI_PlaceholderImage is the API side of F45: an unresolvable placeholder ID is addressable.
+func TestAPI_PlaceholderImage(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.SeedPlaceholder(t, st)
+	srv := httptest.NewServer(api.NewHandler(svc))
+	t.Cleanup(srv.Close)
+	code, d, body := get(t, srv, "/api/v1/images/"+webtest.DigestPlaceholder)
+	require.Equal(t, 200, code, body)
+	require.Equal(t, webtest.DigestPlaceholder, item(d)["id"])
+	require.Equal(t, "unresolvable", item(d)["status"])
+	require.Equal(t, []string{"CronJob/ops/report"}, strs(item(d)["owners"]))
+}

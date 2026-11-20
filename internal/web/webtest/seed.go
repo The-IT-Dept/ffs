@@ -242,3 +242,23 @@ func SeedGoStdlib(t testing.TB, st *store.Store) {
 	}
 	must(st.ApplyFindings(ctx, fs, nil))
 }
+
+// DigestPlaceholder is the ID inventory gives an image whose tag could not be resolved: it holds
+// the reference, slashes included.
+const DigestPlaceholder = "unknown:ghcr.io/example/private:1.0"
+
+// Report is the owner SeedPlaceholder adds.
+var Report = model.OwnerRef{Kind: "CronJob", Namespace: "ops", Name: "report"}
+
+// SeedPlaceholder adds owner CronJob/ops/report running the unresolvable placeholder image
+// DigestPlaceholder.
+func SeedPlaceholder(t testing.TB, st *store.Store) {
+	t.Helper()
+	ctx := context.Background()
+	must := func(err error) { t.Helper(); require.NoError(t, err) }
+	const repo = "ghcr.io/example/private"
+	must(st.UpsertOwner(ctx, model.Owner{Ref: Report, NotRunning: true, UpdatedAt: Now, Containers: []model.ContainerUse{
+		{Name: "report", Kind: model.ContainerRegular, ImageRef: repo + ":1.0", Repo: repo, Digest: DigestPlaceholder}}}))
+	must(st.UpsertImage(ctx, model.Image{Digest: DigestPlaceholder, Repo: repo, Status: model.ImageUnresolvable,
+		StatusReason: "registry refused the tag lookup"}))
+}

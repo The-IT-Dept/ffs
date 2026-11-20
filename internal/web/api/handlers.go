@@ -25,7 +25,7 @@ func NewHandler(svc *Service) http.Handler {
 		"/owners":                           h.owners,
 		"/owners/{kind}/{namespace}/{name}": h.owner,
 		"/images":                           h.images,
-		"/images/{digest}":                  h.image,
+		"/images/{digest...}":               h.image, // placeholder IDs ("unknown:<repo>:<tag>") hold slashes
 		"/nodes":                            h.nodes,
 		"/nodes/{name}":                     h.node,
 		"/cluster":                          h.cluster,

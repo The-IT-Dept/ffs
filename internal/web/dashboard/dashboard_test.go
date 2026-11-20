@@ -236,3 +236,17 @@ func TestDashboard_SeedTierNoneOnOwnerPage(t *testing.T) {
 	contains(t, body, "No upgrade in the current line fixes these findings", "ghcr.io/example/worker:3.0.0", "fixes 1 medium; introduces none")
 	require.NotContains(t, body, "<strong></strong>")
 }
+
+// TestDashboard_PlaceholderImage is the regression test for F45: placeholder IDs contain "/", and
+// the single-segment route answered "That page does not exist" for exactly the blind-spot images.
+func TestDashboard_PlaceholderImage(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.SeedPlaceholder(t, st)
+	srv := serve(t, svc)
+	href := `href="/images/` + webtest.DigestPlaceholder + `"`
+	contains(t, get(t, srv, "/images", 200), href)
+	contains(t, get(t, srv, "/owners/CronJob/ops/report", 200), href)
+	body := get(t, srv, "/images/"+webtest.DigestPlaceholder, 200)
+	contains(t, body, "Unresolvable", "registry refused the tag lookup", "CronJob ops/report")
+	require.NotContains(t, body, "does not exist")
+}

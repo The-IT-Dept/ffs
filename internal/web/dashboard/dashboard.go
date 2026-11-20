@@ -8,6 +8,7 @@ import (
 	"html/template"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -54,8 +55,9 @@ var funcs = template.FuncMap{
 		p, _ := model.ParsePriority(name)
 		return m[p]
 	},
-	"join":     strings.Join,
-	"refLabel": func(kind, ns, name string) string { return keyLabel(kind + "/" + ns + "/" + name) },
+	"join":      strings.Join,
+	"imagePath": imagePath,
+	"refLabel":  func(kind, ns, name string) string { return keyLabel(kind + "/" + ns + "/" + name) },
 }
 
 func formatDate(t *time.Time) string {
@@ -77,6 +79,16 @@ func statusLabel(s string) string {
 		return "Catalogue failed"
 	}
 	return s
+}
+
+// imagePath is an image ID as a path below /images/: each segment escaped, the slashes of a
+// placeholder ID ("unknown:ghcr.io/org/app:1.0") kept, so the rest wildcard reads it back whole.
+func imagePath(id string) string {
+	segs := strings.Split(id, "/")
+	for i, s := range segs {
+		segs[i] = url.PathEscape(s)
+	}
+	return strings.Join(segs, "/")
 }
 
 // keyPath turns an owner key ("Deployment/shop/web", "Cluster//test") into its URL path.
@@ -120,7 +132,7 @@ func New(svc *api.Service) (*Dashboard, error) {
 		"/{$}":                              d.attention,
 		"/workloads":                        d.workloads,
 		"/images":                           d.images,
-		"/images/{digest}":                  d.image,
+		"/images/{digest...}":               d.image, // placeholder IDs ("unknown:<repo>:<tag>") hold slashes
 		"/owners/{kind}/{namespace}/{name}": d.owner,
 		"/vulnerabilities":                  d.vulnerabilities,
 		"/vulnerabilities/{id}":             d.vulnerability,

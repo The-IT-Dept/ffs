@@ -7,7 +7,7 @@
 <table>
 <thead><tr><th>Container</th><th>Kind</th><th>Image</th><th>Digest</th></tr></thead>
 <tbody>
-{{range .Containers}}<tr><td>{{.Name}}</td><td>{{.Kind}}</td><td>{{.Image}}</td><td>{{if .Digest}}<a href="/images/{{.Digest}}">{{.Digest}}</a>{{end}}</td></tr>{{end}}
+{{range .Containers}}<tr><td>{{.Name}}</td><td>{{.Kind}}</td><td>{{.Image}}</td><td>{{if .Digest}}<a href="/images/{{imagePath .Digest}}">{{.Digest}}</a>{{end}}</td></tr>{{end}}
 </tbody>
 </table>
 <h2>Findings</h2>
