@@ -126,6 +126,89 @@ func TestRollups_MatchFindingsAfterEveryWritePath(t *testing.T) {
 	require.Equal(t, 1, on)
 }
 
+// TestRollups_RehomeKeepsRollups runs the node agent's real Store.Rehome, which moves findings with
+// an UPDATE of owner_key and a DELETE, through both arms of its "taken" rule and a free move, and
+// checks the trigger-maintained rollups after each call (Review Focus 5).
+func TestRollups_RehomeKeepsRollups(t *testing.T) {
+	s := newStore(t)
+	web, nodes := ref("Deployment", "shop", "web"), model.NodesOwner(testCluster)
+	const webRepo = "ghcr.io/example/web"
+	group := model.NodeGroupDigestPrefix + "g1"
+	resolvedAt := t0.Add(-10 * 24 * time.Hour)
+	hostFP := func(adv string) string { return model.FindingFingerprint(testCluster, nodes, model.HostRepo, adv) }
+	onHost := func(adv string, st model.FindingState, p model.Priority) model.Finding {
+		return uiFinding(nodes, model.HostRepo, adv, p, func(f *model.Finding) {
+			f.State, f.Digests = st, []string{group}
+			if st == model.StateResolved {
+				f.ResolvedAt = &resolvedAt
+			}
+		})
+	}
+	free := uiFinding(web, webRepo, "CVE-2026-0001", model.PriorityUrgent, func(f *model.Finding) {
+		f.Signals.KEV, f.FixAvailable = true, true
+	})
+	overResolved := uiFinding(web, webRepo, "CVE-2026-0002", model.PriorityHigh, func(f *model.Finding) {
+		f.FixAvailable = true
+		f.Digests = []string{"sha256:web-amd", "sha256:web-arm"}
+		f.Packages = []model.FindingPackage{{Name: "libssl3", Ecosystem: "deb", Installed: "3.0.15-1"},
+			{Name: "openssl", Ecosystem: "deb", Installed: "3.0.15-1"}}
+	})
+	resolvedTarget := onHost("CVE-2026-0002", model.StateResolved, model.PriorityMedium)
+	overOpen := uiFinding(web, webRepo, "CVE-2026-0003", model.PriorityMedium, func(f *model.Finding) { f.Provisional = true })
+	openTarget := onHost("CVE-2026-0003", model.StateOpen, model.PriorityLow)
+	apply(t, s, free, overResolved, resolvedTarget, overOpen, openTarget)
+	require.Empty(t, rollupDrift(t, s), "before the re-home")
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{Low: 1}, Open: 1}, statsOf(t, s, nodes.Key()))
+
+	nodesOwner := model.Owner{Ref: nodes, Containers: []model.ContainerUse{{Name: "g1", Kind: model.ContainerRegular,
+		ImageRef: "g1", Repo: model.HostRepo, Digest: group}}}
+	move := func(f model.Finding) FindingMove {
+		return FindingMove{OldFingerprint: f.Fingerprint, NewFingerprint: hostFP(f.AdvisoryID), Owner: nodes, ImageRepo: model.HostRepo}
+	}
+	rowsOf := func(fp string) (digests, packages int) {
+		t.Helper()
+		require.NoError(t, s.wdb.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM finding_digests WHERE fingerprint = ?),
+			(SELECT count(*) FROM finding_packages WHERE fingerprint = ?)`, fp, fp).Scan(&digests, &packages))
+		return digests, packages
+	}
+
+	// The target holds a resolved row: Rehome deletes it and the moved row takes its fingerprint.
+	require.NoError(t, s.Rehome(ctx, &nodesOwner, []FindingMove{move(overResolved)}, nil))
+	require.Empty(t, rollupDrift(t, s), "a resolved target is replaced")
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{High: 1, Low: 1}, Open: 2, Fixable: 1}, statsOf(t, s, nodes.Key()))
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{Urgent: 1, Medium: 1}, Open: 2, Fixable: 1, Exploited: 1, Provisional: 1},
+		statsOf(t, s, web.Key()))
+	d, p := rowsOf(hostFP(overResolved.AdvisoryID))
+	require.Equal(t, 2, d, "the moved row's two digests replace the resolved row's one")
+	require.Equal(t, 2, p)
+	d, p = rowsOf(overResolved.Fingerprint)
+	require.Zero(t, d+p, "nothing is left under the old fingerprint")
+
+	// The target holds an open row: Rehome keeps it and deletes the moved row.
+	require.NoError(t, s.Rehome(ctx, &nodesOwner, []FindingMove{move(overOpen)}, nil))
+	require.Empty(t, rollupDrift(t, s), "a taken target keeps its row")
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{High: 1, Low: 1}, Open: 2, Fixable: 1}, statsOf(t, s, nodes.Key()))
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{Urgent: 1}, Open: 1, Fixable: 1, Exploited: 1}, statsOf(t, s, web.Key()))
+	d, p = rowsOf(overOpen.Fingerprint)
+	require.Zero(t, d+p)
+	d, _ = rowsOf(hostFP(overOpen.AdvisoryID))
+	require.Equal(t, 1, d, "the kept target still has its own digest row")
+
+	// A free fingerprint, with the old owner dropped: its owner_stats row goes with its last finding.
+	require.NoError(t, s.Rehome(ctx, &nodesOwner, []FindingMove{move(free)}, []string{web.Key()}))
+	require.Empty(t, rollupDrift(t, s), "a move to a free fingerprint")
+	require.Equal(t, OwnerStats{Counts: PriorityCounts{Urgent: 1, High: 1, Low: 1}, Open: 3, Fixable: 2, Exploited: 1},
+		statsOf(t, s, nodes.Key()))
+	got, err := s.OwnerStatsOf(ctx, []string{web.Key()})
+	require.NoError(t, err)
+	require.Empty(t, got)
+	var kind, ns string
+	require.NoError(t, s.wdb.QueryRowContext(ctx, `SELECT owner_kind, namespace FROM owner_stats WHERE owner_key = ?`, nodes.Key()).
+		Scan(&kind, &ns))
+	require.Equal(t, model.OwnerKindNodes, kind)
+	require.Empty(t, ns)
+}
+
 func TestReadModelColumns_MatchModel(t *testing.T) {
 	s := newStore(t)
 	web, cluster := ref("Deployment", "shop", "web"), ref("Cluster", "", testCluster)
