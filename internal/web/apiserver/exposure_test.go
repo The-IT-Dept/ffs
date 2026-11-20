@@ -2,6 +2,7 @@ package apiserver_test
 
 import (
 	"fmt"
+	"net/url"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -155,7 +156,7 @@ func TestExposure_FoldsTailAndExpands(t *testing.T) {
 	require.True(t, gw.Expandable)
 	require.Equal(t, []string{"shop.example.com", "app-12.example.com", "app-01.example.com", "app-02.example.com", "app-03.example.com",
 		"app-04.example.com", "app-05.example.com", "app-06.example.com", "5 more hostnames"}, childLabels(got.Rows, "gw:gateway/public"))
-	tail := rowByID(t, got.Rows, "gw:gateway/public/tail")
+	tail := rowByID(t, got.Rows, "gw:gateway/public/~tail")
 	require.Equal(t, apigen.ExposureRowKindTail, tail.Kind)
 	require.Equal(t, "5 more hostnames", tail.Label)
 	require.Equal(t, "nothing above low", *tail.Detail)
@@ -165,12 +166,54 @@ func TestExposure_FoldsTailAndExpands(t *testing.T) {
 	got = ok[apigen.ExposureTable](t, get(t, h, "/api/v1/exposure?expand=gw:gateway/public"))
 	labels := childLabels(got.Rows, "gw:gateway/public")
 	require.Len(t, labels, 13)
-	require.NotContains(t, rowIDs(got.Rows), "gw:gateway/public/tail")
+	require.NotContains(t, rowIDs(got.Rows), "gw:gateway/public/~tail")
 	for _, r := range got.Rows {
 		if r.Parent != nil && *r.Parent == "gw:gateway/public" {
 			require.Equal(t, apigen.ExposureRowKindHostname, r.Kind, r.Id)
 		}
 	}
+}
+
+// V62: a tail row's id is unique even when a child is named "tail", and expanding it by the tail's
+// id shows the group in full.
+func TestExposure_TailIDsAreUnique(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	for i := 1; i <= 10; i++ {
+		name := fmt.Sprintf("app-%02d", i)
+		host := name + ".example.com"
+		if i == 10 {
+			host = "tail"
+		}
+		ref := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: name}
+		path := "HTTPRoute shop/" + name + " on Gateway gateway/public"
+		require.NoError(t, f.Store.UpsertOwner(ctx, model.Owner{Ref: ref, ServiceAccount: "default", UpdatedAt: webtest.Now,
+			Context: model.WorkloadContext{Exposed: true, ExposurePaths: []string{path}, Exposure: []model.ExposureEdge{{
+				Entry: model.EntryGateway, EntryName: "gateway/public", Hostname: host, Route: "HTTPRoute shop/" + name,
+				Service: "shop/" + name, Path: path}}}}))
+		if host == "tail" { // urgent, so shown while the rest fold
+			require.NoError(t, f.Store.ApplyFindings(ctx, []model.Finding{{
+				Fingerprint: model.FindingFingerprint(webtest.ClusterName, ref, "ghcr.io/example/app", "CVE-2026-0001"), Owner: ref,
+				ImageRepo: "ghcr.io/example/app", AdvisoryID: "CVE-2026-0001", State: model.StateOpen, Priority: model.PriorityUrgent,
+				Severity: model.SeverityCritical, Digests: []string{"sha256:app"}, LastSeen: webtest.Now,
+			}}, nil))
+		}
+	}
+	h := handlerOf(f)
+	for _, target := range []string{"/api/v1/exposure", "/api/v1/exposure?expand=" + url.QueryEscape("gw:gateway/public/~tail")} {
+		got := ok[apigen.ExposureTable](t, get(t, h, target))
+		ids := rowIDs(got.Rows)
+		seen := map[string]bool{}
+		for _, id := range ids {
+			require.False(t, seen[id], "duplicate row id %s in %v", id, ids)
+			seen[id] = true
+		}
+		require.True(t, seen["gw:gateway/public/tail"], "the hostname tail")
+	}
+	folded := ok[apigen.ExposureTable](t, get(t, h, "/api/v1/exposure"))
+	require.Equal(t, apigen.ExposureRowKindTail, rowByID(t, folded.Rows, "gw:gateway/public/~tail").Kind)
+	expanded := ok[apigen.ExposureTable](t, get(t, h, "/api/v1/exposure?expand="+url.QueryEscape("gw:gateway/public/~tail")))
+	require.Len(t, childLabels(expanded.Rows, "gw:gateway/public"), 11, "ten apps and the shop")
 }
 
 func TestExposure_NamespaceAndNodeRegroup(t *testing.T) {

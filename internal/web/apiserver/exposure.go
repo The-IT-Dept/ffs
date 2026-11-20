@@ -24,7 +24,9 @@ const (
 	rowInternal     = "internal"
 	rowNotExposed   = "not-exposed"
 	rowControlPlane = "controlplane"
-	tailSuffix      = "/tail"
+	// tailSuffix ends a tail row's id. "~" is in no hostname, node name or owner key, so no child
+	// id, and no child of another group, can end with it.
+	tailSuffix = "/~tail"
 )
 
 // exposureData holds what the exposure table sums per owner.

@@ -567,6 +567,8 @@ export interface components {
             value: string;
             count: number;
             selected: boolean;
+            /** @description How the value reads when that differs from the value. */
+            label?: string;
         };
         /** @description Facet name to its values, for the requested facets only. */
         Facets: {
@@ -1507,7 +1509,7 @@ export interface operations {
                 /** @description Ecosystem of the finding's first package. */
                 ecosystem?: string[];
                 namespace?: string[];
-                /** @description Owner kinds, such as Deployment. */
+                /** @description Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the cluster itself. */
                 kind?: string[];
                 /** @description Advisory ID or any of its aliases. */
                 advisory?: string;

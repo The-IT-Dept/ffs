@@ -184,7 +184,19 @@ func findingFacets(q store.FindingQuery, counts map[store.FindingFacet][]store.F
 	for f, vals := range counts {
 		out[string(f)] = facetValues(vals, selected[f])
 	}
+	for i, v := range out[string(store.FacetKind)] {
+		if label, ok := clusterLevelKinds[v.Value]; ok {
+			out[string(store.FacetKind)][i].Label = &label
+		}
+	}
 	return out
+}
+
+// clusterLevelKinds labels the kind facet values of the cluster-level owners.
+var clusterLevelKinds = map[string]string{
+	store.ClusterLevelKindPrefix + model.OwnerKindCluster:          "Kubernetes (control plane)",
+	store.ClusterLevelKindPrefix + model.OwnerKindContainerRuntime: "Container runtime (control plane)",
+	store.ClusterLevelKindPrefix + model.OwnerKindNodes:            "Nodes (host packages)",
 }
 
 // facetValues shapes store facet values, in their order, marking the selected ones.

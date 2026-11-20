@@ -118,7 +118,10 @@ paths:
           schema: {type: array, items: {type: string}}
         - in: query
           name: kind
-          description: Owner kinds, such as Deployment.
+          description: >-
+            Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and
+            cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the
+            cluster itself.
           style: form
           explode: false
           schema: {type: array, items: {type: string}}
@@ -828,6 +831,7 @@ components:
         value: {type: string}
         count: {type: integer}
         selected: {type: boolean}
+        label: {type: string, description: How the value reads when that differs from the value.}
 
     Facets:
       type: object

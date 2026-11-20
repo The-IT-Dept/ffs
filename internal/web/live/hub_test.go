@@ -10,6 +10,7 @@ import (
 	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/web/live"
 	"github.com/the-it-dept/ffs/internal/web/webtest"
@@ -151,7 +152,8 @@ func TestHub_PollerPublishesMarkChanges(t *testing.T) {
 func TestStoreNodeMarks_IgnoresHeartbeats(t *testing.T) {
 	f := webtest.Open(t)
 	ctx := t.Context()
-	marks := live.StoreNodeMarks(f.Store)
+	now := webtest.Now
+	marks := live.StoreNodeMarks(f.Store, 30*time.Minute, func() time.Time { return now })
 	before, err := marks(ctx)
 	require.NoError(t, err)
 	require.Len(t, before, 16)
@@ -171,4 +173,41 @@ func TestStoreNodeMarks_IgnoresHeartbeats(t *testing.T) {
 	moved, err := marks(ctx)
 	require.NoError(t, err)
 	require.NotEqual(t, before, moved, "moving worker-2 changes the mark")
+}
+
+// V54: the node mark follows each agent's state, its coverage gaps and its last error, so an open
+// Nodes page hears about an agent going stale, a new gap or a host inventory error.
+func TestStoreNodeMarks_AgentStateGapsAndErrors(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	now := webtest.Now
+	marks := live.StoreNodeMarks(f.Store, 30*time.Minute, func() time.Time { return now })
+	mark := func() string {
+		t.Helper()
+		m, err := marks(ctx)
+		require.NoError(t, err)
+		return m
+	}
+	start := mark()
+
+	now = webtest.Now.Add(20 * time.Minute)
+	require.Equal(t, start, mark(), "worker-1 still reports within staleAfter")
+	now = webtest.Now.Add(30 * time.Minute)
+	stale := mark()
+	require.NotEqual(t, start, stale, "worker-1 went stale with no write")
+
+	at := now.Add(-time.Minute)
+	applied, err := f.Store.AcceptAgentReport(ctx, store.AgentReport{Node: "worker-1", AgentVersion: "v0.1.0", BootID: "boot-worker-1-b",
+		StartedAt: at.Add(-time.Minute), Seq: 1, At: at, Full: true, KernelRelease: "6.8.0-88-generic", Arch: "amd64", PackageDB: "dpkg",
+		Coverage: []model.NodeCoverageGap{{Code: model.GapNodeAgentBlocked, Detail: "permission denied"}}})
+	require.NoError(t, err)
+	require.True(t, applied)
+	blocked := mark()
+	require.NotEqual(t, stale, blocked, "reporting again, with a gap")
+
+	require.NoError(t, f.Store.SetAgentError(ctx, "worker-1", "host inventory not stored: too large"))
+	failed := mark()
+	require.NotEqual(t, blocked, failed, "a last error")
+	require.NoError(t, f.Store.SetAgentError(ctx, "worker-1", "host inventory not stored: decoding"))
+	require.NotEqual(t, failed, mark(), "another last error")
 }

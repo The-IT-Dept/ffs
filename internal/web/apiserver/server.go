@@ -3,6 +3,8 @@
 package apiserver
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -80,8 +82,12 @@ func (s *Server) paramError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // responseError answers a request whose handler failed: with the problem the error maps to, or 500
-// internal, logged, with a generic detail.
+// internal, logged, with a generic detail. A request the client cancelled (the browser aborts
+// superseded queries) gets no answer and no log: there is no one to answer.
 func (s *Server) responseError(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+		return
+	}
 	p := problemOf(err)
 	if p == nil {
 		s.o.Log.Error(err, "API request failed", "path", r.URL.Path)

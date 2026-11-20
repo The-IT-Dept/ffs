@@ -5,11 +5,13 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
 	"github.com/the-it-dept/ffs/internal/web/webtest"
 )
@@ -248,4 +250,48 @@ func TestTransitions_NewestFirstAndScoped(t *testing.T) {
 		query = "?limit=1&cursor=" + url.QueryEscape(*page.Next)
 	}
 	require.Equal(t, []int64{all.Rows[0].Id, all.Rows[1].Id, all.Rows[2].Id, all.Rows[3].Id}, paged)
+}
+
+// V50: the kind facet tells the cluster-level owners apart from namespaced owners of the same kind:
+// the Kubernetes Cluster owner is cluster-level:Cluster, labelled, and a CloudNativePG Cluster is
+// Cluster.
+func TestFindings_KindFacetSeparatesClusterLevelOwners(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	cnpg := model.OwnerRef{Kind: model.OwnerKindCluster, Namespace: "db", Name: "pg-main"}
+	const repo = "ghcr.io/cloudnative-pg/postgresql"
+	require.NoError(t, f.Store.ApplyFindings(ctx, []model.Finding{{Fingerprint: model.FindingFingerprint(webtest.ClusterName, cnpg, repo, "CVE-2026-0001"),
+		Owner: cnpg, ImageRepo: repo, AdvisoryID: "CVE-2026-0001", Digests: []string{"sha256:" + strings.Repeat("5", 64)},
+		Packages: []model.FindingPackage{{Name: "openssl", Ecosystem: "deb", Installed: "3.0.15-1~deb12u1"}}, Severity: model.SeverityCritical,
+		Priority: model.PriorityHigh, State: model.StateOpen, Observed: webtest.Now, Matched: webtest.Now, LastSeen: webtest.Now}}, nil))
+	h := handlerOf(f)
+
+	page := ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?facets=kind"))
+	kinds := map[string]apigen.FacetValue{}
+	for _, v := range page.Facets["kind"] {
+		kinds[v.Value] = v
+	}
+	require.Equal(t, 1, kinds["Cluster"].Count, "the CloudNativePG cluster")
+	require.Nil(t, kinds["Cluster"].Label)
+	for value, label := range map[string]string{"cluster-level:Cluster": "Kubernetes (control plane)",
+		"cluster-level:ContainerRuntime": "Container runtime (control plane)", "cluster-level:Nodes": "Nodes (host packages)"} {
+		require.Equal(t, 1, kinds[value].Count, value)
+		require.NotNil(t, kinds[value].Label, value)
+		require.Equal(t, label, *kinds[value].Label)
+	}
+	require.Equal(t, 6, kinds["Deployment"].Count, "workload kinds keep their plain value")
+
+	cnpgOnly := ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?kind=Cluster"))
+	require.Equal(t, 1, cnpgOnly.Total)
+	require.Equal(t, "pg-main", cnpgOnly.Rows[0].Workload.Name)
+	k8s := ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?kind=cluster-level:Cluster&facets=kind"))
+	require.Equal(t, 1, k8s.Total)
+	require.Equal(t, "CVE-2026-0003", k8s.Rows[0].Advisory.Id)
+	both := ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?kind=Cluster,cluster-level:Cluster"))
+	require.Equal(t, 2, both.Total)
+	for _, v := range k8s.Facets["kind"] {
+		if v.Value == "cluster-level:Cluster" {
+			require.True(t, v.Selected)
+		}
+	}
 }

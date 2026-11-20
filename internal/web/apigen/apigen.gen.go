@@ -1267,9 +1267,12 @@ type ExposureTable struct {
 
 // FacetValue defines model for FacetValue.
 type FacetValue struct {
-	Count    int    `json:"count"`
-	Selected bool   `json:"selected"`
-	Value    string `json:"value"`
+	Count int `json:"count"`
+
+	// Label How the value reads when that differs from the value.
+	Label    *string `json:"label,omitempty"`
+	Selected bool    `json:"selected"`
+	Value    string  `json:"value"`
 }
 
 // Facets Facet name to its values, for the requested facets only.
@@ -2319,7 +2322,7 @@ type ListFindingsParams struct {
 	Ecosystem *[]string `form:"ecosystem,omitempty" json:"ecosystem,omitempty"`
 	Namespace *[]string `form:"namespace,omitempty" json:"namespace,omitempty"`
 
-	// Kind Owner kinds, such as Deployment.
+	// Kind Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the cluster itself.
 	Kind *[]string `form:"kind,omitempty" json:"kind,omitempty"`
 
 	// Advisory Advisory ID or any of its aliases.

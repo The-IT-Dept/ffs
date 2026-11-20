@@ -291,38 +291,59 @@ func TestJump_PrefixFirstPerKind(t *testing.T) {
 	put(t, s, "sha256:web", model.Package{Ecosystem: "deb", Name: "webkit", Version: "1.0"}, model.Package{Ecosystem: "deb", Name: "webkit", Version: "2.0"})
 	require.NoError(t, s.ReplaceNodes(ctx, []model.Node{{Name: "worker-1", Ready: true}, {Name: "cp-1", Ready: true}}))
 
-	hits, err := s.Jump(ctx, "web", 0)
+	hits, more, err := s.Jump(ctx, "web", 0)
 	require.NoError(t, err)
+	require.False(t, more)
 	require.Equal(t, []JumpHit{
-		{Kind: "workload", ID: exWeb.Key(), Label: "web", Detail: "Deployment · shop", Worst: model.PriorityUrgent},
+		{Kind: "workload", ID: exWeb.Key(), Label: "web", Detail: "Deployment · shop", Worst: model.PriorityUrgent, Prefix: true},
 		{Kind: "workload", ID: "Deployment/webshop/legacy-web", Label: "legacy-web", Detail: "Deployment · webshop"},
-		{Kind: "namespace", ID: "webshop", Label: "webshop", Detail: "1 workloads"},
+		{Kind: "namespace", ID: "webshop", Label: "webshop", Detail: "1 workload", Prefix: true},
 		{Kind: "image", ID: "sha256:web", Label: "ghcr.io/example/web", Detail: "sha256:web", Worst: model.PriorityUrgent},
-		{Kind: "package", ID: "deb/webkit", Label: "webkit", Detail: "deb"},
+		{Kind: "package", ID: "deb/webkit", Label: "webkit", Detail: "deb", Prefix: true},
 	}, hits)
 
-	one, err := s.Jump(ctx, "web", 1)
+	one, more, err := s.Jump(ctx, "web", 1)
 	require.NoError(t, err)
+	require.True(t, more, "a second web workload is left out")
 	var kinds []string
 	for _, h := range one {
 		kinds = append(kinds, h.Kind+":"+h.ID)
 	}
 	require.Equal(t, []string{"workload:" + exWeb.Key(), "namespace:webshop", "image:sha256:web", "package:deb/webkit"}, kinds)
 
-	hits, err = s.Jump(ctx, "WORK", 0)
+	hits, _, err = s.Jump(ctx, "WORK", 0)
 	require.NoError(t, err)
-	require.Contains(t, hits, JumpHit{Kind: "node", ID: "worker-1", Label: "worker-1"})
-	require.Equal(t, JumpHit{Kind: "workload", ID: exWorker.Key(), Label: "worker", Detail: "Deployment · shop"}, hits[0])
+	require.Contains(t, hits, JumpHit{Kind: "node", ID: "worker-1", Label: "worker-1", Prefix: true})
+	require.Equal(t, JumpHit{Kind: "workload", ID: exWorker.Key(), Label: "worker", Detail: "Deployment · shop", Prefix: true}, hits[0])
 	require.Equal(t, model.PriorityNone, hits[len(hits)-1].Worst)
 
 	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0001", Title: "web server overflow"}))
 	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0003", Title: "api bug"}))
-	hits, err = s.Jump(ctx, "CVE-2026-000", 0)
+	hits, _, err = s.Jump(ctx, "CVE-2026-000", 0)
 	require.NoError(t, err)
 	require.Equal(t, []JumpHit{
-		{Kind: "advisory", ID: "CVE-2026-0001", Label: "CVE-2026-0001", Detail: "web server overflow", Worst: model.PriorityUrgent},
-		{Kind: "advisory", ID: "CVE-2026-0003", Label: "CVE-2026-0003", Detail: "api bug", Worst: model.PriorityMedium},
+		{Kind: "advisory", ID: "CVE-2026-0001", Label: "CVE-2026-0001", Detail: "web server overflow", Worst: model.PriorityUrgent, Prefix: true},
+		{Kind: "advisory", ID: "CVE-2026-0003", Label: "CVE-2026-0003", Detail: "api bug", Worst: model.PriorityMedium, Prefix: true},
 	}, hits)
+}
+
+// A prefix hit is never lost to an alphabetical cut: with many labels containing the query, those
+// starting with it still come back, before the rest.
+func TestJump_PrefixHitsSurviveTheCut(t *testing.T) {
+	s := newStore(t)
+	for _, name := range []string{"a-kube-1", "a-kube-2", "b-kube-3", "c-kube-4", "d-kube-5", "e-kube-6", "kube-proxy", "kubelet-csr"} {
+		require.NoError(t, s.UpsertOwner(ctx, uiOwner(ref("Deployment", "ops", name))))
+	}
+	hits, more, err := s.Jump(ctx, "kube", 3)
+	require.NoError(t, err)
+	require.True(t, more)
+	var labels []string
+	for _, h := range hits {
+		if h.Kind == "workload" {
+			labels = append(labels, h.Label)
+		}
+	}
+	require.Equal(t, []string{"kube-proxy", "kubelet-csr", "a-kube-1"}, labels)
 }
 
 func TestChangeMarks_StableSensitiveAndReadOnly(t *testing.T) {
