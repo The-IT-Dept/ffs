@@ -250,3 +250,16 @@ func TestDashboard_PlaceholderImage(t *testing.T) {
 	contains(t, body, "Unresolvable", "registry refused the tag lookup", "CronJob ops/report")
 	require.NotContains(t, body, "does not exist")
 }
+
+// TestDashboard_PagesDecodeOnlyWhatTheyShow is the dashboard side of F37: the landing page,
+// Workloads and Vulnerabilities used to decode every open finding on each load.
+func TestDashboard_PagesDecodeOnlyWhatTheyShow(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	srv := serve(t, svc)
+	webtest.Corrupt(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE advisory_id = 'CVE-2026-0004'`)
+	webtest.Corrupt(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
+	contains(t, get(t, srv, "/", 200), "CVE-2026-0001")
+	contains(t, get(t, srv, "/workloads", 200), "shop/worker")
+	contains(t, get(t, srv, "/vulnerabilities", 200), "CVE-2026-0004")
+	contains(t, get(t, srv, "/images", 200), "Partial coverage")
+}

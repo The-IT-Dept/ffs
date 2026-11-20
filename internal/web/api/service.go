@@ -5,6 +5,7 @@ import (
 	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -506,8 +507,9 @@ func (s *Service) Finding(ctx context.Context, id string) (FindingView, bool, er
 
 var openOnly = []model.FindingState{model.StateOpen}
 
-func vulnerabilityView(id string, a model.Advisory, haveAdvisory bool, fs []model.Finding) VulnerabilityView {
-	v := VulnerabilityView{ID: id, Aliases: []string{}}
+func vulnerabilityView(a model.Advisory, haveAdvisory bool, r store.AdvisoryRollup) VulnerabilityView {
+	v := VulnerabilityView{ID: r.AdvisoryID, Aliases: []string{}, HighestPriority: r.HighestPriority, Severity: r.Severity,
+		Owners: r.Owners, FindingCount: r.Findings, FixAvailable: r.FixAvailable}
 	if haveAdvisory {
 		v.Aliases, v.Title = nz(a.Aliases), a.Title
 		v.EPSS, v.EPSSPercentile = a.EPSS, a.EPSSPercentile
@@ -517,39 +519,42 @@ func vulnerabilityView(id string, a model.Advisory, haveAdvisory bool, fs []mode
 			v.KEV, v.KEVAdded = true, a.KEVAdded.UTC().Format(dateFmt)
 		}
 	}
-	owners := map[string]bool{}
-	for _, f := range fs {
-		owners[f.Owner.Key()] = true
-		v.HighestPriority = max(v.HighestPriority, f.Priority)
-		v.Severity = max(v.Severity, f.Severity)
-		v.FixAvailable = v.FixAvailable || f.FixAvailable
-	}
-	v.Owners, v.FindingCount = len(owners), len(fs)
 	return v
 }
 
+// rollup summarises the open findings fs of advisory id, as store.OpenAdvisoryRollups does.
+func rollup(id string, fs []model.Finding) store.AdvisoryRollup {
+	r := store.AdvisoryRollup{AdvisoryID: id, Findings: len(fs)}
+	owners := map[string]bool{}
+	for _, f := range fs {
+		owners[f.Owner.Key()] = true
+		r.HighestPriority = max(r.HighestPriority, f.Priority)
+		r.Severity = max(r.Severity, f.Severity)
+		r.FixAvailable = r.FixAvailable || f.FixAvailable
+	}
+	r.Owners = len(owners)
+	return r
+}
+
 // Vulnerabilities aggregates open findings by advisory: highest priority first, then most owners.
+// The counts come from a SQL rollup, so no finding is decoded.
 func (s *Service) Vulnerabilities(ctx context.Context) ([]VulnerabilityView, error) {
-	fs, err := s.o.Store.ListFindings(ctx, store.FindingFilter{States: openOnly})
+	rs, err := s.o.Store.OpenAdvisoryRollups(ctx)
 	if err != nil {
 		return nil, err
 	}
-	byAdv := map[string][]model.Finding{}
-	var ids []string
-	for _, f := range fs {
-		if _, ok := byAdv[f.AdvisoryID]; !ok {
-			ids = append(ids, f.AdvisoryID)
-		}
-		byAdv[f.AdvisoryID] = append(byAdv[f.AdvisoryID], f)
+	ids := make([]string, 0, len(rs))
+	for _, r := range rs {
+		ids = append(ids, r.AdvisoryID)
 	}
 	advs, err := s.o.Store.Advisories(ctx, ids)
 	if err != nil {
 		return nil, err
 	}
-	out := make([]VulnerabilityView, 0, len(ids))
-	for _, id := range ids {
-		a, ok := advs[id]
-		out = append(out, vulnerabilityView(id, a, ok, byAdv[id]))
+	out := make([]VulnerabilityView, 0, len(rs))
+	for _, r := range rs {
+		a, ok := advs[r.AdvisoryID]
+		out = append(out, vulnerabilityView(a, ok, r))
 	}
 	slices.SortFunc(out, func(a, b VulnerabilityView) int {
 		return cmp.Or(cmp.Compare(b.HighestPriority, a.HighestPriority), cmp.Compare(b.Owners, a.Owners), cmp.Compare(a.ID, b.ID))
@@ -580,18 +585,16 @@ func (s *Service) Vulnerability(ctx context.Context, id string) (VulnerabilityDe
 	if err != nil {
 		return VulnerabilityDetail{}, false, err
 	}
-	return VulnerabilityDetail{VulnerabilityView: vulnerabilityView(canon, a, ok, fs), Links: nz(a.Links), Findings: fvs}, true, nil
+	return VulnerabilityDetail{VulnerabilityView: vulnerabilityView(a, ok, rollup(canon, fs)), Links: nz(a.Links), Findings: fvs}, true, nil
 }
 
 // ---- images ----
 
 const noteCPE = "daily, CPE-based coverage only: "
 
-func (s *Service) imageView(ctx context.Context, img model.Image, owners []string) (ImageView, []model.Package, error) {
-	pkgs, err := s.o.Store.PackagesForImage(ctx, img.Digest)
-	if err != nil {
-		return ImageView{}, nil, err
-	}
+// imageView shapes img. pkgs are its packages, or only the classified ones (store.ClassifiedPackages):
+// the read-time coverage note looks at nothing else.
+func imageView(img model.Image, owners []string, pkgs []model.Package) ImageView {
 	notes := slices.Clone(img.Coverage.Notes)
 	if names := upstream.UncoveredClassified(pkgs); len(names) > 0 {
 		notes = append(notes, noteCPE+strings.Join(names, ", "))
@@ -603,7 +606,7 @@ func (s *Service) imageView(ctx context.Context, img model.Image, owners []strin
 		Coverage: CoverageView{UnattributedElf: img.Coverage.UnattributedELF, RustWithoutAuditable: img.Coverage.RustWithoutAuditable,
 			Notes: nz(notes)},
 		CataloguedAt: utc(img.CataloguedAt), Owners: nz(owners),
-	}, pkgs, nil
+	}
 }
 
 // digestOwners maps each digest an owner runs to the sorted keys of the owners running it.
@@ -630,16 +633,16 @@ func (s *Service) Images(ctx context.Context) ([]ImageView, error) {
 	if err != nil {
 		return nil, err
 	}
+	classified, err := s.o.Store.ClassifiedPackages(ctx, slices.Collect(maps.Keys(running)))
+	if err != nil {
+		return nil, err
+	}
 	out := []ImageView{}
 	for _, img := range imgs {
 		if _, ok := running[img.Digest]; !ok {
 			continue
 		}
-		v, _, err := s.imageView(ctx, img, running[img.Digest])
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, v)
+		out = append(out, imageView(img, running[img.Digest], classified[img.Digest]))
 	}
 	return out, nil
 }
@@ -654,11 +657,11 @@ func (s *Service) Image(ctx context.Context, digest string) (ImageDetail, bool, 
 	if err != nil {
 		return ImageDetail{}, false, err
 	}
-	v, pkgs, err := s.imageView(ctx, img, owners)
+	pkgs, err := s.o.Store.PackagesForImage(ctx, digest)
 	if err != nil {
 		return ImageDetail{}, false, err
 	}
-	d := ImageDetail{ImageView: v, Packages: []PackageView{}, EOL: []EOLView{}}
+	d := ImageDetail{ImageView: imageView(img, owners, pkgs), Packages: []PackageView{}, EOL: []EOLView{}}
 	for _, p := range pkgs {
 		d.Packages = append(d.Packages, PackageView{Name: p.Name, Version: p.Version, Ecosystem: p.Ecosystem,
 			Classifier: p.Classifier, Path: p.Path})
@@ -672,22 +675,6 @@ func (s *Service) Image(ctx context.Context, digest string) (ImageDetail, bool, 
 }
 
 // ---- owners ----
-
-func (s *Service) openCounts(ctx context.Context) (map[string]map[model.Priority]int, error) {
-	fs, err := s.o.Store.ListFindings(ctx, store.FindingFilter{States: openOnly})
-	if err != nil {
-		return nil, err
-	}
-	m := map[string]map[model.Priority]int{}
-	for _, f := range fs {
-		k := f.Owner.Key()
-		if m[k] == nil {
-			m[k] = map[model.Priority]int{}
-		}
-		m[k][f.Priority]++
-	}
-	return m, nil
-}
 
 func ownerView(o model.Owner, counts map[model.Priority]int) OwnerView {
 	v := OwnerView{
@@ -708,19 +695,39 @@ func ownerView(o model.Owner, counts map[model.Priority]int) OwnerView {
 	return v
 }
 
-// Owners lists every owner with its open finding counts.
+// Owners lists every owner with its open finding counts, which come from a SQL rollup.
 func (s *Service) Owners(ctx context.Context) ([]OwnerView, error) {
 	owners, err := s.o.Store.ListOwners(ctx)
 	if err != nil {
 		return nil, err
 	}
-	counts, err := s.openCounts(ctx)
+	counts, err := s.o.Store.OpenCountsByOwner(ctx)
 	if err != nil {
 		return nil, err
 	}
 	out := make([]OwnerView, 0, len(owners))
 	for _, o := range owners {
 		out = append(out, ownerView(o, counts[o.Ref.Key()]))
+	}
+	return out, nil
+}
+
+// OwnerViews returns the views of the owners stored under keys, by key; keys with no owner are
+// left out. It reads only those owners, for pages that show a few of them.
+func (s *Service) OwnerViews(ctx context.Context, keys []string) (map[string]OwnerView, error) {
+	counts, err := s.o.Store.OpenCountsByOwner(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]OwnerView, len(keys))
+	for _, k := range keys {
+		o, ok, err := s.o.Store.GetOwner(ctx, k)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out[k] = ownerView(o, counts[k])
+		}
 	}
 	return out, nil
 }
@@ -768,6 +775,16 @@ func (s *Service) ownerCoverageNotes(ctx context.Context, o model.Owner) ([]stri
 			notes = append(notes, n)
 		}
 	}
+	var digests []string
+	for _, c := range o.Containers {
+		if c.Digest != "" {
+			digests = append(digests, c.Digest)
+		}
+	}
+	classified, err := s.o.Store.ClassifiedPackages(ctx, digests)
+	if err != nil {
+		return nil, err
+	}
 	for _, c := range o.Containers {
 		if c.Digest == "" {
 			continue
@@ -779,11 +796,7 @@ func (s *Service) ownerCoverageNotes(ctx context.Context, o model.Owner) ([]stri
 		if !ok {
 			continue
 		}
-		v, _, err := s.imageView(ctx, img, nil)
-		if err != nil {
-			return nil, err
-		}
-		for _, n := range v.Coverage.Notes {
+		for _, n := range imageView(img, nil, classified[c.Digest]).Coverage.Notes {
 			add(n)
 		}
 		switch img.Status {

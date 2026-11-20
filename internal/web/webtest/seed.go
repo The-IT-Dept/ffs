@@ -3,9 +3,13 @@ package webtest
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
+
+	_ "github.com/glebarez/go-sqlite" // the driver the store uses, for Corrupt
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -57,12 +61,33 @@ func service(t testing.TB, st *store.Store, kube client.Reader) *api.Service {
 	return api.NewService(api.Options{Store: st, Config: cfg, Feeds: feedInfos, EOL: ev, Kube: kube, Now: func() time.Time { return Now }})
 }
 
+// dbPaths records the database file of every store openStore opened, for Corrupt.
+var dbPaths sync.Map // *store.Store → string
+
 func openStore(t testing.TB) *store.Store {
 	t.Helper()
-	st, err := store.Open(context.Background(), t.TempDir()+"/ffs.db")
+	path := t.TempDir() + "/ffs.db"
+	st, err := store.Open(context.Background(), path)
 	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	dbPaths.Store(st, path)
+	t.Cleanup(func() { dbPaths.Delete(st); require.NoError(t, st.Close()) })
 	return st
+}
+
+// Corrupt runs a raw SQL statement against the database behind st, which Seed or Empty opened: a
+// test uses it to plant a row the store cannot decode, proving a page never reads that row.
+func Corrupt(t testing.TB, st *store.Store, query string, args ...any) {
+	t.Helper()
+	path, ok := dbPaths.Load(st)
+	require.True(t, ok, "store not opened by webtest")
+	db, err := sql.Open("sqlite", path.(string))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+	res, err := db.ExecContext(context.Background(), query, args...)
+	require.NoError(t, err)
+	n, err := res.RowsAffected()
+	require.NoError(t, err)
+	require.Positive(t, n, query)
 }
 
 func scheme(t testing.TB) *runtime.Scheme {

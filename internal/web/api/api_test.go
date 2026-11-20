@@ -438,3 +438,41 @@ func TestAPI_PlaceholderImage(t *testing.T) {
 	require.Equal(t, "unresolvable", item(d)["status"])
 	require.Equal(t, []string{"CronJob/ops/report"}, strs(item(d)["owners"]))
 }
+
+// TestAPI_ListsDecodeOnlyWhatTheyShow is the regression test for F37: owner counts, the advisory
+// list and the image list used to decode every open finding, or every package of every image, on
+// each request. A finding and a package the store cannot decode are planted; the lists that do
+// not show them still answer, so they no longer read them.
+func TestAPI_ListsDecodeOnlyWhatTheyShow(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	srv := httptest.NewServer(api.NewHandler(svc))
+	t.Cleanup(srv.Close)
+	// the worker's open medium finding: counted on the lists, decoded only on its own pages
+	webtest.Corrupt(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE fingerprint = ?`,
+		fp(webtest.Worker, "ghcr.io/example/worker", "CVE-2026-0004"))
+	// an unclassified package: the image list's coverage note needs only classified ones
+	webtest.Corrupt(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
+
+	code, d, body := get(t, srv, "/api/v1/owners")
+	require.Equal(t, 200, code, body)
+	for _, o := range items(t, d) {
+		if o["id"] == "Deployment/shop/worker" {
+			require.Equal(t, doc{"medium": float64(1)}, o["counts"])
+		}
+	}
+	code, d, body = get(t, srv, "/api/v1/vulnerabilities")
+	require.Equal(t, 200, code, body)
+	require.Equal(t, []string{"CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003", "CVE-2026-0004"}, ids(t, d))
+	medium := items(t, d)[3]
+	require.Equal(t, "medium", medium["highestPriority"])
+	require.Equal(t, "medium", medium["severity"])
+	require.EqualValues(t, 1, medium["owners"])
+	require.EqualValues(t, 1, medium["findingCount"])
+	require.Equal(t, false, medium["fixAvailable"])
+	require.Equal(t, true, items(t, d)[0]["fixAvailable"])
+	code, _, body = get(t, srv, "/api/v1/images")
+	require.Equal(t, 200, code, body)
+
+	code, _, _ = get(t, srv, "/api/v1/findings?owner=Deployment/shop/worker")
+	require.Equal(t, 500, code, "the planted finding is undecodable where it is shown")
+}

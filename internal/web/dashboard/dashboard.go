@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -195,14 +196,16 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
-	owners, err := d.svc.Owners(ctx)
+	var keys []string
+	for _, f := range fs {
+		if !slices.Contains(keys, f.Owner) {
+			keys = append(keys, f.Owner)
+		}
+	}
+	byKey, err := d.svc.OwnerViews(ctx, keys) // only the owners on the page
 	if err != nil {
 		d.fail(w, r, err)
 		return
-	}
-	byKey := make(map[string]api.OwnerView, len(owners))
-	for _, o := range owners {
-		byKey[o.ID] = o
 	}
 	sgs, err := d.svc.Suggestions(ctx)
 	if err != nil {
