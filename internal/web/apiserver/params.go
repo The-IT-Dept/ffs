@@ -1,9 +1,11 @@
 package apiserver
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
@@ -85,4 +87,26 @@ func stringsParam(p *[]string) []string {
 	}
 	slices.Sort(out)
 	return slices.Compact(out)
+}
+
+// textParam is a free-text parameter: "" when absent; longer than max characters is 400
+// invalid_parameter.
+func textParam(name string, p *string, maxLen int) (string, error) {
+	if p == nil {
+		return "", nil
+	}
+	if utf8.RuneCountInString(*p) > maxLen {
+		return "", badParam(name, fmt.Sprintf("must be at most %d characters", maxLen))
+	}
+	return *p, nil
+}
+
+// resolveScope narrows a parsed scope to one the store answers. A node scope needs the node agent's
+// grouping, which this build does not have, so it is 400 invalid_scope; every other scope is
+// returned unchanged.
+func (s *Server) resolveScope(_ context.Context, sc model.Scope) (model.Scope, error) {
+	if sc.Kind == model.ScopeNode {
+		return model.Scope{}, scopeProblem("node scopes need the node agent")
+	}
+	return sc, nil
 }

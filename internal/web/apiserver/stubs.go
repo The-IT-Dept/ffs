@@ -29,21 +29,6 @@ func (s *Server) GetExposure(context.Context, apigen.GetExposureRequestObject) (
 	return nil, notImplemented()
 }
 
-// ListFindings is not implemented yet.
-func (s *Server) ListFindings(context.Context, apigen.ListFindingsRequestObject) (apigen.ListFindingsResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// ListTransitions is not implemented yet.
-func (s *Server) ListTransitions(context.Context, apigen.ListTransitionsRequestObject) (apigen.ListTransitionsResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// GetAdvisory is not implemented yet.
-func (s *Server) GetAdvisory(context.Context, apigen.GetAdvisoryRequestObject) (apigen.GetAdvisoryResponseObject, error) {
-	return nil, notImplemented()
-}
-
 // ListWorkloads is not implemented yet.
 func (s *Server) ListWorkloads(context.Context, apigen.ListWorkloadsRequestObject) (apigen.ListWorkloadsResponseObject, error) {
 	return nil, notImplemented()
