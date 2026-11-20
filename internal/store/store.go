@@ -34,18 +34,25 @@ type Store struct {
 }
 
 // Open opens (creating if needed) the database at path and applies pending migrations.
-func Open(ctx context.Context, path string) (*Store, error) {
+func Open(ctx context.Context, path string) (*Store, error) { return openThrough(ctx, path, "") }
+
+// openThrough is Open, applying the pending migrations up to and including the one named last
+// ("" = every one). Tests use it to build a store on an older schema.
+func openThrough(ctx context.Context, path, last string) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, fmt.Errorf("store: create directory: %w", err)
 	}
 	wdb, err := sql.Open("sqlite", "file:"+path+
-		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)&_txlock=immediate")
+		"?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=foreign_keys(ON)"+
+		// The read-model rollups are kept by triggers on findings; INSERT OR REPLACE fires the delete
+		// trigger for the row it replaces only with recursive_triggers on.
+		"&_pragma=recursive_triggers(1)&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("store: open writer: %w", err)
 	}
 	wdb.SetMaxOpenConns(1)
 	s := &Store{wdb: wdb}
-	if err := s.migrate(ctx); err != nil {
+	if err := s.migrate(ctx, last); err != nil {
 		return nil, errors.Join(err, wdb.Close())
 	}
 	rdb, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)&_pragma=query_only(1)")
@@ -63,8 +70,8 @@ func (s *Store) Close() error {
 }
 
 // migrate applies every embedded migration not yet recorded in schema_migrations, in lexical
-// order, each in its own transaction.
-func (s *Store) migrate(ctx context.Context) error {
+// order, each in its own transaction, stopping after the one named last when last is not "".
+func (s *Store) migrate(ctx context.Context, last string) error {
 	if _, err := s.wdb.ExecContext(ctx,
 		`CREATE TABLE IF NOT EXISTS schema_migrations(name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
 		return fmt.Errorf("store: create schema_migrations: %w", err)
@@ -97,6 +104,9 @@ func (s *Store) migrate(ctx context.Context) error {
 		})
 		if err != nil {
 			return fmt.Errorf("store: migration %s: %w", name, err)
+		}
+		if name == last {
+			break
 		}
 	}
 	return nil

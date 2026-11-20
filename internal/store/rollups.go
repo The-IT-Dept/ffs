@@ -46,12 +46,14 @@ func (s *Store) OpenAdvisoryRollups(ctx context.Context) ([]AdvisoryRollup, erro
 }
 
 // The rollup queries read only columns and expressions of the findings_rollup index (migration
-// 030), so SQLite answers them from the index: keep the json_extract expressions identical.
+// 030), so SQLite answers them from the index: keep the json_extract expressions identical. The
+// owner counts name the index, as the read model's findings_fix (050) covers them too.
 const (
 	advisoryRollupQuery = `SELECT advisory_id, max(priority), count(DISTINCT owner_key), count(*),
 		group_concat(DISTINCT json_extract(data, '$.Severity')), max(json_extract(data, '$.FixAvailable'))
 		FROM findings WHERE state = 'open' GROUP BY advisory_id ORDER BY advisory_id`
-	ownerCountsQuery = `SELECT owner_key, priority, count(*) FROM findings WHERE state = 'open' GROUP BY owner_key, priority`
+	ownerCountsQuery = `SELECT owner_key, priority, count(*) FROM findings INDEXED BY findings_rollup
+		WHERE state = 'open' GROUP BY owner_key, priority`
 )
 
 // OpenCountsByOwner returns the open findings of every owner that has any, by owner key and priority.
