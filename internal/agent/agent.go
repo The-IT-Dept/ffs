@@ -187,9 +187,14 @@ func newInstance() string {
 	return hex.EncodeToString(b)
 }
 
-// cleanScratch creates the scratch dir and removes the stage dirs and spooled SBOMs a previous run left.
+// cleanScratch creates the scratch dir, readable by the non-root cataloguer whatever the umask, and removes the
+// stage dirs and spooled SBOMs a previous run left.
 func (a *agent) cleanScratch() error {
 	if err := os.MkdirAll(a.o.Scratch, 0o755); err != nil { //nolint:gosec // G301: the non-root cataloguer reads staged files
+		return err
+	}
+	// MkdirAll's mode is filtered by the umask and leaves an existing dir as it is.
+	if err := os.Chmod(a.o.Scratch, 0o755); err != nil { //nolint:gosec // G302: the non-root cataloguer reads staged files
 		return err
 	}
 	entries, err := os.ReadDir(a.o.Scratch)
@@ -509,7 +514,8 @@ func workErrorOf(err error) (string, string) {
 // failureDetail formats a cataloguer failure for a catalog problem or an SBOM result's Failure.
 func failureDetail(kind, msg string) string { return kind + ": " + msg }
 
-// scanImages lists the content store. Images is never nil; ContentStore is false when it could not be read.
+// scanImages lists the content store. Images is nil (unchanged since the last list) when an unexpected error
+// stopped the scan, and has ContentStore false when there is no content store or it cannot be read.
 func (a *agent) scanImages(ctx context.Context) (*wire.Images, []wire.Problem) {
 	if a.store == nil {
 		return &wire.Images{}, []wire.Problem{{Code: wire.ProblemContentStore, Detail: "no containerd content store (CRI-O)"}}
@@ -524,8 +530,9 @@ func (a *agent) scanImages(ctx context.Context) (*wire.Images, []wire.Problem) {
 	case errors.Is(err, fs.ErrPermission):
 		return &wire.Images{}, []wire.Problem{{Code: wire.ProblemPermissionDenied, Path: a.storeHost, Detail: "permission denied"}}
 	}
+	// Not a statement about the content store: the controller keeps the list it has.
 	a.o.Log.Error(err, "scanning the content store")
-	return &wire.Images{}, []wire.Problem{{Code: wire.ProblemContentStore, Path: a.storeHost, Detail: err.Error()}}
+	return nil, []wire.Problem{{Code: wire.ProblemContentStore, Path: a.storeHost, Detail: err.Error()}}
 }
 
 // imagesHash identifies a cached-image list for change detection.

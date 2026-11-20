@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -93,7 +94,8 @@ func TestHostRoot_Resolve(t *testing.T) {
 	require.Equal(t, dir, got)
 
 	_, err = root.Resolve("/a")
-	require.ErrorContains(t, err, "too many symbolic links resolving /a")
+	require.ErrorIs(t, err, syscall.ELOOP)
+	require.EqualError(t, err, "resolving /a: too many levels of symbolic links")
 
 	_, err = root.Resolve("/var/lib/rancher/k3s/data/abc/bin/runc/x")
 	require.ErrorIs(t, err, fs.ErrNotExist, "a file used as a directory is a missing path")
@@ -191,7 +193,7 @@ func TestStageHost_K3sSymlinksStagedOnce(t *testing.T) {
 	require.True(t, fi.Mode().IsRegular())
 }
 
-func TestStageHost_RKE2HighestDataDir(t *testing.T) {
+func TestStageHost_RKE2HighestDataDirWithoutLink(t *testing.T) {
 	host, scratch := t.TempDir(), t.TempDir()
 	writeHostFile(t, host, "var/lib/dpkg/status", "Package: openssl\n")
 	writeHostFile(t, host, "var/lib/rancher/rke2/data/v1.30.9-rke2r1-aaa/bin/runc", "old runc")
@@ -203,8 +205,82 @@ func TestStageHost_RKE2HighestDataDir(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []wire.Binary{{Name: "runc", Path: "/var/lib/rancher/rke2/data/v1.31.4-rke2r1-bbb/bin/runc", Size: 8}}, in.Binaries)
 	require.ElementsMatch(t, []string{"var/lib/dpkg/status", "var/lib/rancher/rke2/data/v1.31.4-rke2r1-bbb/bin/runc"}, stagedFiles(t, in.Dir))
+	require.Empty(t, in.Problems)
 }
 
+func TestStageHost_RKE2CurrentLinkAfterRollback(t *testing.T) {
+	host, scratch := t.TempDir(), t.TempDir()
+	writeHostFile(t, host, "var/lib/dpkg/status", "Package: openssl\n")
+	writeHostFile(t, host, "var/lib/rancher/rke2/data/v1.30.9-rke2r1-aaa/bin/kubelet", "old kubelet")
+	writeHostFile(t, host, "var/lib/rancher/rke2/data/v1.31.4-rke2r1-bbb/bin/kubelet", "new kubelet")
+	// Rolled back: the current link names the older data dir, and the newer one stays behind.
+	hostSymlink(t, host, "var/lib/rancher/rke2/bin", "/var/lib/rancher/rke2/data/v1.30.9-rke2r1-aaa/bin")
+
+	in, err := StageHost(context.Background(), HostRoot(host), PathsFor(DistRKE2), scratch+"/host-1", 1<<20)
+	require.NoError(t, err)
+	require.Equal(t, []wire.Binary{{Name: "kubelet", Path: "/var/lib/rancher/rke2/data/v1.30.9-rke2r1-aaa/bin/kubelet", Size: 11}},
+		in.Binaries, "the binaries RKE2 runs, not the newest data dir")
+}
+
+func TestStageHost_RKE2BinDirMounted(t *testing.T) {
+	// In the agent pod the link is mounted, so it shows as the directory it named when the pod started.
+	host, scratch := t.TempDir(), t.TempDir()
+	writeHostFile(t, host, "var/lib/dpkg/status", "Package: openssl\n")
+	writeHostFile(t, host, "var/lib/rancher/rke2/data/v1.31.4-rke2r1-bbb/bin/kubelet", "new kubelet")
+	writeHostFile(t, host, "var/lib/rancher/rke2/bin/kubelet", "old kubelet")
+
+	in, err := StageHost(context.Background(), HostRoot(host), PathsFor(DistRKE2), scratch+"/host-1", 1<<20)
+	require.NoError(t, err)
+	require.Equal(t, []wire.Binary{{Name: "kubelet", Path: "/var/lib/rancher/rke2/bin/kubelet", Size: 11}}, in.Binaries)
+}
+
+func TestStageHost_UnreadableEntriesAreSkipped(t *testing.T) {
+	host, scratch := t.TempDir(), t.TempDir()
+	writeHostFile(t, host, "etc/os-release", "ID=ubuntu\n")
+	writeHostFile(t, host, "var/lib/dpkg/status", "Package: openssl\n")
+	writeHostFile(t, host, "var/lib/dpkg/status.d", "a file where dpkg keeps a directory") // ENOTDIR when listed
+	hostSymlink(t, host, "usr/bin/kubelet", "kubelet")                                     // ELOOP when resolved
+	writeHostFile(t, host, "usr/bin/containerd", "containerd")
+
+	in, err := StageHost(context.Background(), HostRoot(host), PathsFor(DistContainerd), scratch+"/host-1", 1<<20)
+	require.NoError(t, err, "one bad entry does not stop staging")
+	require.Equal(t, "dpkg", in.PackageDB)
+	require.Equal(t, []wire.Binary{{Name: "containerd", Path: "/usr/bin/containerd", Size: 10}}, in.Binaries)
+	require.Equal(t, []wire.Problem{
+		{Code: "scratch", Path: "/var/lib/dpkg/status.d", Detail: "not staged: not a directory"},
+		{Code: "scratch", Path: "/usr/bin/kubelet", Detail: "not staged: too many levels of symbolic links"},
+	}, in.Problems)
+	require.ElementsMatch(t, []string{"etc/os-release", "var/lib/dpkg/status", "usr/bin/containerd"}, stagedFiles(t, in.Dir))
+}
+
+func TestStageHost_UnreadableDatabaseIsNotMissing(t *testing.T) {
+	host, scratch := t.TempDir(), t.TempDir()
+	hostSymlink(t, host, "var/lib/dpkg/status", "status") // the only database, and it cannot be read
+
+	in, err := StageHost(context.Background(), HostRoot(host), PathsFor(DistContainerd), scratch+"/host-1", 1<<20)
+	require.NoError(t, err)
+	require.Empty(t, in.PackageDB)
+	require.Equal(t, []wire.Problem{{Code: "scratch", Path: "/var/lib/dpkg/status", Detail: "not staged: too many levels of symbolic links"}},
+		in.Problems, "a database that exists is never reported as no_package_db")
+}
+
+func TestStage_ScratchErrorsAreNotHostPermissionProblems(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes to read-only dirs")
+	}
+	host := t.TempDir()
+	writeHostFile(t, host, "etc/os-release", "ID=ubuntu\n")
+	dir := filepath.Join(t.TempDir(), "stage")
+	require.NoError(t, os.Mkdir(dir, 0o500))       //nolint:gosec // G301: a stage dir the collector cannot write
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) }) //nolint:gosec // G302: let the test clean up
+	s := &stager{root: HostRoot(host), dir: dir, max: 1 << 20, staged: map[string]int64{}}
+
+	_, _, _, err := s.stage("/etc/os-release")
+	var se *scratchError
+	require.ErrorAs(t, err, &se, "a stage dir that cannot be written stops staging")
+	require.ErrorIs(t, err, fs.ErrPermission)
+	require.Empty(t, s.problems, "and is not reported as the host denying access")
+}
 func TestStageHost_NoPackageDatabase(t *testing.T) {
 	host, scratch := t.TempDir(), t.TempDir()
 	writeHostFile(t, host, "etc/os-release", "ID=talos\n")

@@ -52,16 +52,24 @@ type blobInfo struct {
 	platform string // image config: "os/arch[/variant]"
 }
 
+// BuildKit marks the attestation manifests it adds to an image index with this annotation and an
+// unknown/unknown platform.
+const (
+	refTypeAnnotation  = "vnd.docker.reference.type"
+	refTypeAttestation = "attestation-manifest"
+)
+
 // Store reads one containerd content store. It is not safe for concurrent use.
 type Store struct {
 	dir       string
 	blobs     map[string]*blobInfo // by digest; pruned to the digests the latest Scan listed
+	attest    map[string]bool      // manifests an index names as attestations, as of the latest refresh
 	fullReads int                  // blobs read in full (tests)
 }
 
 // Open returns a Store over dir, a containerd ".../io.containerd.content.v1.content" directory. It reads nothing.
 func Open(dir string) *Store {
-	return &Store{dir: dir, blobs: map[string]*blobInfo{}}
+	return &Store{dir: dir, blobs: map[string]*blobInfo{}, attest: map[string]bool{}}
 }
 
 func (s *Store) blobPath(digest string) string {
@@ -102,7 +110,28 @@ func (s *Store) refresh(ctx context.Context) error {
 			delete(s.blobs, d)
 		}
 	}
+	s.attest = map[string]bool{}
+	for _, info := range s.blobs {
+		if info.kind != kindIndex {
+			continue
+		}
+		for _, child := range info.index.Manifests {
+			if isAttestation(child) {
+				s.attest[child.Digest.String()] = true
+			}
+		}
+	}
 	return nil
+}
+
+// isAttestation reports whether an index entry is a BuildKit attestation manifest: by its reference type
+// annotation, or by its unknown/unknown platform. Such a manifest has an image config of its own, so its media
+// types alone do not tell it from an image.
+func isAttestation(d v1.Descriptor) bool {
+	if d.Annotations[refTypeAnnotation] == refTypeAttestation {
+		return true
+	}
+	return d.Platform != nil && d.Platform.OS == "unknown" && d.Platform.Architecture == "unknown"
 }
 
 // probe tells the blob kinds apart by which keys are present.
@@ -186,9 +215,13 @@ func isHex64(s string) bool {
 	return true
 }
 
-// isImageManifest reports whether info is a manifest of a runnable image (not an attestation or artifact).
-func isImageManifest(info *blobInfo) bool {
-	return info != nil && info.kind == kindManifest && info.manifest.Config.MediaType.IsConfig()
+// isImageManifest reports whether the blob d is a manifest of a runnable image: not an artifact (a config that is
+// not an image config) and not an attestation (named as one by an index, or with an unknown/unknown config).
+func (s *Store) isImageManifest(d string, info *blobInfo) bool {
+	if info == nil || info.kind != kindManifest || !info.manifest.Config.MediaType.IsConfig() || s.attest[d] {
+		return false
+	}
+	return s.configPlatform(info.manifest) != "unknown/unknown"
 }
 
 // manifestMediaType is the manifest's own media type, defaulting to OCI when it does not say.
@@ -269,7 +302,7 @@ func (s *Store) Scan(ctx context.Context) ([]wire.CachedImage, error) {
 	images := map[string]wire.CachedImage{}
 	var fromIndex map[string]string
 	for d, info := range s.blobs {
-		if !isImageManifest(info) {
+		if !s.isImageManifest(d, info) {
 			continue
 		}
 		platform := s.configPlatform(info.manifest)
@@ -368,7 +401,7 @@ func (s *Store) resolve(digest, platform string) (Target, error) {
 	}
 	switch info.kind {
 	case kindManifest:
-		if !isImageManifest(info) {
+		if !s.isImageManifest(digest, info) {
 			return Target{}, fmt.Errorf("%w: %s is not an image manifest", ErrNotFound, digest)
 		}
 		return targetOf(digest, info.manifest), nil
@@ -384,7 +417,7 @@ func (s *Store) resolve(digest, platform string) (Target, error) {
 		var best string
 		bestComplete := false
 		for d, m := range s.blobs {
-			if !isImageManifest(m) || m.manifest.Config.Digest.String() != digest {
+			if !s.isImageManifest(d, m) || m.manifest.Config.Digest.String() != digest {
 				continue
 			}
 			c := s.complete(m.manifest)
@@ -408,7 +441,9 @@ func (s *Store) resolveIndex(idx *v1.IndexManifest, platform string, depth int) 
 			continue
 		}
 		switch {
-		case isImageManifest(info):
+		case isAttestation(child):
+			continue
+		case s.isImageManifest(d, info):
 			p := descriptorPlatform(child)
 			if p == "" {
 				p = s.configPlatform(info.manifest)

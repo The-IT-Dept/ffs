@@ -24,7 +24,9 @@ type HostPaths struct {
 	PackageDBs map[string][]string // package database dirs by family: "dpkg", "rpm", "apk"
 	// BinDirs are searched for BinaryNames. A "*" path segment expands to the child directory whose name sorts
 	// highest in version-aware order.
-	BinDirs      []string
+	BinDirs []string
+	// Fallbacks maps a BinDirs entry to the dir searched in its place when it is missing.
+	Fallbacks    map[string]string
 	BinaryNames  []string
 	ContentStore string // containerd content store; "" when the runtime has none (CRI-O)
 }
@@ -32,7 +34,10 @@ type HostPaths struct {
 var (
 	baseBinDirs = []string{"/usr/bin", "/usr/sbin", "/usr/local/bin"}
 	k3sBinDirs  = []string{"/var/lib/rancher/k3s/data/current/bin", "/var/lib/rancher/k3s/data/current/bin/aux"}
-	rke2BinDirs = []string{"/var/lib/rancher/rke2/data/*/bin"}
+	// rke2BinDir is RKE2's link to the bin dir of its current data dir. Only without it is the newest data dir
+	// searched, which is wrong after a rollback.
+	rke2BinDir      = "/var/lib/rancher/rke2/bin"
+	rke2DataBinDirs = "/var/lib/rancher/rke2/data/*/bin"
 )
 
 // PathsFor returns the host-path table of a distribution. Each call returns fresh slices and maps.
@@ -45,6 +50,7 @@ func PathsFor(d Distribution) HostPaths {
 			"apk":  {"/lib/apk/db"},
 		},
 		BinDirs:     append([]string(nil), baseBinDirs...),
+		Fallbacks:   map[string]string{},
 		BinaryNames: append([]string(nil), BinaryNames...),
 	}
 	switch d {
@@ -52,7 +58,8 @@ func PathsFor(d Distribution) HostPaths {
 		p.BinDirs = append(p.BinDirs, k3sBinDirs...)
 		p.ContentStore = "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
 	case DistRKE2:
-		p.BinDirs = append(p.BinDirs, rke2BinDirs...)
+		p.BinDirs = append(p.BinDirs, rke2BinDir)
+		p.Fallbacks[rke2BinDir] = rke2DataBinDirs
 		p.ContentStore = "/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content"
 	case DistCRIO:
 		p.ContentStore = ""

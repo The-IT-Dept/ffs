@@ -78,7 +78,7 @@ func (r HostRoot) resolve(hostPath string) (string, error) {
 		}
 		links++
 		if links > maxSymlinks {
-			return "", fmt.Errorf("too many symbolic links resolving %s", hostPath)
+			return "", fmt.Errorf("resolving %s: %w", hostPath, syscall.ELOOP)
 		}
 		target, err := os.Readlink(r.join(next))
 		if err != nil {
@@ -112,8 +112,10 @@ var packageDBOrder = []string{"dpkg", "rpm", "apk"}
 
 // StageHost copies the host's os-release, package databases and known binaries into dir (which must not exist)
 // at their resolved host paths, so the non-root cataloguer can read them without host mounts. At most maxBytes
-// are staged; a file that does not fit is skipped with a scratch problem. Permission errors become
-// permission_denied problems and missing files are skipped. On error, dir is removed.
+// are staged; a file that does not fit is skipped with a scratch problem. Each host entry stands alone: a
+// permission error becomes a permission_denied problem, a missing file is skipped, and any other error reading
+// it (a symlink loop, a path through a file) becomes a scratch problem, and staging goes on. Only a failure to
+// write the stage dir itself (scratch full or unwritable) or ctx ending is an error; dir is then removed.
 func StageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, maxBytes int64) (HostInput, error) {
 	if err := os.Mkdir(dir, 0o755); err != nil { //nolint:gosec // G301: the non-root cataloguer reads staged files
 		return HostInput{}, err
@@ -142,14 +144,12 @@ func stageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, 
 		}
 	}
 
-	found, anyDenied := false, false
+	// blocked: a database dir or file exists but could not be read, so "no database found" would be wrong.
+	found, blocked := false, false
 	for _, family := range packageDBOrder {
 		for _, d := range paths.PackageDBs[family] {
-			files, dirDenied, err := s.packageDBFiles(family, d)
-			if err != nil {
-				return HostInput{}, err
-			}
-			anyDenied = anyDenied || dirDenied
+			files, dirBlocked := s.packageDBFiles(family, d)
+			blocked = blocked || dirBlocked
 			for _, f := range files {
 				if err := ctx.Err(); err != nil {
 					return HostInput{}, err
@@ -166,8 +166,8 @@ func stageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, 
 					}
 				case stOverLimit:
 					found = true // present, but over the byte limit
-				case stDenied:
-					anyDenied = true
+				case stDenied, stUnreadable:
+					blocked = true
 				}
 			}
 		}
@@ -175,10 +175,7 @@ func stageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, 
 
 	seen := map[wire.Binary]bool{}
 	for _, d := range paths.BinDirs {
-		dirPath, ok, err := s.expand(d)
-		if err != nil {
-			return HostInput{}, err
-		}
+		dirPath, ok := s.binDir(d, paths.Fallbacks[d])
 		if !ok {
 			continue
 		}
@@ -204,7 +201,7 @@ func stageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, 
 		return cmp.Or(cmp.Compare(a.Name, b.Name), cmp.Compare(a.Path, b.Path))
 	})
 
-	if !found && !anyDenied {
+	if !found && !blocked {
 		s.problems = append(s.problems, wire.Problem{Code: wire.ProblemNoPackageDB, Detail: "no dpkg, rpm or apk database found"})
 	}
 	in.Problems = s.problems
@@ -215,10 +212,11 @@ func stageHost(ctx context.Context, root HostRoot, paths HostPaths, dir string, 
 type stageStatus int
 
 const (
-	stSkipped   stageStatus = iota // missing or not a regular file
-	stStaged                       // staged now or earlier
-	stDenied                       // permission denied (a problem was recorded)
-	stOverLimit                    // over the byte limit (a problem was recorded)
+	stSkipped    stageStatus = iota // missing or not a regular file
+	stStaged                        // staged now or earlier
+	stDenied                        // permission denied (a problem was recorded)
+	stOverLimit                     // over the byte limit (a problem was recorded)
+	stUnreadable                    // any other error reading it (a problem was recorded)
 )
 
 // stager copies host files into the stage dir, counting bytes against the limit.
@@ -231,26 +229,50 @@ type stager struct {
 	problems []wire.Problem
 }
 
-// readErr turns a host read error into a permission problem (stDenied), a silent skip (missing) or an error to
-// return.
-func (s *stager) readErr(hostPath string, err error) (stageStatus, error) {
+// readErr records a host read error on one entry: a permission problem (stDenied), a silent skip when it is
+// missing, and otherwise a scratch problem (stUnreadable). The entry is skipped either way; staging goes on.
+func (s *stager) readErr(hostPath string, err error) stageStatus {
 	switch {
 	case errors.Is(err, fs.ErrPermission):
 		s.problems = append(s.problems, wire.Problem{Code: wire.ProblemPermissionDenied, Path: hostPath, Detail: "permission denied"})
-		return stDenied, nil
+		return stDenied
 	case errors.Is(err, fs.ErrNotExist):
-		return stSkipped, nil
+		return stSkipped
 	}
-	return stSkipped, err
+	s.unreadable(hostPath, err)
+	return stUnreadable
 }
 
+// unreadable records a scratch problem for an entry that could not be staged.
+func (s *stager) unreadable(hostPath string, err error) {
+	s.problems = append(s.problems, wire.Problem{Code: wire.ProblemScratch, Path: hostPath, Detail: "not staged: " + errReason(err)})
+}
+
+// errReason is the system's description of err ("too many levels of symbolic links"), without the container
+// paths an *fs.PathError carries; err's own text when there is none.
+func errReason(err error) string {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		return errno.Error()
+	}
+	return err.Error()
+}
+
+// scratchError is a failure to write the stage dir: the scratch volume is full or not writable. It stops
+// staging, and is never reported as a problem of the host.
+type scratchError struct{ err error }
+
+func (e *scratchError) Error() string { return "writing the stage dir: " + e.err.Error() }
+
+func (e *scratchError) Unwrap() error { return e.err }
+
 // stage copies the regular file hostPath names to the stage dir at its resolved host path. It returns that path
-// and the size when the file is staged, now or by an earlier call.
+// and the size when the file is staged, now or by an earlier call. The error is a *scratchError: only writing
+// the stage dir stops staging.
 func (s *stager) stage(hostPath string) (string, int64, stageStatus, error) {
 	resolved, err := s.root.resolve(hostPath)
 	if err != nil {
-		st, err := s.readErr(hostPath, err)
-		return "", 0, st, err
+		return "", 0, s.readErr(hostPath, err), nil
 	}
 	if size, ok := s.staged[resolved]; ok {
 		return resolved, size, stStaged, nil
@@ -258,8 +280,7 @@ func (s *stager) stage(hostPath string) (string, int64, stageStatus, error) {
 	src := s.root.join(resolved)
 	fi, err := os.Lstat(src)
 	if err != nil {
-		st, err := s.readErr(hostPath, err)
-		return "", 0, st, err
+		return "", 0, s.readErr(hostPath, err), nil
 	}
 	if !fi.Mode().IsRegular() {
 		return "", 0, stSkipped, nil
@@ -270,8 +291,16 @@ func (s *stager) stage(hostPath string) (string, int64, stageStatus, error) {
 	}
 	n, err := s.copyFile(src, s.dir+resolved, s.max-s.used)
 	if err != nil {
-		st, err := s.readErr(hostPath, err)
-		return "", 0, st, err
+		var se *scratchError
+		if !errors.As(err, &se) {
+			return "", 0, s.readErr(hostPath, err), nil
+		}
+		if errors.Is(se.err, syscall.ENOTDIR) || errors.Is(se.err, fs.ErrExist) {
+			// Two host paths that cannot both be staged (a file where another needs a directory): skip this one.
+			s.unreadable(hostPath, se.err)
+			return "", 0, stUnreadable, nil
+		}
+		return "", 0, stSkipped, fmt.Errorf("staging %s: %w", hostPath, err)
 	}
 	if n < 0 {
 		s.overLimit(hostPath) // the file grew past the limit while it was copied
@@ -288,7 +317,8 @@ func (s *stager) overLimit(hostPath string) {
 }
 
 // copyFile copies src to dst (0644, parents 0755) and returns the bytes copied, or -1 when src holds more than
-// budget bytes (dst is removed).
+// budget bytes (dst is removed). An error writing dst or its parents is a *scratchError; an error reading src
+// is returned as it is.
 func (s *stager) copyFile(src, dst string, budget int64) (int64, error) {
 	in, err := os.Open(src) //nolint:gosec // G304: src is a resolved path under the read-only host root
 	if err != nil {
@@ -296,24 +326,46 @@ func (s *stager) copyFile(src, dst string, budget int64) (int64, error) {
 	}
 	defer in.Close() //nolint:errcheck // read-only
 	if err := s.mkdirs(path.Dir(dst)); err != nil {
-		return 0, err
+		return 0, &scratchError{err}
 	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644) //nolint:gosec // G302/G304: the non-root cataloguer reads staged files
 	if err != nil {
-		return 0, err
+		return 0, &scratchError{err}
 	}
-	n, err := io.Copy(out, io.LimitReader(in, budget+1))
-	if err == nil {
-		err = out.Chmod(0o644) //nolint:gosec // G302: the non-root cataloguer reads staged files
+	r := &sourceReader{r: io.LimitReader(in, budget+1)}
+	n, err := io.Copy(out, r)
+	switch {
+	case r.err != nil:
+		err = r.err
+	case err != nil:
+		err = &scratchError{err}
+	default:
+		if cerr := out.Chmod(0o644); cerr != nil { //nolint:gosec // G302: the non-root cataloguer reads staged files
+			err = &scratchError{cerr}
+		}
 	}
-	if cerr := out.Close(); err == nil {
-		err = cerr
+	if cerr := out.Close(); err == nil && cerr != nil {
+		err = &scratchError{cerr}
 	}
 	if err == nil && n > budget {
 		n = -1
 	}
 	if err != nil || n < 0 {
 		_ = os.Remove(dst)
+	}
+	return n, err
+}
+
+// sourceReader keeps the error of a read from the host, so a copy can tell it from a write error.
+type sourceReader struct {
+	r   io.Reader
+	err error
+}
+
+func (s *sourceReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if err != nil && !errors.Is(err, io.EOF) {
+		s.err = err
 	}
 	return n, err
 }
@@ -335,18 +387,17 @@ func (s *stager) mkdirs(d string) error {
 	return os.Chmod(d, 0o755) //nolint:gosec // G302: the non-root cataloguer reads staged files
 }
 
-// packageDBFiles lists the database files of family in the host dir d. denied is true when d (or dpkg's
-// status.d) could not be read because of permissions; a problem is then recorded. A missing d gives no files.
-func (s *stager) packageDBFiles(family, d string) (files []string, denied bool, err error) {
+// packageDBFiles lists the database files of family in the host dir d. blocked is true when d (or dpkg's
+// status.d) exists but could not be read; a problem is then recorded. A missing d gives no files.
+func (s *stager) packageDBFiles(family, d string) (files []string, blocked bool) {
 	if _, err := s.root.resolve(d); err != nil {
-		st, err := s.readErr(d, err)
-		return nil, st == stDenied, err
+		return nil, s.readErr(d, err) != stSkipped
 	}
 	for _, f := range packageDBFiles[family] {
 		files = append(files, path.Join(d, f))
 	}
 	if family != "dpkg" {
-		return files, false, nil
+		return files, false
 	}
 	statusD := path.Join(d, "status.d")
 	resolved, err := s.root.resolve(statusD)
@@ -356,18 +407,30 @@ func (s *stager) packageDBFiles(family, d string) (files []string, denied bool, 
 			for _, e := range entries {
 				files = append(files, path.Join(statusD, e.Name()))
 			}
-			return files, false, nil
+			return files, false
 		}
 	}
-	st, err := s.readErr(statusD, err)
-	return files, st == stDenied, err
+	return files, s.readErr(statusD, err) != stSkipped
+}
+
+// binDir is the host bin dir d with its "*" segments expanded. When d is missing and has a fallback, the
+// fallback stands in for it: RKE2's bin dir is its link to the current data dir, and only without that link is
+// the newest data dir used. ok is false when there is nothing to search.
+func (s *stager) binDir(d, fallback string) (string, bool) {
+	if fallback != "" {
+		if _, err := s.root.resolve(d); errors.Is(err, fs.ErrNotExist) {
+			return s.expand(fallback)
+		}
+	}
+	return s.expand(d)
 }
 
 // expand replaces each "*" segment of the host dir d by the child directory whose name sorts highest in
-// version-aware order. ok is false when a "*" has no child directory or a dir could not be read.
-func (s *stager) expand(d string) (string, bool, error) {
+// version-aware order. ok is false when a "*" has no child directory or a dir could not be read (a problem is
+// recorded unless it is missing).
+func (s *stager) expand(d string) (string, bool) {
 	if !strings.Contains(d, "*") {
-		return d, true, nil
+		return d, true
 	}
 	cur := "/"
 	for _, c := range strings.Split(d, "/") {
@@ -377,13 +440,13 @@ func (s *stager) expand(d string) (string, bool, error) {
 		}
 		resolved, err := s.root.resolve(cur)
 		if err != nil {
-			_, err = s.readErr(cur, err)
-			return "", false, err
+			s.readErr(cur, err)
+			return "", false
 		}
 		entries, err := os.ReadDir(s.root.join(resolved))
 		if err != nil {
-			_, err = s.readErr(cur, err)
-			return "", false, err
+			s.readErr(cur, err)
+			return "", false
 		}
 		best := ""
 		for _, e := range entries {
@@ -399,11 +462,11 @@ func (s *stager) expand(d string) (string, bool, error) {
 			}
 		}
 		if best == "" {
-			return "", false, nil
+			return "", false
 		}
 		cur = path.Join(cur, best)
 	}
-	return cur, true, nil
+	return cur, true
 }
 
 // versionCompare orders names with numeric runs compared as numbers ("v1.31.4" > "v1.30.9" > "v1.9.0"); names

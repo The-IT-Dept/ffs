@@ -141,7 +141,7 @@ func TestChart_AgentDisabledRendersNothing(t *testing.T) {
 
 func TestChart_AgentSecurityPosture(t *testing.T) {
 	allowed := []string{"/etc/os-release", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/var/lib/dpkg", "/var/lib/rpm", "/lib/apk/db",
-		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", containerdStore, k3sStore, rke2Store}
+		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", "/var/lib/rancher/rke2/bin", containerdStore, k3sStore, rke2Store}
 	for _, sets := range [][]string{nil, {"nodeAgent.distribution=k3s"}, {"nodeAgent.distribution=rke2"}, {"nodeAgent.distribution=crio"}} {
 		o := render(t, sets...)
 		ds := as[appsv1.DaemonSet](t, o.get(t, "DaemonSet", "ffs-agent"))
@@ -305,7 +305,8 @@ func TestChart_AgentMountsPerDistribution(t *testing.T) {
 		{"k3s", []string{"nodeAgent.distribution=k3s"},
 			with(map[string]string{"/var/lib/rancher/k3s/data": "Directory", k3sStore: "Directory"}), "k3s", k3sStore, ""},
 		{"rke2", []string{"nodeAgent.distribution=rke2"},
-			with(map[string]string{"/var/lib/rancher/rke2/data": "Directory", rke2Store: "Directory"}), "rke2", rke2Store, ""},
+			with(map[string]string{"/var/lib/rancher/rke2/data": "Directory", "/var/lib/rancher/rke2/bin": "Directory", rke2Store: "Directory"}),
+			"rke2", rke2Store, ""},
 		{"crio", []string{"nodeAgent.distribution=crio"}, with(nil), "crio", "", ""},
 		{"apk", []string{"nodeAgent.packageDatabases={apk}"},
 			with(map[string]string{"/lib/apk/db": "Directory", containerdStore: "Directory"}, "/var/lib/dpkg", "/var/lib/rpm"), "containerd", containerdStore, ""},

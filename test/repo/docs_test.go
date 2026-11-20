@@ -143,7 +143,7 @@ func TestDocs_CoverageListsBlindSpots(t *testing.T) {
 func TestDocs_NodeAgentListsEveryMount(t *testing.T) {
 	doc := readFile(t, "../../docs/node-agent.md")
 	for _, p := range []string{"/etc/os-release", "/usr/bin", "/usr/sbin", "/usr/local/bin", "/var/lib/dpkg", "/var/lib/rpm", "/lib/apk/db",
-		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", "/var/lib/containerd/io.containerd.content.v1.content",
+		"/var/lib/rancher/k3s/data", "/var/lib/rancher/rke2/data", "/var/lib/rancher/rke2/bin", "/var/lib/containerd/io.containerd.content.v1.content",
 		"/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content",
 		"/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content"} {
 		require.Contains(t, doc, "`"+p+"`", "docs/node-agent.md does not list the mount %s", p)
