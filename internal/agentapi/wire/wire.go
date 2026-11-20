@@ -25,11 +25,15 @@ const (
 )
 
 // Report is sent by the agent to POST /agent/v1/report.
-// Reports are ordered by (BootID, StartedAt, Seq); the controller ignores one it has already applied.
+// Reports are ordered by (BootID, Instance, Seq): within one agent process (Instance) Seq only grows,
+// and a report from a different Instance of the same boot is a newer process (older ones have exited).
+// The controller ignores a report it has already applied. StartedAt is informational only: wall
+// clocks can step back, so it never orders reports.
 type Report struct {
 	Node          string    `json:"node"`
 	AgentVersion  string    `json:"agentVersion"`
 	BootID        string    `json:"bootID"`
+	Instance      string    `json:"instance"` // random per agent process start (32 hex chars)
 	StartedAt     time.Time `json:"startedAt"`
 	Seq           uint64    `json:"seq"`
 	Kind          string    `json:"kind"`               // KindFull | KindImages
@@ -91,10 +95,19 @@ const (
 )
 
 // ReportResponse is the controller's answer to a Report.
+//
+// Back-pressure: when the controller cannot take a full report now (its ingest budget is spent), it
+// answers POST /agent/v1/report with 429 Too Many Requests and a Retry-After header in seconds. The
+// agent waits at least that long and resends without re-cataloguing the host (it keeps the last host
+// inventory it collected until the controller has stored one).
 type ReportResponse struct {
-	Applied bool          `json:"applied"` // false: a duplicate or out-of-order report, nothing stored
-	Work    []WorkRequest `json:"work"`
-	Config  AgentConfig   `json:"config"`
+	Applied bool `json:"applied"` // false: a duplicate or out-of-order report, nothing stored
+	// HostRetry is true when the report was a full report but its host part was not stored (a
+	// transient controller-side failure, or another node's identical host inventory is being stored).
+	// The agent resends the host part on its full-report backoff, reusing the inventory it collected.
+	HostRetry bool          `json:"hostRetry,omitempty"`
+	Work      []WorkRequest `json:"work"`
+	Config    AgentConfig   `json:"config"`
 }
 
 // WorkRequest is sent by the controller inside a ReportResponse: catalogue this image from the node's content store.
