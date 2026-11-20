@@ -623,45 +623,138 @@ func TestServer_AbandonedSBOMResultIsUnread(t *testing.T) {
 	require.Equal(t, held, inFlight())
 }
 
-// TestServer_SBOMBodyReadAfterALongWait: the server's read timeout runs from the start of a request, so a
-// result that waited for the SBOM budget longer than it is still read in full once it has its share.
-func TestServer_SBOMBodyReadAfterALongWait(t *testing.T) {
-	const size = 1 << 20
-	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
-	srv := httptest.NewUnstartedServer(NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{},
-		SBOMs: windowedSBOMs{sboms}, MaxSBOMBytes: 2 * size, SBOMBudget: size}).Handler())
-	srv.Config.ReadTimeout = 200 * time.Millisecond
-	srv.Start()
-	t.Cleanup(srv.Close)
-	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
-	post := func(workID string) <-chan int {
-		answer := make(chan int, 1)
-		go func() {
-			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+wire.PathSBOM, strings.NewReader(result))
-			if err != nil {
-				answer <- 0
-				return
-			}
-			req.Header.Set("Authorization", "Bearer tok")
-			req.Header.Set(wire.HeaderWorkID, workID)
-			resp, err := srv.Client().Do(req)
-			if err != nil {
-				answer <- 0
-				return
-			}
-			_ = resp.Body.Close()
-			answer <- resp.StatusCode
-		}()
-		return answer
-	}
+// serveTLS runs s.Start on a free local port with a certificate of its own until the test ends, and returns its
+// URL and a client built like the agent's (a clone of the default transport): over HTTP/2 when h2, else
+// HTTP/1.1 only.
+func serveTLS(t *testing.T, s *Server, h2 bool) (string, *http.Client) {
+	t.Helper()
+	s.o.CertDir = t.TempDir()
+	writeCert(t, s.o.CertDir, 1)
+	ln, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	s.o.Listen = ln.Addr().String()
+	require.NoError(t, ln.Close())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		require.NoError(t, <-done)
+	})
 
-	first := post("w1")
-	<-sboms.entered // the first result holds the whole SBOM budget
-	second := post("w2")
-	require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second, time.Millisecond)
-	time.Sleep(2 * srv.Config.ReadTimeout) // the second waits past the read timeout
-	close(sboms.release)
-	require.Equal(t, http.StatusNoContent, <-first)
-	require.Equal(t, http.StatusNoContent, <-second, "its body is read after the wait")
-	require.Empty(t, sboms.unreadRequests())
+	pemBytes, err := os.ReadFile(filepath.Join(s.o.CertDir, "tls.crt"))
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(pemBytes))
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{RootCAs: pool, ServerName: "localhost", MinVersion: tls.VersionTLS12}
+	if !h2 {
+		tr.Protocols = new(http.Protocols)
+		tr.Protocols.SetHTTP1(true)
+	}
+	hc := &http.Client{Transport: tr}
+	t.Cleanup(hc.CloseIdleConnections)
+	url := "https://" + s.o.Listen
+	require.Eventually(t, func() bool {
+		req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, url+"/", nil)
+		resp, err := hc.Do(req)
+		if err != nil {
+			return false
+		}
+		_ = resp.Body.Close()
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	return url, hc
+}
+
+// sent is the answer to sendResult: the protocol and status, or the error.
+type sent struct {
+	proto  string
+	status int
+	err    error
+}
+
+// sendResult POSTs an SBOM result body naming workID to url on another goroutine, and returns the answer on
+// the channel; it asserts nothing.
+func sendResult(hc *http.Client, url string, body io.Reader, workID string) <-chan sent {
+	out := make(chan sent, 1)
+	go func() {
+		req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url+wire.PathSBOM, body)
+		if err != nil {
+			out <- sent{err: err}
+			return
+		}
+		req.Header.Set("Authorization", "Bearer tok")
+		req.Header.Set(wire.HeaderWorkID, workID)
+		resp, err := hc.Do(req)
+		if err != nil {
+			out <- sent{err: err}
+			return
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		out <- sent{proto: resp.Proto, status: resp.StatusCode}
+	}()
+	return out
+}
+
+// TestServer_SBOMBodyReadAfterALongWait: a result that waited for the SBOM budget longer than readTimeout is
+// still read in full once it has its share, over the TLS server Start runs, with HTTP/2 (which agents use)
+// and with HTTP/1.1. The body is several times an HTTP/2 stream's receive window, so most of it is read after
+// the wait.
+func TestServer_SBOMBodyReadAfterALongWait(t *testing.T) {
+	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
+		t.Run(proto, func(t *testing.T) {
+			const size = 4 << 20
+			sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
+				MaxSBOMBytes: 2 * size, SBOMBudget: size})
+			s.readTimeout = 2 * time.Second // ample for the body, even with the race detector
+			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+			result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+
+			first := sendResult(hc, url, strings.NewReader(result), "w1")
+			select { // the first result holds the whole SBOM budget
+			case <-sboms.entered:
+			case got := <-first:
+				t.Fatalf("the first result was answered without being handled: %+v", got)
+			}
+			second := sendResult(hc, url, strings.NewReader(result), "w2")
+			require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second,
+				time.Millisecond)
+			time.Sleep(s.readTimeout + 500*time.Millisecond) // the second waits past the read timeout
+			close(sboms.release)
+			require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, <-first)
+			require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, <-second, "its body is read after the wait")
+			require.Empty(t, sboms.unreadRequests())
+		})
+	}
+	require.Zero(t, NewServer(ServerOptions{}).httpServer(context.Background(), nil).ReadTimeout,
+		"over HTTP/2 a server ReadTimeout cuts a body off once it has passed, whatever deadline the handler sets")
+}
+
+// TestServer_StalledBodyIsCutOff: with no server ReadTimeout, the handlers' read deadline still ends a body that
+// stops arriving, over HTTP/2 and HTTP/1.1, and nothing of it is handled.
+func TestServer_StalledBodyIsCutOff(t *testing.T) {
+	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
+		t.Run(proto, func(t *testing.T) {
+			sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms}})
+			s.readTimeout = 200 * time.Millisecond
+			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+			body, stall := io.Pipe()
+			defer func() { _ = stall.Close() }()
+			go func() { _, _ = stall.Write([]byte(`{"id":"w1","node":"worker-1",`)) }() // then nothing more
+
+			select {
+			case got := <-sendResult(hc, url, body, "w1"):
+				if got.err == nil { // or the server closed the connection under the body
+					require.Equal(t, http.StatusBadRequest, got.status)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("the stalled body was not cut off")
+			}
+			require.Empty(t, sboms.entered, "nothing was handled")
+		})
+	}
 }

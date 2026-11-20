@@ -28,7 +28,12 @@ import (
 
 const (
 	readHeaderTimeout = 10 * time.Second
-	readTimeout       = 5 * time.Minute
+	// readTimeout is how long a request's body may take to arrive: from the start of the request, or for a
+	// report or an SBOM result from when it has its share of the budget, so its wait does not use it up. The
+	// handlers set it as a read deadline (limitRead), not as the server's ReadTimeout: over HTTP/2, which agents
+	// use, a ReadTimeout arms a timer at the start of each stream that no later deadline can extend once it has
+	// fired, and a result that waited for its budget longer than it could not be read.
+	readTimeout = 5 * time.Minute
 	// writeTimeout is longer than the agent's client timeout, so the agent sees the answer.
 	writeTimeout    = wire.ClientTimeout + time.Minute
 	idleTimeout     = 2 * time.Minute
@@ -105,10 +110,11 @@ type ResultWindow interface {
 
 // Server serves /agent/v1 over TLS on the leader.
 type Server struct {
-	o       ServerOptions
-	fails   *failLimiter        // failed authentications per source IP
-	reports *semaphore.Weighted // the report budget, by body bytes
-	sboms   *semaphore.Weighted // the SBOM result budget, by body bytes
+	o           ServerOptions
+	fails       *failLimiter        // failed authentications per source IP
+	reports     *semaphore.Weighted // the report budget, by body bytes
+	sboms       *semaphore.Weighted // the SBOM result budget, by body bytes
+	readTimeout time.Duration       // readTimeout; tests shorten it
 }
 
 // NewServer returns the agent API server.
@@ -135,7 +141,22 @@ func NewServer(o ServerOptions) *Server {
 		o.MaxResultWait = maxResultWait
 	}
 	return &Server{o: o, fails: newFailLimiter(), reports: semaphore.NewWeighted(o.IngestBudget),
-		sboms: semaphore.NewWeighted(o.SBOMBudget)}
+		sboms: semaphore.NewWeighted(o.SBOMBudget), readTimeout: readTimeout}
+}
+
+// limitRead gives the request's body readTimeout from now to arrive. A writer without read deadlines (a test's
+// recorder) is left as it is.
+func (s *Server) limitRead(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(s.readTimeout))
+}
+
+// await takes n bytes of budget for r's body like acquire. The body's read deadline is lifted while it waits
+// and set afresh when the wait ends, however it ends, so a body read after a long wait still has readTimeout.
+func (s *Server) await(w http.ResponseWriter, r *http.Request, budget *semaphore.Weighted, n int64,
+	wait time.Duration) (func(), bool) {
+	_ = http.NewResponseController(w).SetReadDeadline(time.Time{})
+	defer s.limitRead(w)
+	return acquire(r.Context(), budget, n, wait)
 }
 
 // acquire takes n bytes of budget, waiting at most wait (no limit when 0) and while ctx lasts. It returns the
@@ -192,17 +213,7 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 	reloader := newCertReloader(s.o.CertDir, s.o.Now)
 	reloader.log = s.o.Log
-	srv := &http.Server{
-		Handler:           s.Handler(),
-		ReadHeaderTimeout: readHeaderTimeout,
-		ReadTimeout:       readTimeout,
-		WriteTimeout:      writeTimeout,
-		IdleTimeout:       idleTimeout,
-		MaxHeaderBytes:    maxHeaderBytes,
-		TLSConfig:         &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: reloader.GetCertificate},
-		ErrorLog:          log.New(logWriter{s.o.Log}, "", 0),
-		BaseContext:       func(net.Listener) context.Context { return ctx },
-	}
+	srv := s.httpServer(ctx, &tls.Config{MinVersion: tls.VersionTLS13, GetCertificate: reloader.GetCertificate})
 	stopped := make(chan struct{})
 	go func() {
 		defer close(stopped)
@@ -218,6 +229,21 @@ func (s *Server) Start(ctx context.Context) error {
 		return nil
 	}
 	return err
+}
+
+// httpServer is the HTTP server Start runs until ctx ends. It has no ReadTimeout: the handlers bound body reads
+// themselves (readTimeout).
+func (s *Server) httpServer(ctx context.Context, tlsConfig *tls.Config) *http.Server {
+	return &http.Server{
+		Handler:           s.Handler(),
+		ReadHeaderTimeout: readHeaderTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
+		TLSConfig:         tlsConfig,
+		ErrorLog:          log.New(logWriter{s.o.Log}, "", 0),
+		BaseContext:       func(net.Listener) context.Context { return ctx },
+	}
 }
 
 // logWriter sends the HTTP server's own messages (TLS handshake errors) to the debug log.
@@ -239,6 +265,7 @@ func (s *Server) Handler() http.Handler {
 		mux.HandleFunc("GET "+wire.PathConfig, s.serveConfig)
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.limitRead(w)
 		h, pattern := mux.Handler(r)
 		if pattern != "" {
 			h.ServeHTTP(w, r)
@@ -444,7 +471,7 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 	if !ok || declaredTooLarge(w, r, s.o.MaxReportBytes, "report") {
 		return
 	}
-	release, ok := acquire(r.Context(), s.reports, bodyWeight(r, s.o.MaxReportBytes, s.o.IngestBudget), s.o.IngestWait)
+	release, ok := s.await(w, r, s.reports, bodyWeight(r, s.o.MaxReportBytes, s.o.IngestBudget), s.o.IngestWait)
 	if !ok {
 		if r.Context().Err() == nil {
 			w.deferred = true
@@ -489,7 +516,7 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 		}
 		wait = min(wait, until)
 	}
-	release, ok := acquire(r.Context(), s.sboms, bodyWeight(r, s.o.MaxSBOMBytes, s.o.SBOMBudget), wait)
+	release, ok := s.await(w, r, s.sboms, bodyWeight(r, s.o.MaxSBOMBytes, s.o.SBOMBudget), wait)
 	if !ok {
 		unread()
 		if r.Context().Err() == nil {
@@ -500,8 +527,6 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 		return // or the agent went away
 	}
 	defer release()
-	// The server's read timeout runs from the start of the request: the wait must not use up the body's time.
-	_ = http.NewResponseController(rw).SetReadDeadline(time.Now().Add(readTimeout))
 	var res wire.SBOMResult
 	if !decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res) || nodeMismatch(w, id, res.Node) {
 		return
