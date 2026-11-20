@@ -64,13 +64,16 @@ func TestMain(m *testing.M) {
 
 // suite is the state the ordered subtests share.
 type suite struct {
-	env     env
-	feeds   *feedServer
-	rx      *webhookrx.Receiver
-	rxURL   string
-	secret  string
-	appRepo string
-	t7, t9  time.Time
+	env        env
+	feeds      *feedServer
+	rx         *webhookrx.Receiver
+	rxURL      string
+	secret     string
+	appRepo    string
+	values     map[string]any // the chart values installed; agent-disabled upgrades with them
+	api        string         // base URL of the current step's port-forward
+	agentGroup string         // ID of the agent node group (node-group sets it)
+	t7, t9     time.Time
 }
 
 func TestE2E(t *testing.T) {
@@ -82,6 +85,10 @@ func TestE2E(t *testing.T) {
 		{"baseline", s.baseline},
 		{"catalogued", s.catalogued},
 		{"ui-loads", s.uiLoads},
+		{"agent-ready", s.agentReady},
+		{"node-group", s.nodeGroup},
+		{"host-finding", s.hostFinding},
+		{"sideloaded", s.sideloaded},
 		{"detected", s.detected},
 		{"exposed", s.exposed},
 		{"kev-immediate", s.kevImmediate},
@@ -89,6 +96,7 @@ func TestE2E(t *testing.T) {
 		{"admin-exception-silences", s.adminExceptionSilences},
 		{"not-running", s.notRunning},
 		{"resolved", s.resolved},
+		{"agent-disabled", s.agentDisabled},
 		{"hygiene", s.hygiene},
 	} {
 		if !t.Run(step.name, step.fn) {
@@ -127,11 +135,18 @@ func setup(t *testing.T) *suite {
 		pullPolicy = "IfNotPresent"
 	}
 	base := s.feeds.BaseURL(s.env.HostAddr)
-	values, err := yaml.Marshal(map[string]any{
+	s.values = map[string]any{
 		"image":       map[string]any{"repository": repo, "tag": tag, "pullPolicy": pullPolicy},
 		"persistence": map[string]any{"size": "2Gi"},
 		// 1800 MiB, below the 2Gi emptyDir limit.
 		"catalog": map[string]any{"scratchSizeLimit": "2Gi", "scratchLimit": 1887436800},
+		// The e2e image is built for the host's architecture. maxImageBytes keeps the kind-loaded ffs
+		// image (well over 16 MiB) out of agent cataloguing, so it stays unresolvable; the side-loaded
+		// fixture is a few MiB.
+		"nodeAgent": map[string]any{
+			"architectures": []string{"amd64", "arm64"}, "maxImageBytes": "16Mi", "scratchSizeLimit": "1Gi",
+			"reportInterval": "10m", "imageListInterval": "20s", "staleAfter": "2m", "runtimeGrace": "2m",
+		},
 		"config": map[string]any{
 			"clusterName": "e2e",
 			"registry":    map[string]any{"mirrors": map[string]any{s.env.RegistryPush: s.env.RegistryInCluster}},
@@ -146,14 +161,19 @@ func setup(t *testing.T) *suite {
 				"kev":     map[string]any{"url": base + kevPath, "interval": "10s"},
 			},
 		},
-	})
+	}
+	values, err := yaml.Marshal(s.values)
 	require.NoError(t, err)
+	if !k3sMode() {
+		appendHostPackage(t)
+	}
 	out := helmInstall(t, values)
 	require.Contains(t, out, "kubectl -n ffs port-forward deploy/ffs 8080")
 	return s
 }
 
-// dumpOnFailure logs what explains a failure: the ffs logs, the feed requests and the deliveries.
+// dumpOnFailure logs what explains a failure: the ffs and agent logs, the feed requests and the
+// deliveries.
 func (s *suite) dumpOnFailure(t *testing.T) {
 	if !t.Failed() {
 		return
@@ -163,6 +183,10 @@ func (s *suite) dumpOnFailure(t *testing.T) {
 	for _, c := range []string{"controller", "catalog"} {
 		out, err := exec.CommandContext(ctx, "kubectl", "-n", "ffs", "logs", "deploy/ffs", "-c", c, "--tail=200").CombinedOutput() //nolint:gosec // G204: c is one of two fixed container names
 		t.Logf("ffs %s logs (err %v):\n%s", c, err, out)
+	}
+	for _, c := range []string{"collector", "catalog"} {
+		out, err := exec.CommandContext(ctx, "kubectl", "-n", agentNS, "logs", "ds/"+agentDS, "-c", c, "--tail=200").CombinedOutput() //nolint:gosec // G204: c is one of two fixed container names
+		t.Logf("agent %s logs (err %v):\n%s", c, err, out)
 	}
 	t.Logf("feed server requests (last 300):\n%s", s.feeds.RequestLog(300))
 	for _, d := range s.rx.Deliveries() {
@@ -313,7 +337,7 @@ func (s *suite) detected(t *testing.T) {
 	defer cancel()
 	require.NoError(t, s.feeds.WaitServed(ctx, asset, at))
 	at = time.Now()
-	s.feeds.PublishOSV("Debian", "DEBIAN-"+cveDebian, debianOSV("DEBIAN-"+cveDebian, cveDebian, "example", "1.0-2", at), at)
+	s.feeds.PublishOSV("Debian", "DEBIAN-"+cveDebian, debianOSV("DEBIAN-"+cveDebian, cveDebian, "example", "1.0-2", "12", "bookworm", at), at)
 
 	// Critical with a fix, not exposed.
 	waitPriority(t, 4*time.Minute, "e2e", findingDebian, "high")

@@ -365,9 +365,9 @@ func zipOf(t *testing.T, entries map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-// debianOSV returns a Debian OSV record in the shape of a real one: it names the source package and
-// carries its CVE only in "upstream".
-func debianOSV(id, cve, source, fixed string, at time.Time) []byte {
+// debianOSV returns a Debian OSV record in the shape of a real one: it names the source package of
+// Debian release (major version, e.g. "12") codename and carries its CVE only in "upstream".
+func debianOSV(id, cve, source, fixed, release, codename string, at time.Time) []byte {
 	ts := at.UTC().Format(time.RFC3339)
 	return mustJSON(map[string]any{
 		"schema_version": "1.7.0",
@@ -379,8 +379,8 @@ func debianOSV(id, cve, source, fixed string, at time.Time) []byte {
 		"affected": []any{map[string]any{
 			"package": map[string]any{
 				"name":      source,
-				"ecosystem": "Debian:12",
-				"purl":      "pkg:deb/debian/" + source + "?arch=source&distro=bookworm",
+				"ecosystem": "Debian:" + release,
+				"purl":      "pkg:deb/debian/" + source + "?arch=source&distro=" + codename,
 			},
 			"ranges": []any{map[string]any{
 				"type":   "ECOSYSTEM",

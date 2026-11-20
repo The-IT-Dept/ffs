@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -43,6 +45,29 @@ Description: ffs e2e fixture
 	phpBinary = "PHP 8.3.10 (cli)\x00X-Powered-By: PHP/8.3.10\x00"
 )
 
+// hostStanza is the dpkg status stanza appended to each kind node's /var/lib/dpkg/status, after a
+// blank line: a host package built from source package "ffs-e2e-host" at 1.0-1.
+const hostStanza = `
+Package: ffs-e2e-host
+Status: install ok installed
+Architecture: all
+Source: ffs-e2e-host
+Version: 1.0-1
+Maintainer: ffs e2e <e2e@example.invalid>
+Description: ffs e2e host fixture
+`
+
+// sideloadStatus is the dpkg status of the side-loaded image: it replaces the app image's.
+const sideloadStatus = `Package: libsideload1
+Status: install ok installed
+Architecture: all
+Source: sideload
+Version: 2.0-1
+Maintainer: ffs e2e <e2e@example.invalid>
+Description: ffs e2e side-loaded fixture
+
+`
+
 // buildSleeper cross-compiles testdata/sleeper for linux/goarch and returns the binary.
 func buildSleeper(t *testing.T, goarch string) []byte {
 	t.Helper()
@@ -60,21 +85,49 @@ func buildSleeper(t *testing.T, goarch string) []byte {
 // Debian os-release and dpkg status, and the php fixture, run as user 65532.
 func appImage(t *testing.T, goarch string) v1.Image {
 	t.Helper()
-	files := []struct {
-		name string
-		mode int64
-		body []byte
-	}{
+	files := []layerFile{
 		{"sleeper", 0o755, buildSleeper(t, goarch)},
 		{"etc/os-release", 0o644, []byte(osRelease)},
 		{"var/lib/dpkg/status", 0o644, []byte(dpkgStatus)},
 		{"usr/local/bin/php", 0o755, []byte(phpBinary)},
 	}
+	img, err := mutate.AppendLayers(empty.Image, fileLayer(t, files))
+	require.NoError(t, err)
+	img = mutate.ConfigMediaType(mutate.MediaType(img, types.OCIManifestSchema1), types.OCIConfigJSON)
+	cfg, err := img.ConfigFile()
+	require.NoError(t, err)
+	cfg = cfg.DeepCopy()
+	cfg.OS, cfg.Architecture = "linux", goarch
+	cfg.Config.Entrypoint = []string{"/sleeper"}
+	cfg.Config.User = "65532"
+	img, err = mutate.ConfigFile(img, cfg)
+	require.NoError(t, err)
+	return img
+}
+
+// layerFile is one regular file of a fixture layer.
+type layerFile struct {
+	name string
+	mode int64
+	body []byte
+}
+
+// fileLayer returns a gzip OCI layer holding files under their parent directories, every entry
+// dated at the epoch.
+func fileLayer(t *testing.T, files []layerFile) v1.Layer {
+	t.Helper()
 	epoch := time.Unix(0, 0)
 	var raw bytes.Buffer
 	gz := gzip.NewWriter(&raw)
 	tw := tar.NewWriter(gz)
-	for _, dir := range []string{"etc/", "usr/", "usr/local/", "usr/local/bin/", "var/", "var/lib/", "var/lib/dpkg/"} {
+	var dirs []string
+	for _, f := range files {
+		for d := path.Dir(f.name); d != "."; d = path.Dir(d) {
+			dirs = append(dirs, d+"/")
+		}
+	}
+	slices.Sort(dirs)
+	for _, dir := range slices.Compact(dirs) {
 		require.NoError(t, tw.WriteHeader(&tar.Header{Typeflag: tar.TypeDir, Name: dir, Mode: 0o755, ModTime: epoch}))
 	}
 	for _, f := range files {
@@ -89,15 +142,28 @@ func appImage(t *testing.T, goarch string) v1.Image {
 		return io.NopCloser(bytes.NewReader(raw.Bytes())), nil
 	}, tarball.WithMediaType(types.OCILayer))
 	require.NoError(t, err)
-	img, err := mutate.AppendLayers(empty.Image, layer)
+	return layer
+}
+
+// sideloadImage returns the linux/goarch side-loaded image: the app image plus a layer whose dpkg
+// status holds only libsideload1 (source package "sideload" at 2.0-1) and which removes the php
+// fixture, so the image shares no advisory with the app image (a second urgent php finding would
+// change what the Exception steps count). Its title label makes its config digest differ from
+// every pushed image's.
+func sideloadImage(t *testing.T, goarch string) v1.Image {
+	t.Helper()
+	img, err := mutate.AppendLayers(appImage(t, goarch), fileLayer(t, []layerFile{
+		{"var/lib/dpkg/status", 0o644, []byte(sideloadStatus)},
+		{"usr/local/bin/.wh.php", 0o644, nil}, // OCI whiteout of /usr/local/bin/php
+	}))
 	require.NoError(t, err)
-	img = mutate.ConfigMediaType(mutate.MediaType(img, types.OCIManifestSchema1), types.OCIConfigJSON)
 	cfg, err := img.ConfigFile()
 	require.NoError(t, err)
 	cfg = cfg.DeepCopy()
-	cfg.OS, cfg.Architecture = "linux", goarch
-	cfg.Config.Entrypoint = []string{"/sleeper"}
-	cfg.Config.User = "65532"
+	if cfg.Config.Labels == nil {
+		cfg.Config.Labels = map[string]string{}
+	}
+	cfg.Config.Labels["org.opencontainers.image.title"] = "ffs-e2e-sideloaded"
 	img, err = mutate.ConfigFile(img, cfg)
 	require.NoError(t, err)
 	return img

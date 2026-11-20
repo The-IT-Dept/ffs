@@ -62,7 +62,7 @@ ifeq ($(FFS_E2E_KUBECONFIG),)
 	KIND=$(KIND) KUBECONFIG=$(E2E_KUBECONFIG) hack/e2e-kind.sh up
 	docker build -t ghcr.io/the-it-dept/ffs:e2e --build-arg VERSION=e2e .
 	$(KIND) load docker-image ghcr.io/the-it-dept/ffs:e2e --name ffs-e2e
-	KUBECONFIG=$(E2E_KUBECONFIG) GOFLAGS=-p=4 go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/... ; s=$$?; [ -n "$$E2E_KEEP" ] || KIND=$(KIND) KUBECONFIG=$(E2E_KUBECONFIG) hack/e2e-kind.sh down; exit $$s
+	KUBECONFIG=$(E2E_KUBECONFIG) KIND=$(KIND) GOFLAGS=-p=4 go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/... ; s=$$?; [ -n "$$E2E_KEEP" ] || KIND=$(KIND) KUBECONFIG=$(E2E_KUBECONFIG) hack/e2e-kind.sh down; exit $$s
 else
 	KUBECONFIG=$(FFS_E2E_KUBECONFIG) GOFLAGS=-p=4 go test -tags e2e -count=1 -timeout 30m -v ./test/e2e/...
 endif
