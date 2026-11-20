@@ -196,3 +196,70 @@ func TestDocs_ReadmeSaysAgentIsDefault(t *testing.T) {
 		require.Contains(t, doc, want)
 	}
 }
+
+// openAPI is the API contract, api/openapi.yaml.
+func openAPI(t *testing.T) map[string]any {
+	t.Helper()
+	var spec map[string]any
+	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../api/openapi.yaml")), &spec))
+	return spec
+}
+
+// enum returns the values of the enum schema components.schemas.<schema>, which must have some.
+func enum(t *testing.T, spec map[string]any, schema string) []string {
+	t.Helper()
+	components, _ := spec["components"].(map[string]any)
+	schemas, _ := components["schemas"].(map[string]any)
+	s, _ := schemas[schema].(map[string]any)
+	values, _ := s["enum"].([]any)
+	require.NotEmpty(t, values, "components.schemas.%s.enum", schema)
+	out := make([]string, len(values))
+	for i, v := range values {
+		str, ok := v.(string)
+		require.True(t, ok, "components.schemas.%s.enum[%d] is not a string", schema, i)
+		out[i] = str
+	}
+	return out
+}
+
+func TestDocs_APIDocumentsEveryOperation(t *testing.T) {
+	doc, spec := readFile(t, "../../docs/api.md"), openAPI(t)
+	paths, _ := spec["paths"].(map[string]any)
+	require.NotEmpty(t, paths)
+	for p := range paths {
+		require.Contains(t, doc, "`/api/v1"+p+"`") // includes /stream
+	}
+	require.Contains(t, doc, "`/api/v1/openapi.yaml`")
+	for _, c := range enum(t, spec, "ProblemCode") {
+		require.Contains(t, doc, "`"+c+"`")
+	}
+	for _, w := range []string{"Last-Event-ID", "application/problem+json", "generatedAt", "cursor", "421", "405"} {
+		require.Contains(t, doc, w)
+	}
+	require.Contains(t, readFile(t, "../../README.md"), "(docs/api.md)")
+}
+
+func TestDocs_CoverageListsEveryGapAndRemedy(t *testing.T) {
+	doc, spec := readFile(t, "../../docs/coverage.md"), openAPI(t)
+	for _, c := range enum(t, spec, "GapCode") {
+		require.Contains(t, doc, "| `"+c+"` |") // first table column
+	}
+	for _, c := range enum(t, spec, "RemedyCode") {
+		require.Contains(t, doc, "`"+c+"`")
+	}
+}
+
+// TestDocs_CallItTheWebUI: user-facing copy calls the embedded UI "the web UI"; "dashboard" survives only for the
+// Grafana dashboard and the dashboardURL key.
+func TestDocs_CallItTheWebUI(t *testing.T) {
+	files := append(docFiles(t), "../../charts/ffs/templates/NOTES.txt", "../../charts/ffs/values.yaml")
+	for _, path := range files {
+		for i, line := range strings.Split(readFile(t, path), "\n") {
+			l := strings.ToLower(line)
+			if strings.Contains(l, "dashboard") && !strings.Contains(l, "grafana") && !strings.Contains(l, "dashboardurl") {
+				t.Errorf("%s:%d says dashboard; call it the web UI: %s", path, i+1, line)
+			}
+		}
+	}
+	require.Contains(t, readFile(t, "../../README.md"), "web UI")
+}

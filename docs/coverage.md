@@ -1,8 +1,32 @@
 # Coverage
 
-ffs never reports an image as clean when it could not see inside it. Every image has a status (`pending`, `catalogued`, `unresolvable` or `catalogFailed`) with a reason, and images with known gaps are marked partial coverage and list coverage notes. The API returns these as `status`, `statusReason`, `partialCoverage` and `coverage.notes`; the dashboard shows them on the Images page and on each workload. The dashboard's landing page starts with any feed that is stale or has never synced and the number of images in use that are not catalogued, the Workloads page shows how many of each workload's images are catalogued, and an advisory page with no findings says when images are not catalogued.
+ffs never reports an image as clean when it could not see inside it. Every image has a status (`pending`, `catalogued`, `unresolvable` or `catalogFailed`) with a reason, and a coverage class: `full` when it is catalogued with nothing ffs knows it missed, `partial` when it is catalogued with known gaps, and `none` when ffs could not see into it. The API returns these as `status`, `statusReason`, `coverage` and `gaps` on every image. The web UI shows how many images in use it sees in full detail next to every count, marks what it cannot see with a hatched pattern, and lists every gap with what to do on its Coverage page.
 
 This page lists what ffs cannot see, and what it shows when it meets it.
+
+## Gaps and what to do
+
+The Coverage page and the API (`/api/v1/coverage`) report each gap with a code and a remedy:
+
+| Gap code | Gap | Remedy | What to do |
+|---|---|---|---|
+| `pending` | not catalogued yet | `wait` | Queued; ffs catalogues it shortly. |
+| `unresolvable_auth` | registry refused access | `add_pull_secret` | Give ffs a pull secret that can read this repository. |
+| `unresolvable_sideloaded` | loaded onto nodes, not in a registry | `enable_node_agent` | The node agent catalogues side-loaded images from the node. |
+| `unresolvable_notfound` | not found in the registry | `enable_node_agent` | Push it to a registry ffs can reach, or let the node agent catalogue it. |
+| `unresolvable_unreachable` | registry not reachable | `check_network` | Allow ffs to reach the registry, or configure a mirror. |
+| `unresolvable_other` | could not be resolved | `check_reference` | Check the image reference; the reason is shown. |
+| `layers_discarded` | layers discarded on every node | `repull_image` | Pull the image again on a node, or push it to a registry. |
+| `catalog_failed` | cataloguing failed | `retry_later` | ffs retries after the quarantine; the reason is shown. |
+| `attestation_partial` | attested SBOM lists no executables | `informational` | Executables were not measured; ffs relies on the attested package list. |
+| `unattributed_executables` | executables without package metadata | `informational` | Copied-in binaries carry no package metadata, so ffs cannot match them. |
+| `rust_no_auditable` | Rust binaries without cargo-auditable | `build_with_auditable` | Build Rust binaries with cargo-auditable so their crates can be matched. |
+| `cpe_only_classifier` | daily, CPE-based coverage only | `informational` | Matched daily against CPE data; the fast path does not cover the software listed. |
+| `node_agent_missing` | kernel and host packages not inventoried | `enable_node_agent` | Enable the node agent, or check why it is not reporting. |
+| `node_agent_blocked` | node agent cannot read host paths | `check_host_permissions` | Allow the node agent to read its host paths (SELinux or policy). |
+| `no_package_database` | no package database (image-based OS) | `informational` | Host packages are not inventoried on image-based operating systems. |
+| `content_store_unreadable` | no containerd content store | `informational` | Side-loaded images on this node cannot be catalogued from it. |
+| `feed_stale` | feed out of date | `check_feed_access` | Check that ffs can reach the feed; the last error is shown. |
 
 ## Blind spots
 

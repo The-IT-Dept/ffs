@@ -1,8 +1,9 @@
 ffs {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
 
-Dashboard and read-only API (bound to {{ .Values.config.listen }} inside the pod):
+Web UI and read-only API (bound to {{ .Values.config.listen }} inside the pod):
   kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "ffs.fullname" . }} 8080
   then open http://127.0.0.1:8080
+  The OpenAPI document is at http://127.0.0.1:8080/api/v1/openapi.yaml
 
 Findings and advisories:
   kubectl get ffs -A

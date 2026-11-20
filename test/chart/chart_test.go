@@ -509,6 +509,8 @@ func TestChart_NotesAndHiddenCategory(t *testing.T) {
 	notes := readFile(t, chartDir+"/templates/NOTES.txt")
 	require.Contains(t, notes, `kubectl -n {{ .Release.Namespace }} port-forward deploy/{{ include "ffs.fullname" . }} 8080`)
 	require.Contains(t, notes, "http://127.0.0.1:8080")
+	require.Contains(t, notes, "Web UI and read-only API")
+	require.Contains(t, notes, "/api/v1/openapi.yaml")
 	hidden := "anx" + "iety"
 	require.NoError(t, filepath.WalkDir(chartDir, func(p string, d fs.DirEntry, err error) error {
 		require.NoError(t, err)

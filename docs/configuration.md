@@ -10,14 +10,14 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 
 | Key | Default | Meaning |
 |---|---|---|
-| `clusterName` | `default` | Cluster name shown in findings, alerts, the API `cluster` field and the dashboard. |
+| `clusterName` | `default` | Cluster name shown in findings, alerts, the API `cluster` field and the web UI. |
 | `namespace` | release namespace | The ffs install namespace. It holds the leader-election Lease, AlertTarget Secrets and the operator registry Secret. Exceptions in this namespace apply cluster-wide, and cluster-level Findings are written here. The chart sets it from the release; it is not a Helm value. |
 | `deploymentName` | release name | The ffs Deployment. Feed-staleness, Finding-cap and cluster-level Events are attached to it. The chart sets it from the release; it is not a Helm value. |
 | `storePath` | `/var/lib/ffs/ffs.db` | Path of the SQLite store. The chart requires it to be under `dataDir`, because only `dataDir` is on the persistent volume. |
 | `dataDir` | `/var/lib/ffs` | Directory for the store and feed data, including the Grype database. The chart mounts the persistent volume here. |
-| `listen` | `127.0.0.1:8080` | Listen address of the dashboard and read-only API. The default is reachable only through `kubectl port-forward`. See [Exposing the dashboard](#exposing-the-dashboard). |
-| `allowedHosts` | `[]` | Host names the dashboard and API answer to besides `localhost` and IP addresses, for example the name your authenticating proxy forwards. Requests for any other host get `421 Misdirected Request`, which stops a web page from reading the API through DNS rebinding while you port-forward. Names only, without scheme or port. With `web.service.enabled`, the chart adds the Service's DNS names. |
-| `dashboardURL` | `""` | External dashboard URL. When set, alerts link to `<dashboardURL>/vulnerabilities/<advisory-id>`. Must be an absolute http(s) URL. |
+| `listen` | `127.0.0.1:8080` | Listen address of the web UI and read-only API. The default is reachable only through `kubectl port-forward`. See [Exposing the web UI](#exposing-the-web-ui). |
+| `allowedHosts` | `[]` | Host names the web UI and API answer to besides `localhost` and IP addresses, for example the name your authenticating proxy forwards. Requests for any other host get `421 Misdirected Request`, which stops a web page from reading the API through DNS rebinding while you port-forward. Names only, without scheme or port. With `web.service.enabled`, the chart adds the Service's DNS names. |
+| `dashboardURL` | `""` | External URL of the web UI. When set, alerts link to `<dashboardURL>/vulnerabilities/<advisory-id>`. Must be an absolute http(s) URL. |
 | `catalog.socket` | `/run/ffs/catalog.sock` | Unix socket between the controller and catalog containers. The chart mounts its directory in both. |
 | `catalog.timeout` | `10m` | Time limit for cataloguing one image. |
 | `catalog.maxImageBytes` | `10737418240` (10 GiB) | Largest image catalogued, measured as the total of its compressed layers. Larger images are not catalogued; they show `catalogFailed` with the reason. |
@@ -63,7 +63,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `exposure.internalGatewayClasses` | `[]` | GatewayClass names whose Gateways do not count as exposure outside the cluster. |
 | `exposure.internalGateways` | `[]` | Gateways, as `namespace/name`, that do not count as exposure outside the cluster. |
 | `exposure.internalLBAnnotations` | `{}` | Service annotations that mark a LoadBalancer as internal, as annotation key to value. The value `*` matches any value. |
-| `crd.minPriority` | `high` | Lowest priority written as a `Finding` resource. Everything is still in the API and dashboard. |
+| `crd.minPriority` | `high` | Lowest priority written as a `Finding` resource. Everything is still in the API and web UI. |
 | `crd.maxFindings` | `2000` | Most `Finding` resources kept; `0` is unlimited. Over the cap the lowest priorities are dropped first, and ffs reports it with an Event and a metric. |
 | `events.minPriority` | `high` | Lowest priority whose transitions emit Kubernetes Events. |
 | `openReports.mode` | `auto` | OpenReports output: `auto` writes reports when the `openreports.io` CRD exists, `on` always writes them, `off` never does. |
@@ -116,8 +116,8 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `tolerations` | `[]` | Pod tolerations. |
 | `affinity` | `{}` | Pod affinity. |
 | `priorityClassName` | `""` | Pod priority class. |
-| `web.service.enabled` | `false` | Create a ClusterIP Service for the dashboard. Requires `config.listen` bound beyond loopback. |
-| `web.service.port` | `8080` | Port of the dashboard Service. |
+| `web.service.enabled` | `false` | Create a ClusterIP Service for the web UI. Requires `config.listen` bound beyond loopback. |
+| `web.service.port` | `8080` | Port of the web UI Service. |
 | `metrics.service.enabled` | `false` | Create the metrics Service. |
 | `metrics.service.port` | `8443` | Port of the metrics Service. |
 | `metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator ServiceMonitor (and the metrics Service). |
@@ -132,11 +132,11 @@ These values configure the chart itself and are not part of `config.yaml`.
 
 Metrics are served on port 8443 behind Kubernetes authentication and authorisation. A scraper needs `get` on the `/metrics` non-resource URL, which the chart's ClusterRole `ffs-metrics-reader` grants; bind it to the scraper's ServiceAccount.
 
-The finding metrics (for example `ffs_findings_open`) carry a `namespace` label naming the workload's namespace, not the ffs namespace. The chart's ServiceMonitor sets `honorLabels: true` so Prometheus keeps it. If you scrape ffs with your own configuration, set `honor_labels: true` on that job too; otherwise Prometheus renames the label to `exported_namespace`, and the shipped alerts and dashboard report every finding in the ffs namespace.
+The finding metrics (for example `ffs_findings_open`) carry a `namespace` label naming the workload's namespace, not the ffs namespace. The chart's ServiceMonitor sets `honorLabels: true` so Prometheus keeps it. If you scrape ffs with your own configuration, set `honor_labels: true` on that job too; otherwise Prometheus renames the label to `exported_namespace`, and the shipped alerts and Grafana dashboard report every finding in the ffs namespace.
 
-## Exposing the dashboard
+## Exposing the web UI
 
-The dashboard and API have no authentication. By default they listen on `127.0.0.1:8080` inside the pod, so they are reachable only through `kubectl -n ffs port-forward deploy/ffs 8080`, which needs RBAC `pods/portforward` in the ffs namespace.
+The web UI and API have no authentication. By default they listen on `127.0.0.1:8080` inside the pod, so they are reachable only through `kubectl -n ffs port-forward deploy/ffs 8080`, which needs RBAC `pods/portforward` in the ffs namespace.
 
 To serve them to more people, put your own authenticating proxy (for example oauth2-proxy) in front:
 
@@ -150,6 +150,8 @@ web:
     enabled: true
 ```
 
-The dashboard answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
+The web UI answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
 
-This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the dashboard shows, so restrict it with a NetworkPolicy to the proxy alone, and do not expose the Service directly through an Ingress or Gateway.
+This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the web UI shows, so restrict it with a NetworkPolicy to the proxy alone, and do not expose the Service directly through an Ingress or Gateway.
+
+The API itself is described in [api.md](api.md).

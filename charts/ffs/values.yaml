@@ -75,13 +75,13 @@ affinity: {}
 # Pod priority class.
 priorityClassName: ""
 
-# Dashboard exposure.
+# Web UI exposure.
 web:
   # Service settings.
   service:
-    # Create a ClusterIP Service for the dashboard; needs config.listen bound beyond loopback.
+    # Create a ClusterIP Service for the web UI; needs config.listen bound beyond loopback.
     enabled: false
-    # Service port for the dashboard.
+    # Service port for the web UI.
     port: 8080
 
 # Authenticated metrics endpoint.
@@ -112,13 +112,13 @@ prometheusRule:
 grafanaDashboard:
   # Create a ConfigMap carrying the Grafana dashboard.
   enabled: false
-  # Namespace of the dashboard ConfigMap; defaults to the release namespace.
+  # Namespace of the Grafana dashboard ConfigMap; defaults to the release namespace.
   namespace: ""
-  # Extra dashboard ConfigMap labels.
+  # Extra Grafana dashboard ConfigMap labels.
   labels:
     # Label the Grafana sidecar selects dashboards by.
     grafana_dashboard: "1"
-  # Extra dashboard ConfigMap annotations.
+  # Extra Grafana dashboard ConfigMap annotations.
   annotations: {}
 
 # Node agent: a DaemonSet that reports each node's host packages and cached images to ffs.
@@ -208,11 +208,11 @@ config:
   storePath: /var/lib/ffs/ffs.db
   # Directory for feed data and the store.
   dataDir: /var/lib/ffs
-  # Dashboard and API listen address.
+  # Web UI and API listen address.
   listen: 127.0.0.1:8080
-  # Host names the dashboard answers besides localhost and IP addresses; web.service.enabled adds the Service's names.
+  # Host names the web UI answers besides localhost and IP addresses; web.service.enabled adds the Service's names.
   allowedHosts: []
-  # External dashboard URL used in links.
+  # External URL of the web UI, used in alert links.
   dashboardURL: ""
   # Cataloguer socket and limits.
   catalog:
