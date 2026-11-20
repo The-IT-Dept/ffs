@@ -47,7 +47,8 @@ func run() error {
 			ID       string    `json:"id"`
 			Type     string    `json:"type"`
 			Verified bool      `json:"verified"`
-		}{d.Received.UTC(), d.ID, d.Type, d.Verified})
+			ReadErr  string    `json:"readError,omitempty"`
+		}{d.Received.UTC(), d.ID, d.Type, d.Verified, d.ReadErr})
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

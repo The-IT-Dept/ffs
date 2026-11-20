@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"time"
@@ -141,7 +142,7 @@ func resetCrashQuarantines(ctx context.Context, st *store.Store, ver string, log
 }
 
 // Run builds the manager, wires every component into it and runs it until ctx is done. The store
-// is closed after the manager has stopped.
+// is closed after the manager's runnables have stopped (runManager).
 func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 	cfg := o.Config
 	ns := o.Namespace
@@ -166,9 +167,12 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
+	// Until the manager starts nothing runs that uses the store, so a failure before then closes it here; from then
+	// on runManager closes it, once the runnables have stopped.
+	started := false
 	defer func() {
-		if cerr := st.Close(); cerr != nil {
-			err = errors.Join(err, fmt.Errorf("close store: %w", cerr))
+		if !started {
+			err = errors.Join(err, closeStore(st))
 		}
 	}()
 	if err := resetCrashQuarantines(ctx, st, version.Version, log); err != nil {
@@ -201,10 +205,8 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 	if err != nil {
 		return err
 	}
-	for _, r := range registrars {
-		if err := r(m, d); err != nil {
-			return err
-		}
+	if err := register(m, d, registrars); err != nil {
+		return err
 	}
 
 	if err := m.AddHealthzCheck("ping", healthz.Ping); err != nil {
@@ -215,5 +217,31 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 		return fmt.Errorf("add readiness check: %w", err)
 	}
 
-	return m.Start(ctx)
+	started = true
+	return runManager(ctx, m, st, log)
+}
+
+// starter is the part of manager.Manager runManager uses.
+type starter interface {
+	Start(ctx context.Context) error
+}
+
+// runManager runs m until ctx is done, then closes st once every runnable has returned. Start returns before they all
+// have only when they outlast the graceful shutdown timeout (its error then wraps context.DeadlineExceeded), and they
+// may still be using the store: it is left open for them, since the process exits next and SQLite's journal keeps
+// the database consistent. The pod's termination grace period leaves room for the timeout and the close (F117).
+func runManager(ctx context.Context, m starter, st io.Closer, log logr.Logger) error {
+	err := m.Start(ctx)
+	if errors.Is(err, context.DeadlineExceeded) {
+		log.Info("components did not stop within the graceful shutdown timeout; the store is left open for them", "error", err.Error())
+		return err
+	}
+	return errors.Join(err, closeStore(st))
+}
+
+func closeStore(st io.Closer) error {
+	if err := st.Close(); err != nil {
+		return fmt.Errorf("close store: %w", err)
+	}
+	return nil
 }

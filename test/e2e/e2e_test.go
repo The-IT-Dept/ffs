@@ -32,6 +32,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/the-it-dept/ffs/api/v1alpha1"
+	"github.com/the-it-dept/ffs/internal/feeds/grypedb/grypedbtest"
 	"github.com/the-it-dept/ffs/internal/web"
 	"github.com/the-it-dept/ffs/test/e2e/webhookrx"
 )
@@ -73,6 +74,7 @@ type suite struct {
 	values     map[string]any // the chart values installed; agent-disabled upgrades with them
 	api        string         // base URL of the current step's port-forward
 	agentGroup string         // ID of the agent node group (node-group sets it)
+	grypeFirst string         // path of the first Grype DB archive, published before the install
 	t7, t9     time.Time
 }
 
@@ -84,6 +86,7 @@ func TestE2E(t *testing.T) {
 	}{
 		{"baseline", s.baseline},
 		{"catalogued", s.catalogued},
+		{"grypedb-update", s.grypeDBUpdate},
 		{"ui-loads", s.uiLoads},
 		{"agent-ready", s.agentReady},
 		{"node-group", s.nodeGroup},
@@ -125,6 +128,12 @@ func setup(t *testing.T) *suite {
 	s.rxURL = "http://" + net.JoinHostPort(s.env.HostAddr, port) + "/"
 	t.Cleanup(func() { s.dumpOnFailure(t) })
 
+	// The first Grype DB build, a small one from the feed's fixtures, is out before ffs starts, so the feed
+	// installs it first thing; grypedb-update publishes the next. Both are stamped in the past, so neither counts
+	// towards settling the OSV findings the suite observes (they stay provisional, as without the feed).
+	s.grypeFirst = s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, grypeBuilt.Add(-24*time.Hour), "**/debian-12/cve-2022-38178.json"),
+		grypeBuilt.Add(-24*time.Hour))
+
 	s.appRepo = s.env.RegistryPush + "/e2e/app"
 	digest := pushAppIndex(t, s.appRepo+":1")
 	t.Logf("pushed %s:1 (%s)", s.appRepo, digest)
@@ -155,7 +164,7 @@ func setup(t *testing.T) *suite {
 			"crd":         map[string]any{"minPriority": "medium"},
 			"upgrades":    map[string]any{"enabled": false},
 			"feeds": map[string]any{
-				"grypedb": map[string]any{"enabled": false},
+				"grypedb": map[string]any{"url": base + grypeListingPath, "interval": "10s"},
 				"epss":    map[string]any{"enabled": false},
 				"eol":     map[string]any{"enabled": false},
 				"osv":     map[string]any{"url": base + "/osv", "interval": "10s"},
@@ -192,7 +201,8 @@ func (s *suite) dumpOnFailure(t *testing.T) {
 	}
 	t.Logf("feed server requests (last 300):\n%s", s.feeds.RequestLog(300))
 	for _, d := range s.rx.Deliveries() {
-		t.Logf("delivery %s type=%s verified=%t received=%s", d.ID, d.Type, d.Verified, d.Received.UTC().Format(time.RFC3339))
+		t.Logf("delivery %s type=%s verified=%t received=%s readError=%q", d.ID, d.Type, d.Verified,
+			d.Received.UTC().Format(time.RFC3339), d.ReadErr)
 	}
 }
 
@@ -285,28 +295,102 @@ func (s *suite) catalogued(t *testing.T) {
 
 	base := portForward(t)
 	eventually(t, 5*time.Minute, func() (bool, string) {
-		var app, self string
-		for _, o := range apiObjects(t, base, "/api/v1/images?limit=200") {
+		objs, err := apiObjects(t.Context(), base, "/api/v1/images?limit=200")
+		if err != nil {
+			return false, err.Error() // a port-forward hiccup or a restart: poll again
+		}
+		// A repository can appear more than once (an entry per digest, and nested objects), so one matching
+		// entry is enough, wherever it is.
+		var app, self []string
+		appOK, selfUnresolvable := false, false
+		for _, o := range objs {
 			switch o["repo"] {
 			case s.appRepo:
-				if o["status"] == "catalogued" && o["platform"] == platform {
-					app = "ok"
-				} else {
-					app = fmt.Sprintf("status %v platform %v", o["status"], o["platform"])
-				}
+				appOK = appOK || (o["status"] == "catalogued" && o["platform"] == platform)
+				app = append(app, fmt.Sprintf("status %v platform %v", o["status"], o["platform"]))
 			case "ghcr.io/the-it-dept/ffs":
-				self = fmt.Sprint(o["status"])
+				selfUnresolvable = selfUnresolvable || o["status"] == "unresolvable"
+				self = append(self, fmt.Sprint(o["status"]))
 			}
 		}
-		if app != "ok" {
-			return false, fmt.Sprintf("image %s %s, want catalogued on %s", s.appRepo, app, platform)
+		if !appOK {
+			return false, fmt.Sprintf("image %s %v, want catalogued on %s", s.appRepo, app, platform)
 		}
 		// The kind-loaded ffs image has only a node-local config digest. A registry-pulled one
 		// (k3s) resolves normally.
-		if s.env.FFSImage == "" && self != "unresolvable" {
-			return false, fmt.Sprintf("image ghcr.io/the-it-dept/ffs status %q, want unresolvable", self)
+		if s.env.FFSImage == "" && !selfUnresolvable {
+			return false, fmt.Sprintf("image ghcr.io/the-it-dept/ffs status %v, want unresolvable", self)
 		}
 		return true, ""
+	})
+}
+
+// grypeBuilt stamps the second fixture Grype DB build, a day before the suite runs; the first is a day older.
+var grypeBuilt = time.Now().UTC().Truncate(time.Second).Add(-24 * time.Hour)
+
+// feedStatus is one entry of GET /api/v1/feeds.
+type feedStatus struct {
+	Name        string    `json:"name"`
+	LastSuccess time.Time `json:"lastSuccess"`
+	LastAttempt time.Time `json:"lastAttempt"`
+	LastError   string    `json:"lastError"`
+}
+
+// grypeFeed returns the grypedb entry of GET /api/v1/feeds.
+func grypeFeed(ctx context.Context, base string) (feedStatus, error) {
+	var body bytes.Buffer
+	code, err := get(ctx, base+"/api/v1/feeds", &body)
+	if err != nil {
+		return feedStatus{}, err
+	}
+	if code != http.StatusOK {
+		return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: %d %s", code, body.String())
+	}
+	var page struct {
+		Feeds []feedStatus `json:"feeds"`
+	}
+	if err := json.Unmarshal(body.Bytes(), &page); err != nil {
+		return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: %w", err)
+	}
+	for _, f := range page.Feeds {
+		if f.Name == "grypedb" {
+			return f, nil
+		}
+	}
+	return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: no grypedb feed in %s", body.String())
+}
+
+// grypeDBUpdate covers the Grype DB feed in the cluster (F120): the first build, published before the install, is
+// installed and hydrated, and the matcher loads it; a second build is then downloaded, installed, hydrated and diffed
+// against the first while the matcher holds the first open, and handed to the engine. The feed's lastSuccess
+// advancing past the second download, with no error, says all of that worked.
+func (s *suite) grypeDBUpdate(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer cancel()
+	require.NoError(t, s.feeds.WaitServed(ctx, s.grypeFirst, time.Time{}), "the first Grype DB build was never downloaded")
+	base := portForward(t)
+	eventually(t, 3*time.Minute, func() (bool, string) {
+		f, err := grypeFeed(t.Context(), base)
+		if err != nil {
+			return false, err.Error()
+		}
+		return !f.LastSuccess.IsZero() && f.LastError == "", fmt.Sprintf("grypedb feed %+v, want the first build installed", f)
+	})
+
+	published := time.Now()
+	second := s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, grypeBuilt), grypeBuilt)
+	require.NoError(t, s.feeds.WaitServed(ctx, second, published), "the second Grype DB build was never downloaded")
+	downloaded := time.Now()
+	// The success of the sync that took the second build is recorded when the sync ends, after the download. The
+	// sync before it ended a whole interval (10s, less 10% jitter) earlier, so a success up to 2s before the
+	// download, allowing for clock skew with the node, can only be this one.
+	eventually(t, 4*time.Minute, func() (bool, string) {
+		f, err := grypeFeed(t.Context(), base)
+		if err != nil {
+			return false, err.Error()
+		}
+		return f.LastSuccess.After(downloaded.Add(-2*time.Second)) && f.LastError == "",
+			fmt.Sprintf("grypedb feed %+v, want a success after the second build's download at %s", f, downloaded.UTC().Format(time.RFC3339Nano))
 	})
 }
 

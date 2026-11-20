@@ -3,6 +3,7 @@ package webhookrx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -70,4 +71,47 @@ func TestReceiver_RecordsTypeAndVerification(t *testing.T) {
 	require.Equal(t, "msg_2", d.ID)
 	_, err = rx.Wait(ctx, func(d Delivery) bool { return d.ID == "msg_3" })
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+// errReader fails after its data.
+type errReader struct {
+	data []byte
+	err  error
+}
+
+func (e *errReader) Read(p []byte) (int, error) {
+	if len(e.data) > 0 {
+		n := copy(p, e.data)
+		e.data = e.data[n:]
+		return n, nil
+	}
+	return 0, e.err
+}
+
+// TestReceiver_RecordsUnreadableBodies: a body that cannot be read in full is answered 400 and still recorded,
+// unverified and with why, so a failed delivery is visible (F55).
+func TestReceiver_RecordsUnreadableBodies(t *testing.T) {
+	rx := New("whsec_MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw")
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/",
+		&errReader{data: []byte(`{"type":"au.theitdept.ffs.digest.v1"`), err: errors.New("connection reset by peer")})
+	req.Header.Set("webhook-id", "msg_cut")
+	w := httptest.NewRecorder()
+	rx.ServeHTTP(w, req)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	big := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/", bytes.NewReader(make([]byte, maxBody+1)))
+	big.Header.Set("webhook-id", "msg_big")
+	w = httptest.NewRecorder()
+	rx.ServeHTTP(w, big)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	got := rx.Deliveries()
+	require.Len(t, got, 2)
+	require.Equal(t, "msg_cut", got[0].ID)
+	require.False(t, got[0].Verified)
+	require.Equal(t, "connection reset by peer", got[0].ReadErr)
+	require.Equal(t, []byte(`{"type":"au.theitdept.ffs.digest.v1"`), got[0].Body, "what was read is kept")
+	require.Equal(t, "msg_big", got[1].ID)
+	require.False(t, got[1].Verified)
+	require.Contains(t, got[1].ReadErr, "request body too large")
 }

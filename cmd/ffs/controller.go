@@ -1,9 +1,12 @@
 package main
 
 import (
+	"flag"
 	"os"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	"k8s.io/klog/v2"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -15,13 +18,14 @@ func newControllerCmd() *cobra.Command {
 	var (
 		configPath string
 		opts       controller.Options
+		logOpts    zap.Options
 	)
 	cmd := &cobra.Command{
 		Use:   "controller",
 		Short: "Run the in-cluster controller",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			ctrl.SetLogger(zap.New())
+			setLogger(zap.New(zap.UseFlagOptions(&logOpts)))
 			cfg, err := config.Load(configPath)
 			if err != nil {
 				return err
@@ -46,5 +50,17 @@ func newControllerCmd() *cobra.Command {
 	f.StringVar(&opts.PprofAddr, "pprof-bind-address", "",
 		"loopback address of a diagnostic pprof listener; off when empty (also "+controller.PprofAddrEnv+")")
 	_ = f.MarkHidden("pprof-bind-address")
+	// --zap-log-level, --zap-encoder, --zap-devel, --zap-stacktrace-level and --zap-time-encoding; for example
+	// --zap-log-level=debug (or 1) turns on V(1) messages.
+	zfs := flag.NewFlagSet("zap", flag.ContinueOnError)
+	logOpts.BindFlags(zfs)
+	f.AddGoFlagSet(zfs)
 	return cmd
+}
+
+// setLogger makes l the logger of controller-runtime and of klog, so client-go and leader election log through it,
+// in the same format and at the same level, rather than as klog text among the JSON lines.
+func setLogger(l logr.Logger) {
+	ctrl.SetLogger(l)
+	klog.SetLogger(l)
 }

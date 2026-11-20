@@ -3,15 +3,21 @@
 package e2e
 
 import (
+	"archive/tar"
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -19,11 +25,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 )
 
-// feedServer serves fixture copies of the OSV bucket, the cvelistV5 release assets and the CISA KEV
-// catalogue, in their upstream URL layouts as of 2026-11-19, so ffs's feeds (Tasks 14, 16 and 17)
-// read them as they read the real ones. Any request outside those layouts fails the test.
+// feedServer serves fixture copies of the OSV bucket, the cvelistV5 release assets, the CISA KEV
+// catalogue and the Grype DB listing and archives, in their upstream URL layouts as of 2026-11-19, so
+// ffs's feeds (Tasks 14, 16 and 17, and the Grype DB feed) read them as they read the real ones. Any
+// request outside those layouts fails the test.
 //
 // cvelistV5 deltas. The cvelist feed stops its walk at yesterday while yesterday's end-of-day delta
 // is missing (inside a 24h grace), and it never re-reads an hourly delta at or before its
@@ -43,6 +52,8 @@ type feedServer struct {
 	cves    map[int]map[string][]byte    // hourly delta of cveDay → CVE ID → record (each hour holds only its own)
 	kev     []kevEntry
 	kevETag int
+	grype   []byte            // latest.json; nil until PublishGrypeDB
+	grypeDB map[string][]byte // archive name → tar.zst
 	log     []served
 	changed chan struct{} // closed and replaced on every logged request
 }
@@ -85,6 +96,7 @@ func startFeedServer(t *testing.T) *feedServer {
 		cveDay:  time.Now().UTC().AddDate(0, 0, -1).Format(time.DateOnly),
 		cves:    map[int]map[string][]byte{},
 		kevETag: 1,
+		grypeDB: map[string][]byte{},
 		changed: make(chan struct{}),
 	}
 	mux := http.NewServeMux()
@@ -94,6 +106,8 @@ func startFeedServer(t *testing.T) *feedServer {
 	mux.HandleFunc("GET /osv/{eco}/{file}", f.serveOSV)
 	mux.HandleFunc("GET /cvelist/download/{tag}/{asset}", f.serveCVE)
 	mux.HandleFunc("GET /kev/known_exploited_vulnerabilities.json", f.serveKEV)
+	mux.HandleFunc("GET "+grypeListingPath, f.serveGrypeListing)
+	mux.HandleFunc("GET /grypedb/{archive}", f.serveGrypeArchive)
 	mux.HandleFunc("/", f.unexpected)
 
 	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "0.0.0.0:0") //nolint:gosec // G102: cluster pods reach the server through the host's address
@@ -152,6 +166,45 @@ func (f *feedServer) PublishKEV(cveID string, added time.Time) {
 		KnownRansomwareCampaignUse: "Unknown", CWEs: []string{},
 	})
 	f.kevETag++
+}
+
+// PublishGrypeDB packs the Grype v6 database in dir (vulnerability.db and import.json) as a tar.zst the way
+// grype's publisher does, lists it in latest.json as the build stamped built, and returns the archive's path.
+func (f *feedServer) PublishGrypeDB(dir string, built time.Time) string {
+	built = built.UTC().Truncate(time.Second)
+	name := fmt.Sprintf("vulnerability-db_v6.1.10_%s_%d.tar.zst", built.Format(time.RFC3339), built.Unix())
+	var buf bytes.Buffer
+	zw, err := zstd.NewWriter(&buf)
+	if err != nil {
+		f.t.Fatalf("feed server: Grype DB archive: %v", err)
+	}
+	tw := tar.NewWriter(zw)
+	for _, file := range []string{"vulnerability.db", "import.json"} {
+		b, err := os.ReadFile(filepath.Join(dir, file)) //nolint:gosec // G304: a database this suite built
+		if err != nil {
+			f.t.Fatalf("feed server: Grype DB archive: %v", err)
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: file, Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(b)), ModTime: built}); err != nil {
+			f.t.Fatalf("feed server: Grype DB archive: %v", err)
+		}
+		if _, err := tw.Write(b); err != nil {
+			f.t.Fatalf("feed server: Grype DB archive: %v", err)
+		}
+	}
+	if err := errors.Join(tw.Close(), zw.Close()); err != nil {
+		f.t.Fatalf("feed server: Grype DB archive: %v", err)
+	}
+	sum := sha256.Sum256(buf.Bytes())
+	listing := mustJSON(map[string]any{
+		"status": "active", "schemaVersion": "v6.1.10", "built": built.Format(time.RFC3339), "path": name,
+		"checksum": "sha256:" + hex.EncodeToString(sum[:]),
+	})
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.grypeDB[name] = buf.Bytes()
+	f.grype = listing
+	return "/grypedb/" + name
 }
 
 // WaitServed waits until a 200 for path is served after after.
@@ -329,6 +382,31 @@ func (f *feedServer) serveKEV(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("ETag", fmt.Sprintf(`"kev-%d"`, etag))
 	serve(w, r, "known_exploited_vulnerabilities.json", body)
+}
+
+// grypeListingPath is the Grype DB feed's latest.json; its archives are its siblings.
+const grypeListingPath = "/grypedb/latest.json"
+
+func (f *feedServer) serveGrypeListing(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	listing := f.grype
+	f.mu.Unlock()
+	if listing == nil {
+		f.unexpected(w, r)
+		return
+	}
+	serve(w, r, "latest.json", listing)
+}
+
+func (f *feedServer) serveGrypeArchive(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	archive, ok := f.grypeDB[r.PathValue("archive")]
+	f.mu.Unlock()
+	if !ok {
+		f.unexpected(w, r)
+		return
+	}
+	serve(w, r, r.PathValue("archive"), archive)
 }
 
 // serve answers through http.ServeContent, so Range and conditional requests work as upstream.
