@@ -178,13 +178,15 @@ func TestChart_AgentSecurityPosture(t *testing.T) {
 		col := agentContainer(t, ds, "collector")
 		hardened(col)
 		require.EqualValues(t, 0, *col.SecurityContext.RunAsUser)
-		require.Equal(t, []string{"/ffs", "agent", "check", "--heartbeat=/scratch/heartbeat", "--max-age=15m"},
+		require.Equal(t, []string{"/ffs", "agent", "check", "--heartbeat=/run/ffs-agent/heartbeat", "--max-age=15m"},
 			col.LivenessProbe.Exec.Command)
 		cat := agentContainer(t, ds, "catalog")
 		hardened(cat)
 		require.EqualValues(t, 65532, *cat.SecurityContext.RunAsUser)
 		require.True(t, *cat.SecurityContext.RunAsNonRoot)
-		require.Equal(t, []string{"run", "scratch"}, slices.Sorted(maps.Keys(mounts(cat))), "the cataloguer has no host mounts")
+		require.Equal(t, []string{"catalog-scratch", "run", "stage"}, slices.Sorted(maps.Keys(mounts(cat))), "the cataloguer has no host mounts")
+		require.True(t, mounts(cat)["stage"].ReadOnly, "the cataloguer cannot change what the collector staged")
+		require.NotContains(t, mounts(cat), "heartbeat", "nor reach the collector's heartbeat")
 
 		token := volumes(ps)["token"]
 		require.NotNil(t, token.Projected)
@@ -234,9 +236,9 @@ func TestChart_AgentDaemonSetShape(t *testing.T) {
 	require.Equal(t, []string{"agent", "--controller=https://ffs-agent-api.ffs.svc:8444", "--ca-file=/etc/ffs-agent/ca/ca.crt",
 		"--token-file=/var/run/secrets/ffs-agent/token", "--host-root=/host", "--distribution=containerd",
 		"--content-store=/host" + containerdStore, "--scratch=/scratch/stage", "--catalog-socket=/run/ffs/catalog.sock",
-		"--heartbeat=/scratch/heartbeat", "--max-image-bytes=1073741824"}, col.Args)
+		"--heartbeat=/run/ffs-agent/heartbeat", "--max-image-bytes=1073741824"}, col.Args)
 	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/scratch/catalog", "--local-root=/scratch/stage",
-		"--max-concurrent=1", "--nice=10", "--scratch-limit=2952790016", // 4Gi − 1Gi − 256Mi
+		"--max-concurrent=1", "--nice=10", "--scratch-limit=2684354560", // its 2816Mi volume − 256Mi
 		"--worker-memory-limit=536870912"}, cat.Args) // 640Mi − 128Mi
 	require.Equal(t, col.Image, cat.Image)
 
@@ -245,16 +247,24 @@ func TestChart_AgentDaemonSetShape(t *testing.T) {
 			c.Resources.Limits.Cpu().String(), c.Resources.Limits.Memory().String()}
 	}
 	require.Equal(t, []string{"10m", "32Mi", "100m", "128Mi"}, res(col))
+	require.Equal(t, resource.MustParse("1Gi"), col.Resources.Requests[corev1.ResourceEphemeralStorage])
 	require.Equal(t, []string{"10m", "32Mi", "400m", "640Mi"}, res(cat))
 
 	ps := ds.Spec.Template.Spec
 	v := volumes(ps)
-	require.Equal(t, resource.MustParse("4Gi"), *v["scratch"].EmptyDir.SizeLimit)
+	require.EqualValues(t, int64(1342177280), v["stage"].EmptyDir.SizeLimit.Value(), "1Gi image + 256Mi")
+	require.EqualValues(t, int64(2952790016), v["catalog-scratch"].EmptyDir.SizeLimit.Value(), "4Gi − 1280Mi")
+	require.Equal(t, resource.MustParse("1Mi"), *v["heartbeat"].EmptyDir.SizeLimit)
 	require.NotNil(t, v["run"].EmptyDir)
 	require.Equal(t, "ffs-agent-ca", v["ca"].ConfigMap.Name)
 	require.Equal(t, corev1.VolumeMount{Name: "ca", MountPath: "/etc/ffs-agent/ca", ReadOnly: true}, mounts(col)["ca"])
-	require.Equal(t, "/scratch", mounts(col)["scratch"].MountPath)
+	require.Equal(t, corev1.VolumeMount{Name: "stage", MountPath: "/scratch/stage"}, mounts(col)["stage"])
+	require.Equal(t, corev1.VolumeMount{Name: "heartbeat", MountPath: "/run/ffs-agent"}, mounts(col)["heartbeat"])
 	require.Equal(t, "/run/ffs", mounts(col)["run"].MountPath)
+	require.Equal(t, corev1.VolumeMount{Name: "stage", MountPath: "/scratch/stage", ReadOnly: true}, mounts(cat)["stage"])
+	require.Equal(t, corev1.VolumeMount{Name: "catalog-scratch", MountPath: "/scratch/catalog"}, mounts(cat)["catalog-scratch"])
+	require.Equal(t, "/run/ffs", mounts(cat)["run"].MountPath)
+	require.NotContains(t, v, "scratch", "no volume is shared but the socket's")
 
 	require.Equal(t, []corev1.Toleration{{Operator: corev1.TolerationOpExists}}, ps.Tolerations)
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux"}, ps.NodeSelector)
@@ -269,11 +279,7 @@ func TestChart_AgentDaemonSetShape(t *testing.T) {
 	require.Equal(t, []string{"amd64", "arm64"}, arch(ps)[0].Values)
 	require.Equal(t, "system-node-critical", ps.PriorityClassName)
 
-	_, err := renderErr(t, "nodeAgent.scratchSizeLimit=1Gi", "nodeAgent.maxImageBytes=1Gi")
-	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit (1073741824 bytes) must exceed nodeAgent.maxImageBytes (1073741824 bytes) by more than 256Mi")
-	_, err = renderErr(t, "nodeAgent.scratchSizeLimit=768Mi", "nodeAgent.maxImageBytes=64Mi")
-	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit must be at least 1Gi: host inputs are staged up to 512Mi")
-	_, err = renderErr(t, "nodeAgent.port=8443")
+	_, err := renderErr(t, "nodeAgent.port=8443")
 	require.ErrorContains(t, err, "nodeAgent.port must not be one of the controller's other ports (8080, 8081, 8443)")
 }
 
@@ -599,4 +605,125 @@ func TestChart_AgentMemoryLimits(t *testing.T) {
 	cc = container(t, podSpec(t, "catalog.resources.limits=null"), "catalog")
 	require.Equal(t, "limits.memory", envOf(cc)["GOMEMLIMIT"].ValueFrom.ResourceFieldRef.Resource)
 	require.False(t, slices.ContainsFunc(cc.Args, func(a string) bool { return strings.HasPrefix(a, "--worker-memory-limit") }))
+}
+
+// TestChart_AgentScratchVolumes: nodeAgent.scratchSizeLimit is split between the collector's staging volume
+// and the cataloguer's own, and a total too small for both is refused.
+func TestChart_AgentScratchVolumes(t *testing.T) {
+	sizes := func(sets ...string) (stage, catalog int64, limit string) {
+		t.Helper()
+		ds := daemonSet(t, sets...)
+		v := volumes(ds.Spec.Template.Spec)
+		for _, a := range agentContainer(t, ds, "catalog").Args {
+			if l, ok := strings.CutPrefix(a, "--scratch-limit="); ok {
+				limit = l
+			}
+		}
+		return v["stage"].EmptyDir.SizeLimit.Value(), v["catalog-scratch"].EmptyDir.SizeLimit.Value(), limit
+	}
+	stage, catalog, limit := sizes("nodeAgent.maxImageBytes=16Mi", "nodeAgent.scratchSizeLimit=2Gi")
+	require.Equal(t, int64(805306368), stage, "host inputs (512Mi) outgrow a small image, + 256Mi")
+	require.Equal(t, int64(1342177280), catalog)
+	require.Equal(t, "1073741824", limit)
+
+	stage, catalog, limit = sizes("nodeAgent.maxImageBytes=2Gi", "nodeAgent.scratchSizeLimit=8Gi")
+	require.Equal(t, int64(2415919104), stage, "2Gi image + 256Mi")
+	require.Equal(t, int64(6174015488), catalog)
+	require.Equal(t, "5905580032", limit)
+
+	_, err := renderErr(t, "nodeAgent.scratchSizeLimit=1Gi", "nodeAgent.maxImageBytes=1Gi")
+	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit (1073741824 bytes) must be at least 1879048192 bytes: the staging volume "+
+		"takes nodeAgent.maxImageBytes or 512Mi, whichever is larger, plus 256Mi, and the cataloguer needs 512Mi to unpack images")
+	_, err = renderErr(t, "nodeAgent.scratchSizeLimit=1Gi", "nodeAgent.maxImageBytes=64Mi")
+	require.ErrorContains(t, err, "nodeAgent.scratchSizeLimit (1073741824 bytes) must be at least 1342177280 bytes")
+}
+
+// TestChart_AgentContainerdRoot: nodeAgent.hostPaths.containerdRoot moves the content store mount and the
+// collector's --content-store together, for any containerd distribution.
+func TestChart_AgentContainerdRoot(t *testing.T) {
+	for _, tc := range []struct {
+		root, dist string
+	}{
+		{"/var/lib/k0s/containerd", "containerd"},
+		{"/var/snap/microk8s/common/var/lib/containerd", "containerd"},
+		{"/data/containerd", "k3s"},
+	} {
+		ds := daemonSet(t, "nodeAgent.hostPaths.containerdRoot="+tc.root, "nodeAgent.distribution="+tc.dist)
+		store := tc.root + "/io.containerd.content.v1.content"
+		hm := hostMounts(t, ds)
+		require.Equal(t, "Directory", hm[store], tc.root)
+		for _, def := range []string{containerdStore, k3sStore} {
+			require.NotContains(t, hm, def, "the distribution's content store is not mounted as well")
+		}
+		require.Contains(t, agentContainer(t, ds, "collector").Args, "--content-store=/host"+store, tc.root)
+	}
+	require.Contains(t, hostMounts(t, daemonSet(t, "nodeAgent.hostPaths.containerdRoot=")), containerdStore, "empty uses the table")
+
+	for root, want := range map[string]string{
+		"var/lib/containerd":               "must be an absolute path to containerd's root directory",
+		"/var/lib/../../etc":               "must be an absolute path to containerd's root directory",
+		"/var/lib/containerd/./x":          "must be an absolute path to containerd's root directory",
+		"/var/lib/containerd with a space": "must be an absolute path to containerd's root directory",
+		"/run/containerd":                  "/run/containerd is not allowed; the agent never mounts it",
+		"/var/lib/kubelet":                 "/var/lib/kubelet is not allowed; the agent never mounts it",
+	} {
+		_, err := renderErr(t, "nodeAgent.hostPaths.containerdRoot="+root)
+		require.ErrorContains(t, err, "nodeAgent.hostPaths.containerdRoot", root)
+		require.ErrorContains(t, err, want, root)
+	}
+	_, err := renderErr(t, "nodeAgent.hostPaths.containerdRoot=/var/lib/k0s/containerd", "nodeAgent.distribution=crio")
+	require.ErrorContains(t, err, "nodeAgent.hostPaths.containerdRoot does not apply to crio")
+}
+
+// TestChart_AgentScratchRequest: the collector requests nodeAgent.scratchRequest of ephemeral storage, unless
+// its resources already say how much.
+func TestChart_AgentScratchRequest(t *testing.T) {
+	req := func(sets ...string) (resource.Quantity, bool) {
+		t.Helper()
+		q, ok := agentContainer(t, daemonSet(t, sets...), "collector").Resources.Requests[corev1.ResourceEphemeralStorage]
+		return q, ok
+	}
+	q, ok := req()
+	require.True(t, ok)
+	require.Equal(t, resource.MustParse("1Gi"), q)
+	q, _ = req("nodeAgent.scratchRequest=2Gi")
+	require.Equal(t, resource.MustParse("2Gi"), q)
+	q, _ = req("nodeAgent.resources.collector.requests.ephemeral-storage=3Gi")
+	require.Equal(t, resource.MustParse("3Gi"), q, "an explicit request wins")
+	_, ok = req("nodeAgent.scratchRequest=")
+	require.False(t, ok, "empty requests none")
+	_, ok = agentContainer(t, daemonSet(t), "catalog").Resources.Requests[corev1.ResourceEphemeralStorage]
+	require.False(t, ok, "the request is the collector's")
+}
+
+// TestChart_AgentUpdateStrategy: the agent DaemonSet replaces a tenth of its pods at a time by default.
+func TestChart_AgentUpdateStrategy(t *testing.T) {
+	ten := intstr.FromString("10%")
+	require.Equal(t, appsv1.DaemonSetUpdateStrategy{Type: appsv1.RollingUpdateDaemonSetStrategyType,
+		RollingUpdate: &appsv1.RollingUpdateDaemonSet{MaxUnavailable: &ten}}, daemonSet(t).Spec.UpdateStrategy)
+	five := intstr.FromInt32(5)
+	require.Equal(t, &five, daemonSet(t, "nodeAgent.updateStrategy.rollingUpdate.maxUnavailable=5").Spec.UpdateStrategy.RollingUpdate.MaxUnavailable)
+	ds := daemonSet(t, "nodeAgent.updateStrategy.type=OnDelete", "nodeAgent.updateStrategy.rollingUpdate=null")
+	require.Equal(t, appsv1.DaemonSetUpdateStrategy{Type: appsv1.OnDeleteDaemonSetStrategyType}, ds.Spec.UpdateStrategy)
+}
+
+// TestChart_AgentValueGuards: values that would render an invalid DaemonSet are refused with a clear message.
+func TestChart_AgentValueGuards(t *testing.T) {
+	for sets, want := range map[string]string{
+		"nodeAgent.hostPaths.extraBinDirs={/opt/bin,/opt/bin}": "nodeAgent.hostPaths.extraBinDirs: /opt/bin is listed twice",
+		"nodeAgent.hostPaths.extraBinDirs={/usr/bin}":          "nodeAgent.hostPaths.extraBinDirs: /usr/bin is searched already; list only other directories",
+		"nodeAgent.hostPaths.extraBinDirs={/usr/sbin}":         "nodeAgent.hostPaths.extraBinDirs: /usr/sbin is searched already",
+		"nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}":    "nodeAgent.hostPaths.extraBinDirs: /usr/local/bin is searched already",
+		"nodeAgent.architectures=null":                         "nodeAgent.architectures must list at least one node architecture",
+		"nodeAgent.architectures={}":                           "nodeAgent.architectures must list at least one node architecture",
+	} {
+		_, err := renderErr(t, strings.Split(sets, ";")...)
+		require.ErrorContains(t, err, want, sets)
+	}
+	// On image-based OSes /usr/local/bin is not mounted, so it may be listed.
+	hm := hostMounts(t, daemonSet(t, "nodeAgent.packageDatabases={}", "nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}"))
+	require.Equal(t, "Directory", hm["/usr/local/bin"])
+	ps := daemonSet(t, "nodeAgent.architectures={amd64,,arm64}").Spec.Template.Spec
+	require.Equal(t, []string{"amd64", "arm64"},
+		ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values)
 }

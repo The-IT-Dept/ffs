@@ -91,7 +91,7 @@ func TestAgentCmd_Flags(t *testing.T) {
 		"scratch":         "/scratch/stage",
 		"catalog-socket":  "/run/ffs/catalog.sock",
 		"max-image-bytes": "1073741824",
-		"heartbeat":       "/scratch/heartbeat",
+		"heartbeat":       "/run/ffs-agent/heartbeat",
 		"extra-bin-dir":   "[]",
 	} {
 		f := cmd.Flags().Lookup(flag)
@@ -104,7 +104,7 @@ func TestAgentCmd_Flags(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "check", check.Name())
 	require.True(t, check.Hidden)
-	for flag, def := range map[string]string{"heartbeat": "/scratch/heartbeat", "max-age": "15m0s"} {
+	for flag, def := range map[string]string{"heartbeat": "/run/ffs-agent/heartbeat", "max-age": "15m0s"} {
 		f := check.Flags().Lookup(flag)
 		require.NotNil(t, f, flag)
 		require.Equal(t, def, f.DefValue, flag)

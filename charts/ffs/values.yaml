@@ -135,9 +135,11 @@ nodeAgent:
   packageDatabases: auto
   # Extra host paths to read.
   hostPaths:
-    # Extra binary directories to scan, each under /usr or /opt.
+    # Extra binary directories to scan, each under /usr or /opt, listed once and not /usr/bin, /usr/sbin or /usr/local/bin.
     extraBinDirs: []
-  # Node architectures to schedule on; published images are amd64 only, so other architectures are skipped.
+    # containerd root directory (absolute), such as /var/lib/k0s/containerd for k0s; empty uses the distribution's.
+    containerdRoot: ""
+  # Node architectures to schedule on, at least one; published images are amd64 only, so other architectures are skipped.
   architectures: [amd64]
   # Node selector of the agent pods.
   nodeSelector:
@@ -157,8 +159,18 @@ nodeAgent:
     catalog:
       requests: {cpu: 10m, memory: 32Mi}
       limits: {cpu: 400m, memory: 640Mi}
-  # Size limit of the agent scratch volume.
+  # Total size limit of the agent's scratch volumes: the staging volume takes maxImageBytes or 512Mi, whichever is larger, plus 256Mi, and the cataloguer's the rest, at least 512Mi.
   scratchSizeLimit: 4Gi
+  # Ephemeral storage the collector requests for the scratch volumes, so pods are scheduled where staging fits; empty requests none.
+  scratchRequest: 1Gi
+  # DaemonSet update strategy; the default replaces a tenth of the agent pods at a time.
+  updateStrategy:
+    # RollingUpdate or OnDelete.
+    type: RollingUpdate
+    # Rolling update settings.
+    rollingUpdate:
+      # Agent pods replaced at once, as a number or a percentage of the nodes.
+      maxUnavailable: 10%
   # Largest image the agent catalogues, as a byte count or a quantity such as 1Gi.
   maxImageBytes: 1Gi
   # Port of the agent API on the controller.

@@ -259,25 +259,52 @@ dry run) it resolves as if there were no nodes.
 {{- end -}}
 
 {{- /*
-ffs.agentContentStore is the host path of the containerd content store of a distribution, "" for crio.
-The paths follow the agent's host-path table.
+ffs.agentContentStore is the host path of the containerd content store, "" for crio, from (dict "dist"
+<distribution> "root" <nodeAgent.hostPaths.containerdRoot>). An empty root uses the distribution's path from
+the agent's host-path table; a set root (k0s, MicroK8s or a custom containerd root) replaces it and must be an
+absolute path outside the directories the agent never mounts.
 */ -}}
 {{- define "ffs.agentContentStore" -}}
+{{- $root := toString (.root | default "") | trim -}}
+{{- if $root -}}
+{{- if or (not (regexMatch "^(/[A-Za-z0-9._+-]+)+$" $root)) (regexMatch "(^|/)\\.\\.?(/|$)" $root) -}}
+{{- fail (printf "nodeAgent.hostPaths.containerdRoot must be an absolute path to containerd's root directory, such as /var/lib/k0s/containerd, not %q" $root) -}}
+{{- end -}}
+{{- if regexMatch "^/(proc|sys|dev|run|var/run|var/lib/kubelet|etc/kubernetes|etc/rancher)(/|$)" $root -}}
+{{- fail (printf "nodeAgent.hostPaths.containerdRoot: %s is not allowed; the agent never mounts it" $root) -}}
+{{- end -}}
+{{- if eq .dist "crio" -}}
+{{- fail "nodeAgent.hostPaths.containerdRoot does not apply to crio, which has no containerd content store" -}}
+{{- end -}}
+{{- printf "%s/io.containerd.content.v1.content" $root -}}
+{{- else -}}
 {{- get (dict "containerd" "/var/lib/containerd/io.containerd.content.v1.content"
   "k3s" "/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content"
-  "rke2" "/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content") . -}}
+  "rke2" "/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content") .dist -}}
+{{- end -}}
 {{- end -}}
 
 {{- /*
-ffs.agentExtraBinDirs is nodeAgent.hostPaths.extraBinDirs as JSON, each checked to be a directory under
-/usr or /opt.
+ffs.agentExtraBinDirs is nodeAgent.hostPaths.extraBinDirs as JSON, from (dict "root" $ "imageBased" <bool>).
+Each must be a directory under /usr or /opt, listed once, and not one the chart mounts already (/usr/bin,
+/usr/sbin, and /usr/local/bin except on image-based OSes): two mounts at one path make the DaemonSet invalid.
 */ -}}
 {{- define "ffs.agentExtraBinDirs" -}}
+{{- $builtIn := list "/usr/bin" "/usr/sbin" -}}
+{{- if not .imageBased -}}
+{{- $builtIn = append $builtIn "/usr/local/bin" -}}
+{{- end -}}
 {{- $dirs := list -}}
-{{- range .Values.nodeAgent.hostPaths.extraBinDirs -}}
+{{- range .root.Values.nodeAgent.hostPaths.extraBinDirs -}}
 {{- $d := toString . -}}
 {{- if or (not (regexMatch "^/(usr|opt)(/[A-Za-z0-9._+-]+)+$" $d)) (contains ".." $d) -}}
 {{- fail (printf "nodeAgent.hostPaths.extraBinDirs: %s is not allowed; use a directory under /usr or /opt" $d) -}}
+{{- end -}}
+{{- if has $d $builtIn -}}
+{{- fail (printf "nodeAgent.hostPaths.extraBinDirs: %s is searched already; list only other directories" $d) -}}
+{{- end -}}
+{{- if has $d $dirs -}}
+{{- fail (printf "nodeAgent.hostPaths.extraBinDirs: %s is listed twice" $d) -}}
 {{- end -}}
 {{- $dirs = append $dirs $d -}}
 {{- end -}}
@@ -285,20 +312,43 @@ ffs.agentExtraBinDirs is nodeAgent.hostPaths.extraBinDirs as JSON, each checked 
 {{- end -}}
 
 {{- /*
-ffs.agentScratchLimit is the agent cataloguer's --scratch-limit: nodeAgent.scratchSizeLimit less
-nodeAgent.maxImageBytes (the staged image) and 256Mi of headroom, in bytes.
+ffs.agentArchitectures is nodeAgent.architectures as JSON, without empty entries (--set x={} gives [""]); it
+must name at least one architecture, or the DaemonSet's node affinity is invalid.
 */ -}}
-{{- define "ffs.agentScratchLimit" -}}
+{{- define "ffs.agentArchitectures" -}}
+{{- $archs := list -}}
+{{- range .Values.nodeAgent.architectures -}}
+{{- $a := toString . | trim -}}
+{{- if $a -}}
+{{- $archs = append $archs $a -}}
+{{- end -}}
+{{- end -}}
+{{- if not $archs -}}
+{{- fail "nodeAgent.architectures must list at least one node architecture, such as amd64" -}}
+{{- end -}}
+{{- toJson $archs -}}
+{{- end -}}
+
+{{- /*
+ffs.agentScratch sizes the agent's scratch volumes from nodeAgent.scratchSizeLimit, their total, as JSON
+{"stage", "catalog", "limit"} in bytes:
+- stage: the collector's staging volume, which the cataloguer mounts read-only. It holds the host inputs (up to
+  512Mi) or one image (up to nodeAgent.maxImageBytes), plus 256Mi for spooled SBOMs (up to 65Mi each: a job's
+  and a kept host inventory's) and file-system overhead.
+- catalog: the cataloguer's own volume, where it unpacks images: the rest, at least 512Mi.
+- limit: the cataloguer's --scratch-limit, its volume less 256Mi, so a job is stopped before the kubelet
+  evicts the pod.
+*/ -}}
+{{- define "ffs.agentScratch" -}}
 {{- $size := include "ffs.bytes" (list "nodeAgent.scratchSizeLimit" .Values.nodeAgent.scratchSizeLimit) | int64 -}}
 {{- $image := include "ffs.bytes" (list "nodeAgent.maxImageBytes" .Values.nodeAgent.maxImageBytes) | int64 -}}
-{{- if lt $size 1073741824 -}}
-{{- fail "nodeAgent.scratchSizeLimit must be at least 1Gi: host inputs are staged up to 512Mi" -}}
+{{- $stage := add (max $image 536870912) 268435456 -}}
+{{- $need := add $stage 536870912 -}}
+{{- if lt $size $need -}}
+{{- fail (printf "nodeAgent.scratchSizeLimit (%d bytes) must be at least %d bytes: the staging volume takes nodeAgent.maxImageBytes or 512Mi, whichever is larger, plus 256Mi, and the cataloguer needs 512Mi to unpack images" $size $need) -}}
 {{- end -}}
-{{- $limit := sub (sub $size $image) 268435456 -}}
-{{- if le $limit 0 -}}
-{{- fail (printf "nodeAgent.scratchSizeLimit (%d bytes) must exceed nodeAgent.maxImageBytes (%d bytes) by more than 256Mi: the agent stages an image and unpacks it in the same scratch volume" $size $image) -}}
-{{- end -}}
-{{- $limit -}}
+{{- $catalog := sub $size $stage -}}
+{{- toJson (dict "stage" $stage "catalog" $catalog "limit" (sub $catalog 268435456)) -}}
 {{- end -}}
 
 {{- /*

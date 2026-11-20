@@ -158,7 +158,7 @@ func TestDocs_NodeAgentListsEveryMount(t *testing.T) {
 
 // nodeAgentLeaves are the nodeAgent values documented as one row although they hold maps or lists.
 var nodeAgentLeaves = map[string]bool{"resources": true, "nodeSelector": true, "tolerations": true,
-	"tls.certManager.issuerRef": true, "hostPaths.extraBinDirs": true}
+	"tls.certManager.issuerRef": true, "hostPaths.extraBinDirs": true, "updateStrategy": true}
 
 // valuePaths returns the dotted paths of the leaves under m, prefix included.
 func valuePaths(prefix string, m map[string]any) []string {
@@ -183,7 +183,7 @@ func TestDocs_NodeAgentCoversEveryValue(t *testing.T) {
 	}
 	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../charts/ffs/values.yaml")), &values))
 	paths := valuePaths("", values.NodeAgent)
-	require.Len(t, paths, 28)
+	require.Len(t, paths, 31)
 	doc := readFile(t, "../../docs/node-agent.md")
 	for _, p := range paths {
 		require.Contains(t, doc, "`nodeAgent."+p+"`", "docs/node-agent.md does not describe nodeAgent.%s", p)

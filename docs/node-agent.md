@@ -30,6 +30,7 @@ Every host path is mounted read-only, without mount propagation, into the collec
 | `/var/lib/containerd/io.containerd.content.v1.content` | containerd | Cached images. |
 | `/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content` | k3s | Cached images. |
 | `/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content` | RKE2 | Cached images. |
+| `<nodeAgent.hostPaths.containerdRoot>/io.containerd.content.v1.content` | when set | Cached images, in place of the distribution's content store. |
 | each `nodeAgent.hostPaths.extraBinDirs` entry | when listed | Known host binaries in other directories, each under `/usr` or `/opt`. |
 
 In the bin directories the agent looks only for these binaries: `containerd`, `containerd-shim-runc-v2`, `runc`, `kubelet`, `k3s`, `rke2`, `crictl` and `crio`. Their Go modules are what ffs matches.
@@ -47,6 +48,8 @@ Only the running kernel's packages are matched. Other installed kernels are left
 
 The collector runs as UID 0 with every capability dropped, a read-only root filesystem, no privilege escalation and the RuntimeDefault seccomp profile, so it can read root-owned files but nothing else. The cataloguer runs as UID 65532 with no host mounts. The liveness probe runs `ffs agent check` in the collector and needs no port.
 
+The two containers share only the directory of the cataloguer's socket. The collector stages host inputs and images into its own volume, which the cataloguer mounts read-only; the cataloguer unpacks images into a volume of its own, which is also its workers' temporary directory; and the collector keeps its heartbeat on a small volume the cataloguer does not mount.
+
 ## Why a privileged namespace
 
 The baseline and restricted Pod Security Standards forbid `hostPath` volumes, and restricted also forbids UID 0. The agent namespace is therefore labelled `pod-security.kubernetes.io/enforce: privileged` (and `audit` and `warn`). It holds only the agent, and the ffs namespace stays restricted.
@@ -62,9 +65,11 @@ With `nodeAgent.createNamespace: false`, create the namespace yourself with thos
 
 The limits total 500m CPU and 768Mi memory per pod, and the steady-state target is under 256Mi of memory per pod. Beyond that:
 
-- a 4 GiB scratch volume (`nodeAgent.scratchSizeLimit`), cleaned after every job;
+- 4 GiB of scratch space (`nodeAgent.scratchSizeLimit`), cleaned after every job: a staging volume of `nodeAgent.maxImageBytes` or 512Mi, whichever is larger, plus 256Mi, and the cataloguer's volume for the rest;
+- a request for 1 GiB of ephemeral storage on the collector (`nodeAgent.scratchRequest`), so the scheduler places the agent only where staging fits and the kubelet counts it before evicting other pods for disk pressure;
 - one small report every 5 minutes, and a full report with the host SBOM every 6 hours;
-- one image catalogued at a time, at nice 10.
+- one image catalogued at a time, at nice 10;
+- upgrades that replace a tenth of the agent pods at a time (`nodeAgent.updateStrategy`), so a rollout across hundreds of nodes finishes within `helm --wait` and GitOps timeouts.
 
 The collector never holds an SBOM in memory. It streams the cataloguer's answer into a file on the scratch volume, checking on the way that it is JSON, and streams the report or SBOM result to the controller from that file, which it then deletes. Its memory use does not grow with the SBOM, which the cataloguer caps at 65 MiB (the controller's 64 MiB SBOM limit plus 1 MiB). `GOMEMLIMIT` is 90% of each container's memory limit, and the cataloguer's workers get its limit less 128Mi, which the catalog server keeps for itself. A full report over `nodeAgent.maxReportBytes` is sent without its host SBOM. Images larger than `nodeAgent.maxImageBytes` are not catalogued by the agent.
 
@@ -95,6 +100,11 @@ The first agent data on a cluster is a baseline: each AlertTarget gets one summa
 - **k3s**: the binaries under `/var/lib/rancher/k3s/data` and the content store under `/var/lib/rancher/k3s/agent/containerd`.
 - **RKE2**: the binaries through `/var/lib/rancher/rke2/bin`, RKE2's link to its current data directory, and the content store under `/var/lib/rancher/rke2/agent/containerd`. The link is followed when the collector container starts, so after an RKE2 upgrade or rollback the node reports the binaries RKE2 now runs once the collector restarts (for example with `kubectl rollout restart daemonset/ffs-agent -n ffs-agent`).
 - **CRI-O** (`crio`): nodes report host packages and binaries, but there is no containerd content store, so side-loaded images cannot be catalogued from them. Each node shows `no containerd content store on this node; side-loaded images cannot be catalogued from it`.
+- **Other containerd roots.** k0s, MicroK8s and custom installs keep containerd elsewhere. The content store mount must exist, or the agent pods never start, so set `nodeAgent.hostPaths.containerdRoot` to containerd's root directory (the agent reads `io.containerd.content.v1.content` under it):
+  - k0s: `--set nodeAgent.hostPaths.containerdRoot=/var/lib/k0s/containerd`. k0s reports a `+k0s` kubelet version, which `auto` reads as containerd.
+  - MicroK8s: `--set nodeAgent.hostPaths.containerdRoot=/var/snap/microk8s/common/var/lib/containerd`.
+
+  The path must be absolute, and the chart refuses system directories such as `/run` and `/var/lib/kubelet`. It applies to every node the DaemonSet runs on, and not to `crio`.
 
 In a cluster with mixed distributions, `auto` uses the most common one, and the content store and data directory mounts must exist on every node the DaemonSet runs on. Set `nodeAgent.distribution` and `nodeAgent.nodeSelector` to match one kind of node, or install one release per node pool.
 
@@ -145,13 +155,16 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.createNamespace` | `true` | Create the agent namespace with the privileged Pod Security labels. |
 | `nodeAgent.distribution` | `auto` | Host path layout: `auto`, `containerd`, `k3s`, `rke2` or `crio`. |
 | `nodeAgent.packageDatabases` | `auto` | Package databases to mount: `auto`, or a list of `dpkg`, `rpm` and `apk`. An empty list means an image-based OS. |
-| `nodeAgent.hostPaths.extraBinDirs` | `[]` | Extra host directories searched for the known binaries, each under `/usr` or `/opt`. |
-| `nodeAgent.architectures` | `[amd64]` | Node architectures the DaemonSet schedules on. |
+| `nodeAgent.hostPaths.extraBinDirs` | `[]` | Extra host directories searched for the known binaries, each under `/usr` or `/opt`, listed once, and not `/usr/bin`, `/usr/sbin` or `/usr/local/bin`, which are searched already. |
+| `nodeAgent.hostPaths.containerdRoot` | `""` | containerd's root directory, for k0s, MicroK8s or a custom root, such as `/var/lib/k0s/containerd`; the content store under it replaces the distribution's. Empty uses the distribution's. See [Distributions](#distributions). |
+| `nodeAgent.architectures` | `[amd64]` | Node architectures the DaemonSet schedules on; at least one. |
 | `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods. |
 | `nodeAgent.tolerations` | `[{operator: Exists}]` | Tolerations of the agent pods; the default runs on every node. |
 | `nodeAgent.priorityClassName` | `""` | Priority class of the agent pods. |
 | `nodeAgent.resources` | see [Footprint](#footprint) | Requests and limits of the `collector` and `catalog` containers. Memory limits are byte counts or whole quantities such as `640Mi`: `GOMEMLIMIT` is 90% of each, and the cataloguer's workers get its limit less 128Mi, so it must be at least 192Mi. |
-| `nodeAgent.scratchSizeLimit` | `4Gi` | Size limit of the scratch volume; at least 1Gi, and more than `nodeAgent.maxImageBytes` plus 256Mi. |
+| `nodeAgent.scratchSizeLimit` | `4Gi` | Total size limit of the agent's scratch volumes. The staging volume takes `nodeAgent.maxImageBytes` or 512Mi, whichever is larger, plus 256Mi, and the cataloguer's volume the rest, which must be at least 512Mi. |
+| `nodeAgent.scratchRequest` | `1Gi` | Ephemeral storage the collector requests for the scratch volumes. An `ephemeral-storage` request in `nodeAgent.resources.collector` takes precedence; empty requests none. |
+| `nodeAgent.updateStrategy` | `{type: RollingUpdate, rollingUpdate: {maxUnavailable: 10%}}` | Update strategy of the agent DaemonSet. |
 | `nodeAgent.maxImageBytes` | `1Gi` | Largest image the agent catalogues. |
 | `nodeAgent.port` | `8444` | Port of the agent API on the controller; not 8080, 8081 or 8443. |
 | `nodeAgent.exposedNodes` | `""` | Node label selector; host findings on matching nodes count as exposed. |
