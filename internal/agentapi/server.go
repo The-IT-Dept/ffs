@@ -65,11 +65,14 @@ type ServerOptions struct {
 	SBOMs           SBOMHandler             // nil: /agent/v1/sbom is not served
 	Config          func() wire.AgentConfig // nil: /agent/v1/config is not served
 	Log             logr.Logger
-	Now             func() time.Time // certificate reload clock; nil: time.Now
+	Now             func() time.Time // certificate reload and rate-limit clock; nil: time.Now
 }
 
 // Server serves /agent/v1 over TLS on the leader.
-type Server struct{ o ServerOptions }
+type Server struct {
+	o     ServerOptions
+	fails *failLimiter // failed authentications per source IP
+}
 
 // NewServer returns the agent API server.
 func NewServer(o ServerOptions) *Server {
@@ -82,7 +85,7 @@ func NewServer(o ServerOptions) *Server {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Server{o: o}
+	return &Server{o: o, fails: newFailLimiter()}
 }
 
 // NeedLeaderElection makes the agent API leader-only: reports write the leader's store.
@@ -226,10 +229,18 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// authenticate checks the bearer token, answering the request itself when it fails.
+// authenticate checks the bearer token, answering the request itself when it fails. A source IP whose
+// failed authentications exceed its token bucket gets 429, and its tokens are not reviewed until it refills.
 func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity, bool) {
+	ip, now := sourceIP(r), s.o.Now()
+	if s.fails.limited(ip, now) {
+		w.Header().Set("Retry-After", "1")
+		writeError(w, http.StatusTooManyRequests, "too many failed authentications")
+		return Identity{}, false
+	}
 	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok || strings.TrimSpace(token) == "" {
+		s.fails.fail(ip, now)
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "unauthenticated")
 		return Identity{}, false
@@ -237,6 +248,7 @@ func (s *Server) authenticate(w http.ResponseWriter, r *http.Request) (Identity,
 	id, err := s.o.Auth.Authenticate(r.Context(), strings.TrimSpace(token))
 	switch {
 	case errors.Is(err, ErrUnauthenticated):
+		s.fails.fail(ip, now)
 		s.o.Log.V(1).Info("agent token rejected", "reason", err.Error(), "remote", r.RemoteAddr)
 		w.Header().Set("WWW-Authenticate", "Bearer")
 		writeError(w, http.StatusUnauthorized, "unauthenticated")
