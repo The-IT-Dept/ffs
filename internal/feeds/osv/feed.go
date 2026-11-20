@@ -49,14 +49,25 @@ const (
 	setDiffInterval  = 7 * 24 * time.Hour
 	retention        = 14 * 24 * time.Hour
 
-	metaWatermark   = "wm."   // + bucket: RFC 3339 time of the newest row handed off
-	metaGeneration  = "gen."  // + bucket: x-goog-generation of modified_id.csv when last read
-	metaBootstrap   = "boot." // + bucket (Go, GIT): when all.zip was loaded
-	metaRecordBytes = "size." // + bucket: average uncompressed size of its records, measured
-	metaMalicious   = "mal."  // + language bucket: when all of its MAL- records were loaded
+	metaWatermark   = "wm."        // + bucket: RFC 3339 time of the newest row handed off
+	metaGeneration  = "gen."       // + bucket: x-goog-generation of modified_id.csv when last read
+	metaBootstrap   = "boot."      // + bucket (Go, GIT): when all.zip was loaded
+	metaRecordBytes = "size."      // + bucket: average uncompressed size of its records, measured
+	metaMalicious   = "mal."       // + language bucket: when all of its MAL- records were loaded
+	metaZipBehind   = "zipbehind." // + bucket: when its all.zip was first seen older than modified_id.csv
 	metaGitRepos    = "repos.GIT"
 	metaSetDiff     = "setdiff"
 )
+
+// zipBehindWait is how long polls of a bucket wait for its all.zip to catch up with its
+// modified_id.csv. The OSV exporter uploads all.zip seconds after the listing; a zip still behind
+// after this (a mirror that refreshes it less often) is read anyway, and what it lacks is read one
+// record at a time.
+const zipBehindWait = 30 * time.Minute
+
+// errZipBehind means a bucket's all.zip is older than the modified_id.csv being polled: the poll
+// waits for the next one rather than read records the zip may not hold yet.
+var errZipBehind = errors.New("osv: all.zip is older than modified_id.csv")
 
 // maxZipBytes bounds a download of all of all.zip. A bigger one is read with Range requests or one
 // GET per record instead. A variable so tests can lower it.
@@ -224,14 +235,13 @@ func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string)
 	for _, id := range cached {
 		have[id] = true
 	}
-	var ids []string
-	for id := range listed {
+	want := map[string]time.Time{}
+	for id, modified := range listed {
 		if strings.HasPrefix(id, "MAL-") && !have[id] {
-			ids = append(ids, id)
+			want[id] = modified
 		}
 	}
-	slices.Sort(ids)
-	changed, takeErr := f.take(ctx, st, b, ids)
+	changed, takeErr := f.take(ctx, st, b, want, "")
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
@@ -279,8 +289,7 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 	}
 	wm := f.watermark(*st, b)
 	newest := wm
-	seen := map[string]bool{}
-	var ids []string
+	want := map[string]time.Time{} // ID → modified time of its newest row
 	for {
 		stop := false
 		for _, row := range rows {
@@ -291,11 +300,10 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 				stop = true
 				break
 			}
-			if row.id == "" || SkipID(b, row.id) || seen[row.id] {
+			if _, dup := want[row.id]; row.id == "" || SkipID(b, row.id) || dup {
 				continue
 			}
-			seen[row.id] = true
-			ids = append(ids, row.id)
+			want[row.id] = row.ts
 		}
 		if stop || rd.done {
 			break
@@ -305,7 +313,11 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		}
 	}
 
-	changed, takeErr := f.take(ctx, st, b, ids)
+	changed, takeErr := f.take(ctx, st, b, want, rd.gen)
+	if errors.Is(takeErr, errZipBehind) { // nothing taken; the listing is read again next time
+		logr.FromContextOrDiscard(ctx).V(1).Info("OSV all.zip is older than modified_id.csv; polling again next time", "bucket", b)
+		return f.save(ctx, st)
+	}
 	if err := f.handOff(ctx, st, changed); err != nil {
 		return errors.Join(takeErr, err)
 	}
@@ -316,6 +328,7 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
 	}
 	setMeta(st, metaGeneration+b, rd.gen)
+	delete(st.Meta, metaZipBehind+b)
 	return f.save(ctx, st)
 }
 
@@ -327,20 +340,26 @@ func (f *Feed) watermark(st store.FeedState, b string) time.Time {
 	return f.o.Now().UTC().Add(-firstPollWindow)
 }
 
-// take fetches and caches the records ids of b, returning the ones to hand off: those whose
-// affected hash changed and dropped GIT records (see put); on an error, those so far, which the
-// caller still hands off. It reads them the cheapest way (see choose): one GET each, Range reads of
-// their entries in all.zip, or all of all.zip. Every candidate is pending while the cache is
+// take fetches and caches the records of b that want names, returning the ones to hand off: those
+// whose affected hash changed and dropped GIT records (see put); on an error, those so far, which
+// the caller still hands off. want maps each ID to the modified time modified_id.csv lists for it
+// (zero: not known). It reads them the cheapest way (see choose): one GET each, Range reads of
+// their entries in all.zip, or all of all.zip. all.zip can be an export older than the listing, so
+// an entry older than its listed time, or a listed record the zip lacks, is then read with one GET:
+// record files are uploaded before the listing. When csvGen and the zip's generation show the zip
+// is older than the listing, take returns errZipBehind instead, having read nothing, until the zip
+// has been behind for zipBehindWait (see plan). Every candidate is pending while the cache is
 // written, so a crash between a record's write and its hand-off cannot lose it.
-func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []string) ([]recKey, error) {
-	if len(ids) == 0 {
+func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map[string]time.Time, csvGen string) ([]recKey, error) {
+	if len(want) == 0 {
 		return nil, nil
 	}
+	ids := slices.Sorted(maps.Keys(want))
 	gitCached, err := f.gitCached(ctx, b)
 	if err != nil {
 		return nil, err
 	}
-	how, probe, err := f.plan(ctx, *st, b, len(ids))
+	how, probe, err := f.plan(ctx, st, b, len(ids), csvGen)
 	if err != nil {
 		return nil, err
 	}
@@ -353,16 +372,10 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []st
 		return nil, err
 	}
 
-	want := func() map[string]bool {
-		m := make(map[string]bool, len(ids))
-		for _, id := range ids {
-			m[id] = true
-		}
-		return m
-	}
 	var (
-		out   []recKey
-		sizes sizeStats
+		out    []recKey
+		stats  readStats
+		behind []string // listed records the zip held only an older version of, or lacked
 	)
 	switch how {
 	case wholeZip:
@@ -371,20 +384,42 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, ids []st
 			return nil, err
 		}
 		defer func() { _ = os.Remove(path) }()
-		out, sizes, err = f.storeZip(ctx, b, path, want(), gitCached)
+		out, stats, behind, err = f.storeZip(ctx, b, path, want, gitCached)
 	case rangedZip:
-		out, sizes, err = f.storeRanged(ctx, b, probe, want(), gitCached)
+		out, stats, behind, err = f.storeRanged(ctx, b, probe, want, gitCached)
 	default:
-		out, sizes, err = f.storeRecords(ctx, b, ids, gitCached)
+		out, stats, err = f.storeRecords(ctx, b, ids, gitCached)
 	}
-	learnRecordBytes(st, b, sizes)
+	if err == nil && len(behind) > 0 {
+		logr.FromContextOrDiscard(ctx).Info("OSV all.zip is older than modified_id.csv for some records; reading them one at a time",
+			"bucket", b, "records", len(behind))
+		var (
+			more  []recKey
+			extra readStats
+		)
+		more, extra, err = f.storeRecords(ctx, b, behind, gitCached)
+		out = append(out, more...)
+		stats.n, stats.bytes = stats.n+extra.n, stats.bytes+extra.bytes
+	}
+	learnRecordBytes(st, b, stats)
 	return out, err
 }
 
+// zipBehind reports whether all.zip, of version zipVersion, is known to be older than the
+// modified_id.csv of generation csvGen: both are GCS generations (object creation times in
+// microseconds) and the zip's is the smaller. A version that is not a generation (an ETag) proves
+// nothing.
+func zipBehind(zipVersion, csvGen string) bool {
+	z, zerr := strconv.ParseInt(zipVersion, 10, 64)
+	c, cerr := strconv.ParseInt(csvGen, 10, 64)
+	return zerr == nil && cerr == nil && z < c
+}
+
 // plan picks how take reads n records of b. all.zip is probed only when one GET per record looks
-// expensive; a bucket without all.zip is read one GET per record.
-func (f *Feed) plan(ctx context.Context, st store.FeedState, b string, n int) (transport, zipProbe, error) {
-	recordBytes := recordBytesOf(st, b)
+// expensive; a bucket without all.zip is read one GET per record. A zip older than the listing of
+// generation csvGen (see zipBehind) gives errZipBehind, until it has been behind for zipBehindWait.
+func (f *Feed) plan(ctx context.Context, st *store.FeedState, b string, n int, csvGen string) (transport, zipProbe, error) {
+	recordBytes := recordBytesOf(*st, b)
 	if int64(n)*(recordBytes+requestOverhead) <= probeAbove {
 		return perRecord, zipProbe{}, nil
 	}
@@ -395,16 +430,36 @@ func (f *Feed) plan(ctx context.Context, st store.FeedState, b string, n int) (t
 	case err != nil:
 		return perRecord, p, err
 	}
+	if zipBehind(p.version, csvGen) {
+		now := f.o.Now().UTC()
+		since, err := time.Parse(time.RFC3339, st.Meta[metaZipBehind+b])
+		if err != nil {
+			since = now
+			st.Meta[metaZipBehind+b] = now.Format(time.RFC3339)
+		}
+		if now.Sub(since) < zipBehindWait {
+			return perRecord, p, errZipBehind
+		}
+	}
 	how := choose(n, recordBytes, p)
 	logr.FromContextOrDiscard(ctx).V(1).Info("reading OSV records", "bucket", b, "records", n, "transport", how.String(),
 		"recordBytes", recordBytes, "zipBytes", p.size, "rangeReads", p.ranged)
 	return how, p, nil
 }
 
-// sizeStats sums the uncompressed sizes of the records a take read.
-type sizeStats struct{ n, bytes int64 }
+// readStats sums the uncompressed sizes of the records a take read, and keeps the newest modified
+// time among them.
+type readStats struct {
+	n, bytes int64
+	newest   time.Time
+}
 
-func (s *sizeStats) add(n int) { s.n, s.bytes = s.n+1, s.bytes+int64(n) }
+func (s *readStats) add(n int, modified time.Time) {
+	s.n, s.bytes = s.n+1, s.bytes+int64(n)
+	if modified.After(s.newest) {
+		s.newest = modified
+	}
+}
 
 // recordBytesOf returns the measured average record size of b, or defaultRecordBytes.
 func recordBytesOf(st store.FeedState, b string) int64 {
@@ -416,7 +471,7 @@ func recordBytesOf(st store.FeedState, b string) int64 {
 
 // learnRecordBytes folds the sizes a take read into b's average, weighting a read of 100 records or
 // more fully. The caller saves st.
-func learnRecordBytes(st *store.FeedState, b string, s sizeStats) {
+func learnRecordBytes(st *store.FeedState, b string, s readStats) {
 	if s.n == 0 {
 		return
 	}
@@ -429,10 +484,10 @@ func learnRecordBytes(st *store.FeedState, b string, s sizeStats) {
 }
 
 // storeRecords GETs the records ids of b, fetchChunk at a time, and caches each (see put).
-func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCached map[string]bool) ([]recKey, sizeStats, error) {
+func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCached map[string]bool) ([]recKey, readStats, error) {
 	var (
 		out   []recKey
-		sizes sizeStats
+		sizes readStats
 	)
 	for chunk := range slices.Chunk(ids, fetchChunk) {
 		raws, err := f.fetchRecords(ctx, b, chunk)
@@ -443,8 +498,8 @@ func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCach
 			if raw == nil {
 				continue
 			}
-			sizes.add(len(raw))
-			res, err := f.put(ctx, b, chunk[i], raw, gitCached)
+			res, modified, err := f.put(ctx, b, chunk[i], raw, gitCached, time.Time{})
+			sizes.add(len(raw), modified)
 			if err != nil {
 				return out, sizes, err
 			}
@@ -457,26 +512,33 @@ func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCach
 }
 
 // storeRanged reads the entries of the probed all.zip of b that want names with Range requests,
-// rangedChunk at a time, and caches each (see put).
-func (f *Feed) storeRanged(ctx context.Context, b string, p zipProbe, want, gitCached map[string]bool) ([]recKey, sizeStats, error) {
+// rangedChunk at a time, and caches each (see put). It also returns, sorted, the IDs want names
+// that the zip lacks or holds only in a version older than want's time (see put).
+func (f *Feed) storeRanged(ctx context.Context, b string, p zipProbe, want map[string]time.Time, gitCached map[string]bool) ([]recKey, readStats, []string, error) {
 	log := logr.FromContextOrDiscard(ctx)
-	var sizes sizeStats
+	var sizes readStats
 	z, err := openRemoteZip(ctx, f.o.HTTP, f.bucketURL(b, "all.zip"), p)
 	if err != nil {
-		return nil, sizes, err
+		return nil, sizes, nil, err
 	}
 	var files []*zip.File
+	found := make(map[string]bool, len(want))
 	for _, zf := range z.zr.File {
 		id := zipEntryID(b, zf, want)
 		switch {
 		case id == "":
 		case zf.UncompressedSize64 > maxRecordBytes:
+			found[id] = true
 			log.Info("skipping an oversized OSV record", "bucket", b, "id", id)
 		default:
+			found[id] = true
 			files = append(files, zf)
 		}
 	}
-	var out []recKey
+	var (
+		out    []recKey
+		behind []string
+	)
 	for chunk := range slices.Chunk(files, rangedChunk) {
 		raws := make([][]byte, len(chunk))
 		g, gctx := errgroup.WithContext(ctx)
@@ -492,21 +554,35 @@ func (f *Feed) storeRanged(ctx context.Context, b string, p zipProbe, want, gitC
 			})
 		}
 		if err := g.Wait(); err != nil {
-			return out, sizes, fmt.Errorf("osv: %s all.zip: %w", b, err)
+			return out, sizes, nil, fmt.Errorf("osv: %s all.zip: %w", b, err)
 		}
 		for i, raw := range raws {
-			sizes.add(len(raw))
 			id := strings.TrimSuffix(chunk[i].Name, ".json")
-			res, err := f.put(ctx, b, id, raw, gitCached)
+			res, modified, err := f.put(ctx, b, id, raw, gitCached, want[id])
+			sizes.add(len(raw), modified)
 			if err != nil {
-				return out, sizes, err
+				return out, sizes, nil, err
 			}
-			if res == putChanged || res == putDropped {
+			switch res {
+			case putChanged, putDropped:
 				out = append(out, recKey{b, id})
+			case putStale:
+				behind = append(behind, id)
 			}
 		}
 	}
-	return out, sizes, nil
+	return out, sizes, lacking(want, found, behind), nil
+}
+
+// lacking returns behind plus the IDs want names that found does not, sorted.
+func lacking(want map[string]time.Time, found map[string]bool, behind []string) []string {
+	for id := range want {
+		if !found[id] {
+			behind = append(behind, id)
+		}
+	}
+	slices.Sort(behind)
+	return behind
 }
 
 // gitCached returns the IDs held in the GIT cache when b is GIT, else nil. put needs them to notice
@@ -560,13 +636,17 @@ const (
 	putUnchanged                  // cached, with the affected hash it already had
 	putChanged                    // new, or its affected hash changed; its index names were rewritten
 	putDropped                    // a cached GIT record that no longer references a GitRepos repository
+	putStale                      // older than the version the listing names: not cached
 )
 
-// put caches one record of b. A GIT record that references no GitRepos repository is skipped,
+// put caches one record of b and returns its modified time. A record older than notBefore (when
+// set: the time modified_id.csv lists for it, compared to the second) is an older version than the
+// listing names, read from an all.zip behind it: it is not cached (putStale), and the caller reads
+// the record again directly. A GIT record that references no GitRepos repository is skipped,
 // unless the GIT cache holds it (gitCached): its repository mapping changed, and the cached copy
 // would keep matching the old repository for good. The new raw then replaces the cached one with
 // no index names, and deliverKeys hands it off and deletes it from the cache.
-func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[string]bool) (putResult, error) {
+func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[string]bool, notBefore time.Time) (putResult, time.Time, error) {
 	info, err := parseRecord(raw)
 	if err == nil && info.ID != id {
 		err = fmt.Errorf("osv: record %s has id %q", id, info.ID)
@@ -577,26 +657,29 @@ func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[
 	}
 	if err != nil {
 		logr.FromContextOrDiscard(ctx).Info("skipping an unreadable OSV record", "bucket", b, "id", id, "error", err.Error())
-		return putSkipped, nil
+		return putSkipped, time.Time{}, nil
 	}
 	modified := info.modified(f.o.Now().UTC())
+	if !notBefore.IsZero() && modified.Truncate(time.Second).Before(notBefore.Truncate(time.Second)) {
+		return putStale, modified, nil
+	}
 	if b == BucketGIT && !f.tracked(info) {
 		if !gitCached[id] {
-			return putSkipped, nil
+			return putSkipped, modified, nil
 		}
 		if _, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw); err != nil {
-			return putSkipped, err
+			return putSkipped, modified, err
 		}
-		return putDropped, f.o.Store.PutOSVRecordNames(ctx, b, id, nil)
+		return putDropped, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, nil)
 	}
 	changed, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw)
 	switch {
 	case err != nil:
-		return putSkipped, err
+		return putSkipped, modified, err
 	case !changed:
-		return putUnchanged, nil
+		return putUnchanged, modified, nil
 	}
-	return putChanged, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
+	return putChanged, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
 }
 
 // tracked reports whether a GIT record references one of the GitRepos repositories.
@@ -619,10 +702,12 @@ func (f *Feed) downloadZip(ctx context.Context, b string) (string, error) {
 
 // zipEntryID returns the record ID of zf, an entry of b's all.zip, when it is a plain "<id>.json"
 // file that want names (every one when want is nil) and not a notice; else "".
-func zipEntryID(b string, zf *zip.File, want map[string]bool) string {
+func zipEntryID(b string, zf *zip.File, want map[string]time.Time) string {
 	id, ok := strings.CutSuffix(zf.Name, ".json")
-	if !ok || id == "" || strings.ContainsAny(zf.Name, `/\`) || !zf.Mode().IsRegular() ||
-		(want != nil && !want[id]) || SkipID(b, id) {
+	if !ok || id == "" || strings.ContainsAny(zf.Name, `/\`) || !zf.Mode().IsRegular() || SkipID(b, id) {
+		return ""
+	}
+	if _, wanted := want[id]; want != nil && !wanted {
 		return ""
 	}
 	return id
@@ -631,41 +716,54 @@ func zipEntryID(b string, zf *zip.File, want map[string]bool) string {
 // storeZip caches the records in the all.zip at path: those named in want, or every record when
 // want is nil. It returns the records to hand off: the changed and dropped ones (see put), or with
 // want nil (a bootstrap, which may be re-running after a crash) every cached one, including on an
-// error those so far. Entries other than plain "<id>.json" files of at most 4 MiB are ignored.
-func (f *Feed) storeZip(ctx context.Context, b, path string, want, gitCached map[string]bool) ([]recKey, sizeStats, error) {
-	var sizes sizeStats
+// error those so far. With want set it also returns, sorted, the IDs want names that the zip lacks
+// or holds only in a version older than want's time (see put). Entries other than plain
+// "<id>.json" files of at most 4 MiB are ignored.
+func (f *Feed) storeZip(ctx context.Context, b, path string, want map[string]time.Time, gitCached map[string]bool) ([]recKey, readStats, []string, error) {
+	var sizes readStats
 	zr, err := zip.OpenReader(path)
 	if err != nil {
-		return nil, sizes, fmt.Errorf("osv: %s all.zip: %w", b, err)
+		return nil, sizes, nil, fmt.Errorf("osv: %s all.zip: %w", b, err)
 	}
 	defer func() { _ = zr.Close() }()
-	var out []recKey
+	var (
+		out    []recKey
+		behind []string
+	)
+	found := make(map[string]bool, len(want))
 	for _, zf := range zr.File {
 		if err := ctx.Err(); err != nil {
-			return out, sizes, err
+			return out, sizes, nil, err
 		}
 		id := zipEntryID(b, zf, want)
 		if id == "" {
 			continue
 		}
+		found[id] = true
 		raw, err := readEntry(zf)
 		if errors.Is(err, feeds.ErrTooLarge) {
 			logr.FromContextOrDiscard(ctx).Info("skipping an oversized OSV record", "bucket", b, "id", id)
 			continue
 		}
 		if err != nil {
-			return out, sizes, fmt.Errorf("osv: %s all.zip %s: %w", b, zf.Name, err)
+			return out, sizes, nil, fmt.Errorf("osv: %s all.zip %s: %w", b, zf.Name, err)
 		}
-		sizes.add(len(raw))
-		res, err := f.put(ctx, b, id, raw, gitCached)
+		res, modified, err := f.put(ctx, b, id, raw, gitCached, want[id])
+		sizes.add(len(raw), modified)
 		if err != nil {
-			return out, sizes, err
+			return out, sizes, nil, err
 		}
-		if res == putChanged || res == putDropped || (want == nil && res == putUnchanged) {
+		switch {
+		case res == putChanged || res == putDropped || (want == nil && res == putUnchanged):
 			out = append(out, recKey{b, id})
+		case res == putStale:
+			behind = append(behind, id)
 		}
 	}
-	return out, sizes, nil
+	if want == nil {
+		return out, sizes, nil, nil
+	}
+	return out, sizes, lacking(want, found, behind), nil
 }
 
 // readEntry reads a zip entry of at most maxRecordBytes.
@@ -691,7 +789,9 @@ func readEntry(zf *zip.File) ([]byte, error) {
 // bootstrap loads all of Go or GIT from all.zip (GIT filtered to GitRepos) and hands off every kept
 // record, and, on a GIT reload, every cached one the filter now drops. The watermark is the newest
 // modified_id.csv row read before the download, or now for an empty listing, so polling resumes
-// with nothing missed.
+// with nothing missed. all.zip can be an export older than that listing (the exporter uploads it
+// after modified_id.csv): the watermark is then the newest record the zip held, and the listing's
+// generation is not recorded, so the next poll reads what the zip lacked.
 func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) error {
 	now := f.o.Now().UTC()
 	rd := newCSVReader(f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
@@ -712,15 +812,19 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 		return err
 	}
 	defer func() { _ = os.Remove(path) }()
-	keys, _, err := f.storeZip(ctx, b, path, nil, gitCached)
+	keys, read, _, err := f.storeZip(ctx, b, path, nil, gitCached)
 	if err != nil {
 		return err
+	}
+	gen := rd.gen
+	if !read.newest.IsZero() && read.newest.Before(wm) {
+		wm, gen = read.newest, ""
 	}
 	// The load is complete: record it with the records pending in one write, so a handler failure
 	// redelivers them without downloading all.zip again.
 	st.Meta[metaBootstrap+b] = now.Format(time.RFC3339)
 	st.Meta[metaWatermark+b] = wm.Format(time.RFC3339Nano)
-	setMeta(st, metaGeneration+b, rd.gen)
+	setMeta(st, metaGeneration+b, gen)
 	if b == BucketGIT {
 		st.Meta[metaGitRepos] = f.reposKey
 	}
@@ -841,7 +945,7 @@ func (f *Feed) setDiff(ctx context.Context, st *store.FeedState, buckets []strin
 		}
 		cached[b] = map[string]bool{}
 		for _, id := range ids {
-			if listed[id] {
+			if _, ok := listed[id]; ok {
 				cached[b][id] = true
 			} else {
 				vanished[b] = append(vanished[b], id)

@@ -38,6 +38,10 @@ type fakeBucket struct {
 	records map[string][]byte // served as <id>.json and inside all.zip
 	noRange bool              // all.zip ignores Range headers
 	zip     []byte            // all.zip, built on first request
+	// zipRecords, when set, is what all.zip holds instead of records: an export older than the
+	// listing and the record files. zipGen, when set, is all.zip's x-goog-generation instead of gen.
+	zipRecords map[string][]byte
+	zipGen     string
 }
 
 // bucketServer serves <bucket>/modified_id.csv (with Range support), <bucket>/<id>.json and
@@ -85,13 +89,20 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	csv, gen := fb.csv, fb.gen
 	records := maps.Clone(fb.records)
+	if file == "all.zip" && fb.zipGen != "" {
+		gen = fb.zipGen
+	}
 	if rg := r.Header.Get("Range"); rg != "" && file == "modified_id.csv" {
 		s.ranges[b] = append(s.ranges[b], rg)
 	}
 	var zipped []byte
 	if file == "all.zip" {
 		if fb.zip == nil {
-			fb.zip = zipOf(records)
+			src := records
+			if fb.zipRecords != nil {
+				src = fb.zipRecords
+			}
+			fb.zip = zipOf(src)
 		}
 		zipped = fb.zip
 		if r.Header.Get("Range") == "" || fb.noRange {
@@ -992,4 +1003,177 @@ func TestOSVRetention_KeepsMaliciousRecords(t *testing.T) {
 
 	require.NoError(t, e.feed().Sync(ctx))
 	require.Equal(t, []string{"MAL-2025-0001"}, e.ids(t, "npm"))
+}
+
+// laggingPyPI sets up a PyPI bucket whose all.zip is the export before the newest one, as the OSV
+// exporter leaves it for a few seconds after uploading modified_id.csv: changed records were changed
+// again (stale in the zip) and one record is new (absent from it). It returns the IDs the newest
+// export changed. n records changed at t1, the zip holds them; total is the bucket's size.
+func laggingPyPI(e *env, total, n int, gen, zipGen string) (t1, t2 time.Time, newest []string) {
+	t0, t1, t2 := now.Add(-48*time.Hour), now.Add(-30*time.Minute), now.Add(-time.Minute)
+	records, zipped := map[string][]byte{}, map[string][]byte{}
+	var top, mid, old []row
+	for i := range total {
+		id := fmt.Sprintf("PYSEC-2026-%05d", i)
+		switch {
+		case i < 3: // changed again by the newest export: the zip has the previous version
+			records[id], zipped[id] = pypi(id, "3.0.0", t2), pypi(id, "2.0.0", t1)
+			top = append(top, row{t2, id})
+			newest = append(newest, id)
+		case i < n:
+			records[id] = pypi(id, "2.0.0", t1)
+			zipped[id] = records[id]
+			mid = append(mid, row{t1, id})
+		default:
+			records[id] = pypi(id, "1.0.0", t0)
+			zipped[id] = records[id]
+			old = append(old, row{t0, id})
+		}
+	}
+	const added = "PYSEC-2026-NEW00"
+	records[added] = pypi(added, "3.0.0", t2)
+	top = append(top, row{t2, added})
+	newest = append(newest, added)
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(slices.Concat(top, mid, old)...), records: records, zipRecords: zipped,
+		gen: gen, zipGen: zipGen})
+	slices.Sort(newest)
+	return t1, t2, newest
+}
+
+// fixedIn returns the fixed version a cached PyPI record names.
+func fixedIn(t *testing.T, e *env, id string) string {
+	t.Helper()
+	raws, err := e.st.OSVRecordsByID(ctx, []string{id})
+	require.NoError(t, err)
+	require.Len(t, raws, 1, id)
+	var r struct {
+		Affected []struct {
+			Ranges []struct {
+				Events []map[string]string `json:"events"`
+			} `json:"ranges"`
+		} `json:"affected"`
+	}
+	require.NoError(t, json.Unmarshal(raws[0], &r))
+	return r.Affected[0].Ranges[0].Events[1]["fixed"]
+}
+
+// TestOSVSync_ZipBehindListingReadsChangesDirectly (R4): all.zip can be the previous export for a few
+// seconds after modified_id.csv was uploaded, and a mirror may not say which object is newer. An
+// entry older than its listing row, or a listed record absent from the zip, is read with one GET
+// (record files are uploaded before the listing), so the watermark never passes a change the zip
+// did not hold.
+func TestOSVSync_ZipBehindListingReadsChangesDirectly(t *testing.T) {
+	for name, tc := range map[string]struct {
+		total, changed int
+		wm             time.Duration // before now
+	}{
+		"ranged": {total: 2000, changed: 100, wm: time.Hour},
+		"whole":  {total: 5001, changed: 5001, wm: 72 * time.Hour},
+	} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.inUse(t, python)
+			_, t2, newest := laggingPyPI(e, tc.total, tc.changed, "", "")
+			e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-tc.wm)), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+			require.NoError(t, e.feed().Sync(ctx))
+			if name == "whole" {
+				require.Equal(t, 1, e.srv.wholeZips("PyPI"))
+			} else {
+				require.Zero(t, e.srv.wholeZips("PyPI"))
+			}
+			require.Equal(t, len(newest), e.srv.recordGETs("PyPI"), "only the records the zip lacks are read directly")
+			for _, id := range newest {
+				require.Equal(t, "3.0.0", fixedIn(t, e, id), id)
+			}
+			require.Contains(t, e.sink.keys(), "PyPI/PYSEC-2026-NEW00")
+			require.Equal(t, ts(t2), e.meta(t)["wm.PyPI"])
+		})
+	}
+}
+
+// TestOSVSync_ZipOlderGenerationWaits (R4): when the bucket says all.zip is older than
+// modified_id.csv (GCS generations), a poll that would read the zip waits for the next one rather
+// than reading an export it knows is behind, unless the zip has stayed behind for too long.
+func TestOSVSync_ZipOlderGenerationWaits(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	const csvGen, oldZip, newZip = "1763600000000002", "1763600000000001", "1763600000000003"
+	_, t2, newest := laggingPyPI(e, 2000, 100, csvGen, oldZip)
+	wm := ts(now.Add(-time.Hour))
+	e.putMeta(t, map[string]string{"wm.PyPI": wm, "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx), "a zip behind the listing is not a failure")
+	require.Empty(t, e.ids(t, "PyPI"))
+	require.Empty(t, e.sink.all())
+	require.Zero(t, e.srv.recordGETs("PyPI"))
+	require.Equal(t, wm, e.meta(t)["wm.PyPI"], "the watermark stays")
+	require.Empty(t, e.meta(t)["gen.PyPI"], "the listing is read again next time")
+
+	// The next poll finds the newest export's all.zip.
+	e.srv.mu.Lock()
+	fb := e.srv.buckets["PyPI"]
+	fb.zipRecords, fb.zip, fb.zipGen = nil, nil, newZip
+	e.srv.mu.Unlock()
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Zero(t, e.srv.recordGETs("PyPI"))
+	require.Len(t, e.ids(t, "PyPI"), 101)
+	for _, id := range newest {
+		require.Equal(t, "3.0.0", fixedIn(t, e, id), id)
+	}
+	require.Equal(t, ts(t2), e.meta(t)["wm.PyPI"])
+	require.Equal(t, csvGen, e.meta(t)["gen.PyPI"])
+}
+
+// TestOSVSync_ZipBehindTooLongIsReadAnyway (R4): a zip that stays behind its listing (a mirror that
+// refreshes it less often) does not hold the watermark for good: past the wait the poll reads it and
+// reads what it lacks directly.
+func TestOSVSync_ZipBehindTooLongIsReadAnyway(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	_, t2, newest := laggingPyPI(e, 2000, 100, "1763600000000002", "1763600000000001")
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "mal.PyPI": ts(now)})
+	clock := now
+	f := e.feed(func(o *osv.Options) { o.Now = func() time.Time { return clock } })
+
+	require.NoError(t, f.Sync(ctx))
+	require.Empty(t, e.ids(t, "PyPI"))
+	clock = now.Add(29 * time.Minute)
+	require.NoError(t, f.Sync(ctx))
+	require.Empty(t, e.ids(t, "PyPI"), "still within the wait")
+	clock = now.Add(30 * time.Minute)
+	require.NoError(t, f.Sync(ctx))
+	require.Len(t, e.ids(t, "PyPI"), 101)
+	require.Equal(t, len(newest), e.srv.recordGETs("PyPI"))
+	for _, id := range newest {
+		require.Equal(t, "3.0.0", fixedIn(t, e, id), id)
+	}
+	require.Equal(t, ts(t2), e.meta(t)["wm.PyPI"])
+}
+
+// TestOSVBootstrap_ZipBehindListing (R4): a Go or GIT load whose all.zip is older than the listing
+// resumes polling from the newest record the zip held, not from the listing's newest row, so the
+// records the zip lacked are read by the next poll.
+func TestOSVBootstrap_ZipBehindListing(t *testing.T) {
+	e := newEnv(t)
+	tOld, tNew := now.Add(-2*time.Hour), now.Add(-time.Minute)
+	records := map[string][]byte{
+		"GO-2026-0001": record("GO-2026-0001", "Go", "stdlib", "1.22.6", tNew),
+		"GO-2026-0002": record("GO-2026-0002", "Go", "golang.org/x/net", "0.33.0", tOld),
+		"GO-2026-0003": record("GO-2026-0003", "Go", "golang.org/x/crypto", "0.31.0", tNew),
+	}
+	zipped := map[string][]byte{
+		"GO-2026-0001": record("GO-2026-0001", "Go", "stdlib", "1.22.5", tOld),
+		"GO-2026-0002": records["GO-2026-0002"],
+	}
+	e.srv.set("Go", &fakeBucket{csv: csvOf(row{tNew, "GO-2026-0001"}, row{tNew, "GO-2026-0003"}, row{tOld, "GO-2026-0002"}),
+		records: records, zipRecords: zipped})
+	e.putMeta(t, map[string]string{"setdiff": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, ts(tOld), e.meta(t)["wm.Go"], "the newest record all.zip held")
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []string{"GO-2026-0001", "GO-2026-0002", "GO-2026-0003"}, e.ids(t, "Go"))
+	require.Contains(t, string(e.sink.lastDelivered(t, "GO-2026-0001").Raw), `"fixed":"1.22.6"`)
+	require.Equal(t, ts(tNew), e.meta(t)["wm.Go"])
 }

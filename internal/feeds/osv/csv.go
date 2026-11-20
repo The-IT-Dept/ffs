@@ -109,17 +109,18 @@ func parseRows(data []byte) []csvRow {
 	return rows
 }
 
-// listIDs reads a whole modified_id.csv and returns the IDs it lists.
-func listIDs(ctx context.Context, c *http.Client, url string) (map[string]bool, error) {
+// listIDs reads a whole modified_id.csv and returns the IDs it lists, each with its newest
+// modified time.
+func listIDs(ctx context.Context, c *http.Client, url string) (map[string]time.Time, error) {
 	resp, err := feeds.Fetch(ctx, c, feeds.Request{URL: url, MaxBytes: maxCSVBytes})
 	if err != nil {
 		return nil, err
 	}
 	rows := parseRows(resp.Body)
-	ids := make(map[string]bool, len(rows))
+	ids := make(map[string]time.Time, len(rows))
 	for _, row := range rows {
-		if row.id != "" {
-			ids[row.id] = true
+		if t, ok := ids[row.id]; row.id != "" && (!ok || row.ts.After(t)) {
+			ids[row.id] = row.ts
 		}
 	}
 	return ids, nil
