@@ -111,3 +111,27 @@ test('an empty result leads with coverage on a fresh install', async () => {
   renderApp('/vulnerabilities')
   expect(await screen.findByText('ffs cannot see into 4 of 4 images yet, so this may not be everything.')).toBeInTheDocument()
 })
+
+test('the kind facet and its chips read cluster-level owners by the label the server gives them', async () => {
+  mockApi().on(
+    '/findings',
+    findingsPage({
+      total: 1,
+      findings: 1,
+      rows: [findingRow({ id: 'f1' })],
+      facets: {
+        kind: [
+          { value: 'Deployment', count: 5, selected: false },
+          { value: 'cluster-level:Nodes', count: 3, selected: true, label: 'Nodes (host packages)' },
+          { value: 'cluster-level:Cluster', count: 1, selected: false, label: 'Kubernetes (control plane)' },
+        ],
+      },
+    }),
+  )
+  renderApp('/vulnerabilities?kind=cluster-level:Nodes')
+  expect(await screen.findByRole('checkbox', { name: /^Nodes \(host packages\)\s*3$/ })).toBeChecked()
+  expect(screen.getByRole('checkbox', { name: /^Kubernetes \(control plane\)\s*1$/ })).not.toBeChecked()
+  expect(screen.getByRole('checkbox', { name: /^Deployment\s*5$/ })).toBeInTheDocument()
+  expect(screen.queryByText('cluster-level:Nodes')).toBeNull()
+  expect(screen.getByRole('button', { name: 'Remove Kind: Nodes (host packages)' })).toBeInTheDocument()
+})

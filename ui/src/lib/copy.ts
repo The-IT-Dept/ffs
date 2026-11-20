@@ -46,6 +46,8 @@ const relatedLabel: Record<RelatedSectionId, string> = {
   exceptions: 'Exceptions',
 }
 
+const agentState = { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>
+
 // copy holds every user-facing string. The strings marked Contract are the Contract's Copy section
 // verbatim; change them there first.
 export const copy = {
@@ -434,7 +436,7 @@ export const copy = {
     nodeGroups: 'Affected node groups',
     nodeGroupCols: { group: 'Node group', nodes: 'Nodes', installed: 'Installed' },
   },
-  agentState: { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>,
+  agentState,
   nodes: {
     ready: 'Ready',
     notReady: 'Not ready',
@@ -450,6 +452,20 @@ export const copy = {
     // A stale agent has no gap code of its own: its last report may be out of date.
     agentStale: 'node agent stopped reporting',
     groupGap: 'ffs cannot see all of this group',
+    // A group's agents by state, zero parts left out: "7 reporting · 1 without host inventory · 1 not
+    // scheduled"; "—" when there are none.
+    agentCounts: (a: S<'AgentCounts'>) => {
+      const parts: [number, string][] = [
+        [a.reporting, agentState.reporting],
+        [a.reportingWithoutInventory, 'without host inventory'],
+        [a.stale, agentState.stale],
+        [a.never, agentState.never],
+        [a.unsupported, 'not scheduled'],
+        [a.disabled, agentState.disabled],
+      ]
+      const shown = parts.filter(([n]) => n > 0).map(([n, label]) => `${formatCount(n)} ${label}`)
+      return shown.length ? shown.join(' · ') : '—'
+    },
     kind: { agent: 'node agent', nodeinfo: 'node status' } satisfies Record<S<'NodeGroupKind'>, string>,
     groupCols: {
       group: 'Group',

@@ -23,20 +23,14 @@ export function namespacePath(ns: string): string {
   return `/namespaces/${enc(ns)}`
 }
 
+// nodeGroupPath is a node group's page. id is the group's key as the API gives it (a stable name,
+// possibly qualified as <name>-<arch>, <name>-nodeinfo or <name>@<node>), used as it is.
 export function nodeGroupPath(id: string): string {
   return `/nodegroups/${enc(id)}`
 }
 
 export function nodePath(name: string): string {
   return `/nodes/${enc(name)}`
-}
-
-// nodeGroupLinkIds is the path ID of each listed node group: its stable name, which survives the
-// package updates that re-key the group, unless another listed group shares that name; then its ID.
-export function nodeGroupLinkIds(groups: readonly { id: string; name: string }[]): Map<string, string> {
-  const named = new Map<string, number>()
-  for (const g of groups) if (g.name) named.set(g.name, (named.get(g.name) ?? 0) + 1)
-  return new Map(groups.map((g) => [g.id, g.name && named.get(g.name) === 1 ? g.name : g.id]))
 }
 
 export interface OwnerLike {
@@ -102,8 +96,10 @@ export function explorerHref(kind: ExplorerKind, s: ExplorerSearch): string {
   return EXPLORERS[kind].path + stringifySearchParams(s)
 }
 
-// hitPath is where a command-menu hit goes.
+// hitPath is where a command-menu hit goes. A workload hit is an owner key and goes where the owner
+// links, so the control plane and Nodes hits open their own pages.
 export function hitPath(hit: SearchHit): string {
+  if (hit.kind === 'workload') return ownerPath(hit.id)
   if (hit.kind === 'advisory') return advisoryPath(hit.id)
   if (hit.kind === 'package') {
     const i = hit.id.indexOf('/')
@@ -117,8 +113,6 @@ export function hitPath(hit: SearchHit): string {
     }
   }
   switch (hit.kind) {
-    case 'workload':
-      return ownerPath(hit.id)
     case 'namespace':
       return namespacePath(hit.id)
     case 'image':
@@ -128,6 +122,16 @@ export function hitPath(hit: SearchHit): string {
     case 'node':
       return nodePath(hit.id)
   }
+}
+
+// hitKindLabel is how a command-menu hit's kind reads: a cluster-level owner (the control plane, the
+// Nodes page) by what it holds, every other hit by its kind.
+export function hitKindLabel(hit: SearchHit): string {
+  if (hit.kind === 'workload') {
+    const o = ownerOfKey(hit.id)
+    if (isClusterLevel(o)) return ownerLabel(o)
+  }
+  return copy.command.kind[hit.kind]
 }
 
 export type RelatedSectionId = S<'RelatedSection'>['id']

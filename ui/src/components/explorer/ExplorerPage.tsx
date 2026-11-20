@@ -135,7 +135,7 @@ export function ExplorerPage<K extends ExplorerKind>({
     if (gone) void navigate({ to: gone === 'nodegroup' || gone === 'node' ? '/nodes' : '/workloads', replace: true, state: goneState(gone) })
   }, [gone, navigate])
 
-  const chips = chipsOf(search, epssBump)
+  const chips = chipsOf(search, epssBump, q.data?.facets)
   const data = q.data
   const grouped = kind === 'findings' && search.group !== undefined
   const findingsData = kind === 'findings' ? (data as S<'FindingsPage'> | undefined) : undefined

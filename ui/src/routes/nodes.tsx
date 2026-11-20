@@ -8,6 +8,7 @@ import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { ControlPlaneBlock } from '@/components/nodes/ControlPlaneBlock'
+import { HOST_GAP_CODES } from '@/components/nodes/NodeGaps'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCount } from '@/components/signals/PriorityCount'
@@ -15,7 +16,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { nodeGroupLinkIds, nodeGroupPath } from '@/lib/links'
+import { nodeGroupPath } from '@/lib/links'
+import { formatScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 import { rootRoute } from './root'
 
@@ -26,16 +28,16 @@ function Count({ n }: { n: number }) {
 }
 
 // gappedGroups is the set of node groups ffs cannot fully see into: groups with no host inventory
-// (nodeinfo), groups with members whose agent is not reporting, and groups the cluster rail marks
-// with a gap (an agent that cannot read the host, an image-based OS). The rail is asked anyway on
-// this page, so its marks cost no request; it lists groups by ID or by stable name. It lists only
-// its worst few groups, so a host gap in a group beyond them goes unmarked until NodeGroupRow
-// carries its own gaps.
+// (nodeinfo), groups whose members have a host gap (an agent that cannot read the host, no package
+// database, an agent not reporting or not scheduled, a host inventory not stored), and groups the
+// cluster rail marks with a gap. The rail's mark also covers a host inventory that is stored but
+// not yet matched; it is asked anyway on this page, so it costs no request, and lists groups by the
+// same key as the rows.
 function gappedGroups(groups: Group[], rail?: S<'ScopeCard'>): Set<string> {
   const marked = new Set((rail?.related.find((r) => r.id === 'nodegroups')?.items ?? []).filter((i) => i.gap && i.scope).map((i) => i.scope))
   return new Set(
     groups
-      .filter((g) => g.kind !== 'agent' || g.agents.reporting < g.members || marked.has(`nodegroup:${g.id}`) || (g.name !== '' && marked.has(`nodegroup:${g.name}`)))
+      .filter((g) => g.kind !== 'agent' || (g.gaps ?? []).some((c) => HOST_GAP_CODES.includes(c)) || marked.has(formatScope({ kind: 'nodegroup', value: g.id })))
       .map((g) => g.id),
   )
 }
@@ -50,7 +52,6 @@ function Figure({ g, gap, children }: { g: Group; gap: boolean; children: ReactN
 function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'ScopeCard'> }) {
   if (list.groups.length === 0) return <EmptyState message={copy.emptyList.nodeGroups} />
   const gapped = gappedGroups(list.groups, rail)
-  const linkIds = nodeGroupLinkIds(list.groups)
   const c = copy.nodes.groupCols
   const heads: { label: string; right?: boolean }[] = [
     { label: c.group },
@@ -65,7 +66,7 @@ function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'Scop
     { label: c.urgent, right: true },
     { label: c.high, right: true },
     { label: c.fixable, right: true },
-    ...(list.agentEnabled ? [{ label: c.agents, right: true }, { label: c.reboot, right: true }] : []),
+    ...(list.agentEnabled ? [{ label: c.agents }, { label: c.reboot, right: true }] : []),
     { label: c.drift },
   ]
   return (
@@ -83,7 +84,7 @@ function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'Scop
         {list.groups.map((g) => (
           <TableRow key={g.id} className="h-[30px]">
             <TableCell className="py-0">
-              <AppLink href={nodeGroupPath(linkIds.get(g.id) ?? g.id)} className="hover:underline">
+              <AppLink href={nodeGroupPath(g.id)} className="hover:underline">
                 {g.label}
                 {g.name && g.name !== g.label ? <span className="ml-1.5 text-muted-foreground">{g.name}</span> : null}
               </AppLink>
@@ -121,12 +122,7 @@ function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'Scop
             </TableCell>
             {list.agentEnabled ? (
               <>
-                <TableCell
-                  className="py-0 text-right tabular-nums"
-                  title={`${copy.agentState.stale}: ${g.agents.stale} · ${copy.agentState.never}: ${g.agents.never} · ${copy.agentState.disabled}: ${g.agents.disabled}`}
-                >
-                  {`${formatCount(g.agents.reporting)}/${formatCount(g.members)}`}
-                </TableCell>
+                <TableCell className="py-0 tabular-nums">{copy.nodes.agentCounts(g.agents)}</TableCell>
                 <TableCell className="py-0 text-right tabular-nums">
                   <Count n={g.rebootPending} />
                 </TableCell>

@@ -32,6 +32,27 @@ test('jumps to a placeholder image in one path segment', async () => {
   expect(router.state.location.pathname).toBe('/images/unknown%3Aghcr.io%2Fexample%2Fprivate%3A1.0')
 })
 
+test('the Nodes and control plane hits open their pages and read by what they hold', async () => {
+  mockApi().on(
+    '/search',
+    searchResult({
+      hits: [
+        { kind: 'workload', id: 'Nodes//test', label: 'Nodes', detail: '3 nodes', worst: 'high' },
+        { kind: 'workload', id: 'Cluster//test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' },
+      ],
+    }),
+  )
+  const { router, user } = renderApp('/')
+  await user.keyboard('{Control>}k{/Control}')
+  await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'no')
+  const nodes = await screen.findByRole('option', { name: /3 nodes/ })
+  expect(nodes).toHaveTextContent(/^Nodes \(host packages\)Nodes/)
+  expect(screen.getByRole('option', { name: /Kubernetes 1\.35\.1/ })).toHaveTextContent(/^Control planeControl plane/)
+  expect(screen.queryByText(copy.command.kind.workload)).toBeNull()
+  await user.click(nodes)
+  expect(router.state.location.pathname).toBe('/nodes')
+})
+
 test('says to refine the search when more objects matched than are listed', async () => {
   mockApi().on('/search', searchResult({ hits: [{ kind: 'namespace', id: 'kube-system', label: 'kube-system' }], truncated: true }))
   const { user } = renderApp('/')

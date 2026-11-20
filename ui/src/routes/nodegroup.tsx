@@ -23,6 +23,7 @@ import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
 import { nodeGroupPath, nodePath } from '@/lib/links'
 import { type NodeGroupSearch, parseNodeGroupSearch, revalidate, stringifySearchParams } from '@/lib/query'
+import { formatScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 
 type View = NonNullable<NodeGroupSearch['view']>
@@ -286,7 +287,9 @@ function MembersView({ d, id }: { d: Detail; id: string }) {
 }
 
 function NodeGroupPage() {
-  // id is the group's stable name, as the app links groups, or its ID; the API resolves both.
+  // id is the group's key, as the API links groups (its stable name, qualified when other groups
+  // share it), or any other form the API resolves (a label, an ID). It is used as it is, never
+  // parsed.
   const { id } = Route.useParams()
   const search = revalidate(parseNodeGroupSearch, Route.useSearch())
   const navigate = Route.useNavigate()
@@ -298,15 +301,15 @@ function NodeGroupPage() {
   const trust = useScopeTrust({ kind: 'nodegroup', value: id })
   const missing = q.error instanceof ApiProblem && q.error.code === 'not_found'
   useEffect(() => {
-    // A group no longer listed under this name or ID lands on the list instead, with a notice.
+    // A group no longer listed under this key lands on the list instead, with a notice.
     if (missing) void navigate({ to: '/nodes', replace: true, state: goneState('nodegroup') })
   }, [missing, navigate])
 
   const d = q.data
   const g = d?.group
   const view = search.view ?? 'findings'
-  // Queries scope by the group's current ID, which the detail resolved from the URL.
-  const scope = g ? `nodegroup:${g.id}` : ''
+  // Queries scope by the key the detail resolved the URL's id to.
+  const scope = g ? formatScope({ kind: 'nodegroup', value: g.id }) : ''
   const agents = d ? d.members.map((m) => m.agent) : []
   // What the agents cannot see on any member leads the page: under the header, and ahead of the
   // findings and host packages, because no findings is not proof that nothing needs attention.

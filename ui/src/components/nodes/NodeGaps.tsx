@@ -3,6 +3,18 @@ import { CoverageMark } from '@/components/signals/CoverageMark'
 import { copy } from '@/lib/copy'
 import { cn } from '@/lib/utils'
 
+// HOST_GAP_CODES are the node gaps after which ffs does not see a node's host packages in full (the
+// server's hostGapCodes): its agent cannot read the host, there is no package database, the agent
+// is not reporting or not scheduled on it, or its host inventory is not stored. A content store the
+// agent cannot read concerns side-loaded images only.
+export const HOST_GAP_CODES: readonly GapCode[] = [
+  'node_agent_blocked',
+  'no_package_database',
+  'node_agent_missing',
+  'host_not_inventoried',
+  'node_agent_unsupported',
+]
+
 // NodeGapSummary is one thing ffs cannot see on a set of nodes, and how many of them it affects.
 export interface NodeGapSummary {
   key: GapCode | 'stale'

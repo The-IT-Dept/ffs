@@ -1,3 +1,4 @@
+import type { S } from '@/api/types'
 import { copy, facetValueLabel } from './copy'
 import { COVERAGE_CLASSES, FINDING_STATES, FIX_CLASSES, IMAGE_STATUSES, isOneOf, PRIORITIES, SIGNALS } from './enums'
 import { parseScope, type ScopeKind } from './scope'
@@ -199,12 +200,16 @@ export interface Chip {
 const CHIP_STRING_KEYS: readonly StringKey[] = ['advisory', 'package', 'repo', 'q', 'fixKey']
 
 // chipsOf lists the removable filters of a search: the scope, then every array value, then the
-// single-value filters. Grouping, sorting and paging are not filters.
-export function chipsOf(s: ExplorerSearch, epssBump = 0.1): Chip[] {
+// single-value filters. Grouping, sorting and paging are not filters. A value reads by the label
+// the server gives it in facets, when it gives one.
+export function chipsOf(s: ExplorerSearch, epssBump = 0.1, facets?: S<'Facets'>): Chip[] {
   const chips: Chip[] = []
   if (s.scope && s.scope !== 'cluster') chips.push({ key: 'scope', value: s.scope, label: `${copy.facetTitle.scope}: ${s.scope}` })
   for (const k of ARRAY_KEYS) {
-    for (const v of s[k] ?? []) chips.push({ key: k, value: v, label: `${copy.facetTitle[k]}: ${facetValueLabel(k, v, epssBump)}` })
+    for (const v of s[k] ?? []) {
+      const label = facets?.[k]?.find((f) => f.value === v)?.label || facetValueLabel(k, v, epssBump)
+      chips.push({ key: k, value: v, label: `${copy.facetTitle[k]}: ${label}` })
+    }
   }
   for (const k of CHIP_STRING_KEYS) {
     const v = s[k]
