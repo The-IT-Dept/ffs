@@ -19,9 +19,8 @@ const (
 	// MaxAttempts is the number of sends after which a delivery that keeps failing is given up.
 	MaxAttempts = 12
 
-	drainBatch    = 200 // deliveries read per DrainOnce
-	drainParallel = 8   // targets sent to at once; each target's deliveries go in order
-	sendTimeout   = 30 * time.Second
+	drainBatch  = 200 // deliveries read per target per drain
+	sendTimeout = 30 * time.Second
 
 	baseBackoff   = 5 * time.Second
 	maxBackoff    = 15 * time.Minute
@@ -45,59 +44,77 @@ func NextAttempt(attempt int, retryAfter time.Duration, rnd float64) time.Durati
 	return d
 }
 
-// DrainOnce sends the deliveries that are due, up to 200: targets in parallel, each target's in
-// order. Only targets that can be sent to now are read: deliveries of unregistered or disabled
-// targets, and of a target backing off after a failed send, stay pending and take no place in the
-// batch. When ctx is cancelled mid-send the attempt is not recorded, so the delivery is sent again
-// later with the same ID.
+// DrainOnce sends the deliveries that are due and waits for the sends. Each target is drained on
+// its own: its deliveries are read separately, up to 200, and sent in order, in parallel with the
+// other targets, so one target's backlog or slow endpoint never delays another target's alerts.
+// Only targets that can be sent to now are drained: deliveries of unregistered, disabled or paused
+// targets, and of a target backing off after a failed send, stay pending. When ctx is cancelled
+// mid-send the attempt is not recorded, so the delivery is sent again later with the same ID.
 func (e *Engine) DrainOnce(ctx context.Context) error {
+	wait, err := e.startDrains(ctx)
+	if err != nil {
+		return err
+	}
+	return wait()
+}
+
+// startDrains starts a drain for every sendable target that has none running, and returns a
+// function that waits for those drains and returns their errors. Start calls it on every tick
+// without waiting, so a target still sending a long backlog is skipped while the others are
+// drained again.
+func (e *Engine) startDrains(ctx context.Context) (wait func() error, err error) {
 	now := e.now()
 	ready, err := e.sendable(ctx, now)
 	if err != nil {
-		return fmt.Errorf("notify: targets: %w", err)
-	}
-	if len(ready) == 0 {
-		return nil
-	}
-	ds, err := e.st.PendingDeliveriesFor(ctx, now, slices.Sorted(maps.Keys(ready)), drainBatch)
-	if err != nil {
-		return fmt.Errorf("notify: pending deliveries: %w", err)
-	}
-	var order []string
-	byTarget := map[string][]store.Delivery{}
-	for _, d := range ds {
-		if _, ok := byTarget[d.Target]; !ok {
-			order = append(order, d.Target)
-		}
-		byTarget[d.Target] = append(byTarget[d.Target], d)
+		return nil, fmt.Errorf("notify: targets: %w", err)
 	}
 	var (
 		wg   sync.WaitGroup
 		mu   sync.Mutex
 		errs []error
-		sem  = make(chan struct{}, drainParallel)
 	)
-	for _, uid := range order {
+	for _, uid := range slices.Sorted(maps.Keys(ready)) {
 		t := ready[uid]
+		if !e.claimDrain(uid) {
+			continue
+		}
 		wg.Go(func() {
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			if err := e.drainTarget(ctx, t, byTarget[uid]); err != nil {
+			defer e.releaseDrain(uid)
+			if err := e.drainTarget(ctx, t, now); err != nil {
 				mu.Lock()
 				errs = append(errs, fmt.Errorf("notify: target %s: %w", t.cfg.Name, err))
 				mu.Unlock()
 			}
 		})
 	}
-	wg.Wait()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return errors.Join(errs...)
+	return func() error {
+		wg.Wait()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return errors.Join(errs...)
+	}, nil
 }
 
-// sendable returns, by UID, the targets that can be sent to at now: registered, not disabled, and
-// not backing off after a failed send.
+// claimDrain marks the target uid as draining; false when a drain of it is already running.
+func (e *Engine) claimDrain(uid string) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.draining[uid] {
+		return false
+	}
+	e.draining[uid] = true
+	return true
+}
+
+func (e *Engine) releaseDrain(uid string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.draining, uid)
+}
+
+// sendable returns, by UID, the targets that can be sent to at now: registered, not paused, not
+// disabled, and not backing off after a failed send.
 func (e *Engine) sendable(ctx context.Context, now time.Time) (map[string]*target, error) {
 	rows, err := e.st.NotifyTargets(ctx)
 	if err != nil {
@@ -107,19 +124,37 @@ func (e *Engine) sendable(ctx context.Context, now time.Time) (map[string]*targe
 	defer e.mu.Unlock()
 	out := map[string]*target{}
 	for _, r := range rows {
-		if t := e.targets[r.Target]; t != nil && !r.Disabled && !e.backoff[r.Target].After(now) {
+		if t := e.targets[r.Target]; t != nil && !t.cfg.Paused && !r.Disabled && !e.backoff[r.Target].After(now) {
 			out[r.Target] = t
 		}
 	}
 	return out, nil
 }
 
-// drainTarget sends ds in order. After a failure that is the endpoint's rather than the message's
-// (anything but Permanent or Gone), the rest wait as long as the failed delivery does, so an
-// endpoint that is down costs one send timeout per retry rather than one per queued delivery. The
-// wait is kept in memory: after a restart the target is tried again at once.
-func (e *Engine) drainTarget(ctx context.Context, t *target, ds []store.Delivery) error {
+// current reports whether t is still the registered, unpaused target of its UID, with the same
+// endpoint and settings. A drain checks it before each send, so pausing a target, or detaching or
+// re-pointing it, stops a backlog mid-way; the rest stays pending.
+func (e *Engine) current(t *target) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cur := e.targets[t.cfg.UID]
+	return cur != nil && !cur.cfg.Paused && cur.cfg.ConfigHash == t.cfg.ConfigHash
+}
+
+// drainTarget sends the target's deliveries due at now, oldest first. After a failure that is the
+// endpoint's rather than the message's (anything but Permanent or Gone), the rest wait as long as
+// the failed delivery does, so an endpoint that is down costs one send timeout per retry rather
+// than one per queued delivery. The wait is kept in memory: after a restart the target is tried
+// again at once.
+func (e *Engine) drainTarget(ctx context.Context, t *target, now time.Time) error {
+	ds, err := e.st.PendingDeliveriesFor(ctx, now, []string{t.cfg.UID}, drainBatch)
+	if err != nil {
+		return fmt.Errorf("pending deliveries: %w", err)
+	}
 	for _, d := range ds {
+		if !e.current(t) {
+			return nil
+		}
 		var m Message
 		var sendErr error
 		if err := json.Unmarshal(d.Payload, &m); err != nil {

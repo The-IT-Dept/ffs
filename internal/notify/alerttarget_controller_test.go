@@ -54,11 +54,14 @@ func secretOf(name string, data map[string]string) *corev1.Secret {
 type recordingFactory struct {
 	calls []notify.SinkConfig
 	types []string
+	sinks []*fakeSink
 }
 
 func (f *recordingFactory) New(typ string, cfg notify.SinkConfig) (notify.Sink, error) {
 	f.calls, f.types = append(f.calls, cfg), append(f.types, typ)
-	return &fakeSink{}, nil
+	s := &fakeSink{}
+	f.sinks = append(f.sinks, s)
+	return s, nil
 }
 
 type recHarness struct {
@@ -66,6 +69,7 @@ type recHarness struct {
 	c       client.Client
 	st      *store.Store
 	eng     *notify.Engine
+	base    *harness
 	factory *recordingFactory
 	updates int
 }
@@ -73,7 +77,7 @@ type recHarness struct {
 func newRecHarness(t *testing.T, objs ...client.Object) *recHarness {
 	t.Helper()
 	h := newHarness(t)
-	rh := &recHarness{st: h.st, eng: h.eng, factory: &recordingFactory{}}
+	rh := &recHarness{st: h.st, eng: h.eng, base: h, factory: &recordingFactory{}}
 	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(objs...).WithStatusSubresource(&ffsv1alpha1.AlertTarget{}).
 		WithInterceptorFuncs(interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, o client.Object, opts ...client.SubResourceUpdateOption) error {
 			rh.updates++
@@ -298,4 +302,42 @@ func TestTargetReconciler_SecretReadErrorIsDistinct(t *testing.T) {
 	cond := assertCondition(t, got, "Ready", metav1.ConditionFalse, "SecretUnreadable")
 	assert.Contains(t, cond.Message, "forbidden: boom")
 	assert.Empty(t, h.factory.calls)
+}
+
+// TestTargetReconciler_BrokenSecretStopsDelivery pins F32: once the Secret is deleted or made
+// invalid, nothing more goes to the endpoint the target had, and fixing the Secret resumes delivery
+// from the target's cursor with its stored state intact.
+func TestTargetReconciler_BrokenSecretStopsDelivery(t *testing.T) {
+	h := newRecHarness(t, alertTarget("slack", "s"), secretOf("s", map[string]string{"url": hookURL}))
+	assertCondition(t, h.reconcile(t), "Ready", metav1.ConditionTrue, "Registered")
+	h.base.process() // baseline
+	old := h.factory.sinks[len(h.factory.sinks)-1]
+	require.Len(t, old.ofKind(notify.KindBaseline), 1)
+
+	var sec corev1.Secret
+	require.NoError(t, h.c.Get(ctx, types.NamespacedName{Namespace: "ffs", Name: "s"}, &sec))
+	require.NoError(t, h.c.Delete(ctx, &sec))
+	assertCondition(t, h.reconcile(t), "Ready", metav1.ConditionFalse, "SecretNotFound")
+	h.base.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	h.base.process()
+	assert.Empty(t, old.ofKind(notify.KindImmediate), "nothing goes to the old endpoint once the Secret is gone")
+
+	require.NoError(t, h.c.Create(ctx, secretOf("s", map[string]string{"other": hookURL})))
+	assertCondition(t, h.reconcile(t), "Ready", metav1.ConditionFalse, "SecretInvalid")
+	h.base.process()
+	assert.Empty(t, old.ofKind(notify.KindImmediate), "nor while the Secret is invalid")
+	st, ok, err := h.eng.Status(ctx, "uid-ops")
+	require.NoError(t, err)
+	require.True(t, ok, "the stored state is kept")
+	assert.False(t, st.BaselineAt.IsZero())
+
+	require.NoError(t, h.c.Get(ctx, types.NamespacedName{Namespace: "ffs", Name: "s"}, &sec))
+	sec.Data = map[string][]byte{"url": []byte(strings.Replace(hookURL, "TOKEN", "NEWTOKEN", 1))}
+	require.NoError(t, h.c.Update(ctx, &sec))
+	assertCondition(t, h.reconcile(t), "Ready", metav1.ConditionTrue, "Registered")
+	h.base.process()
+	fixed := h.factory.sinks[len(h.factory.sinks)-1]
+	assert.Empty(t, fixed.ofKind(notify.KindBaseline), "no second baseline")
+	assert.Equal(t, []string{"CVE-2026-0001"}, advisories(fixed.sent), "the alert held back is sent from the cursor")
+	assert.Empty(t, old.ofKind(notify.KindImmediate))
 }

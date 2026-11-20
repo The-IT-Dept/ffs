@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
 	"sync"
@@ -36,7 +37,8 @@ const (
 	reasonInvalid              = "Invalid"
 	reasonUrgentRequiresAdmin  = "UrgentRequiresAdmin"
 
-	// exceptionResync refreshes an Exception's status counts, which move with findings.
+	// exceptionResync refreshes an Exception's status counts, which move with findings. An expired
+	// Exception that excepts nothing is not refreshed: nothing can change its counts any more.
 	exceptionResync = 2 * time.Minute
 )
 
@@ -49,6 +51,7 @@ type ExceptionStore interface {
 	PutExceptionRule(ctx context.Context, r findings.ExceptionRule) (changed bool, err error)
 	DeleteExceptionRule(ctx context.Context, namespace, name string) (deleted bool, err error)
 	ExceptionRules(ctx context.Context) ([]findings.ExceptionRule, error)
+	CountExceptedBy(ctx context.Context, key string) (int, error)
 	ListFindings(ctx context.Context, f store.FindingFilter) ([]model.Finding, error)
 	Advisories(ctx context.Context, ids []string) (map[string]model.Advisory, error)
 }
@@ -107,7 +110,8 @@ func durationText(d time.Duration) string {
 }
 
 // Reconcile caches or drops one Exception's rule and refreshes its status. A valid Exception is
-// requeued at its expiry or within 2 minutes, whichever is sooner, so its counts stay current.
+// requeued at its expiry or within 2 minutes, whichever is sooner, so its counts stay current; one
+// that has expired and excepts nothing is not requeued.
 // The engine recomputes when the cached rule changed or was dropped, and once per expiry when an
 // expired rule still excepts findings (see reopenExpired); never merely because of the requeue.
 func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -149,6 +153,9 @@ func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 	}
 	if err := r.writeStatus(ctx, &ex, st); err != nil {
 		return reconcile.Result{}, err
+	}
+	if st.Expired && st.MatchedFindings == 0 {
+		return reconcile.Result{}, nil // final: it can except nothing, and nothing it excepts is left to reopen
 	}
 	requeue := exceptionResync
 	if left := rule.Expires.Sub(now); left > 0 && left < requeue {
@@ -276,36 +283,37 @@ func (r *ExceptionReconciler) rule(ctx context.Context, ex *v1alpha1.Exception) 
 }
 
 // status computes the status of a valid Exception: the findings it excepts, the open urgent
-// findings it matches but may not except (it is not cluster-wide), and whether it expired.
+// findings it matches but may not except (it is not cluster-wide), and whether it expired. Only
+// those rows are read: the excepted count comes from an index, and the urgent candidates are the
+// open urgent findings of the Exception's own namespace, so a reconcile never decodes every finding.
 func (r *ExceptionReconciler) status(ctx context.Context, ex *v1alpha1.Exception, rule findings.ExceptionRule,
 	now time.Time) (v1alpha1.ExceptionStatus, error) {
-	fs, err := r.Store.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen, model.StateExcepted}})
-	if err != nil {
-		return v1alpha1.ExceptionStatus{}, fmt.Errorf("list findings: %w", err)
-	}
 	st := v1alpha1.ExceptionStatus{Expired: !now.Before(rule.Expires), ObservedGeneration: ex.Generation,
 		Conditions: slices.Clone(ex.Status.Conditions)}
-	var urgent []model.Finding
-	for _, f := range fs {
-		switch {
-		case f.State == model.StateExcepted && f.ExceptedBy == rule.Key():
-			st.MatchedFindings++
-		case f.State == model.StateOpen && f.Priority == model.PriorityUrgent && !rule.ClusterWide:
-			urgent = append(urgent, f)
-		}
+	matched, err := r.Store.CountExceptedBy(ctx, rule.Key())
+	if err != nil {
+		return v1alpha1.ExceptionStatus{}, fmt.Errorf("count excepted findings: %w", err)
 	}
-	if len(urgent) > 0 {
-		ids := make([]string, 0, len(urgent))
-		for _, f := range urgent {
-			ids = append(ids, f.AdvisoryID)
-		}
-		advs, err := r.Store.Advisories(ctx, ids)
+	st.MatchedFindings = int32(min(matched, math.MaxInt32))
+	if !rule.ClusterWide && !st.Expired {
+		urgent, err := r.Store.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen},
+			MinPriority: model.PriorityUrgent, Namespace: rule.Namespace})
 		if err != nil {
-			return v1alpha1.ExceptionStatus{}, fmt.Errorf("load advisories: %w", err)
+			return v1alpha1.ExceptionStatus{}, fmt.Errorf("list urgent findings: %w", err)
 		}
-		for _, f := range urgent {
-			if rule.Matches(f, advs[f.AdvisoryID].Aliases, now) {
-				st.UrgentNotExcepted++
+		if len(urgent) > 0 {
+			ids := make([]string, 0, len(urgent))
+			for _, f := range urgent {
+				ids = append(ids, f.AdvisoryID)
+			}
+			advs, err := r.Store.Advisories(ctx, ids)
+			if err != nil {
+				return v1alpha1.ExceptionStatus{}, fmt.Errorf("load advisories: %w", err)
+			}
+			for _, f := range urgent {
+				if rule.Matches(f, advs[f.AdvisoryID].Aliases, now) {
+					st.UrgentNotExcepted++
+				}
 			}
 		}
 	}

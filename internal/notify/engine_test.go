@@ -626,6 +626,35 @@ func TestNotify_FeedStaleOncePerEpisode(t *testing.T) {
 	}
 }
 
+// TestNotify_FeedStaleBeforeReady pins that the opt-in feed-stale alert does not wait for Ready
+// (F5): a Grype DB that never downloads keeps Ready false, and that is exactly when the alert matters.
+func TestNotify_FeedStaleBeforeReady(t *testing.T) {
+	h := newHarness(t, func(o *notify.Options) { o.FeedStaleAfter = map[string]time.Duration{"grypedb": 48 * time.Hour} })
+	h.ready = false
+	h.target("ops", func(c *notify.TargetConfig) { c.NotifyOnFeedStale = true })
+	h.target("paused", func(c *notify.TargetConfig) { c.NotifyOnFeedStale, c.Paused = true, true })
+	h.target("quiet")
+	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "grypedb", LastAttempt: h.now, LastError: "connection refused"}))
+	h.process()
+	assert.Empty(t, h.sink.sent, "not stale yet")
+
+	h.now = h.now.Add(49 * time.Hour)
+	h.process()
+	m := h.sink.only(t)
+	assert.Equal(t, notify.KindFeedStale, m.Kind)
+	assert.Equal(t, "ops", m.TargetName)
+	assert.Equal(t, "Feed grypedb has never synced successfully", m.Title)
+	cur, err := h.st.Cursor(ctx, "notify:uid-ops")
+	require.NoError(t, err)
+	assert.Zero(t, cur, "nothing else runs before Ready")
+
+	h.ready = true
+	h.process()
+	assert.Len(t, h.sink.ofKind(notify.KindFeedStale), 1, "the same episode is not sent again")
+	assert.Len(t, h.sink.ofKind(notify.KindBaseline), 2, "the baselines of ops and quiet follow Ready")
+}
+
 func TestNotify_UnregisterAndRetainDeleteState(t *testing.T) {
 	h := newHarness(t)
 	h.target("ops")

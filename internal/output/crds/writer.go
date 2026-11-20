@@ -194,7 +194,8 @@ func (w *Writer) Sync(ctx context.Context) error {
 // selectFindings returns the open findings to write as resources, highest priority first, and how
 // many eligible findings the cap left out. Findings at or above minPriority are ranked by
 // priority, then earliest matched, then fingerprint. When two findings share a resource name (one owner running
-// two affected repositories), the higher-ranked one is written; the other stays in the API.
+// two affected repositories), the higher-ranked one is written; the other stays in the API. A cap
+// (crd.maxFindings) of 0 or less means unlimited, as documented.
 func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority) (keep []model.Finding, dropped int) {
 	var eligible []model.Finding
 	for _, f := range open {
@@ -214,7 +215,10 @@ func (w *Writer) selectFindings(open []model.Finding, minPriority model.Priority
 		seen[k] = true
 		return false
 	})
-	keep = eligible[:min(len(eligible), max(w.o.Config.CRD.MaxFindings, 0))]
+	keep = eligible
+	if limit := w.o.Config.CRD.MaxFindings; limit > 0 && len(keep) > limit {
+		keep = keep[:limit]
+	}
 	return keep, len(eligible) - len(keep)
 }
 

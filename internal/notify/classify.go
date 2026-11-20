@@ -13,7 +13,7 @@ import (
 // something sent, or a fix appearing (digest only) count.
 func classify(t model.Transition, l *store.LedgerEntry) Event {
 	if t.Trigger == model.TriggerUpgradeAvailable {
-		return "" // not notified in v0.0.1
+		return "" // never an alert of its own: the digest lists it (see digest)
 	}
 	switch t.ToState {
 	case model.StateOpen:
@@ -82,17 +82,24 @@ func excepted(uid string, t model.Transition, l *store.LedgerEntry, now time.Tim
 }
 
 // latest is a run of transitions reduced per fingerprint: the last transition of each, in
-// first-seen order, and whether any was a fix appearing. UpgradeAvailable transitions are ignored.
+// first-seen order, and whether any was a fix appearing. UpgradeAvailable transitions are kept
+// apart, the last per fingerprint in first-seen order, and never become a final transition.
 type latest struct {
-	order   []string
-	final   map[string]model.Transition
-	fixSeen map[string]bool
+	order        []string
+	final        map[string]model.Transition
+	fixSeen      map[string]bool
+	upgradeOrder []string
+	upgrades     map[string]model.Transition
 }
 
 func reduce(ts []model.Transition) latest {
-	r := latest{final: map[string]model.Transition{}, fixSeen: map[string]bool{}}
+	r := latest{final: map[string]model.Transition{}, fixSeen: map[string]bool{}, upgrades: map[string]model.Transition{}}
 	for _, t := range ts {
 		if t.Trigger == model.TriggerUpgradeAvailable {
+			if _, ok := r.upgrades[t.Fingerprint]; !ok {
+				r.upgradeOrder = append(r.upgradeOrder, t.Fingerprint)
+			}
+			r.upgrades[t.Fingerprint] = t
 			continue
 		}
 		if _, ok := r.final[t.Fingerprint]; !ok {

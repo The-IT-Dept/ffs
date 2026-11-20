@@ -174,7 +174,9 @@ type TargetReconciler struct {
 	NewSink   SinkFactory
 }
 
-// Reconcile registers the AlertTarget req names, or forgets it when it is gone.
+// Reconcile registers the AlertTarget req names, or forgets it when it is gone. A target that
+// cannot be registered (its Secret is missing, unreadable or invalid, or its spec is invalid) is
+// detached, so nothing goes on being sent to the endpoint it had before; its stored state is kept.
 func (r *TargetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var at ffsv1alpha1.AlertTarget
 	if err := r.Client.Get(ctx, req.NamespacedName, &at); err != nil {
@@ -185,6 +187,9 @@ func (r *TargetReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	cond := r.register(ctx, &at)
+	if cond != nil {
+		r.Engine.Detach(string(at.UID))
+	}
 	if cond == nil {
 		// Registered: the Engine's stored state decides the condition.
 		c, err := r.engineCondition(ctx, &at)

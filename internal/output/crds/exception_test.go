@@ -259,3 +259,62 @@ func TestExceptionReconciler_DeletedRemovesRule(t *testing.T) {
 	require.Empty(t, rules(t, st), "a rule without an Exception is pruned")
 	require.Equal(t, 3, eng.calls)
 }
+
+// filterRecorder records the finding filters the reconciler reads with.
+type filterRecorder struct {
+	*store.Store
+	filters []store.FindingFilter
+}
+
+func (s *filterRecorder) ListFindings(ctx context.Context, f store.FindingFilter) ([]model.Finding, error) {
+	s.filters = append(s.filters, f)
+	return s.Store.ListFindings(ctx, f)
+}
+
+// TestExceptionReconciler_ReadsOnlyWhatItCounts pins the cost of a reconcile (F36): it decodes
+// only the open urgent findings of the Exception's namespace, never every open and excepted
+// finding, and an expired Exception that excepts nothing is not requeued forever.
+func TestExceptionReconciler_ReadsOnlyWhatItCounts(t *testing.T) {
+	needEnv(t)
+	st := newStore(t)
+	seedAdvisory(t, st)
+	excepted := openFinding(deployment("web", "a"), debianRepo, cve, model.PriorityHigh, t0)
+	excepted.State, excepted.ExceptedBy = model.StateExcepted, "web/accept"
+	urgent := openFinding(deployment("web", "b"), debianRepo, cve, model.PriorityUrgent, t0)
+	high := openFinding(deployment("web", "c"), debianRepo, cve, model.PriorityHigh, t0)
+	apply(t, st, excepted, urgent, high)
+	now := t0
+	r, _ := newReconciler(t, st, &now)
+	rec := &filterRecorder{Store: st}
+	r.Store = rec
+	expires := t0.Add(24 * time.Hour)
+	createException(t, "web", "accept", acceptSpec(cve, expires))
+
+	res := reconcileException(t, r, "web", "accept")
+	require.Equal(t, 2*time.Minute, res.RequeueAfter)
+	s := getException(t, "web", "accept").Status
+	require.Equal(t, int32(1), s.MatchedFindings)
+	require.Equal(t, int32(1), s.UrgentNotExcepted)
+	require.NotEmpty(t, rec.filters)
+	for _, f := range rec.filters {
+		require.Equal(t, []model.FindingState{model.StateOpen}, f.States, "only open findings are read")
+		require.Equal(t, model.PriorityUrgent, f.MinPriority, "only urgent findings are read")
+		require.Equal(t, "web", f.Namespace, "only the Exception's namespace is read")
+	}
+
+	// Expired and still excepting a finding: requeued until the engine reopens it.
+	now = expires.Add(time.Second)
+	rec.filters = nil
+	res = reconcileException(t, r, "web", "accept")
+	require.Equal(t, 2*time.Minute, res.RequeueAfter)
+	require.Empty(t, rec.filters, "an expired Exception excepts nothing new, so no urgent finding is read")
+
+	// Expired and excepting nothing: final, not requeued.
+	excepted.State, excepted.ExceptedBy = model.StateOpen, ""
+	apply(t, st, excepted)
+	res = reconcileException(t, r, "web", "accept")
+	require.Zero(t, res.RequeueAfter)
+	s = getException(t, "web", "accept").Status
+	require.True(t, s.Expired)
+	require.Zero(t, s.MatchedFindings)
+}

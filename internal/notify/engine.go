@@ -37,8 +37,9 @@ const (
 // Options configures an Engine.
 type Options struct {
 	Cluster, DashboardURL string
-	// Ready reports that the initial inventory is catalogued and matched; nothing is processed
-	// before, so the first baseline covers the whole cluster. Nil means always ready.
+	// Ready reports that the initial inventory is catalogued and matched; nothing but feed-stale
+	// alerts is processed before, so the first baseline covers the whole cluster. Nil means always
+	// ready.
 	Ready   func(ctx context.Context) bool
 	Changed <-chan struct{}
 	// FeedStaleAfter is the staleness threshold of each registered feed, keyed by feed name.
@@ -60,6 +61,9 @@ type Engine struct {
 	targets map[string]*target   // by UID
 	uids    map[string]string    // name → UID
 	backoff map[string]time.Time // by UID: after a failed send, nothing more goes to the target before this
+	// draining holds the UIDs of the targets with a drain running, so a target is never drained
+	// twice at once.
+	draining map[string]bool
 
 	// passMu serialises ProcessOnce with deleting a target's stored state, so a pass never
 	// writes state back for a target removed under it.
@@ -79,7 +83,7 @@ func New(st *store.Store, o Options) *Engine {
 		o.Ready = func(context.Context) bool { return true }
 	}
 	return &Engine{st: st, o: o, started: o.Now().UTC(), targets: map[string]*target{}, uids: map[string]string{},
-		backoff: map[string]time.Time{}, feedSent: map[string]bool{}}
+		backoff: map[string]time.Time{}, draining: map[string]bool{}, feedSent: map[string]bool{}}
 }
 
 // now is the engine clock in UTC, the zone of every stored and sent time.
@@ -159,6 +163,16 @@ func (e *Engine) Unregister(ctx context.Context, name string) error {
 	return errors.Join(errs...)
 }
 
+// Detach stops processing and delivering for the target uid until it is registered again, as when
+// its Secret goes missing or its spec turns invalid: nothing more is sent to the endpoint it had.
+// Unlike Unregister, its stored state (baseline, ledger, cursors and queued deliveries) is kept, so
+// once it is registered again it resumes from its cursor. A send already under way finishes.
+func (e *Engine) Detach(uid string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.dropLocked(uid)
+}
+
 // Retain deletes the stored state of every target whose UID is not in liveUIDs, such as an
 // AlertTarget deleted while ffs was not running.
 func (e *Engine) Retain(ctx context.Context, liveUIDs []string) error {
@@ -220,11 +234,15 @@ func (e *Engine) snapshot() []*target {
 func (e *Engine) NeedLeaderElection() bool { return true }
 
 // Start processes transitions on every Changed signal and every 15s, drains the outbox every 2s,
-// and prunes old deliveries daily, until ctx is done. Errors are logged and the loops go on.
+// and prunes old deliveries daily, until ctx is done. Errors are logged and the loops go on. A
+// drain is not waited for before the next tick, so a target sending a long backlog never holds up
+// the other targets' drains.
 func (e *Engine) Start(ctx context.Context) error {
 	log := logr.FromContextOrDiscard(ctx).WithName("notify")
 	var wg sync.WaitGroup
 	wg.Go(func() {
+		var drains sync.WaitGroup
+		defer drains.Wait()
 		tick := time.NewTicker(drainInterval)
 		defer tick.Stop()
 		for {
@@ -233,9 +251,18 @@ func (e *Engine) Start(ctx context.Context) error {
 				return
 			case <-tick.C:
 			}
-			if err := e.DrainOnce(ctx); err != nil && ctx.Err() == nil {
-				log.Error(err, "delivering notifications failed")
+			wait, err := e.startDrains(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					log.Error(err, "delivering notifications failed")
+				}
+				continue
 			}
+			drains.Go(func() {
+				if err := wait(); err != nil && ctx.Err() == nil {
+					log.Error(err, "delivering notifications failed")
+				}
+			})
 		}
 	})
 	defer wg.Wait()
@@ -272,16 +299,19 @@ func (e *Engine) prune(ctx context.Context, log logr.Logger) {
 
 // ProcessOnce runs one pass for every registered target: the baseline for a new target, otherwise
 // immediate alerts for the transitions since its cursor, then its digest when due and its
-// feed-stale alerts. It does nothing until Ready. Deliveries are queued for DrainOnce.
+// feed-stale alerts. Until Ready only the feed-stale alerts run: the alert that says ffs might be
+// wrong is never held back by the wait for the initial match. Deliveries are queued for DrainOnce.
 func (e *Engine) ProcessOnce(ctx context.Context) error {
-	if !e.o.Ready(ctx) {
-		return nil
-	}
+	ready := e.o.Ready(ctx)
 	e.passMu.Lock()
 	defer e.passMu.Unlock()
 	var errs []error
 	for _, t := range e.snapshot() {
-		if err := e.processTarget(ctx, t); err != nil {
+		pass := e.processTarget
+		if !ready {
+			pass = e.feedStaleOnly
+		}
+		if err := pass(ctx, t); err != nil {
 			errs = append(errs, fmt.Errorf("notify: target %s: %w", t.cfg.Name, err))
 		}
 		if ctx.Err() != nil {
@@ -331,6 +361,19 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 		return err
 	}
 	return e.feedStale(ctx, t, now)
+}
+
+// feedStaleOnly is the pass of a target before Ready: its feed-stale alerts, unless it is paused
+// or disabled.
+func (e *Engine) feedStaleOnly(ctx context.Context, t *target) error {
+	if t.cfg.Paused || !t.cfg.NotifyOnFeedStale {
+		return nil
+	}
+	st, ok, err := e.st.NotifyTarget(ctx, t.cfg.UID)
+	if err != nil || !ok || st.Disabled {
+		return err
+	}
+	return e.feedStale(ctx, t, e.now())
 }
 
 // transitionsAfter reads up to limit transitions after cursor, a page at a time, and returns them
