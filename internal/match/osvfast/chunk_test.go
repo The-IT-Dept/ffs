@@ -120,3 +120,21 @@ func TestMatchImageBoundsRecordLoads(t *testing.T) {
 	require.Len(t, ms, 9)
 	require.Equal(t, []int{3, 3, 3}, *loads)
 }
+
+// TestMatchImageReadsAreBoundedInBytes: by default a read takes as many records as 64 MiB holds of the largest
+// record the OSV feed caches (4 MiB), not a count: a host's kernel records average over 400 KB, and 256 of them
+// at a time, parsed together, held most of a gigabyte.
+func TestMatchImageReadsAreBoundedInBytes(t *testing.T) {
+	records, bytes := osvfast.RecordChunk()
+	require.Equal(t, 64<<20, bytes)
+	require.Equal(t, 4<<20, osvfast.MaxCachedRecordBytes)
+	require.Equal(t, 16, records)
+	require.LessOrEqual(t, records*osvfast.MaxCachedRecordBytes, bytes)
+
+	m, pkgs := hostFixture(t)
+	loads := osvfast.WatchRecordLoads(t)
+	ms, err := m.MatchImage(ctx, match.ImageInput{Digest: dHost, Packages: pkgs})
+	require.NoError(t, err)
+	require.Len(t, ms, 9)
+	require.Equal(t, []int{9}, *loads, "nine records fit one read")
+}

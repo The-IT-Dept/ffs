@@ -104,14 +104,14 @@ func TestChart_DeploymentShape(t *testing.T) {
 		require.Len(t, c.Env, 1, c.Name)
 		require.Equal(t, "GOMEMLIMIT", c.Env[0].Name)
 	}
-	require.Equal(t, "1932735283", ctl.Env[0].Value, "90% of the controller's 2Gi limit")
+	require.Equal(t, "966367641", ctl.Env[0].Value, "90% of the controller's 1Gi limit")
 	require.Equal(t, "1932735283", cat.Env[0].Value, "90% of the cataloguer's 2Gi limit")
 	reqs := func(c corev1.Container) (string, string, string, bool) {
 		return c.Resources.Requests.Cpu().String(), c.Resources.Requests.Memory().String(),
 			c.Resources.Limits.Memory().String(), c.Resources.Limits.Cpu().IsZero()
 	}
 	cpu, mem, lim, noCPU := reqs(ctl)
-	require.Equal(t, []any{"200m", "512Mi", "2Gi", true}, []any{cpu, mem, lim, noCPU})
+	require.Equal(t, []any{"200m", "512Mi", "1Gi", true}, []any{cpu, mem, lim, noCPU})
 	cpu, mem, lim, noCPU = reqs(cat)
 	require.Equal(t, []any{"100m", "256Mi", "2Gi", true}, []any{cpu, mem, lim, noCPU})
 
@@ -619,7 +619,7 @@ func TestChart_ControllerGoMemLimit(t *testing.T) {
 		require.Equal(t, "GOMEMLIMIT", c.Env[0].Name)
 		return c.Env[0]
 	}
-	require.Equal(t, "1932735283", env().Value, "90% of the default 2Gi")
+	require.Equal(t, "966367641", env().Value, "90% of the default 1Gi")
 	require.Equal(t, "1449551462", env("controller.resources.limits.memory=1536Mi").Value)
 	require.Equal(t, "1800000000", env("controller.resources.limits.memory=2G").Value)
 	e := env("controller.resources.limits=null")
