@@ -2,6 +2,7 @@ package apiserver
 
 import (
 	"context"
+	"net/http"
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
@@ -16,4 +17,9 @@ func (s *Server) ScopeGapsAndCount(ctx context.Context, sc model.Scope) ([]apige
 	}
 	n, err := s.scopeGapCount(ctx, sc)
 	return gaps, n, err
+}
+
+// ResponseError answers a request whose handler failed with err, as the strict handler does.
+func (s *Server) ResponseError(w http.ResponseWriter, r *http.Request, err error) {
+	s.responseError(w, r, err)
 }

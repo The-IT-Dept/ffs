@@ -54,6 +54,9 @@ const (
 	unappliedLogEvery = 3
 )
 
+// errEncoding is a full report that could not be encoded.
+var errEncoding = errors.New("encoding the full report")
+
 var (
 	// backoffBase is the first failed-report backoff; tests shorten it.
 	backoffBase = 10 * time.Second
@@ -271,6 +274,12 @@ func (a *agent) loop(ctx context.Context) {
 			}
 		}
 		if ctx.Err() != nil {
+			// Stopping: the requests not reached are answered skipped, so none of them counts against its image.
+			ws := make([]wire.WorkRequest, 0, len(work))
+			for _, j := range work {
+				ws = append(ws, j.w)
+			}
+			a.skip(ctx, ws...)
 			return
 		}
 	}
@@ -304,7 +313,8 @@ func (a *agent) newReport(kind string) wire.Report {
 // fullReport sends a full report and schedules the next reports; it returns the work the controller handed back.
 // It first probes the controller's config, and skips the report when the controller does not answer. The host
 // inventory is the one kept from an earlier attempt while that is younger than the report interval, so retries
-// never stage or catalogue the host again; it is dropped once the controller has stored a host part.
+// never stage or catalogue the host again. It is dropped once the controller has stored a host part, and when
+// a send fails for a reason a resend would not mend (see keepHostAfter).
 func (a *agent) fullReport(parent context.Context, s *schedule) []wire.WorkRequest {
 	a.lease(fullReportTimeout)
 	ctx, cancel := context.WithTimeout(parent, fullReportTimeout)
@@ -331,20 +341,30 @@ func (a *agent) fullReport(parent context.Context, s *schedule) []wire.WorkReque
 		r.Host = &wire.Host{PackageDB: inv.packageDB, Binaries: inv.binaries}
 		r.Problems = append(slices.Clone(inv.problems), r.Problems...)
 		doc = &inv.sbom
-		if body, err := encodeReport(r, doc); err == nil && a.cfg.MaxReportBytes > 0 && body.size() > a.cfg.MaxReportBytes {
-			r.Problems = append(r.Problems, wire.Problem{Code: wire.ProblemCatalog,
-				Detail: fmt.Sprintf("host SBOM of %d bytes exceeds the report limit %d", inv.sbom.size, a.cfg.MaxReportBytes)})
-			r.Host, doc = nil, nil
-			a.dropHost()
-		}
 	}
-	resp, err := a.client.Report(ctx, r, doc)
+	body, err := encodeReport(r, doc)
+	if err == nil && doc != nil && a.cfg.MaxReportBytes > 0 && body.size() > a.cfg.MaxReportBytes {
+		r.Problems = append(r.Problems, wire.Problem{Code: wire.ProblemCatalog,
+			Detail: fmt.Sprintf("host SBOM of %d bytes exceeds the report limit %d", inv.sbom.size, a.cfg.MaxReportBytes)})
+		r.Host = nil
+		a.dropHost()
+		body, err = encodeReport(r, nil)
+	}
+	var resp wire.ReportResponse
+	if err == nil {
+		resp, err = a.client.sendReport(ctx, &body)
+	} else {
+		err = fmt.Errorf("%w: %w", errEncoding, err)
+	}
 	a.touch()
 	if parent.Err() != nil {
 		return nil
 	}
 	now := a.o.Now()
 	if err != nil {
+		if !keepHostAfter(err) {
+			a.dropHost()
+		}
 		wait := a.retryIn(err, &s.fullBackoff)
 		s.nextFull = now.Add(wait)
 		a.logFailure(err, "sending a full report", "seq", r.Seq, "retryIn", wait)
@@ -447,6 +467,18 @@ func (a *agent) logFailure(err error, msg string, kv ...any) {
 		return
 	}
 	a.o.Log.Error(err, msg, kv...)
+}
+
+// keepHostAfter reports whether a full report whose send failed with err keeps its host inventory for the
+// resend: when the controller deferred it (429) or failed (5xx), or did not answer at all (a network error).
+// Any other answer (400, 401, 403, 413) would refuse the same inventory again, and a report that could not be
+// encoded would fail again, so the inventory is dropped and collected afresh for the next report.
+func keepHostAfter(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code == http.StatusTooManyRequests || se.Code >= http.StatusInternalServerError
+	}
+	return !errors.Is(err, errEncoding)
 }
 
 // controllerUnavailable reports whether err means the controller is not (yet) taking reports.

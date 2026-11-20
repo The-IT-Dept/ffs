@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -54,6 +55,40 @@ func TestJump_InUseContainerImagesAndHostPackages(t *testing.T) {
 	hits, _, err = s.Jump(ctx, "%", 0)
 	require.NoError(t, err)
 	require.Empty(t, hits)
+}
+
+// A node group's host-only packages give it one hit: its best-ranked matching package with the
+// highest version installed. limit and more count node groups, not packages.
+func TestJump_HostPackagesOneHitPerGroup(t *testing.T) {
+	s := newStore(t)
+	const g1, g2 = "nodegroup:g1", "nodegroup:g2"
+	var pkgs1 []model.Package
+	for i := range 7 {
+		pkgs1 = append(pkgs1, deb(fmt.Sprintf("libnet%d", i), ""))
+	}
+	kmod := deb("netkmod", "")
+	kmod.Version, kmod.ID = "2.0", "netkmod-2.0"
+	pkgs1 = append(pkgs1, deb("netkmod", ""), kmod)
+	for _, d := range []string{g1, g2} {
+		require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: d, Repo: "host", Status: model.ImageCatalogued}))
+	}
+	require.NoError(t, s.PutSBOM(ctx, g1, nil, pkgs1))
+	require.NoError(t, s.PutSBOM(ctx, g2, nil, []model.Package{deb("libnet9", "")}))
+	require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: model.NodesOwner(testCluster),
+		Containers: []model.ContainerUse{{Name: "g1", Digest: g1}, {Name: "g2", Digest: g2}}}))
+
+	hits, more, err := s.Jump(ctx, "net", 0)
+	require.NoError(t, err)
+	require.False(t, more, "nine packages match, in two node groups")
+	require.Equal(t, []JumpHit{
+		{Kind: "hostpackage", ID: g1, Label: "netkmod", Detail: "2.0", Prefix: true},
+		{Kind: "hostpackage", ID: g2, Label: "libnet9", Detail: "1.0"},
+	}, hits, "g1 by its prefix match, with the highest version installed; g2 by the package it has")
+
+	one, more, err := s.Jump(ctx, "net", 1)
+	require.NoError(t, err)
+	require.True(t, more, "a second node group matches")
+	require.Len(t, one, 1)
 }
 
 func TestStore_CountFindings(t *testing.T) {

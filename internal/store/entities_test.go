@@ -629,23 +629,31 @@ func TestEntityCounts_MatchExplorerTotals(t *testing.T) {
 }
 
 // The image gap tally counts what CoverageImages lists: one gap for an image not seen into, one per
-// partial-coverage reason, and hands back the classifier-found packages of the catalogued images.
+// partial-coverage reason, and one per catalogued image with a classifier-found package the covered
+// list does not name (however many such packages it has).
 func TestImageGapTally_CountsCodes(t *testing.T) {
 	s := newStore(t)
 	seedExplorer(t, s)
-	redis := model.Package{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary", Path: "/usr/local/bin/redis-server"}
-	put(t, s, "sha256:worker", redis)
-	put(t, s, "sha256:node-exporter", redis) // pending: its packages are not counted
-	tally, err := s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeCluster})
+	binary := func(name, classifier string) model.Package {
+		return model.Package{Ecosystem: "binary", Name: name, Version: "7.4.1", Classifier: classifier, Path: "/usr/local/bin/" + name}
+	}
+	redis, valkey := binary("redis-server", "redis-binary"), binary("valkey", "valkey-binary")
+	covered := []CoveredClassifier{{Ecosystem: "binary", Classifier: "valkey-binary", Name: "valkey"},
+		{Ecosystem: "binary", Classifier: "redis-binary", Name: "redis"}}
+	put(t, s, "sha256:worker", redis, binary("traefik", "traefik-binary")) // two uncovered packages, one gap
+	put(t, s, "sha256:web", valkey)                                        // covered
+	put(t, s, "sha256:node-exporter", redis)                               // pending: its packages are not counted
+	tally, err := s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeCluster}, covered)
 	require.NoError(t, err)
 	// api (attestation), node-exporter (pending), the placeholder (unresolvable), norow (no row)
-	require.Equal(t, 4, tally.Codes)
-	require.Len(t, tally.Classified, 1)
-	require.Equal(t, []string{"redis-server"}, names(tally.Classified["sha256:worker"]))
+	require.Equal(t, ImageGapTally{Codes: 4, Uncovered: 1}, tally)
+
+	tally, err = s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeCluster}, nil)
+	require.NoError(t, err)
+	require.Equal(t, ImageGapTally{Codes: 4, Uncovered: 2}, tally, "with nothing covered, web's valkey is uncovered too")
 
 	require.NoError(t, s.MarkUnmatched(ctx, "sha256:worker", t0))
-	tally, err = s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"})
+	tally, err = s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"}, covered)
 	require.NoError(t, err)
-	require.Equal(t, 1, tally.Codes, "worker is pending until its first match")
-	require.Empty(t, tally.Classified)
+	require.Equal(t, ImageGapTally{Codes: 1}, tally, "worker is pending until its first match")
 }

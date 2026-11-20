@@ -55,6 +55,11 @@ type Identity struct{ Node, Pod, PodUID, ServiceAccount, Namespace string }
 // ErrUnauthenticated is a token the controller does not accept from an agent.
 var ErrUnauthenticated = errors.New("agentapi: unauthenticated")
 
+// errPodNotSeen is a rejection because the controller's pod cache does not show the token's pod running
+// on a node yet: the cache can lag a pod that just started (missing, or not yet bound to its node), so the
+// rejection is not cached. It wraps ErrUnauthenticated.
+var errPodNotSeen = fmt.Errorf("%w: the token's pod is not running", ErrUnauthenticated)
+
 // Authenticator checks an agent's bearer token. It returns an error wrapping ErrUnauthenticated for a token it
 // rejects; any other error means it could not decide.
 type Authenticator interface {
@@ -76,7 +81,8 @@ type authEntry struct {
 }
 
 // tokenReviewAuth authenticates with TokenReview and caches outcomes by the token's sha256, never the token:
-// an accepted token until the earlier of CacheTTL and its exp, a rejected one for rejectCacheTTL.
+// an accepted token until the earlier of CacheTTL and its exp, a rejected one for rejectCacheTTL, except a
+// token whose pod the pod cache does not hold yet.
 type tokenReviewAuth struct {
 	c    client.Client
 	pods client.Reader
@@ -119,6 +125,8 @@ func (a *tokenReviewAuth) Authenticate(ctx context.Context, bearer string) (Iden
 	}
 	id, err := a.identity(ctx, tr.Status)
 	switch {
+	case errors.Is(err, errPodNotSeen):
+		return Identity{}, err // the pod cache may lag a new pod: reviewed again next time
 	case errors.Is(err, ErrUnauthenticated):
 		a.remember(key, authEntry{err: err, expires: now.Add(rejectCacheTTL)}, now)
 		return Identity{}, err
@@ -183,12 +191,15 @@ func (a *tokenReviewAuth) identity(ctx context.Context, st authenticationv1.Toke
 	var pod corev1.Pod
 	if err := a.pods.Get(ctx, client.ObjectKey{Namespace: a.o.Namespace, Name: id.Pod}, &pod); err != nil {
 		if apierrors.IsNotFound(err) {
-			return Identity{}, fmt.Errorf("%w: the token's pod is not running", ErrUnauthenticated)
+			return Identity{}, errPodNotSeen
 		}
 		return Identity{}, fmt.Errorf("reading the agent pod: %w", err)
 	}
-	if string(pod.UID) != id.PodUID || pod.Namespace != a.o.Namespace || pod.Spec.NodeName == "" {
+	if string(pod.UID) != id.PodUID || pod.Namespace != a.o.Namespace {
 		return Identity{}, fmt.Errorf("%w: the token's pod is not running", ErrUnauthenticated)
+	}
+	if pod.Spec.NodeName == "" {
+		return Identity{}, errPodNotSeen
 	}
 	id.Node = pod.Spec.NodeName
 	return id, nil

@@ -175,6 +175,38 @@ func TestAcceptAgentReport_OrderedByInstanceNotClock(t *testing.T) {
 	require.Equal(t, t0, rows[0].StartedAt, "the start is stored as reported")
 }
 
+// TestAcceptAgentReport_WithoutInstanceOrderedByStart: an agent older than the Instance field (during a
+// rollout) sends none; its processes of one boot are ordered by when they started.
+func TestAcceptAgentReport_WithoutInstanceOrderedByStart(t *testing.T) {
+	s := newStore(t)
+	accept := func(r AgentReport) bool {
+		t.Helper()
+		ok, err := s.AcceptAgentReport(ctx, r)
+		require.NoError(t, err)
+		return ok
+	}
+	old := func(started time.Time, seq uint64) AgentReport {
+		r := fullReport("worker-1", "boot-a", started, seq, t0.Add(time.Duration(seq)*time.Minute))
+		r.Instance = ""
+		return r
+	}
+	require.True(t, accept(old(t0, 40)))
+	require.False(t, accept(old(t0, 40)), "the same process: a duplicate")
+	require.False(t, accept(old(t0, 39)), "the same process: stale")
+	require.True(t, accept(old(t0, 41)))
+	require.True(t, accept(old(t0.Add(time.Hour), 1)), "a process that started later is applied from seq 1")
+	require.True(t, accept(old(t0.Add(time.Hour), 2)))
+	require.False(t, accept(old(t0, 42)), "the process it replaced is stale")
+	require.True(t, accept(fullReport("worker-1", "boot-b", t0, 1, t0.Add(time.Hour))), "another boot")
+
+	upgraded := fullReport("worker-1", "boot-b", t0, 1, t0.Add(2*time.Hour))
+	upgraded.Instance = "proc-new"
+	require.True(t, accept(upgraded), "an agent that sends an Instance is ordered by it, whatever it started at")
+	rows, err := s.AgentNodes(ctx)
+	require.NoError(t, err)
+	require.Equal(t, "proc-new", rows[0].Instance)
+}
+
 func agentGroup(id string) model.NodeGroup {
 	return model.NodeGroup{ID: id, Kind: model.NodeGroupAgent, Name: "ubuntu-26.04-k7.0.0-34", Label: "ubuntu-26.04-k7.0.0-34-" + id,
 		Digest: "nodegroup:" + id, OSImage: "Ubuntu 26.04 LTS", KernelRelease: "7.0.0-34-generic", PackageDB: "dpkg", PackageCount: 812}

@@ -24,9 +24,13 @@ import (
 const (
 	defaultWorkQuarantineAfter = 2
 	defaultWorkQuarantineFor   = 24 * time.Hour
-	// reasonOfferExpired is the counted failure of an offer the agent reached but sent no result for before
-	// it expired: the agent was probably killed cataloguing the image (out of memory), or the image ran past
-	// its deadline, so an image that keeps doing it is quarantined like one whose cataloguer fails (spec §9.3).
+	// resultGrace is how long after its deadline a request still takes a result: the agent's job ends at the
+	// deadline, and its result is posted after that.
+	resultGrace = 2 * time.Minute
+	// reasonOfferExpired is the counted failure of an offer the agent reached but sent no result for: the agent
+	// answers every request it reaches, skipped ones included, so its process most likely died cataloguing the
+	// image (killed out of memory, say), and an image that keeps doing it is quarantined like one whose
+	// cataloguer fails (spec §9.3).
 	reasonOfferExpired = "the node agent sent no result before the request expired"
 )
 
@@ -57,15 +61,19 @@ type WorkOptions struct {
 }
 
 // WorkQueue offers unresolvable images to the node agents that hold them and accepts the SBOMs they send
-// back. Offers live in memory only: after a restart every image is offered afresh.
+// back. Offers live in memory only: after a restart every image is offered afresh. A node holds at most
+// PerReport offers before their deadlines, however often it reports, and an offer takes a result until
+// resultGrace after its deadline.
 //
-// An offer that expires unanswered counts against its image only when the agent had reached it. An agent
-// process works through the requests it is given one at a time, in the order they were offered, and sends
-// nothing for a request it reaches past its deadline. So an unanswered offer made while an earlier offer to
-// the same agent process was still live, and that earlier offer also went unanswered, was queued behind the
-// job that stalled: it was never attempted, or only for what was left of its deadline, and is not counted.
-// Offers to a restarted agent (a new Instance) start a new queue. Still counted: the request an agent was on
-// when its cataloguer was not up or the agent was stopping, as neither sends anything.
+// The agent answers every request it reaches: with an SBOM, a failure, a reason the image is unavailable, or
+// skipped when it did not attempt it for a reason that is not the image's (too little time left, a busy
+// cataloguer, a scratch volume that cannot take it, the agent stopping). A skipped request is released
+// without counting. So a request that expires unanswered was cut short: the agent process died on it (killed
+// out of memory, say), or its result was lost. It counts against its image unless it was queued behind
+// another: an agent process works through its requests one at a time, in the order they were offered, so an
+// unanswered offer made while an earlier unanswered offer to the same process was still before its deadline
+// was never attempted, and is not counted. Of the requests a process held when it died, only the one it died
+// on counts. A restarted agent (a new Instance) starts a new queue.
 type WorkQueue struct {
 	o WorkOptions
 
@@ -112,9 +120,10 @@ func declineKey(node, digest string) string { return node + "\x00" + digest }
 
 func agentKey(node, instance string) string { return node + "\x00" + instance }
 
-// Offer picks up to PerReport images for node's agent to catalogue, oldest first: unresolvable images of an
-// offered class that a pod on node runs, that node holds complete, that are not offered to any node or
-// declined by this one, and that are not quarantined.
+// Offer picks images for node's agent to catalogue, oldest first, up to PerReport less the node's offers
+// before their deadlines: unresolvable images of an offered class that a pod on node runs, that node holds complete, that are
+// not offered to any node or declined by this one, and that are not quarantined. It first counts every expired
+// offer forget returns, joining the errors of any it could not record.
 func (q *WorkQueue) Offer(ctx context.Context, node string) ([]wire.WorkRequest, error) {
 	if q.o.PerReport <= 0 {
 		return nil, nil
@@ -132,12 +141,16 @@ func (q *WorkQueue) Offer(ctx context.Context, node string) ([]wire.WorkRequest,
 			candidates = append(candidates, img)
 		}
 	}
+	var errs []error
 	for _, e := range q.forget(now, offerable) {
 		q.o.Log.Info("node agent sent no result for an image before the request expired", "node", e.node, "digest", e.digest)
 		if _, err := q.o.Store.RecordAgentJobFailure(ctx, e.digest, e.node, reasonOfferExpired, now, q.o.QuarantineAfter,
 			q.o.QuarantineFor); err != nil {
-			return nil, err
+			errs = append(errs, fmt.Errorf("counting the expired request of %s on %s: %w", e.digest, e.node, err))
 		}
+	}
+	if err := errors.Join(errs...); err != nil {
+		return nil, err
 	}
 	if len(candidates) == 0 {
 		return nil, nil
@@ -170,15 +183,21 @@ func (q *WorkQueue) Offer(ctx context.Context, node string) ([]wire.WorkRequest,
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	room := q.o.PerReport
+	for _, o := range q.offers {
+		if o.node == node && o.deadline.After(now) {
+			room--
+		}
+	}
 	slices.SortFunc(candidates, func(a, b model.Image) int {
 		return cmp.Or(q.seen[a.Digest].Compare(q.seen[b.Digest]), cmp.Compare(a.Digest, b.Digest))
 	})
 	var work []wire.WorkRequest
 	for _, img := range candidates {
-		if len(work) == q.o.PerReport {
+		if len(work) >= room {
 			break
 		}
-		if o, ok := q.offers[img.Digest]; ok && o.deadline.After(now) {
+		if _, ok := q.offers[img.Digest]; ok { // live, or past its deadline but still taking a result
 			continue
 		}
 		if until, ok := q.declined[declineKey(node, img.Digest)]; ok && until.After(now) {
@@ -213,9 +232,9 @@ func (q *WorkQueue) hold(digest, id, node, instance string, now time.Time) offer
 type expiredOffer struct{ digest, node string }
 
 // forget records when each offerable digest was first seen, and drops what is no longer needed: the order of
-// digests that are no longer offerable, expired offers, expired declines and stalls no live offer can be
-// behind. It returns the expired offers to count: unanswered, of a digest still offerable, and not queued
-// behind another unanswered offer to the same agent process (see WorkQueue).
+// digests that are no longer offerable, offers resultGrace past their deadline, expired declines and stalls
+// no recorded offer can be behind. It returns the expired offers to count: unanswered, of a digest still
+// offerable, and the first unanswered offer of their agent process, not one queued behind it (see WorkQueue).
 func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) []expiredOffer {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -235,7 +254,7 @@ func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) []expiredOf
 	}
 	var expired []unanswered
 	for d, o := range q.offers {
-		if o.deadline.After(now) {
+		if o.deadline.Add(resultGrace).After(now) {
 			continue
 		}
 		delete(q.offers, d)
@@ -258,8 +277,9 @@ func (q *WorkQueue) forget(now time.Time, offerable map[string]bool) []expiredOf
 		}
 	}
 	for k, until := range q.stalled {
-		// Every offer made before until has a deadline before until+Timeout, so it has been settled.
-		if !until.Add(q.o.Timeout).After(now) {
+		// Every offer made before until has a deadline before until+Timeout, so it has been settled by then
+		// plus the grace.
+		if !until.Add(q.o.Timeout + resultGrace).After(now) {
 			delete(q.stalled, k)
 		}
 	}
@@ -290,11 +310,12 @@ func heldComplete(rows []model.NodeImage, d, indexDigest string) bool {
 	return false
 }
 
-// SBOM applies a node agent's result for one image. It is accepted only for a live offer of the image to
-// that node: one Offer made to the node whose deadline has not passed. Anything else is ErrForbidden with
-// nothing written, so a node cannot supply, fail or decline an image it was not asked for. A handled result
-// releases the offer; a transient failure keeps it, marked answered, so the agent can send the result again
-// and its expiry is not counted against the image.
+// SBOM applies a node agent's result for one image. It is accepted only for an offer of the image to that
+// node that still takes a result: one Offer made to the node, no more than resultGrace past its deadline.
+// Anything else is ErrForbidden with nothing written, so a node cannot supply, fail, decline or skip an image
+// it was not asked for. A handled result releases the offer; a skipped one is released without counting and
+// leaves the image offerable. A transient failure keeps the offer, marked answered, so the agent can send the
+// result again and its expiry is not counted against the image.
 func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult) error {
 	if res.Node != id.Node {
 		return fmt.Errorf("%w: result is for node %s, not %s", ErrForbidden, res.Node, id.Node)
@@ -310,7 +331,7 @@ func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult)
 		return fmt.Errorf("%w: a result carries exactly one of syftJSON, unavailable and failure", ErrBadRequest)
 	}
 	switch res.Unavailable {
-	case "", wire.UnavailableNotFound, wire.UnavailableLayersDiscarded, wire.UnavailableTooLarge:
+	case "", wire.UnavailableNotFound, wire.UnavailableLayersDiscarded, wire.UnavailableTooLarge, wire.UnavailableSkipped:
 	default:
 		return fmt.Errorf("%w: unknown unavailable reason %q", ErrBadRequest, res.Unavailable)
 	}
@@ -318,12 +339,17 @@ func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult)
 	q.mu.Lock()
 	o, live := q.offers[res.Digest]
 	q.mu.Unlock()
-	if !live || o.node != id.Node || !o.deadline.After(now) {
+	if !live || o.node != id.Node || !o.deadline.Add(resultGrace).After(now) {
 		return fmt.Errorf("%w: %s was not offered to %s, or its offer has expired", ErrForbidden, res.Digest, id.Node)
+	}
+	log := q.o.Log.WithValues("node", id.Node, "digest", res.Digest)
+	if res.Unavailable == wire.UnavailableSkipped {
+		log.V(1).Info("node agent skipped the image; it is offered again")
+		q.release(res.Digest, o.id)
+		return nil
 	}
 	img, ok, err := q.o.Store.GetImage(ctx, res.Digest)
 	if err == nil && ok {
-		log := q.o.Log.WithValues("node", id.Node, "digest", res.Digest)
 		switch {
 		case hasSyft:
 			err = q.ingest(ctx, id, res, img, now, log)
@@ -334,18 +360,82 @@ func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult)
 			err = q.unavailable(ctx, id, res, img, now, log)
 		}
 	}
-	transient := err != nil && !errors.Is(err, ErrForbidden)
+	if err != nil && !errors.Is(err, ErrForbidden) { // transient: the offer stays for the agent's retry
+		q.markAnswered(res.Digest, o.id)
+		return err
+	}
+	q.release(res.Digest, o.id)
+	return err
+}
+
+// release drops the offer id of digest, unless another offer has replaced it.
+func (q *WorkQueue) release(digest, id string) {
 	q.mu.Lock()
-	if cur, still := q.offers[res.Digest]; still && cur.id == o.id {
-		if transient { // the offer stays for the agent's retry
-			cur.answered = true
-			q.offers[res.Digest] = cur
-		} else {
-			delete(q.offers, res.Digest)
+	defer q.mu.Unlock()
+	if cur, ok := q.offers[digest]; ok && cur.id == id {
+		delete(q.offers, digest)
+	}
+}
+
+// ResultWait is how long a result from node may wait for the ingest budget before it is read, and what to call
+// when it waited that long unread. An agent process answers its requests one at a time, in the order they were
+// offered, and the node's newest process (the one its latest offer went to) is the one working, so the result
+// in flight answers that process's earliest unanswered request that still takes a result: the wait ends when
+// that request stops taking one, and unread marks it answered, because the controller held it up, not the
+// image. The requests behind it get answers of their own. Failing such a request, the earliest of the node's
+// other requests that still take a result bounds the wait. wait is zero or less when none does.
+func (q *WorkQueue) ResultWait(node string) (wait time.Duration, unread func()) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := q.o.Now()
+	var newest offer
+	for _, o := range q.offers {
+		if o.node == node && o.seq > newest.seq {
+			newest = o
 		}
 	}
-	q.mu.Unlock()
-	return err
+	// inFlightFirst orders the requests a result from node most likely answers: the newest process's first,
+	// then unanswered ones, then in offer order.
+	inFlightFirst := func(a, b offer) int {
+		return cmp.Or(falseFirst(a.instance != newest.instance, b.instance != newest.instance),
+			falseFirst(a.answered, b.answered), cmp.Compare(a.seq, b.seq))
+	}
+	var digest string
+	var target offer
+	for d, o := range q.offers {
+		if o.node != node || !o.deadline.Add(resultGrace).After(now) {
+			continue
+		}
+		if digest == "" || inFlightFirst(o, target) < 0 {
+			digest, target = d, o
+		}
+	}
+	if digest == "" {
+		return 0, func() {}
+	}
+	return target.deadline.Add(resultGrace).Sub(now), func() { q.markAnswered(digest, target.id) }
+}
+
+// falseFirst orders false before true.
+func falseFirst(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case !a:
+		return -1
+	}
+	return 1
+}
+
+// markAnswered marks the offer id of digest answered, unless another offer has replaced it: a result for it
+// arrived but was not handled, so its expiry is not counted against the image.
+func (q *WorkQueue) markAnswered(digest, id string) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if cur, ok := q.offers[digest]; ok && cur.id == id {
+		cur.answered = true
+		q.offers[digest] = cur
+	}
 }
 
 // ingest stores an agent SBOM, with where it came from, through the acquirer. A refused document counts

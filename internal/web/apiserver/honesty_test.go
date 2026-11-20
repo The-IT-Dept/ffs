@@ -488,3 +488,23 @@ func TestSharedImages_CountOwnFindingsAndImagesOnce(t *testing.T) {
 	require.Equal(t, apigen.CoverageFigure{InUse: 2, SeenInto: 1, Full: 1}, host.Signals.Coverage,
 		"nginx (shared) and the proxy image, each once")
 }
+
+// The cluster rail's node-group item is hatched as the group's own card is: by the group's coverage
+// figure, which also needs its host SBOM catalogued and matched, not only its members' gaps.
+func TestClusterRail_NodeGroupGapFollowsItsCoverage(t *testing.T) {
+	f := webtest.Open(t)
+	for _, node := range []string{"worker-1", "worker-2"} {
+		agentReport(t, f, node, time.Minute)
+	}
+	label := "ubuntu-24.04-k6.8.0-88-3f9c1a"
+	ng := "?scope=" + url.QueryEscape("nodegroup:"+webtest.AgentGroupKey)
+	h := handlerOf(f)
+	require.Equal(t, apigen.CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}, scopeCard(t, h, ng).Trust.Coverage)
+	require.False(t, relatedItem(t, scopeCard(t, h, ""), apigen.RelatedSectionIdNodegroups, label).Gap, "every member in full")
+
+	require.NoError(t, f.Store.MarkUnmatched(t.Context(), nodegroup.GroupDigest(webtest.AgentGroupID), webtest.Now))
+	h = handlerOf(f)
+	require.Equal(t, apigen.CoverageFigure{InUse: 1}, scopeCard(t, h, ng).Trust.Coverage, "the host SBOM is not matched yet")
+	require.True(t, relatedItem(t, scopeCard(t, h, ""), apigen.RelatedSectionIdNodegroups, label).Gap,
+		"the rail agrees with the group's card")
+}

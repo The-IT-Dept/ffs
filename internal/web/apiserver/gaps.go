@@ -157,6 +157,10 @@ func (s *Server) scopeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, e
 	return gaps, nil
 }
 
+// coveredClassifiers are the classifier-found packages the upstream map covers, which the store's
+// gap tally does not count as cpe_only_classifier gaps.
+var coveredClassifiers = upstream.Covered()
+
 // scopeGapCount is len(scopeGaps(sc)), counted without listing the gaps: the stale feeds, the image
 // gaps from the store's tally (the scope's images are never read one by one), and the node gaps.
 func (s *Server) scopeGapCount(ctx context.Context, sc model.Scope) (int, error) {
@@ -173,16 +177,11 @@ func (s *Server) scopeGapCount(ctx context.Context, sc model.Scope) (int, error)
 	}
 	switch sc.Kind {
 	case model.ScopeCluster, model.ScopeNamespace, model.ScopeWorkload:
-		t, err := s.o.Store.ImageGapTally(ctx, sc)
+		t, err := s.o.Store.ImageGapTally(ctx, sc, coveredClassifiers)
 		if err != nil {
 			return 0, err
 		}
-		n += t.Codes
-		for _, pkgs := range t.Classified {
-			if len(upstream.UncoveredClassified(pkgs)) > 0 {
-				n++
-			}
-		}
+		n += t.Codes + t.Uncovered
 	case model.ScopeImage:
 		images, err := s.gapImages(ctx, sc)
 		if err != nil {

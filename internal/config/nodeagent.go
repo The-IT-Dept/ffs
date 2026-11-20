@@ -26,7 +26,9 @@ type NodeAgentConfig struct {
 	WorkTimeout       time.Duration `yaml:"workTimeout"`
 	ExposedNodes      string        `yaml:"exposedNodes"` // node label selector; "" exposes no node
 	// Architectures and NodeSelector are where the agent DaemonSet schedules, as the chart renders it: the
-	// controller shows other nodes as not scheduled rather than as missing an agent. Empty: every node.
+	// controller shows other nodes as not scheduled rather than as missing an agent. The defaults are the
+	// chart's, [amd64] and kubernetes.io/os: linux. A value in the file replaces the default rather than
+	// merging into it, and an explicitly empty (or null) value means every node.
 	Architectures []string          `yaml:"architectures"`
 	NodeSelector  map[string]string `yaml:"nodeSelector"`
 }
@@ -36,6 +38,7 @@ func defaultNodeAgent() NodeAgentConfig {
 		Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent", ServiceAccount: "ffs-agent",
 		MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
 		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
+		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
 	}
 }
 

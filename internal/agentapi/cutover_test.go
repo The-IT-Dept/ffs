@@ -275,13 +275,15 @@ func TestCutover_UnsupportedNodesDoNotBlockCutover(t *testing.T) {
 	}
 	x := newCutoverFixture(t, labelled("worker-1", "amd64", "linux"), labelled("arm-1", "arm64", "linux"),
 		labelled("win-1", "amd64", "windows"))
+	x.setConfig(func(c *config.Config) {
+		c.NodeAgent.Architectures, c.NodeAgent.NodeSelector = []string{}, map[string]string{}
+	})
 	x.pass(t)
-	require.False(t, x.state(t).RuntimeRetired, "every Ready node counts while nothing says where the agent runs")
+	require.False(t, x.state(t).RuntimeRetired, "every Ready node counts while the config says the agent runs everywhere")
 	require.Nil(t, x.state(t).Unsupported)
 
-	x.setConfig(func(c *config.Config) {
-		c.NodeAgent.Architectures = []string{"amd64"}
-		c.NodeAgent.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+	x.setConfig(func(c *config.Config) { // the chart's defaults: amd64, Linux
+		c.NodeAgent.Architectures, c.NodeAgent.NodeSelector = config.Default().NodeAgent.Architectures, config.Default().NodeAgent.NodeSelector
 	})
 	x.pass(t)
 	x.requireForward(t)

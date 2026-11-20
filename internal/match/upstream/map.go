@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 // binaryEcosystem is the Syft package type of packages found by a binary classifier.
@@ -118,6 +119,20 @@ func (e Entry) Tags(version string) []string {
 	for _, f := range e.TagFormats {
 		if t := r.Replace(f); !slices.Contains(out, t) {
 			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// Covered lists every package Lookup finds an entry for, as the store compares them in SQL
+// (Store.ImageGapTally): the binary ecosystem, and each classifier and name of one entry.
+func Covered() []store.CoveredClassifier {
+	var out []store.CoveredClassifier
+	for _, e := range Map {
+		for _, c := range e.Classifiers {
+			for _, n := range e.Names {
+				out = append(out, store.CoveredClassifier{Ecosystem: binaryEcosystem, Classifier: c, Name: n})
+			}
 		}
 	}
 	return out

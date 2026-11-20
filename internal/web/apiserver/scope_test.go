@@ -270,3 +270,19 @@ func TestScope_ViewCountsMatchExplorerTotals(t *testing.T) {
 	require.NoError(t, err)
 	check("PruneResolved")
 }
+
+// Answers name a node group by its key, whichever way the request named it: its fingerprint ID, its
+// label or the key itself.
+func TestScope_EchoesTheGroupsKey(t *testing.T) {
+	_, h := newAPI(t)
+	want := "nodegroup:" + webtest.AgentGroupKey
+	for _, ref := range []string{webtest.AgentGroupID, "ubuntu-24.04-k6.8.0-88-3f9c1a", webtest.AgentGroupKey} {
+		q := "?scope=" + url.QueryEscape("nodegroup:"+ref)
+		c := scopeCard(t, h, q)
+		require.Equal(t, want, c.Scope.Scope, ref)
+		require.Equal(t, "ubuntu-24.04-k6.8.0-88-3f9c1a", c.Scope.Label, ref)
+		sum := ok[apigen.Summary](t, get(t, h, "/api/v1/summary"+q))
+		require.Equal(t, want, sum.Scope.Scope, ref)
+	}
+	require.Equal(t, "node:worker-2", scopeCard(t, h, "?scope=node:worker-2").Scope.Scope, "a node scope stays the node")
+}

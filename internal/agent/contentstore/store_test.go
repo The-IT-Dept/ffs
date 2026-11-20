@@ -364,3 +364,27 @@ func TestScan_SkipsBuildKitAttestations(t *testing.T) {
 		})
 	}
 }
+
+// TestScan_SkipsLooseAttestationByItsConfig: an attestation manifest no index names, with an image config whose
+// platform is unknown/unknown (as BuildKit writes it), is not a cached image: only its config gives it away.
+func TestScan_SkipsLooseAttestationByItsConfig(t *testing.T) {
+	ctx := context.Background()
+	dir := filepath.Join(t.TempDir(), "io.containerd.content.v1.content")
+	amd := describe(t, platformImage(t, "linux", "amd64", "", types.OCIManifestSchema1))
+	att := describe(t, attestationImage(t, "unknown", "unknown"))
+	contentstoretest.WriteImage(t, dir, amd.img)
+	contentstoretest.WriteImage(t, dir, att.img)
+
+	s := Open(dir)
+	got, err := s.Scan(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []wire.CachedImage{{Digest: amd.manifest, MediaType: string(types.OCIManifestSchema1), ConfigDigest: amd.config,
+		Platform: "linux/amd64", Size: amd.size, Complete: true}}, got, "the loose attestation is not a cached image")
+	for _, d := range []string{att.manifest, att.config} {
+		_, err = s.Resolve(ctx, d, "")
+		require.ErrorIs(t, err, ErrNotFound, d)
+	}
+	tg, err := s.Resolve(ctx, amd.manifest, "")
+	require.NoError(t, err)
+	require.Equal(t, amd.manifest, tg.Manifest)
+}

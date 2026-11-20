@@ -2,6 +2,7 @@ package apiserver_test
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -58,4 +59,31 @@ func TestServer_CancelledRequestIsNotAnError(t *testing.T) {
 
 	rec := get(t, h, "/api/v1/summary")
 	require.Equal(t, http.StatusOK, rec.Code, "a live request is answered")
+}
+
+// A handler error that says something was cancelled, while the request itself is live, is answered
+// 500 internal and logged, never left as an empty 200.
+func TestServer_LiveRequestWithACancelledErrorIsAnswered(t *testing.T) {
+	f := webtest.Open(t)
+	var (
+		mu     sync.Mutex
+		logged []string
+	)
+	o := f.Options()
+	o.Log = funcr.New(func(prefix, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		logged = append(logged, prefix+" "+args)
+	}, funcr.Options{})
+	s := apiserver.New(o)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/summary", nil)
+	rec := httptest.NewRecorder()
+	s.ResponseError(rec, req, fmt.Errorf("reading the store: %w", context.Canceled))
+	p := wantProblem(t, rec, http.StatusInternalServerError, apigen.ProblemCodeInternal)
+	require.NotNil(t, p.Detail)
+	require.Equal(t, "internal error", *p.Detail)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, logged, 1)
+	require.Contains(t, logged[0], "API request failed")
 }

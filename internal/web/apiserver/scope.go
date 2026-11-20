@@ -82,6 +82,9 @@ func (s *Server) GetScope(ctx context.Context, req apigen.GetScopeRequestObject)
 	if _, err := s.resolveScope(ctx, sc); err != nil {
 		return nil, err
 	}
+	if sc, err = s.canonicalScope(ctx, sc); err != nil {
+		return nil, err
+	}
 	title, err := s.scopeTitle(ctx, sc)
 	if err != nil {
 		return nil, err
@@ -195,11 +198,13 @@ func (r *rail) cluster(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		gap := g.Kind != model.NodeGroupAgent
-		for _, m := range g.Members {
-			gap = gap || hostGap(agents.of(m))
+		// The group's own coverage figure, as its card shows it: a host SBOM pending, unmatched or failed
+		// is a gap as much as a member's.
+		cov, err := s.scopeCoverage(ctx, gs.scope(g))
+		if err != nil {
+			return err
 		}
-		items = append(items, countsItem(gs.scope(g), "nodegroup", g.Label, plural(len(g.Members), "node"), st, gap))
+		items = append(items, countsItem(gs.scope(g), "nodegroup", g.Label, plural(len(g.Members), "node"), st, cov.Full < cov.InUse))
 	}
 	r.related(apigen.RelatedSectionIdNodegroups, items)
 

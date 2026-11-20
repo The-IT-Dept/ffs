@@ -168,6 +168,12 @@ func TestResetCrashQuarantines_OnVersionChange(t *testing.T) {
 	require.NoError(t, s.SetAgentError(ctx, "worker-1",
 		"host inventory quarantined until 2026-11-21T07:10:00Z: the controller stopped while processing the host inventory"))
 	require.NoError(t, s.SetAgentError(ctx, "worker-2", "host inventory quarantined until 2026-11-21T07:10:00Z: decoding SBOM: unexpected end"))
+	// An image a crash interrupted mid-acquisition, whose earlier crash was counted; and one whose
+	// counted failure was the image's own (no acquisition in flight).
+	require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: "sha256:inflight", Repo: "ghcr.io/example/inflight",
+		Status: model.ImagePending, Attempts: 1}))
+	require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: "sha256:counted", Repo: "ghcr.io/example/counted",
+		Status: model.ImagePending, Attempts: 1}))
 	_, err := s.BeginAcquire(ctx, "sha256:inflight", now)
 	require.NoError(t, err)
 	_, err = s.BeginAcquire(ctx, "nodehost:worker-1", now)
@@ -182,8 +188,14 @@ func TestResetCrashQuarantines_OnVersionChange(t *testing.T) {
 	r, changed, err := s.ResetCrashQuarantines(ctx, "v0.0.1-rc.7")
 	require.NoError(t, err)
 	require.True(t, changed, "no version was stored")
-	require.Equal(t, CrashReset{Images: 4, Jobs: 3, Inflight: 2, Matches: 1, Errors: 1}, r)
-	require.Equal(t, 11, r.Cleared())
+	require.Equal(t, CrashReset{Images: 4, Jobs: 3, Inflight: 2, Attempts: 1, Matches: 1, Errors: 1}, r)
+	require.Equal(t, 12, r.Cleared())
+	for digest, attempts := range map[string]int{"sha256:inflight": 0, "sha256:counted": 1} {
+		img, _, err := s.GetImage(ctx, digest)
+		require.NoError(t, err)
+		require.Equal(t, model.ImagePending, img.Status, digest)
+		require.Equal(t, attempts, img.Attempts, "%s: only an interrupted acquisition's attempts are reset", digest)
+	}
 
 	for _, d := range []string{"sha256:stopped", "sha256:catstopped", "sha256:match", "sha256:timeout"} {
 		img, ok, err := s.GetImage(ctx, d)

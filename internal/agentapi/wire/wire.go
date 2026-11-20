@@ -126,7 +126,7 @@ type SBOMResult struct {
 	Digest       string          `json:"digest"`
 	SyftJSON     json.RawMessage `json:"syftJSON,omitempty"`
 	Coverage     model.Coverage  `json:"coverage"`
-	Unavailable  string          `json:"unavailable,omitempty"` // UnavailableNotFound | UnavailableLayersDiscarded | UnavailableTooLarge
+	Unavailable  string          `json:"unavailable,omitempty"` // UnavailableNotFound | UnavailableLayersDiscarded | UnavailableTooLarge | UnavailableSkipped
 	Failure      string          `json:"failure,omitempty"`     // cataloguer crash, OOM or timeout: counts toward the poison pill
 }
 
@@ -135,6 +135,10 @@ const (
 	UnavailableNotFound        = "not_found"
 	UnavailableLayersDiscarded = "layers_discarded"
 	UnavailableTooLarge        = "too_large"
+	// UnavailableSkipped: the agent did not attempt the request, for a reason that is not the image's (too
+	// little of its time left, a busy cataloguer, a scratch volume that cannot take it, the agent stopping).
+	// The controller releases the request without counting it, and offers the image again.
+	UnavailableSkipped = "skipped"
 )
 
 // AgentConfig is sent by the controller from GET /agent/v1/config and inside every ReportResponse.

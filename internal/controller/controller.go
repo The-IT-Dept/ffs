@@ -128,9 +128,14 @@ func resetCrashQuarantines(ctx context.Context, st *store.Store, ver string, log
 	if err != nil {
 		return err
 	}
-	if changed {
+	switch {
+	case !changed:
+	case r.Previous == "":
+		log.Info("recorded controller version", "version", ver, "cleared", r.Cleared())
+	default:
 		log.Info("controller version changed; quarantines from crashes of the previous version cleared", "previous", r.Previous,
-			"version", ver, "cleared", r.Cleared(), "images", r.Images, "agentJobs", r.Jobs, "inflight", r.Inflight, "matchRuns", r.Matches)
+			"version", ver, "cleared", r.Cleared(), "images", r.Images, "agentJobs", r.Jobs, "inflight", r.Inflight,
+			"attempts", r.Attempts, "matchRuns", r.Matches, "errors", r.Errors)
 	}
 	return nil
 }

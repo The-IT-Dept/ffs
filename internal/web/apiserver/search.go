@@ -69,8 +69,12 @@ type searchHit struct {
 	prefix bool
 }
 
-// hitOf shapes a store hit; it has a scope when its kind has one.
+// hitOf shapes a store hit; it has a scope when its kind has one, and a namespace's detail is its
+// workload count.
 func hitOf(h store.JumpHit) searchHit {
+	if h.Kind == "namespace" {
+		h.Detail = plural(h.Count, "workload")
+	}
 	hit := apigen.SearchHit{Kind: apigen.SearchHitKind(h.Kind), Id: h.ID, Label: h.Label, Detail: optString(h.Detail)}
 	if kind, ok := hitScopes[h.Kind]; ok {
 		hit.Scope = optString(model.Scope{Kind: kind, Value: h.ID}.String())
@@ -83,14 +87,14 @@ func hitOf(h store.JumpHit) searchHit {
 }
 
 // interleave orders hits prefix ones first; within each tier the kinds take turns, in searchKinds
-// order, each kind's hits keeping their order.
+// order, each kind's hits keeping their order. A hit of a kind searchKinds does not list is left out.
 func interleave(hits []searchHit) []searchHit {
 	out := make([]searchHit, 0, len(hits))
 	for _, prefix := range []bool{true, false} {
 		queues := make([][]searchHit, len(searchKinds))
 		for _, h := range hits {
-			if h.prefix == prefix {
-				i := slices.Index(searchKinds, h.kind)
+			i := slices.Index(searchKinds, h.kind)
+			if h.prefix == prefix && i >= 0 {
 				queues[i] = append(queues[i], h)
 			}
 		}

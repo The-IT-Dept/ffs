@@ -64,7 +64,13 @@ func (c *clock) Add(d time.Duration) {
 
 func newStore(t *testing.T) *store.Store {
 	t.Helper()
-	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "ffs.db"))
+	return newStoreAt(t, filepath.Join(t.TempDir(), "ffs.db"))
+}
+
+// newStoreAt is newStore with its database at path.
+func newStoreAt(t *testing.T, path string) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), path)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	return st

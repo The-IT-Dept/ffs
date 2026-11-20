@@ -8,6 +8,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/feeds/osv"
 	"github.com/the-it-dept/ffs/internal/match/upstream"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 func bin(class, name string) model.Package {
@@ -92,4 +93,29 @@ func TestMap_Golden(t *testing.T) {
 		{Ecosystem: "deb", Name: "openssl", Version: "3.0.15-1~deb12u1"},
 	}))
 	require.Empty(t, upstream.UncoveredClassified(nil))
+}
+
+// Covered is exactly what Lookup finds: each listed package is found, and of every classifier and
+// name the map pairs within one entry, none is left out.
+func TestCovered_IsWhatLookupFinds(t *testing.T) {
+	covered := upstream.Covered()
+	listed := map[store.CoveredClassifier]bool{}
+	for _, c := range covered {
+		_, ok := upstream.Lookup(model.Package{Ecosystem: c.Ecosystem, Classifier: c.Classifier, Name: c.Name})
+		require.True(t, ok, "%+v", c)
+		listed[c] = true
+	}
+	n := 0
+	for _, e := range upstream.Map {
+		for _, class := range e.Classifiers {
+			for _, name := range e.Names {
+				require.True(t, listed[store.CoveredClassifier{Ecosystem: "binary", Classifier: class, Name: name}], "%s %s", class, name)
+				n++
+			}
+		}
+	}
+	require.Len(t, covered, n)
+	_, ok := upstream.Lookup(bin("traefik-binary", "traefik"))
+	require.False(t, ok)
+	require.NotContains(t, covered, store.CoveredClassifier{Ecosystem: "binary", Classifier: "traefik-binary", Name: "traefik"})
 }

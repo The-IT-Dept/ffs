@@ -192,6 +192,8 @@ func TestCoverage_ScopesAndImages(t *testing.T) {
 	require.Equal(t, CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}, cov(model.Scope{Kind: model.ScopeImage, Value: "sha256:web"}))
 	require.Equal(t, CoverageFigure{InUse: 1, SeenInto: 1}, cov(model.Scope{Kind: model.ScopeImage, Value: "sha256:api"}))
 	require.Equal(t, CoverageFigure{InUse: 1}, cov(model.Scope{Kind: model.ScopeImage, Value: "sha256:norow"}))
+	require.Equal(t, CoverageFigure{}, cov(model.Scope{Kind: model.ScopeImage, Value: "sha256:unused"}),
+		"a catalogued image no owner runs is neither seen into nor in full: never more than in use")
 	_, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeControlPlane})
 	require.ErrorIs(t, err, ErrScope)
 
@@ -297,7 +299,7 @@ func TestJump_PrefixFirstPerKind(t *testing.T) {
 	require.Equal(t, []JumpHit{
 		{Kind: "workload", ID: exWeb.Key(), Label: "web", Detail: "Deployment · shop", Worst: model.PriorityUrgent, Prefix: true},
 		{Kind: "workload", ID: "Deployment/webshop/legacy-web", Label: "legacy-web", Detail: "Deployment · webshop"},
-		{Kind: "namespace", ID: "webshop", Label: "webshop", Detail: "1 workload", Prefix: true},
+		{Kind: "namespace", ID: "webshop", Label: "webshop", Count: 1, Prefix: true},
 		{Kind: "image", ID: "sha256:web", Label: "ghcr.io/example/web", Detail: "sha256:web", Worst: model.PriorityUrgent},
 		{Kind: "package", ID: "deb/webkit", Label: "webkit", Detail: "deb", Prefix: true},
 	}, hits)

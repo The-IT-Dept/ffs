@@ -195,6 +195,56 @@ func TestAuth_CachesBySHA256OfToken(t *testing.T) {
 	require.Len(t, *specs, 7, "an undecided review is never cached")
 }
 
+// TestAuth_PodNotSeenYetIsNotCached: a token whose pod the pod cache does not hold yet, or holds not yet
+// bound to a node (a pod that just started), is rejected but reviewed again next time, so the agent is
+// accepted once the cache catches up. Other rejections, such as a pod UID mismatch, stay cached.
+func TestAuth_PodNotSeenYetIsNotCached(t *testing.T) {
+	ctx := context.Background()
+	clk := newClock(t0)
+	podOnly := func(name, uid string) authenticationv1.TokenReviewStatus {
+		st := goodStatus()
+		st.User.Extra = map[string]authenticationv1.ExtraValue{extraPodName: {name}, extraPodUID: {uid}}
+		return st
+	}
+	c, specs := reviewer(t, func(spec authenticationv1.TokenReviewSpec) (authenticationv1.TokenReviewStatus, error) {
+		if spec.Token == "other-uid" {
+			return podOnly("ffs-agent-x7k2p", "uid-9"), nil
+		}
+		return podOnly("ffs-agent-x7k2p", "uid-1"), nil
+	})
+	pods := fake.NewClientBuilder().Build()
+	a := NewTokenReviewAuthenticator(c, pods, AuthOptions{Namespace: "ffs-agent", ServiceAccount: "ffs-agent", Now: clk.Now})
+
+	for range 2 {
+		_, err := a.Authenticate(ctx, "new-pod")
+		require.ErrorIs(t, err, ErrUnauthenticated)
+		require.ErrorContains(t, err, "the token's pod is not running")
+	}
+	require.Len(t, *specs, 2, "not cached: each attempt is reviewed")
+
+	pod := agentPod("ffs-agent", "ffs-agent-x7k2p", "uid-1", "")
+	require.NoError(t, pods.Create(ctx, pod))
+	for range 2 {
+		_, err := a.Authenticate(ctx, "new-pod")
+		require.ErrorIs(t, err, ErrUnauthenticated)
+		require.ErrorContains(t, err, "the token's pod is not running")
+	}
+	require.Len(t, *specs, 4, "a pod not yet bound to its node is not cached either")
+
+	pod.Spec.NodeName = "worker-2"
+	require.NoError(t, pods.Update(ctx, pod))
+	id, err := a.Authenticate(ctx, "new-pod")
+	require.NoError(t, err, "accepted at once when the pod cache has the pod on its node")
+	require.Equal(t, "worker-2", id.Node)
+	require.Len(t, *specs, 5)
+
+	for range 2 {
+		_, err = a.Authenticate(ctx, "other-uid")
+		require.ErrorIs(t, err, ErrUnauthenticated)
+	}
+	require.Len(t, *specs, 6, "a pod UID mismatch is still cached")
+}
+
 // jwtWithExp is a JWT-shaped token whose payload carries exp; its signature is not checked here.
 func jwtWithExp(t *testing.T, exp time.Time, nonce string) string {
 	t.Helper()

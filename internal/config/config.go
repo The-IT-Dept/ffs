@@ -2,6 +2,7 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -168,13 +169,39 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(f)
+	if err != nil {
+		return Config{}, fmt.Errorf("read %s: %w", path, err)
+	}
 	c := Default()
-	dec := yaml.NewDecoder(f)
+	clearReplacedDefaults(data, &c)
+	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
 	if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
 		return Config{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return c, c.Validate()
+}
+
+// clearReplacedDefaults clears the defaults that are lists or maps and that the file sets, so the file's
+// value replaces them: the decoder would merge a map into its default, and an explicitly empty or null
+// value would then not mean what it says.
+func clearReplacedDefaults(data []byte, c *Config) {
+	var set struct {
+		NodeAgent struct {
+			Architectures yaml.Node `yaml:"architectures"`
+			NodeSelector  yaml.Node `yaml:"nodeSelector"`
+		} `yaml:"nodeAgent"`
+	}
+	if yaml.Unmarshal(data, &set) != nil {
+		return // the strict decode reports it
+	}
+	if set.NodeAgent.Architectures.Kind != 0 {
+		c.NodeAgent.Architectures = nil
+	}
+	if set.NodeAgent.NodeSelector.Kind != 0 {
+		c.NodeAgent.NodeSelector = nil
+	}
 }
 
 // Validate reports every problem at once, each prefixed with its YAML path.

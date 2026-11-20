@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -174,18 +175,20 @@ func TestWork_UnavailableAndFailures(t *testing.T) {
 		require.Empty(t, res.SyftJSON)
 	}
 
+	// A busy cataloguer (restarting after a worker ran out of memory, say) is not the image's: skipped.
 	e.runner.setFn(func(context.Context, sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
 		return nil, &catalog.WorkError{Kind: sbom.KindBusy, Msg: "cataloguer is busy"}
 	})
 	a.runJob(ctx, work(e.manifest), time.Now())
-	e.ctl.noSBOM(t)
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
 
 	calls := len(e.runner.requests())
 	past := work(e.manifest)
 	past.Deadline = time.Now().Add(-time.Second)
 	a.runJob(ctx, past, time.Now())
-	e.ctl.noSBOM(t)
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
 	require.Len(t, e.runner.requests(), calls, "work past its deadline is not started")
+	e.ctl.noSBOM(t)
 
 	require.Empty(t, workDirs(t, e.scratch))
 	require.Equal(t, int32(1), e.runner.maxActive.Load())
@@ -202,7 +205,7 @@ func TestWork_SkipsJobWithTooLittleTimeLeft(t *testing.T) {
 	// Offered 11 minutes ago with a minute left: queued behind a long job, it would likely time out.
 	late := wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: platform, Deadline: now.Add(time.Minute)}
 	a.runJob(ctx, late, now.Add(-10*time.Minute))
-	e.ctl.noSBOM(t)
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
 	require.Empty(t, e.runner.requests(), "a job with less than a quarter of its time left is not started")
 
 	// The same minute left of a 3-minute offer is more than a quarter: the job runs.
@@ -224,21 +227,75 @@ func TestWork_ScratchFailuresAreNotTheImages(t *testing.T) {
 	require.NoError(t, os.MkdirAll(filepath.Join(e.scratch, "sbom-work-w1.json", "x"), 0o750))
 	a.runJob(ctx, work, time.Now())
 	require.Len(t, e.runner.requests(), 1, "the image was catalogued")
-	e.ctl.noSBOM(t)
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
 	require.NoError(t, os.RemoveAll(filepath.Join(e.scratch, "sbom-work-w1.json")))
 
 	// The image cannot be staged: a blob path in its stage dir is taken.
 	require.NoError(t, os.MkdirAll(filepath.Join(e.scratch, "work-w1", "blobs", "sha256", strings.TrimPrefix(e.manifest, "sha256:")), 0o750))
 	a.runJob(ctx, work, time.Now())
 	require.Len(t, e.runner.requests(), 1, "nothing was staged to catalogue")
-	e.ctl.noSBOM(t)
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
 
-	// Neither is the image's failure: nothing was sent, so nothing counts toward its quarantine.
+	// Neither is the image's failure: both were answered skipped, which counts nothing toward its quarantine.
 	a.runJob(ctx, work, time.Now())
 	res := e.ctl.nextSBOM(t)
 	require.Empty(t, res.Failure)
 	require.NotEmpty(t, res.SyftJSON)
 	require.Empty(t, spooled(t, e.scratch))
+	require.Empty(t, workDirs(t, e.scratch))
+}
+
+// requireSkipped checks a skipped result: the agent did not attempt the request, and says so with nothing else.
+func requireSkipped(t *testing.T, res wire.SBOMResult, id, digest string) {
+	t.Helper()
+	require.Equal(t, wire.SBOMResult{ID: id, Node: "worker-1", AgentVersion: version.Version, Digest: digest,
+		Unavailable: wire.UnavailableSkipped}, res)
+}
+
+// TestRun_StoppingAgentSkipsTheJobsItHolds: an agent that is stopping answers the job it is on and the jobs
+// queued behind it skipped, so none of them is left to expire and count against its image.
+func TestRun_StoppingAgentSkipsTheJobsItHolds(t *testing.T) {
+	e := newEnv(t)
+	platform := "linux/" + runtime.GOARCH
+	cataloguing := make(chan struct{}, 1)
+	e.runner.setFn(func(ctx context.Context, req sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
+		if req.Source == sbom.CatalogSourceHostDir {
+			return &sbom.CatalogResponse{SyftJSON: json.RawMessage(hostJSON)}, nil
+		}
+		select {
+		case cataloguing <- struct{}{}:
+		default:
+		}
+		<-ctx.Done() // the job runs until the agent stops
+		return nil, ctx.Err()
+	})
+	var offered atomic.Bool
+	e.ctl.setAnswer(func(r wire.Report) (int, wire.ReportResponse) {
+		resp := wire.ReportResponse{Applied: true, Config: testConfig()}
+		if r.Kind == wire.KindFull && offered.CompareAndSwap(false, true) {
+			deadline := time.Now().Add(5 * time.Minute)
+			for _, id := range []string{"w1", "w2", "w3"} {
+				resp.Work = append(resp.Work, wire.WorkRequest{ID: id, Digest: e.config, Platform: platform, Deadline: deadline})
+			}
+		}
+		return http.StatusOK, resp
+	})
+	e.startCataloguer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- Run(ctx, e.opts) }()
+	<-cataloguing // on w1
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(waitFor):
+		t.Fatal("Run did not return after cancel")
+	}
+	for _, id := range []string{"w1", "w2", "w3"} {
+		requireSkipped(t, e.ctl.nextSBOM(t), id, e.config)
+	}
+	e.ctl.noSBOM(t)
 	require.Empty(t, workDirs(t, e.scratch))
 }
 
