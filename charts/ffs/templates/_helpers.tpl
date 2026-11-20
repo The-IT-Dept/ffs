@@ -376,6 +376,15 @@ ffs.agentScratch sizes the agent's scratch volumes from nodeAgent.scratchSizeLim
 {{- end -}}
 
 {{- /*
+ffs.agentTLSSecret is the name of the Secret holding the agent API's certificate. The Secret cert-manager writes
+has a name of its own, so switching nodeAgent.tls.certManager.enabled either way never asks Helm to take over
+cert-manager's Secret, or cert-manager to write into the chart's.
+*/ -}}
+{{- define "ffs.agentTLSSecret" -}}
+{{- include "ffs.fullname" . -}}-agent{{ if .Values.nodeAgent.tls.certManager.enabled }}-cert-manager{{ end }}-tls
+{{- end -}}
+
+{{- /*
 ffs.agentTLSPair decides the agent API's certificate from (dict "secret" <looked-up Secret> "configMap"
 <looked-up ConfigMap> "root" $). While both exist and the Secret's ffs.theitdept.au/not-after
 annotation (unix seconds) is more than 30 days ahead, their data is returned unchanged, so renders do

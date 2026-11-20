@@ -482,17 +482,22 @@ data:
 	require.EqualValues(t, 8444, svc.Spec.Ports[0].Port)
 	require.Equal(t, intstr.FromString("agent-api"), svc.Spec.Ports[0].TargetPort)
 
-	o = render(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer",
-		"nodeAgent.tls.certManager.issuerRef.kind=ClusterIssuer", "nodeAgent.tls.caBundle="+testCABundle)
+	certManager := []string{"nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer",
+		"nodeAgent.tls.certManager.issuerRef.kind=ClusterIssuer", "nodeAgent.tls.caBundle=" + testCABundle}
+	o = render(t, certManager...)
 	crt := o.get(t, "Certificate", "ffs-agent-tls")
 	require.Equal(t, "ffs", crt.GetNamespace())
 	spec, _, err := unstructured.NestedMap(crt.Object, "spec")
 	require.NoError(t, err)
 	require.Len(t, spec, 3)
-	require.Equal(t, "ffs-agent-tls", spec["secretName"])
+	// cert-manager's Secret has a name of its own, so switching certManager.enabled either way never asks Helm to
+	// adopt cert-manager's Secret, or cert-manager to take over the chart's.
+	require.Equal(t, "ffs-agent-cert-manager-tls", spec["secretName"])
+	require.Equal(t, "ffs-agent-cert-manager-tls", volumes(podSpec(t, certManager...))["agent-tls"].Secret.SecretName)
 	require.Equal(t, []any{"ffs-agent-api", "ffs-agent-api.ffs", "ffs-agent-api.ffs.svc", "ffs-agent-api.ffs.svc.cluster.local"}, spec["dnsNames"])
 	require.Equal(t, map[string]any{"name": "ca-issuer", "kind": "ClusterIssuer"}, spec["issuerRef"])
 	require.False(t, o.has("Secret", "ffs-agent-tls"))
+	require.False(t, o.has("Secret", "ffs-agent-cert-manager-tls"), "cert-manager writes it, not the chart")
 	require.Equal(t, testCABundle, as[corev1.ConfigMap](t, o.get(t, "ConfigMap", "ffs-agent-ca")).Data["ca.crt"])
 
 	_, err = renderErr(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer")

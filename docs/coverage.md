@@ -49,6 +49,8 @@ Images whose credentials only the kubelet holds, through a credential-provider p
 The node agent closes most of the rest. When a side-loaded image, or one ffs cannot pull, is held complete in the containerd content store of a node whose pods run it, ffs asks that node's agent to catalogue it there. The image is then `catalogued` with `source` `agent`, until a registry SBOM replaces it. What remains `unresolvable`:
 - images whose layers containerd discarded after unpacking them, shown as `image layers were discarded by containerd on every node that holds the image`;
 - images on CRI-O nodes, which have no containerd content store;
+- images larger than `nodeAgent.maxImageBytes` (1Gi by default), which the agent does not catalogue, and images whose SBOM is larger than 64 MiB; both keep the reason they were unresolvable for;
+- images held only on nodes the agent DaemonSet does not run on: nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector`, or with a taint that `nodeAgent.tolerations` does not tolerate;
 - every such image while the node agent is disabled.
 
 ### Managed control planes and node components

@@ -146,7 +146,7 @@ spec:
         {{- if .Values.nodeAgent.enabled }}
         - name: agent-tls
           secret:
-            secretName: {{ $name }}-agent-tls
+            secretName: {{ include "ffs.agentTLSSecret" . }}
             # The agent API listens before its certificate exists (cert-manager may issue it later).
             optional: true
         {{- end }}
