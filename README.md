@@ -140,6 +140,8 @@ spec:
 
 An Exception matches on any combination of `advisories` (aliases included), `packages`, `imageRepositories` (globs) and `owners`; every list that is set must match. `reason` and `expires` are required, and `expires` can be at most one year away.
 
+An Exception's `owners` entries are workload names or `Kind/Name`. A bare name matches only namespaced workloads. The cluster-level owners `Cluster/<cluster>`, `Nodes/<cluster>` and `ContainerRuntime/<runtime>` match only their `Kind/Name` form, so an Exception naming the cluster never excepts host or container runtime findings.
+
 Only Exceptions in the ffs namespace can except `urgent` findings. An Exception in any other namespace leaves urgent findings open and alerting, and its status says so.
 
 ## Coverage

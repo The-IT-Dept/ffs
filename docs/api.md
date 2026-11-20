@@ -34,11 +34,11 @@ Most operations take a `scope` parameter that narrows the answer:
 | `namespace:<namespace>` | One namespace. |
 | `workload:<kind>/<namespace>/<name>` | One workload, for example `workload:Deployment/shop/web`. The namespace part is empty for owners without one (`workload:Cluster//test`). In the path of `/api/v1/workloads/{kind}/{namespace}/{name}`, such a namespace is written `-`. |
 | `image:<digest>` | One image, by any image ID, including placeholders such as `unknown:registry.example.com/app:1.0`. In the path of `/api/v1/images/{digest}`, percent-encode the ID as one segment. |
-| `nodegroup:<id>` | One node group. |
+| `nodegroup:<id>` | One node group, by its key as the API's links give it, its label or its ID. |
 | `node:<name>` | One node. |
 | `controlplane` | The Kubernetes control plane and the container runtime. |
 
-A malformed scope, or one an operation does not accept, is `400` with the code `invalid_scope`. The operations table lists the scopes each operation accepts where it does not accept them all.
+A malformed scope, or one an operation does not accept, is `400` with the code `invalid_scope`. An unknown node, node group or workload is `404` with the code `not_found`. The operations table lists the scopes each operation accepts where it does not accept them all.
 
 ## Filters, facets and sorting
 
@@ -55,6 +55,7 @@ The explorer endpoints (`/findings`, `/workloads`, `/images` and `/packages`) fi
   | `/images` | `status`, `source`, `coverage`, `namespace`, `priority` |
   | `/packages` | `ecosystem`, `priority` |
 
+- The `kind` facet of `/findings` lists the cluster-level owners as `cluster-level:Cluster`, `cluster-level:ContainerRuntime` and `cluster-level:Nodes`, each with a `label`, apart from workloads of the same kind. `kind=` takes either form.
 - `group` on `/findings` takes `advisory`, `workload`, `image`, `package`, `namespace` or `fix`. A grouped response fills `groupRows` and leaves `rows` empty; `total` then counts groups and `findings` the findings across them.
 - `sort` takes one of these values. A leading `-` means descending.
 
@@ -130,14 +131,16 @@ Errors are RFC 9457 problem documents, `application/problem+json`, with `type`, 
 | `/api/v1/images/{digest}/packages` | A page of one image's packages, searchable with `q` and filtered by `ecosystem`. |
 | `/api/v1/packages` | The packages explorer: package versions in the scope's images, with facets. Scopes: `cluster`, `namespace`, `workload`, `image`. |
 | `/api/v1/nodegroups` | The control plane and the node groups, with node agent status. |
-| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. |
+| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. `id` is the group's key: its stable name, with `-<arch>`, `-nodeinfo` or `@<member node>` added when other groups share the name, which survives package updates; a label or ID is also accepted. |
 | `/api/v1/nodes/{name}` | One node: its group, node agent status, counts and cached images. |
 | `/api/v1/coverage` | The coverage funnel and every coverage gap, with a remedy code; see [coverage.md](coverage.md#gaps-and-what-to-do). Scopes: `cluster`, `namespace`, `workload`. |
 | `/api/v1/feeds` | Feed freshness, and the data sources with their licences and attribution. |
 | `/api/v1/exceptions` | Exceptions with what they match. |
 | `/api/v1/settings` | The effective settings that shape findings, without registry, listener or storage settings. |
-| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups and nodes, at most 20. |
+| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups (by name, or holding a matching host-only package), nodes, the control plane and Nodes, at most 20. Labels starting with `q` come first, the kinds taking turns, and `truncated` is set when more matched. |
 | `/api/v1/stream` | Change notifications; see [Live updates](#live-updates). |
+
+Each row of `/api/v1/nodegroups` counts its members by node agent state in `agents`: `reporting` (the host inventory is stored), `reportingWithoutInventory` (the agent reports, but the host inventory is not stored or not current; the node shows the `host_not_inventoried` gap), `stale`, `never`, `disabled`, and `unsupported` (the node agent does not schedule on the node; it shows the `node_agent_unsupported` gap).
 
 ## Examples
 

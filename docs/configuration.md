@@ -87,7 +87,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `nodeAgent.staleAfter` | `30m` | After this long without a report, a node shows "node agent not reporting". At least twice `imageListInterval`. |
 | `nodeAgent.runtimeGrace` | `2h` | How long nodes must lack fresh reports before runtime findings move back to the node-status owner. |
 | `nodeAgent.workPerReport` | `3` | Side-loaded and unresolvable image SBOM requests handed out with each report, 0 to 10; 0 turns them off. |
-| `nodeAgent.workTimeout` | `30m` | How long a request stays with the node it was offered to. |
+| `nodeAgent.workTimeout` | `20m` | How long a request stays with the node it was offered to. `workTimeout` plus `imageListInterval` must be shorter than `staleAfter`: an agent reports between jobs, not during one. |
 | `nodeAgent.exposedNodes` | `""` | A Kubernetes node label selector, for example `node-role.example.com/edge`. Host findings on matching nodes count as exposed. Empty exposes no node. |
 | `nodeAgent.architectures` | `[amd64]` | Node architectures the agent DaemonSet schedules on; the chart sets it from `nodeAgent.architectures`. Other nodes show `node_agent_unsupported` and do not hold back the switch from node status to the agent. Empty means every node; the chart requires at least one. |
 | `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods; the chart sets it from `nodeAgent.nodeSelector`. Nodes it does not match show `node_agent_unsupported`. Empty means every node. |
@@ -106,7 +106,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `rbac.readPullSecrets` | `true` | Grant cluster-wide `get` on Secrets so pull secrets of pods and ServiceAccounts can be read. When false, private images that need them show as `unresolvable`. |
 | `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. The memory limit is a byte count or a quantity such as `1536Mi` or `1.5Gi`; `GOMEMLIMIT` is set to 90% of it. |
 | `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. SQLite's temporary files do not use it: they go to `<dataDir>/tmp` on the persistent volume, or to `SQLITE_TMPDIR` when that is set. |
-| `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. |
+| `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. The memory limit is a byte count or a quantity such as `2Gi` or `1.5Gi`; `GOMEMLIMIT` is set to 90% of it, and each catalog worker gets the limit less 128Mi for the catalog server, divided by `config.catalog.concurrency` (at least 64Mi each). |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |
 | `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch space the catalogue jobs may use together, as a byte count or a quantity such as `18Gi`. It must be greater than 0 and below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod; the chart refuses to render otherwise. |
 | `persistence.size` | `20Gi` | Size of the volume for the store and feed data. While a Grype DB update runs, the volume holds two builds (the November 2026 database is 2.7 GB before indexing), and diffing them takes about 2.5 GB more of SQLite temporary files. Keep at least 10Gi. |
