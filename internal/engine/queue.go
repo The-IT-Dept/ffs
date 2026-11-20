@@ -8,6 +8,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
@@ -21,8 +22,8 @@ const (
 	pruneInterval  = 24 * time.Hour
 )
 
-// triggerRank orders the triggers a queued owner can hold: when an owner is queued again, the
-// higher-ranked trigger wins.
+// triggerRank orders the top triggers of queued owners' causes: Drain recomputes the owners a feed
+// queued first.
 func triggerRank(t model.Trigger) int {
 	switch t {
 	case model.TriggerNewAdvisory:
@@ -35,38 +36,37 @@ func triggerRank(t model.Trigger) int {
 	return 0
 }
 
-// enqueue queues keys for a recompute with trig and wakes the worker.
-func (e *Engine) enqueue(keys []string, trig model.Trigger) {
+// enqueue queues keys for a recompute with cause c and wakes the worker.
+func (e *Engine) enqueue(keys []string, c findings.Causes) {
 	if len(keys) == 0 {
 		return
 	}
-	e.merge(keys, trig)
+	e.merge(keys, c)
 	select {
 	case e.wake <- struct{}{}:
 	default:
 	}
 }
 
-// merge adds keys to the queue without waking the worker.
-func (e *Engine) merge(keys []string, trig model.Trigger) {
+// merge adds keys to the queue without waking the worker. An owner already queued keeps its causes
+// and adds c, so its recompute labels each transition with the cause that explains it.
+func (e *Engine) merge(keys []string, c findings.Causes) {
 	e.qmu.Lock()
 	defer e.qmu.Unlock()
 	for _, k := range keys {
-		if cur, ok := e.pending[k]; !ok || triggerRank(trig) > triggerRank(cur) {
-			e.pending[k] = trig
-		}
+		e.pending[k] |= c
 	}
 }
 
 // take removes up to n queued owners and counts the batch as running, under the queue lock, so
 // Idle never sees the batch neither queued nor running. It returns nil when the queue is empty.
-func (e *Engine) take(n int) map[string]model.Trigger {
+func (e *Engine) take(n int) map[string]findings.Causes {
 	e.qmu.Lock()
 	defer e.qmu.Unlock()
 	if len(e.pending) == 0 {
 		return nil
 	}
-	batch := make(map[string]model.Trigger, min(n, len(e.pending)))
+	batch := make(map[string]findings.Causes, min(n, len(e.pending)))
 	for k, t := range e.pending {
 		if len(batch) == n {
 			break
@@ -78,8 +78,8 @@ func (e *Engine) take(n int) map[string]model.Trigger {
 	return batch
 }
 
-// Drain recomputes every queued owner, up to 256 at a time, one Recompute per trigger. Owners whose
-// recompute failed are queued again without waking the worker, and Drain returns the error.
+// Drain recomputes every queued owner, up to 256 at a time, one Recompute per set of causes. Owners
+// whose recompute failed are queued again without waking the worker, and Drain returns the error.
 func (e *Engine) Drain(ctx context.Context) error {
 	for {
 		batch := e.take(drainBatch)
@@ -94,21 +94,21 @@ func (e *Engine) Drain(ctx context.Context) error {
 	}
 }
 
-func (e *Engine) drainBatch(ctx context.Context, batch map[string]model.Trigger) error {
-	byTrigger := map[model.Trigger][]string{}
-	for k, t := range batch {
-		byTrigger[t] = append(byTrigger[t], k)
+func (e *Engine) drainBatch(ctx context.Context, batch map[string]findings.Causes) error {
+	byCauses := map[findings.Causes][]string{}
+	for k, c := range batch {
+		byCauses[c] = append(byCauses[c], k)
 	}
-	triggers := slices.SortedFunc(maps.Keys(byTrigger), func(a, b model.Trigger) int {
-		return cmp.Or(cmp.Compare(triggerRank(b), triggerRank(a)), cmp.Compare(a, b))
+	causes := slices.SortedFunc(maps.Keys(byCauses), func(a, b findings.Causes) int {
+		return cmp.Or(cmp.Compare(triggerRank(b.Top()), triggerRank(a.Top())), cmp.Compare(a, b))
 	})
 	var errs []error
-	for _, t := range triggers {
-		keys := byTrigger[t]
+	for _, c := range causes {
+		keys := byCauses[c]
 		slices.Sort(keys)
-		failed, err := e.recompute(ctx, keys, t)
+		failed, err := e.recompute(ctx, keys, c)
 		if err != nil {
-			e.merge(failed, t)
+			e.merge(failed, c)
 			errs = append(errs, err)
 		}
 	}
@@ -167,7 +167,7 @@ func (e *Engine) Start(ctx context.Context) error {
 
 // catchUp queues every owner, reporting whether it could.
 func (e *Engine) catchUp(ctx context.Context) bool {
-	if err := e.enqueueAll(ctx, model.TriggerInventoryChange); err != nil {
+	if err := e.enqueueAll(ctx, findings.CauseInventory); err != nil {
 		e.o.Log.Error(err, "queuing every owner at start failed; retrying", "after", drainRetry)
 		return false
 	}

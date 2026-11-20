@@ -2,6 +2,7 @@ package priority
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -157,5 +158,63 @@ func TestEvaluate_ConfigThresholds(t *testing.T) {
 		if len(s) >= 4 && s[:4] == "EPSS" {
 			t.Errorf("unexpected EPSS reason %q", s)
 		}
+	}
+}
+
+func TestEvaluate_EPSSHysteresis(t *testing.T) {
+	cfg := config.Default().Priority
+	prev := func(p model.Priority) opt { return func(i *Input) { i.Previous = p } }
+	cases := []struct {
+		name string
+		in   Input
+		want model.Priority
+	}{
+		// the bump edge: 0.1 to enter, below 0.09 to leave
+		{"new, just under the bump", in(low, epss(0.0999)), pL},
+		{"new, at the bump", in(low, epss(0.1)), pM},
+		{"low before, inside the band", in(low, epss(0.095), prev(pL)), pL},
+		{"low before, at the bump", in(low, epss(0.1), prev(pL)), pM},
+		{"bumped before, inside the band", in(low, epss(0.095), prev(pM)), pM},
+		{"bumped before, at the leave edge", in(low, epss(0.09), prev(pM)), pM},
+		{"bumped before, below the leave edge", in(low, epss(0.0899), prev(pM)), pL},
+		// the high edge: 0.5 to enter, below 0.45 to leave
+		{"new, just under high", in(low, epss(0.4999)), pM},
+		{"new, at high", in(low, epss(0.5)), pH},
+		{"medium before, inside the band", in(low, epss(0.47), prev(pM)), pM},
+		{"medium before, at high", in(low, epss(0.5), prev(pM)), pH},
+		{"high before, inside the band", in(low, epss(0.47), prev(pH)), pH},
+		{"high before, at the leave edge", in(low, epss(0.45), prev(pH)), pH},
+		{"high before, below the leave edge", in(low, epss(0.4499), prev(pH)), pM},
+		// the band only keeps what EPSS gave: never above the leave edges' rank, nor above Previous
+		{"urgent before (KEV removed), inside the band", in(low, epss(0.47), prev(pU)), pH},
+		{"high before for another reason, EPSS below both bands", in(low, epss(0.05), prev(pH)), pL},
+		{"not running, bumped before, inside the band", in(low, epss(0.095), notRunning, prev(pM)), pL},
+		{"medium severity exposed with a fix, high before, inside the band", in(med, exposed, fix("1.2"), epss(0.47), prev(pH)), pH},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, reasons := Evaluate(c.in, cfg)
+			if got != c.want {
+				t.Fatalf("priority = %v, want %v", got, c.want)
+			}
+			held := c.in.Previous > rank(c.in, cfg) && got > rank(c.in, cfg)
+			wantReason := c.in.EPSS >= cfg.EPSSBump || held
+			hasReason := false
+			for _, r := range reasons {
+				hasReason = hasReason || strings.HasPrefix(r, "EPSS ")
+			}
+			if hasReason != wantReason {
+				t.Fatalf("reasons %q: EPSS reason %v, want %v", reasons, hasReason, wantReason)
+			}
+		})
+	}
+
+	// the leave edges are 90% of the configured ones
+	custom := config.PriorityConfig{EPSSHigh: 0.8, EPSSBump: 0.2}
+	if got := Thresholds(in(low, epss(0.75), prev(pH)), custom); got != (config.PriorityConfig{EPSSHigh: 0.72, EPSSBump: 0.18}) {
+		t.Fatalf("leave edges = %+v", got)
+	}
+	if got := Thresholds(in(low, epss(0.75)), custom); got != custom {
+		t.Fatalf("a new finding enters at the configured edges, got %+v", got)
 	}
 }

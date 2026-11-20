@@ -587,3 +587,28 @@ func TestBuild_OSVSeverityFallback(t *testing.T) {
 	assert.Equal(t, model.SeverityCritical, f.Severity)
 	assert.Equal(t, "cna", f.SeveritySource)
 }
+
+func TestBuild_EPSSEdgesFollowThePreviousPriority(t *testing.T) {
+	ms := []model.Match{match(model.SourceGrype, libssl3Amd, "CVE-2026-0007", vendor(model.SeverityLow, "debian"))}
+	adv := advisory("CVE-2026-0007", func(a *model.Advisory) { a.EPSS = 0.47 })
+	fp := model.FindingFingerprint("prod", api().Ref, phpRepo, "CVE-2026-0007")
+
+	fresh := one(t, Build(input(ms, adv)))
+	assert.Equal(t, model.PriorityMedium, fresh.Priority, "a new finding enters high at 0.5")
+	assert.True(t, fresh.Signals.EPSSElevated)
+
+	in := input(ms, adv)
+	in.Previous = map[string]model.Priority{fp: model.PriorityHigh}
+	held := one(t, Build(in))
+	assert.Equal(t, model.PriorityHigh, held.Priority, "a high finding leaves only below 0.45")
+	assert.Contains(t, held.Reasons, "EPSS 0.47")
+	assert.True(t, held.Signals.EPSSElevated)
+
+	adv.EPSS = 0.095
+	in = input(ms, adv)
+	in.Previous = map[string]model.Priority{fp: model.PriorityMedium}
+	assert.Equal(t, model.PriorityMedium, one(t, Build(in)).Priority, "bumped: held until below 0.09")
+	assert.True(t, one(t, Build(in)).Signals.EPSSElevated, "the bump that holds it is shown")
+	assert.Equal(t, model.PriorityLow, one(t, Build(input(ms, adv))).Priority)
+	assert.False(t, one(t, Build(input(ms, adv))).Signals.EPSSElevated)
+}

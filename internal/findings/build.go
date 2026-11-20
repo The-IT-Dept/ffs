@@ -49,7 +49,11 @@ type BuildInput struct {
 	// matched (store.UnmatchedDigests): what that digest holds is unknown, so a finding the matches
 	// do not build stands instead of resolving (spec §6.2: never clean when not catalogued). Its
 	// advisory must be in Advisories.
-	Carry          []model.Finding
+	Carry []model.Finding
+	// Previous holds the priority of each of the owner's stored findings that is not resolved, by
+	// fingerprint: it decides which EPSS edges rank the finding (priority.Thresholds). A finding
+	// absent from it, new or reopening, enters at the configured edges.
+	Previous       map[string]model.Priority
 	Now            time.Time
 	PriorityConfig config.PriorityConfig
 }
@@ -401,11 +405,12 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string, ctx 
 		SAReasons:        ctx.SAReasons,
 		NotRunning:       b.in.Owner.NotRunning,
 		GoStdlib:         f.GoStdlib,
+		Previous:         b.in.Previous[f.Fingerprint],
 	}
 	f.Signals = model.FindingSignals{
 		Exposed: pin.Exposed, Privileged: pin.Privileged, PowerfulSA: pin.PowerfulSA, NotRunning: pin.NotRunning,
 		KEV: pin.KEVAdded != nil, Malicious: pin.Malicious,
-		EPSSElevated: pin.EPSS >= b.in.PriorityConfig.EPSSBump, EPSS: pin.EPSS,
+		EPSSElevated: pin.EPSS >= priority.Thresholds(pin, b.in.PriorityConfig).EPSSBump, EPSS: pin.EPSS,
 	}
 	f.Priority, f.Reasons = priority.Evaluate(pin, b.in.PriorityConfig)
 	b.except(f, adv.Aliases, pin)

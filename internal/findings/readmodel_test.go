@@ -166,7 +166,7 @@ func TestDiff_SignalsAndFixMakeNoTransition(t *testing.T) {
 	built := stored
 	built.Signals = model.FindingSignals{Exposed: true, EPSS: 0.3}
 	built.Fix = &model.FixAction{Kind: model.FixKindRebuild, Key: "rebuild:debian:12", Label: "debian 12 rebuild", Distro: deb12}
-	ups, ts := Diff([]model.Finding{stored}, []model.Finding{built}, Withdrawals{}, now, model.TriggerInventoryChange)
+	ups, ts := Diff([]model.Finding{stored}, []model.Finding{built}, Withdrawals{}, now, CauseInventory)
 	require.Empty(t, ts)
 	require.Len(t, ups, 1)
 	require.Equal(t, built.Signals, ups[0].Signals)
