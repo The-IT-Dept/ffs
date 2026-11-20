@@ -406,11 +406,18 @@ func hasImageID(p *corev1.Pod) bool {
 
 // containerList de-duplicates the uses and sorts them by name, then digest.
 func containerList(uses []use) []model.ContainerUse {
-	seen := map[model.ContainerUse]bool{}
+	// ExposurePaths is a slice, so it cannot be part of a map key; workload uses never set it.
+	type key struct {
+		Name, ImageRef, Repo, Digest, Platform string
+		Kind                                   model.ContainerKind
+		Root                                   bool
+	}
+	seen := map[key]bool{}
 	var out []model.ContainerUse
 	for _, u := range uses {
-		if !seen[u.ContainerUse] {
-			seen[u.ContainerUse] = true
+		k := key{u.Name, u.ImageRef, u.Repo, u.Digest, u.Platform, u.Kind, u.RootUnlessImageUser}
+		if !seen[k] {
+			seen[k] = true
 			out = append(out, u.ContainerUse)
 		}
 	}

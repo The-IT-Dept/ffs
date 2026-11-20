@@ -6,14 +6,18 @@ import "strings"
 const (
 	OwnerKindCluster          = "Cluster"
 	OwnerKindContainerRuntime = "ContainerRuntime"
+	OwnerKindNodes            = "Nodes"
 )
 
-// ClusterLevel reports whether r is one of ffs's synthetic cluster-level owners: kind Cluster or
-// ContainerRuntime with no namespace. A workload owner of the same kind, such as a CloudNativePG
+// ClusterLevel reports whether r is one of ffs's synthetic cluster-level owners: kind Cluster,
+// ContainerRuntime or Nodes with no namespace. A workload owner of the same kind, such as a CloudNativePG
 // Cluster, is namespaced, so the namespace tells them apart.
 func (r OwnerRef) ClusterLevel() bool {
-	return r.Namespace == "" && (r.Kind == OwnerKindCluster || r.Kind == OwnerKindContainerRuntime)
+	return r.Namespace == "" && (r.Kind == OwnerKindCluster || r.Kind == OwnerKindContainerRuntime || r.Kind == OwnerKindNodes)
 }
+
+// NodesOwner returns the one owner of every host finding in cluster.
+func NodesOwner(cluster string) OwnerRef { return OwnerRef{Kind: OwnerKindNodes, Name: cluster} }
 
 // ClusterLevelKey reports ClusterLevel for an owner key, "Kind/Namespace/Name".
 func ClusterLevelKey(key string) bool {

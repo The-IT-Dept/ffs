@@ -32,4 +32,18 @@ func TestClusterLevel(t *testing.T) {
 	require.True(t, ClusterLevelKey("ContainerRuntime//containerd"))
 	require.False(t, ClusterLevelKey("Cluster/db/pg"))
 	require.False(t, ClusterLevelKey("cluster"))
+	require.True(t, OwnerRef{Kind: "Nodes", Name: "prod"}.ClusterLevel())
+	require.False(t, OwnerRef{Kind: "Nodes", Namespace: "ops", Name: "prod"}.ClusterLevel())
+	require.True(t, ClusterLevelKey("Nodes//prod"))
+}
+
+func TestNodesOwner(t *testing.T) {
+	o := NodesOwner("prod")
+	require.Equal(t, OwnerRef{Kind: OwnerKindNodes, Name: "prod"}, o)
+	require.Equal(t, "Nodes//prod", o.Key())
+	// golden: sha256("prod|Nodes||prod|host|CVE-2026-0001"). Task 5 must not change it.
+	require.Equal(t, "05e7813802473e285dcc97c21f886ea0da448a12bbbe6c3e74ed3916e6bf34d1",
+		FindingFingerprint("prod", o, HostRepo, "CVE-2026-0001"))
+	_, ok := APIVersionForKind(OwnerKindNodes)
+	require.False(t, ok)
 }

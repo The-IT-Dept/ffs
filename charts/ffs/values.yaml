@@ -121,6 +121,85 @@ grafanaDashboard:
   # Extra dashboard ConfigMap annotations.
   annotations: {}
 
+# Node agent: a DaemonSet that reports each node's host packages and cached images to ffs.
+nodeAgent:
+  # Run the node agent. When false, no agent objects are installed.
+  enabled: true
+  # Agent namespace; empty means <release namespace>-agent.
+  namespace: ""
+  # Create the agent namespace.
+  createNamespace: true
+  # Container runtime layout of the nodes: auto, containerd, k3s, rke2 or crio.
+  distribution: auto
+  # Package databases to mount: auto, or a list of dpkg, rpm and apk.
+  packageDatabases: auto
+  # Extra host paths to read.
+  hostPaths:
+    # Extra binary directories to scan, each under /usr or /opt.
+    extraBinDirs: []
+  # Node architectures to schedule on; published images are amd64 only, so other architectures are skipped.
+  architectures: [amd64]
+  # Node selector of the agent pods.
+  nodeSelector:
+    kubernetes.io/os: linux
+  # Tolerations of the agent pods; the default runs on every node.
+  tolerations:
+    - operator: Exists
+  # Priority class of the agent pods.
+  priorityClassName: ""
+  # Agent container resources.
+  resources:
+    # Collector container.
+    collector:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+    # Cataloguer container.
+    catalog:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 400m, memory: 640Mi}
+  # Size limit of the agent scratch volume.
+  scratchSizeLimit: 4Gi
+  # Largest image the agent catalogues, as a byte count or a quantity such as 1Gi.
+  maxImageBytes: 1Gi
+  # Port of the agent API on the controller.
+  port: 8444
+  # Node label selector; host findings on matching nodes count as exposed, and empty exposes no node.
+  exposedNodes: ""
+  # Time between full host reports per node.
+  reportInterval: 6h
+  # Time between cached-image checks, which also act as the heartbeat.
+  imageListInterval: 5m
+  # Time without a report before a node shows "node agent not reporting".
+  staleAfter: 30m
+  # How long nodes must lack fresh reports before runtime findings move back to the node-status owner.
+  runtimeGrace: 2h
+  # Largest agent report accepted, as a byte count or a quantity such as 32Mi.
+  maxReportBytes: 33554432
+  # Image SBOM requests handed out with each report, 0 to 10; 0 turns them off.
+  workPerReport: 3
+  # How long a request stays with the node it was offered to.
+  workTimeout: 30m
+  # TLS of the agent API.
+  tls:
+    # Certificate issued by cert-manager; needs tls.caBundle.
+    certManager:
+      # Issue the agent API certificate with cert-manager.
+      enabled: false
+      # Issuer reference for the certificate.
+      issuerRef: {}
+    # PEM CA bundle the agents trust for the agent API.
+    caBundle: ""
+  # SELinux type of the collector container, for example spc_t.
+  seLinuxType: ""
+  # OpenShift settings.
+  openshift:
+    # Create an SCC for the agent and bind its ServiceAccount to it.
+    scc: false
+  # NetworkPolicy settings.
+  networkPolicy:
+    # Create a NetworkPolicy limiting the agent API to the agent pods.
+    enabled: true
+
 # ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.
 config:
   # Cluster name shown in findings and alerts.
