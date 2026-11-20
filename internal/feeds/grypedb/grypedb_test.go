@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	v6 "github.com/anchore/grype/grype/db/v6"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 
@@ -235,6 +236,33 @@ func TestGrypeDB_DiffReportsChangedPackages(t *testing.T) {
 	require.Contains(t, u.Changed, grypedb.PackageKey{Ecosystem: "deb", Name: "firefox-esr"})
 	require.Contains(t, u.Changed, grypedb.PackageKey{Ecosystem: "deb", Name: "thunderbird"})
 	require.NotContains(t, u.Changed, grypedb.PackageKey{Ecosystem: "deb", Name: "bind9"})
+}
+
+// TestGrypeDB_DiffWhileTheMatcherHoldsTheCurrentDB: the Grype matcher keeps the current build open
+// read-only, through SQLite's per-process shared cache, while the next build is diffed against it. The
+// diff must not need a writable connection to that file ("attempt to write a readonly database"), and the
+// copy it reads is gone afterwards.
+func TestGrypeDB_DiffWhileTheMatcherHoldsTheCurrentDB(t *testing.T) {
+	fx := newFixture(t)
+	fx.srv.publish(t, grypedbtest.BuildDB(t, built1, "**/debian-12/cve-2022-38178.json"), built1)
+	require.NoError(t, fx.feed.Sync(ctx))
+	require.Len(t, fx.h.updates, 1)
+
+	rdr, err := v6.NewReader(v6.Config{DBDirPath: fx.h.updates[0].Path}) // as internal/match/grype opens it
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = rdr.Close() })
+
+	fx.srv.publish(t, grypedbtest.BuildDB(t, built2), built2)
+	require.NoError(t, fx.feed.Sync(ctx))
+	require.Len(t, fx.h.updates, 2)
+	require.False(t, fx.h.updates[1].Full)
+	require.Contains(t, fx.h.updates[1].Changed, grypedb.PackageKey{Ecosystem: "deb", Name: "firefox-esr"})
+
+	entries, err := os.ReadDir(filepath.Dir(fx.h.updates[1].Path))
+	require.NoError(t, err)
+	for _, e := range entries {
+		require.NotEqual(t, ".diff-old", e.Name(), "the copy the diff read is removed")
+	}
 }
 
 func TestGrypeDB_ChecksumMismatch(t *testing.T) {

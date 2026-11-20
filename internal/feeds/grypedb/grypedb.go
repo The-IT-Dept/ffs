@@ -46,6 +46,7 @@ const (
 	dirLayout             = "20060102T150405Z"
 	downloadDir           = ".download"
 	stagingDir            = ".staging"
+	diffOldDir            = ".diff-old"
 	metaCurrent           = "current"
 	metaLastFull          = "lastFull"
 )
@@ -190,7 +191,7 @@ func (f *Feed) Sync(ctx context.Context) error {
 	// A full re-match ignores Changed, and the diff of two production builds takes minutes and
 	// gigabytes of SQLite temp space: run it only when its result is used.
 	if !u.Full && current != name {
-		if u.Changed, err = changedPackages(filepath.Join(f.root, current), newDir); err != nil {
+		if u.Changed, err = f.changedPackages(filepath.Join(f.root, current), newDir); err != nil {
 			return err
 		}
 	}
@@ -317,8 +318,23 @@ func (f *Feed) prune(keep ...string) error {
 
 // changedPackages diffs two DB directories and returns the deduplicated, lowercased packages whose
 // vulnerability records were added, removed or modified.
-func changedPackages(oldDir, newDir string) (_ []PackageKey, err error) {
-	d, err := diff.NewDBDiffer(diff.Config{OldDB: oldDir, NewDB: newDir, Include: diff.Includes{Packages: true}})
+//
+// The differ opens both databases for writing first (it hydrates them: migrations and ANALYZE). Grype
+// opens every database with SQLite's shared cache, which is one cache per file per process, and the
+// Grype matcher in this process holds oldDir's database open read-only, so a writable connection to that
+// file joins a read-only cache and fails ("attempt to write a readonly database"). The diff therefore
+// reads a copy of oldDir, on the same volume, removed when it ends (and by prune after a crash). newDir is
+// not open in this process until the handler takes the update.
+func (f *Feed) changedPackages(oldDir, newDir string) (_ []PackageKey, err error) {
+	oldCopy := filepath.Join(f.root, diffOldDir)
+	if err := os.RemoveAll(oldCopy); err != nil {
+		return nil, fmt.Errorf("grypedb: diff: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(oldCopy) }()
+	if err := os.CopyFS(oldCopy, os.DirFS(oldDir)); err != nil {
+		return nil, fmt.Errorf("grypedb: diff: copy the current database: %w", err)
+	}
+	d, err := diff.NewDBDiffer(diff.Config{OldDB: oldCopy, NewDB: newDir, Include: diff.Includes{Packages: true}})
 	if err != nil {
 		return nil, fmt.Errorf("grypedb: diff: %w", err)
 	}
