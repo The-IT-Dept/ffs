@@ -17,6 +17,7 @@ import (
 	"github.com/anchore/stereoscope/pkg/image"
 	"github.com/anchore/syft/syft"
 	"github.com/anchore/syft/syft/cataloging"
+	"github.com/anchore/syft/syft/source"
 	_ "github.com/glebarez/go-sqlite" // the "sqlite" driver Syft's RPM cataloger needs; without it every image fails (see internal/store for why not modernc.org/sqlite)
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
@@ -30,9 +31,23 @@ type WorkError struct{ Kind, Msg string }
 
 func (e *WorkError) Error() string { return e.Msg }
 
-// Catalog pulls req.Ref and catalogues it with Syft, in process. It is the worker's body; the
-// server runs it in a child process.
+// Catalog catalogues the source of req with Syft, in process: req.Ref pulled from its registry, or
+// a local OCI layout or staged host directory at req.Path. It is the worker's body; the server runs
+// it in a child process.
 func Catalog(ctx context.Context, req sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
+	switch req.Source {
+	case "", sbom.CatalogSourceRegistry:
+		return catalogRegistry(ctx, req)
+	case sbom.CatalogSourceOCIDir:
+		return catalogOCIDir(ctx, req)
+	case sbom.CatalogSourceHostDir:
+		return catalogHostDir(ctx, req)
+	}
+	return nil, &WorkError{Kind: sbom.KindBadRequest, Msg: fmt.Sprintf("unknown source %q", req.Source)}
+}
+
+// catalogRegistry pulls req.Ref and catalogues it.
+func catalogRegistry(ctx context.Context, req sbom.CatalogRequest) (*sbom.CatalogResponse, error) {
 	if !strings.Contains(req.Ref, "@sha256:") {
 		return nil, &WorkError{Kind: sbom.KindBadRequest, Msg: fmt.Sprintf("ref %q is not pinned by a sha256 digest", req.Ref)}
 	}
@@ -49,17 +64,13 @@ func Catalog(ctx context.Context, req sbom.CatalogRequest) (*sbom.CatalogRespons
 		return nil, workError(err)
 	}
 	defer func() { _ = src.Close() }()
+	return catalogImage(ctx, src)
+}
 
-	cfg := syft.DefaultCreateSBOMConfig().WithUnknownsConfig(cataloging.UnknownsConfig{
-		RemoveWhenPackagesDefined:         true,
-		IncludeExecutablesWithoutPackages: true,
-	})
-	// The grype CLI's settings, so matching sees what `grype sbom:` would: Go symbols for its
-	// gosymbols qualifier, and packages without a version dropped.
-	cfg.Packages.Golang = cfg.Packages.Golang.WithCaptureSymbols(cataloging.SymbolScopeAll)
-	cfg.Compliance.MissingVersion = cataloging.ComplianceActionDrop
-
-	doc, err := syft.CreateSBOM(ctx, src, cfg)
+// catalogImage catalogues an image source with imageSBOMConfig, marks Rust binaries without
+// cargo-auditable metadata and encodes the result.
+func catalogImage(ctx context.Context, src source.Source) (*sbom.CatalogResponse, error) {
+	doc, err := syft.CreateSBOM(ctx, src, imageSBOMConfig())
 	if err != nil {
 		return nil, workError(err)
 	}
@@ -71,6 +82,20 @@ func Catalog(ctx context.Context, req sbom.CatalogRequest) (*sbom.CatalogRespons
 		return nil, workError(err)
 	}
 	return &sbom.CatalogResponse{SyftJSON: b, Coverage: sbom.CoverageOf(doc)}, nil
+}
+
+// imageSBOMConfig is the SBOM configuration of an image, from a registry or an OCI layout: unknowns
+// kept for executables without packages, and the grype CLI's settings, so matching sees what
+// `grype sbom:` would: Go symbols for its gosymbols qualifier, and packages without a version
+// dropped.
+func imageSBOMConfig() *syft.CreateSBOMConfig {
+	cfg := syft.DefaultCreateSBOMConfig().WithUnknownsConfig(cataloging.UnknownsConfig{
+		RemoveWhenPackagesDefined:         true,
+		IncludeExecutablesWithoutPackages: true,
+	})
+	cfg.Packages.Golang = cfg.Packages.Golang.WithCaptureSymbols(cataloging.SymbolScopeAll)
+	cfg.Compliance.MissingVersion = cataloging.ComplianceActionDrop
+	return cfg
 }
 
 // RunWorker reads one CatalogRequest from in, runs Catalog and writes a CatalogResponse, or a

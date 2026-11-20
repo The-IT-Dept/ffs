@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -40,6 +43,8 @@ func TestCatalogCmd_Flags(t *testing.T) {
 		"scratch":        "/scratch",
 		"scratch-limit":  "19327352832",
 		"max-concurrent": "2",
+		"local-root":     "",
+		"nice":           "0",
 	} {
 		f := cmd.Flags().Lookup(flag)
 		require.NotNil(t, f, flag)
@@ -51,4 +56,17 @@ func TestCatalogCmd_Flags(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "worker", worker.Name())
 	require.True(t, worker.Hidden)
+}
+
+func TestCatalogCmd_NiceRange(t *testing.T) {
+	for _, nice := range []string{"20", "-1"} {
+		sock := filepath.Join(t.TempDir(), "c.sock")
+		cmd := newCatalogCmd()
+		cmd.SetArgs([]string{"--nice=" + nice, "--socket=" + sock, "--scratch=" + t.TempDir()})
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		err := cmd.ExecuteContext(context.Background())
+		require.EqualError(t, err, "--nice must be between 0 and 19", nice)
+		require.NoFileExists(t, sock, "rejected before listening")
+	}
 }
