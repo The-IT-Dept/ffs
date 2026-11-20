@@ -5,7 +5,7 @@ import { SignalCells } from '@/components/signals/SignalCells'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
-import { scopePath, workloadPath } from '@/lib/links'
+import { ownerHref, ownerLabel, scopePath } from '@/lib/links'
 import { parseScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 
@@ -47,8 +47,9 @@ function Detail({ text }: { text?: string }) {
   return text ? <span className="ml-2 font-normal text-muted-foreground">{text}</span> : null
 }
 
+// Hostname is "hostname → workloads". The workloads behind a hostname can sit in several
+// namespaces, so the row names none.
 function Hostname({ row }: { row: Row }) {
-  const first = row.workloads[0]
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <span>{row.label}</span>
@@ -56,13 +57,12 @@ function Hostname({ row }: { row: Row }) {
       {row.workloads.map((w, i) => (
         <Fragment key={w.scope}>
           {i > 0 ? <span className="text-muted-foreground">,</span> : null}
-          <AppLink href={workloadPath(w.kind, w.namespace, w.name)} className="hover:underline">
-            {w.name}
+          <AppLink href={ownerHref(w)} className="hover:underline">
+            {ownerLabel(w)}
           </AppLink>
         </Fragment>
       ))}
       {row.moreWorkloads > 0 ? <span className="text-muted-foreground">+{formatCount(row.moreWorkloads)}</span> : null}
-      {first?.namespace ? <span className="text-muted-foreground">· {first.namespace}</span> : null}
     </span>
   )
 }
@@ -154,7 +154,7 @@ export function ExposureTable({ table, expand, onToggle }: { table: S<'ExposureT
           const next = table.rows[i + 1]
           return (
             <TableRow key={row.id} data-tinted={row.depth === 0 ? '' : undefined} className={cn('h-[30px]', row.depth === 0 && 'bg-muted/50 font-semibold')}>
-              <TableCell className="max-w-[34rem] truncate py-0">
+              <TableCell className="max-w-[34rem] truncate py-0 max-sm:max-w-[60vw]">
                 {row.depth === 0 ? (
                   <GroupPath row={row} open={open.has(row.id)} onToggle={onToggle} />
                 ) : (

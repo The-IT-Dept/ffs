@@ -31,6 +31,18 @@ export function findingsQuery(s: ExplorerSearch, o?: { facets?: readonly string[
   return apiQuery('/findings', { query } as unknown as ApiParams<'/findings'>)
 }
 
+function groupOfKey(key: readonly unknown[]): unknown {
+  return (key[2] as { query?: { group?: unknown } } | undefined)?.query?.group
+}
+
+// keepWhileGroup is placeholderData that keeps the previous answer on screen only while the
+// grouping (the explorer's group, the home table's regroup) is unchanged. Rows of another
+// grouping would render with this grouping's cells and links, so a regroup shows a skeleton.
+export function keepWhileGroup<T>(group: string | undefined) {
+  return (prev: T | undefined, prevQuery: { queryKey: readonly unknown[] } | undefined): T | undefined =>
+    prevQuery && groupOfKey(prevQuery.queryKey) === group ? prev : undefined
+}
+
 // explorerQuery asks an explorer's endpoint for a search, with that explorer's facets.
 export function explorerQuery<K extends ExplorerKind>(kind: K, s: ExplorerSearch) {
   const spec = EXPLORERS[kind]

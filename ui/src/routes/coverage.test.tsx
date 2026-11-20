@@ -1,5 +1,6 @@
 import { screen, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
+import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
 import { coverageBody, gap } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
@@ -47,4 +48,30 @@ test('unknown pods show —, and the scope travels to the API', async () => {
   renderApp('/coverage?scope=namespace:ops')
   expect(await screen.findByText('—')).toBeInTheDocument()
   expect(api.calls('/coverage')[0].searchParams.get('scope')).toBe('namespace:ops')
+})
+
+test('node gaps for agents that report without a host inventory, or do not run, have their own copy', async () => {
+  mockApi().on(
+    '/coverage',
+    coverageBody({
+      totalGaps: 2,
+      gaps: [
+        gap({ code: 'host_not_inventoried', remedy: 'check_node_agent', what: '2 nodes', detail: 'host inventory quarantined', affects: { workloads: 0, images: 0, nodes: 2 } }),
+        gap({ code: 'node_agent_unsupported', remedy: 'informational', what: 'worker-1', detail: '', affects: { workloads: 0, images: 0, nodes: 1 } }),
+      ],
+    }),
+  )
+  renderApp('/coverage')
+  expect((await screen.findByText('agent reporting, host not inventoried')).closest('.hatched')).not.toBeNull()
+  expect(screen.getByText("Check the node agent's logs on these nodes; the last error is shown.")).toBeInTheDocument()
+  expect(screen.getByText('host inventory quarantined')).toBeInTheDocument()
+  expect(screen.getByText('not scheduled by the node agent').closest('.hatched')).not.toBeNull()
+  expect(screen.getByText('Its architecture or node selector excludes this node from the node agent.')).toBeInTheDocument()
+})
+
+test('no gaps says so, not that nothing needs attention', async () => {
+  mockApi().on('/coverage', coverageBody())
+  renderApp('/coverage')
+  expect(await screen.findByText(copy.emptyList.gaps)).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
 })

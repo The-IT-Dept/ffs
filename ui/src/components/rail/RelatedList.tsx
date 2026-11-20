@@ -7,6 +7,7 @@ import { copy } from '@/lib/copy'
 import { formatCompact } from '@/lib/format'
 import { imagePath, relatedFilterable, relatedHref, scopePath } from '@/lib/links'
 import { formatScope, parseScope, type Scope } from '@/lib/scope'
+import { cn, touchBlock } from '@/lib/utils'
 
 function itemHref(scope: Scope, item: S<'RelatedItem'>): string | undefined {
   if (!item.scope) return undefined
@@ -76,7 +77,7 @@ export function RelatedList({ scope, section }: { scope: Scope; section: S<'Rela
         })}
       </ul>
       {moreHref ? (
-        <AppLink href={moreHref} className="px-2 text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:flex max-lg:min-h-10 max-lg:items-center">
+        <AppLink href={moreHref} className={cn('px-2 text-[11px] text-muted-foreground hover:text-foreground hover:underline', touchBlock)}>
           {copy.rail.more(section.more)}
         </AppLink>
       ) : null}

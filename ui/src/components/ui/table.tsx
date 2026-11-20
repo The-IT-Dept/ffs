@@ -3,6 +3,8 @@ import { cn } from "@/lib/utils"
 
 // Rows are ruled on their cells (separate borders, no spacing) rather than on the rows, so the
 // sticky first column (styles.css) carries its own rule while the rest of the row scrolls under it.
+// Under border-separate a border on a tr, thead or tfoot is never drawn: every row rule belongs on
+// the cells, as TableRow, TableBody and TableFooter put it.
 function Table({ className, ...props }: React.ComponentProps<"table">) {
   return (
     <div
@@ -22,7 +24,7 @@ function TableHeader({ className, ...props }: React.ComponentProps<"thead">) {
   return (
     <thead
       data-slot="table-header"
-      className={cn("[&_tr>*]:border-b", className)}
+      className={className}
       {...props}
     />
   )
@@ -43,7 +45,7 @@ function TableFooter({ className, ...props }: React.ComponentProps<"tfoot">) {
     <tfoot
       data-slot="table-footer"
       className={cn(
-        "border-t bg-muted/50 font-medium [&>tr]:last:border-b-0",
+        "bg-muted/50 font-medium [&>tr>*]:border-t [&>tr:last-child>*]:border-b-0",
         className
       )}
       {...props}

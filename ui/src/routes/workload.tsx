@@ -1,5 +1,5 @@
 import { keepPreviousData, useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import { useState } from 'react'
 import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
@@ -12,7 +12,8 @@ import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import type { FixGroupKind } from '@/components/fix/FixGroupList'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState } from '@/components/layout/EmptyState'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { Field, FieldList } from '@/components/layout/FieldList'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { CoverageMark } from '@/components/signals/CoverageMark'
@@ -27,9 +28,8 @@ import { copy, facetValueLabel } from '@/lib/copy'
 import { shortDigest } from '@/lib/format'
 import { advisoryPath, imagePath, namespacePath, scopePath } from '@/lib/links'
 import { parseWorkloadSearch, revalidate, type WorkloadSearch } from '@/lib/query'
-import { formatScope, workloadScope } from '@/lib/scope'
+import { formatScope, type Scope, workloadScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
-import { rootRoute } from './root'
 
 type Detail = S<'WorkloadDetail'>
 type View = NonNullable<WorkloadSearch['view']>
@@ -63,7 +63,7 @@ function Chips({ d }: { d: Detail }) {
         </Badge>
       ) : null}
       {d.counts.high > 0 ? (
-        <Badge variant="outline" className="text-(--high)">
+        <Badge variant="outline" className="text-(--high-text)">
           {copy.workload.high(d.counts.high)}
         </Badge>
       ) : null}
@@ -131,7 +131,8 @@ function Containers({ d, scope }: { d: Detail; scope: string }) {
   )
 }
 
-function FindingsView({ scope, group, coverage, onGroup }: { scope: string; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
+function FindingsView({ scope, group, coverage, onGroup }: { scope: Scope; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
+  const trust = useScopeTrust(scope)
   // The request always groups (by fix unless the URL says otherwise); the URL leaves the default out.
   return (
     <div className="flex flex-col gap-2">
@@ -141,7 +142,7 @@ function FindingsView({ scope, group, coverage, onGroup }: { scope: string; grou
         options={GROUPS.map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
         onChange={(v) => onGroup(v as FixGroupKind)}
       />
-      <FixGroupFindings scope={scope} group={group} empty={<EmptyState coverage={coverage} />} />
+      <FixGroupFindings scope={formatScope(scope)} group={group} empty={<EmptyState coverage={coverage} feeds={trust?.feeds} scope={scope} />} />
     </div>
   )
 }
@@ -185,22 +186,19 @@ function RbacView({ d }: { d: Detail }) {
       </ul>
     ) : null
   return (
-    <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-2 text-[12px]">
-      <dt className="text-muted-foreground">{w.serviceAccount}</dt>
-      <dd>
+    <FieldList className="gap-y-2 text-[12px]">
+      <Field label={w.serviceAccount}>
         <Mono wrap>{d.serviceAccount}</Mono>
-      </dd>
-      <dt className="text-muted-foreground">{w.saPower}</dt>
-      <dd>
+      </Field>
+      <Field label={w.saPower}>
         {yesNo(d.saPower)}
         {reasons(d.saReasons)}
-      </dd>
-      <dt className="text-muted-foreground">{w.privilegedTitle}</dt>
-      <dd>
+      </Field>
+      <Field label={w.privilegedTitle}>
         {yesNo(d.privileged)}
         {reasons(d.privilegeReasons)}
-      </dd>
-    </dl>
+      </Field>
+    </FieldList>
   )
 }
 
@@ -216,7 +214,7 @@ const historyColumns: Column<S<'TransitionRow'>>[] = [
       </AppLink>
     ),
   },
-  { id: 'change', header: h.change, cell: (r) => `${r.fromState} → ${r.toState}` },
+  { id: 'change', header: h.change, cell: (r) => `${r.fromState || copy.workload.created} → ${r.toState}` },
   {
     id: 'priority',
     header: h.priority,
@@ -232,7 +230,7 @@ const historyColumns: Column<S<'TransitionRow'>>[] = [
     header: h.trigger,
     cell: (r) => (
       <span className="inline-flex items-center gap-1.5">
-        {r.trigger}
+        {copy.workload.trigger[r.trigger] ?? r.trigger}
         {r.provisional ? <span className="rounded border px-1 text-[10px] leading-4 text-muted-foreground">{copy.explorer.tag.provisional}</span> : null}
       </span>
     ),
@@ -245,7 +243,7 @@ function HistoryView({ scope }: { scope: string }) {
   const q = useQuery({ ...apiQuery('/transitions', { query: { scope, ...(cursor ? { cursor } : {}) } }), placeholderData: keepPreviousData })
   if (q.error && !q.data) return <ProblemNotice error={q.error} />
   if (!q.data) return <Skeleton className="h-24" />
-  if (q.data.rows.length === 0) return <EmptyState />
+  if (q.data.rows.length === 0) return <EmptyState message={copy.emptyList.history} />
   const next = q.data.next
   return (
     <>
@@ -268,9 +266,9 @@ function HistoryView({ scope }: { scope: string }) {
 }
 
 function WorkloadPage() {
-  const { kind, namespace, name } = workloadRoute.useParams()
-  const search = revalidate(parseWorkloadSearch, workloadRoute.useSearch())
-  const navigate = workloadRoute.useNavigate()
+  const { kind, namespace, name } = Route.useParams()
+  const search = revalidate(parseWorkloadSearch, Route.useSearch())
+  const navigate = Route.useNavigate()
   const scopeObj = workloadScope(kind, namespace, name)
   const scope = formatScope(scopeObj)
   const detail = useQuery(apiQuery('/workloads/{kind}/{namespace}/{name}', { path: { kind, namespace, name } }))
@@ -313,7 +311,7 @@ function WorkloadPage() {
             </TabsList>
             <TabsContent value="findings">
               <FindingsView
-                scope={scope}
+                scope={scopeObj}
                 group={group}
                 coverage={d.coverage}
                 onGroup={(g) => void navigate({ to: '.', search: { ...search, group: g === 'fix' ? undefined : g } })}
@@ -342,9 +340,5 @@ function WorkloadPage() {
   )
 }
 
-export const workloadRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/workloads/$kind/$namespace/$name',
-  validateSearch: parseWorkloadSearch,
-  component: WorkloadPage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/workloads/$kind/$namespace/$name')({ component: WorkloadPage })

@@ -1,15 +1,15 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
+import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { ControlPlaneBlock } from '@/components/nodes/ControlPlaneBlock'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
-import { rootRoute } from './root'
 
 const SCOPE = 'controlplane'
 
@@ -24,6 +24,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function ControlPlanePage() {
   const list = useQuery(apiQuery('/nodegroups', {}))
+  const trust = useScopeTrust({ kind: 'controlplane', value: '' })
   return (
     <div>
       <PageHeader title={copy.page.controlplane} />
@@ -40,14 +41,11 @@ function ControlPlanePage() {
         <Skeleton className="h-24" />
       )}
       <Section title={copy.view('findings', 'controlplane')}>
-        <FixGroupFindings scope={SCOPE} />
+        <FixGroupFindings scope={SCOPE} empty={<EmptyState coverage={trust?.coverage} feeds={trust?.feeds} />} />
       </Section>
     </div>
   )
 }
 
-export const controlPlaneRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/controlplane',
-  component: ControlPlanePage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/controlplane')({ component: ControlPlanePage })

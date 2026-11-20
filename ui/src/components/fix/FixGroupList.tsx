@@ -4,6 +4,7 @@ import { useState } from 'react'
 import type { S } from '@/api/types'
 import type { Column } from '@/components/explorer/ExplorerTable'
 import { ExplorerTable } from '@/components/explorer/ExplorerTable'
+import { OwnerCell } from '@/components/explorer/OwnerCell'
 import { findingsQuery } from '@/components/explorer/params'
 import { PriorityCell } from '@/components/explorer/PriorityCell'
 import { AppLink } from '@/components/layout/AppLink'
@@ -13,8 +14,9 @@ import { RelativeTime } from '@/components/signals/RelativeTime'
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy, countsLine, fixGroupHeader } from '@/lib/copy'
-import { advisoryPath, explorerHref, workloadPath } from '@/lib/links'
+import { advisoryPath, explorerHref } from '@/lib/links'
 import { type ExplorerSearch, parsePackageKey } from '@/lib/query'
+import { cn, touchLink } from '@/lib/utils'
 
 export type FixGroupKind = 'fix' | 'advisory' | 'package'
 
@@ -27,7 +29,9 @@ type Row = S<'FindingGroupRow'>
 export function groupFilter(group: FixGroupKind, row: Row): ExplorerSearch {
   if (group === 'fix') return { fixKey: row.key }
   if (group === 'advisory') return { advisory: row.key }
-  return { package: parsePackageKey(row.key).name }
+  // A package group is one ecosystem's package; the same name in another ecosystem is another.
+  const p = parsePackageKey(row.key)
+  return p.ecosystem ? { package: p.name, ecosystem: [p.ecosystem] } : { package: p.name }
 }
 
 function header(group: FixGroupKind, row: Row): string {
@@ -60,11 +64,7 @@ function GroupFindings({ row, group, base }: { row: Row; group: FixGroupKind; ba
           {
             id: 'workload',
             header: copy.fixList.cols.workload,
-            cell: (r: S<'FindingRow'>) => (
-              <AppLink href={workloadPath(r.workload.kind, r.workload.namespace, r.workload.name)} className="hover:underline">
-                {r.workload.name}
-              </AppLink>
-            ),
+            cell: (r: S<'FindingRow'>) => <OwnerCell owner={r.workload} nodeGroups={r.nodeGroups} namespace={false} />,
           },
         ]),
     { id: 'priority', header: copy.fixList.cols.priority, cell: (r) => <PriorityCell finding={r} /> },
@@ -93,7 +93,7 @@ function GroupFindings({ row, group, base }: { row: Row; group: FixGroupKind; ba
       {row.findings > GROUP_PREVIEW ? (
         <AppLink
           href={explorerHref('findings', filter)}
-          className="mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center"
+          className={cn('mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline', touchLink)}
         >
           {copy.fixList.more(row.findings - GROUP_PREVIEW)}
         </AppLink>

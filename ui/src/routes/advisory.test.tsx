@@ -1,8 +1,9 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
 import { advisoryPath } from '@/lib/links'
+import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
-import { advisoryDetail, counts, findingRow, findingsPage, fixAction, groupRow } from '@/test/fixtures'
+import { advisoryDetail, counts, coverageFigure, feedFreshness, findingRow, findingsPage, fixAction, groupRow, summary } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
 
 const adv = advisoryDetail({
@@ -52,4 +53,46 @@ test('affected workloads are grouped by fix and open by fix key', async () => {
   )
   expect(await screen.findByRole('columnheader', { name: 'Workload' })).toBeInTheDocument()
   expect(screen.queryByRole('columnheader', { name: 'Advisory' })).toBeNull()
+})
+
+test('an advisory with no affected workloads leads with the images ffs has not seen into', async () => {
+  mockApi()
+    .on('/advisories/{id}', advisoryDetail({ uncatalogued: 2 }))
+    .on('/summary', summary({ coverage: coverageFigure({ inUse: 10, seenInto: 8, full: 7 }) }))
+  renderApp(advisoryPath('CVE-2026-0001'))
+  expect(await screen.findByText(copy.coverageFirst(2, 10))).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('before the summary is in, an empty affected list still leads with the uncatalogued count', async () => {
+  mockApi().on('/advisories/{id}', advisoryDetail({ uncatalogued: 2 }))
+  renderApp(advisoryPath('CVE-2026-0001'))
+  expect((await screen.findByText('2 images not seen into')).closest('.hatched')).not.toBeNull()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('an advisory with no affected workloads and a stale matching feed does not read clean', async () => {
+  mockApi()
+    .on('/advisories/{id}', advisoryDetail({ uncatalogued: 0 }))
+    .on('/summary', summary({ feeds: feedFreshness({ fresh: false, stale: ['osv'] }) }))
+  renderApp(advisoryPath('CVE-2026-0001'))
+  expect(await screen.findByText('feed out of date: osv')).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('an advisory that affects host packages lists its node groups with members and installed versions', async () => {
+  mockApi()
+    .on(
+      '/advisories/{id}',
+      advisoryDetail({
+        nodeGroups: [{ id: 'ubuntu-24.04-k6.8', label: 'ubuntu-24.04-k6.8-3f9c1a', nodes: 3, versions: [{ package: 'openssl', version: '3.0.13-0ubuntu3' }] }],
+      }),
+    )
+    .on('/summary', summary())
+  renderApp(advisoryPath('CVE-2026-0001'))
+  expect(await screen.findByText(copy.advisory.nodeGroups)).toBeInTheDocument()
+  const row = screen.getByRole('row', { name: /ubuntu-24\.04/ })
+  expect(within(row).getByRole('link', { name: 'ubuntu-24.04-k6.8-3f9c1a' })).toHaveAttribute('href', '/nodegroups/ubuntu-24.04-k6.8')
+  expect(within(row).getByText('3')).toBeInTheDocument()
+  expect(within(row).getByText('3.0.13-0ubuntu3')).toBeInTheDocument()
 })

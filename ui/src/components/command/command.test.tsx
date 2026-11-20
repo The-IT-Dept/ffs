@@ -1,5 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
+import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
 import { searchResult } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
@@ -29,4 +30,29 @@ test('jumps to a placeholder image in one path segment', async () => {
   await user.type(await screen.findByRole('combobox'), 'private')
   await user.click(await screen.findByRole('option', { name: /private/ }))
   expect(router.state.location.pathname).toBe('/images/unknown%3Aghcr.io%2Fexample%2Fprivate%3A1.0')
+})
+
+test('says to refine the search when more objects matched than are listed', async () => {
+  mockApi().on('/search', searchResult({ hits: [{ kind: 'namespace', id: 'kube-system', label: 'kube-system' }], truncated: true }))
+  const { user } = renderApp('/')
+  await user.keyboard('{Control>}k{/Control}')
+  await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'kube')
+  expect(await screen.findByText(copy.command.truncated)).toBeInTheDocument()
+})
+
+test('does not ask to refine a search that listed everything', async () => {
+  mockApi().on('/search', searchResult({ hits: [{ kind: 'namespace', id: 'kube-system', label: 'kube-system' }], truncated: false }))
+  const { user } = renderApp('/')
+  await user.keyboard('{Control>}k{/Control}')
+  await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'kube')
+  expect(await screen.findByRole('option', { name: /kube-system/ })).toBeInTheDocument()
+  expect(screen.queryByText(copy.command.truncated)).toBeNull()
+})
+
+test('the search hint is ⌘K on Apple platforms and Ctrl K elsewhere', async () => {
+  mockApi()
+  vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel')
+  renderApp('/')
+  expect(await screen.findByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
+  vi.restoreAllMocks()
 })

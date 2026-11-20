@@ -4,7 +4,7 @@ import { mockApi } from '@/test/api'
 import { facet, findingRow, findingsPage, scopeCard } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
 
-// The window's width is the one input here: useMediaQuery answers WIDE ((min-width: 1024px)) from
+// The window's width is the one input here: useMediaQuery answers WIDE ((min-width: 64rem)) from
 // media.wide, and every other query as no match.
 const media = vi.hoisted(() => ({ wide: true, asked: [] as string[] }))
 vi.mock('@/lib/hooks', async (importOriginal) => {
@@ -36,21 +36,25 @@ test('from 1024 px the rail sits inline and there is no menu button', async () =
   renderApp('/')
   const rail = await screen.findByRole('complementary', { name: 'Scope' })
   expect(await within(rail).findByText('Kubernetes 1.35.0 · 3 nodes · 4 namespaces')).toBeInTheDocument()
-  expect(screen.queryByRole('button', { name: 'Open navigation' })).toBeNull()
-  expect(screen.getByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
-  expect(media.asked).toContain('(min-width: 1024px)')
+  expect(screen.queryByRole('button', { name: /^Open navigation/ })).toBeNull()
+  // jsdom reports no platform, so the hint is the one for every platform but Apple's.
+  expect(screen.getByRole('button', { name: /^Search/ })).toHaveTextContent('Ctrl K')
+  expect(media.asked).toContain('(min-width: 64rem)')
 })
 
 test('below 1024 px the rail is a drawer behind a menu button that names the scope', async () => {
   media.wide = false
   mockApi().on('/scope', card)
   renderApp('/')
-  const menu = await screen.findByRole('button', { name: 'Open navigation' })
+  const menu = await screen.findByRole('button', { name: /^Open navigation/ })
   await waitFor(() => expect(menu).toHaveTextContent('Clustertest'))
   expect(menu).toHaveAttribute('title', 'Cluster: test')
+  // The accessible name holds the visible scope, so it can be spoken to it (WCAG 2.5.3).
+  expect(menu).toHaveAccessibleName('Open navigation: Cluster test')
   expect(screen.queryByRole('complementary', { name: 'Scope' })).toBeNull()
   expect(screen.queryByText('Kubernetes 1.35.0 · 3 nodes · 4 namespaces')).toBeNull()
   const search = screen.getByRole('button', { name: 'Search' })
+  expect(search).not.toHaveTextContent('Ctrl K')
   expect(search).not.toHaveTextContent('⌘K')
 })
 
@@ -58,21 +62,41 @@ test('the drawer opens with the rail, closes on Escape and gives focus back to t
   media.wide = false
   mockApi().on('/scope', card)
   const { user } = renderApp('/')
-  const menu = await screen.findByRole('button', { name: 'Open navigation' })
+  const menu = await screen.findByRole('button', { name: /^Open navigation/ })
   await user.click(menu)
   const drawer = await screen.findByRole('dialog', { name: 'Navigation' })
   expect(within(drawer).getByText('Kubernetes 1.35.0 · 3 nodes · 4 namespaces')).toBeInTheDocument()
+  expect(drawer).toContainElement(document.activeElement as HTMLElement)
+  // Tab past the last control wraps inside the drawer; focus never reaches the page behind it.
+  const stops = within(drawer).getAllByRole('link').length + within(drawer).getAllByRole('button').length + within(drawer).queryAllByRole('searchbox').length
+  for (let i = 0; i <= stops + 1; i++) {
+    await user.tab()
+    expect(drawer).toContainElement(document.activeElement as HTMLElement)
+  }
+  await user.tab({ shift: true })
   expect(drawer).toContainElement(document.activeElement as HTMLElement)
   await user.keyboard('{Escape}')
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
   expect(menu).toHaveFocus()
 })
 
+test('the drawer closes on a tap on the overlay', async () => {
+  media.wide = false
+  mockApi().on('/scope', card)
+  const { user } = renderApp('/')
+  await user.click(await screen.findByRole('button', { name: /^Open navigation/ }))
+  await screen.findByRole('dialog', { name: 'Navigation' })
+  const overlay = document.querySelector('[data-slot="sheet-overlay"]')!
+  expect(overlay).not.toBeNull()
+  await user.click(overlay)
+  await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
+})
+
 test('the drawer closes when one of its links navigates', async () => {
   media.wide = false
   mockApi().on('/scope', card).on('/findings', findingsPage())
   const { router, user } = renderApp('/')
-  await user.click(await screen.findByRole('button', { name: 'Open navigation' }))
+  await user.click(await screen.findByRole('button', { name: /^Open navigation/ }))
   const drawer = await screen.findByRole('dialog', { name: 'Navigation' })
   await user.click(within(drawer).getByRole('link', { name: /Vulnerabilities/ }))
   expect(router.state.location.pathname).toBe('/vulnerabilities')
@@ -83,13 +107,13 @@ test('the drawer closes on any route change, not only its own links', async () =
   media.wide = false
   mockApi().on('/scope', card).on('/findings', findingsPage())
   const { router, user } = renderApp('/')
-  await user.click(await screen.findByRole('button', { name: 'Open navigation' }))
+  await user.click(await screen.findByRole('button', { name: /^Open navigation/ }))
   expect(await screen.findByRole('dialog', { name: 'Navigation' })).toBeInTheDocument()
   await act(() => router.navigate({ href: '/vulnerabilities?priority=urgent' }))
   await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull())
   // Back to the page it was opened on, it stays closed.
   await act(() => router.navigate({ href: '/' }))
-  expect(await screen.findByRole('button', { name: 'Open navigation' })).toBeInTheDocument()
+  expect(await screen.findByRole('button', { name: /^Open navigation/ })).toBeInTheDocument()
   expect(screen.queryByRole('dialog')).toBeNull()
 })
 

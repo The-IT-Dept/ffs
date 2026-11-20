@@ -1,7 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import { Fragment, type ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
+import type { S } from '@/api/types'
 import { FixGroupList } from '@/components/fix/FixGroupList'
 import { AppLink } from '@/components/layout/AppLink'
 import { EmptyState } from '@/components/layout/EmptyState'
@@ -15,7 +16,8 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import { copy, countsLine } from '@/lib/copy'
 import { formatCount, formatDate } from '@/lib/format'
-import { rootRoute } from './root'
+import { nodeGroupPath } from '@/lib/links'
+import { cn, touchBlock } from '@/lib/utils'
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -40,12 +42,83 @@ function Heads({ labels }: { labels: string[] }) {
   )
 }
 
+// advisoryCoverage is the coverage figure an advisory's affected list rests on: the images in use
+// (from the cluster summary) less the uncatalogued ones the advisory reports, which ffs cannot
+// match the advisory against. Undefined until the summary has loaded.
+function advisoryCoverage(a: S<'AdvisoryDetail'>, s?: S<'Summary'>): S<'CoverageFigure'> | undefined {
+  if (!s) return undefined
+  const inUse = Math.max(s.coverage.inUse, a.uncatalogued)
+  const seenInto = inUse - a.uncatalogued
+  return { inUse, seenInto, full: Math.min(s.coverage.full, seenInto) }
+}
+
+// isWebLink reports whether an advisory reference from feed data is an http or https URL; only
+// those are links, anything else is shown as text.
+function isWebLink(l: string): boolean {
+  try {
+    const u = new URL(l)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+// Uncatalogued says how many images in use ffs has not seen into, so could not match.
+function Uncatalogued({ n, className }: { n: number; className?: string }) {
+  return (
+    <p className={className}>
+      <CoverageMark>{copy.advisory.uncatalogued(n)}</CoverageMark>{' '}
+      <AppLink href="/coverage" className="text-muted-foreground underline underline-offset-2 hover:text-foreground">
+        {copy.coverageLink}
+      </AppLink>
+    </p>
+  )
+}
+
+// NodeGroups lists the node groups an advisory affects through host packages: each group links to
+// its page, with its member count and the installed versions there.
+function NodeGroups({ groups }: { groups: S<'FindingNodeGroup'>[] }) {
+  const c = copy.advisory.nodeGroupCols
+  return (
+    <Table className="text-[12px]">
+      <Heads labels={[c.group, c.nodes, c.installed]} />
+      <TableBody>
+        {groups.map((g) => (
+          <TableRow key={g.id} className="h-[30px]">
+            <TableCell className="py-0">
+              <AppLink href={nodeGroupPath(g.id)} className="hover:underline">
+                {g.label}
+              </AppLink>
+            </TableCell>
+            <TableCell className="py-0 tabular-nums">{formatCount(g.nodes)}</TableCell>
+            <TableCell className="py-0">
+              <span className="inline-flex flex-wrap items-center gap-x-3">
+                {g.versions.map((v) => (
+                  <span key={`${v.package}@${v.version}`} className="inline-flex items-center gap-1.5">
+                    <span>{v.package}</span>
+                    <Mono>{v.version}</Mono>
+                  </span>
+                ))}
+              </span>
+            </TableCell>
+          </TableRow>
+        ))}
+      </TableBody>
+    </Table>
+  )
+}
+
 function AdvisoryPage() {
-  const { id } = advisoryRoute.useParams()
+  const { id } = Route.useParams()
   const q = useQuery(apiQuery('/advisories/{id}', { path: { id } }))
+  // The cluster summary, for the images in use and the feeds the affected list rests on.
+  const summary = useQuery(apiQuery('/summary', { query: {} }))
   const a = q.data
   const c = copy.advisory.cols
   const t = copy.advisory.timeline
+  // An empty affected list leads with the images ffs has not seen into: as a figure once the
+  // summary is in, as a count before.
+  const coverage = a ? advisoryCoverage(a, summary.data) : undefined
 
   return (
     <div>
@@ -125,8 +198,22 @@ function AdvisoryPage() {
           </ol>
 
           <Section title={copy.advisory.affected}>
-            {a.byFix.length > 0 ? <FixGroupList rows={a.byFix} group="fix" base={{ advisory: a.id }} /> : <EmptyState />}
+            {a.byFix.length > 0 ? (
+              <FixGroupList rows={a.byFix} group="fix" base={{ advisory: a.id }} />
+            ) : (
+              <EmptyState
+                coverage={coverage}
+                feeds={summary.data?.feeds}
+                lead={!coverage && a.uncatalogued > 0 ? <Uncatalogued n={a.uncatalogued} /> : undefined}
+              />
+            )}
           </Section>
+
+          {a.nodeGroups && a.nodeGroups.length > 0 ? (
+            <Section title={copy.advisory.nodeGroups}>
+              <NodeGroups groups={a.nodeGroups} />
+            </Section>
+          ) : null}
 
           {a.packages.length > 0 ? (
             <Section title={copy.advisory.packages}>
@@ -149,28 +236,25 @@ function AdvisoryPage() {
             </Section>
           ) : null}
 
-          {a.uncatalogued > 0 ? (
-            <p className="mt-3 text-[12px]">
-              <CoverageMark>{copy.advisory.uncatalogued(a.uncatalogued)}</CoverageMark>{' '}
-              <AppLink href="/coverage" className="text-muted-foreground underline underline-offset-2 hover:text-foreground">
-                {copy.coverageLink}
-              </AppLink>
-            </p>
-          ) : null}
+          {a.uncatalogued > 0 && a.byFix.length > 0 ? <Uncatalogued n={a.uncatalogued} className="mt-3 text-[12px]" /> : null}
 
           {a.links.length > 0 ? (
             <Section title={copy.advisory.links}>
               <ul className="flex flex-col gap-0.5 text-[12px]">
                 {a.links.map((l) => (
                   <li key={l}>
-                    <a
-                      href={l}
-                      target="_blank"
-                      rel="noreferrer noopener"
-                      className="break-all underline underline-offset-2 hover:text-foreground max-lg:flex max-lg:min-h-10 max-lg:items-center"
-                    >
-                      {l}
-                    </a>
+                    {isWebLink(l) ? (
+                      <a
+                        href={l}
+                        target="_blank"
+                        rel="noreferrer noopener"
+                        className={cn('break-all underline underline-offset-2 hover:text-foreground', touchBlock)}
+                      >
+                        {l}
+                      </a>
+                    ) : (
+                      <span className="break-all text-muted-foreground">{l}</span>
+                    )}
                   </li>
                 ))}
               </ul>
@@ -186,8 +270,5 @@ function AdvisoryPage() {
   )
 }
 
-export const advisoryRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/vulnerabilities/$id',
-  component: AdvisoryPage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/vulnerabilities/$id')({ component: AdvisoryPage })

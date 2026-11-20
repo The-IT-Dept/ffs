@@ -46,6 +46,8 @@ test('hostname rows link their workloads and fold the rest', async () => {
   renderApp('/')
   expect(await screen.findByRole('link', { name: 'web' })).toHaveAttribute('href', '/workloads/Deployment/shop/web')
   expect(screen.getByText('+2')).toBeInTheDocument()
+  // The workloads behind a hostname can sit in several namespaces, so the row names none.
+  expect(within(screen.getByRole('row', { name: /shop\.example\.com/ })).queryByText(/shop$/)).toBeNull()
   expect(screen.getAllByRole('columnheader').map((h) => h.textContent)).toEqual(['Path', 'Urgent', 'High', 'Fixable', 'Privileged', 'SA power', 'Exploited', 'Coverage', 'Best fix'])
 })
 
@@ -103,4 +105,15 @@ test('a namespace explorer view redirects to the scoped explorer', async () => {
   const { router } = renderApp('/namespaces/shop?view=images')
   await waitFor(() => expect(router.state.location.pathname).toBe('/images'))
   expect(router.state.location.search).toEqual({ scope: 'namespace:shop' })
+})
+
+test('an empty home view says what ffs cannot see once', async () => {
+  mockApi()
+    .on('/summary', summary({ coverage: coverageFigure({ inUse: 7, seenInto: 5, full: 4 }) }))
+    .on('/exposure', exposureTable({ rows: [] }))
+  renderApp('/')
+  const main = await screen.findByRole('main')
+  expect(await within(main).findByText(copy.coverageFirst(2, 7))).toBeInTheDocument()
+  await waitFor(() => expect(within(main).getAllByText(copy.coverageFirst(2, 7))).toHaveLength(1))
+  expect(within(main).queryByText(copy.empty)).toBeNull()
 })

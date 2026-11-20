@@ -1,4 +1,5 @@
 import { Fragment, type ReactNode } from 'react'
+import { cn, touchLink } from '@/lib/utils'
 import { AppLink } from './AppLink'
 
 export interface Crumb {
@@ -19,7 +20,7 @@ export function PageHeader({ crumbs, kind, title, sub, actions }: { crumbs?: Cru
               <Fragment key={`${i}:${c.label}`}>
                 {i > 0 ? <span aria-hidden="true" className="mx-1">›</span> : null}
                 {c.href ? (
-                  <AppLink href={c.href} className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+                  <AppLink href={c.href} className={cn('hover:text-foreground hover:underline', touchLink)}>
                     {c.label}
                   </AppLink>
                 ) : (

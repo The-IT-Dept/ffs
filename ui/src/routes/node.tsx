@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import { AppLink } from '@/components/layout/AppLink'
@@ -13,7 +13,7 @@ import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
 import { nodeGroupPath } from '@/lib/links'
-import { rootRoute } from './root'
+import { cn, touchLink } from '@/lib/utils'
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -25,7 +25,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function NodePage() {
-  const { name } = nodeRoute.useParams()
+  const { name } = Route.useParams()
   const q = useQuery(apiQuery('/nodes/{name}', { path: { name } }))
   const d = q.data
   const n = d?.node
@@ -52,7 +52,7 @@ function NodePage() {
         <>
           <div className="flex flex-wrap items-center gap-2 text-[12px]">
             {d.group ? (
-              <AppLink href={nodeGroupPath(d.group.id)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+              <AppLink href={nodeGroupPath(d.group.id)} className={cn('hover:underline', touchLink)}>
                 {d.group.label}
               </AppLink>
             ) : (
@@ -65,12 +65,12 @@ function NodePage() {
             <span className="text-muted-foreground">· {copy.workload.fixable(d.fixable)}</span>
           </div>
           <Section title={copy.nodes.memberCols.agent}>
-            <AgentGate agentData={hasAgentData(d.agent)}>
+            <AgentGate agentData={hasAgentData(d.agent)} agents={[d.agent]}>
               <AgentStatusView agent={d.agent} />
             </AgentGate>
           </Section>
           <Section title={copy.view('cachedImages', 'node')}>
-            <AgentGate agentData={hasAgentData(d.agent)}>
+            <AgentGate agentData={hasAgentData(d.agent)} agents={[d.agent]}>
               <NodeImagesTable images={d.cachedImages} />
             </AgentGate>
           </Section>
@@ -84,8 +84,5 @@ function NodePage() {
   )
 }
 
-export const nodeRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/nodes/$name',
-  component: NodePage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/nodes/$name')({ component: NodePage })

@@ -5,6 +5,7 @@ import { CoverageFigureText } from './CoverageFigureText'
 import { PriorityCount } from './PriorityCount'
 import { PriorityDot } from './PriorityDot'
 import { SignalCells } from './SignalCells'
+import { priorityTone } from './tone'
 
 test('spends colour only on urgent, high and medium dots', () => {
   render(
@@ -17,6 +18,9 @@ test('spends colour only on urgent, high and medium dots', () => {
   )
   expect(screen.getByText('3')).toHaveClass('text-(--urgent)')
   expect(screen.getByText('0')).toHaveClass('text-muted-foreground')
+  // High text takes the darker text orange; high dots keep the fill.
+  expect(priorityTone.high.text).toBe('text-(--high-text)')
+  expect(priorityTone.high.dot).toBe('bg-(--high)')
   expect(screen.getByRole('img', { name: 'medium' })).toHaveClass('bg-(--medium)')
   expect(screen.getByRole('img', { name: 'low' }).className).not.toMatch(/--(urgent|high|medium)/)
 })

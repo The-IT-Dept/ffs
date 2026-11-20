@@ -2,7 +2,7 @@ import { act, screen, waitFor, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
 import { imagePath } from '@/lib/links'
 import { mockApi } from '@/test/api'
-import { coverageFigure, feedFreshness, scopeCard } from '@/test/fixtures'
+import { coverageFigure, feedFreshness, scopeCard, workloadsPage } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
 
 const shop = scopeCard({
@@ -58,7 +58,7 @@ test('rebuilds around the destination after navigation', async () => {
 })
 
 test('filters a related section through its explorer, server-side', async () => {
-  mockApi().on('/scope', shop)
+  mockApi().on('/scope', shop).on('/workloads', workloadsPage())
   const { router, user } = renderApp('/namespaces/shop')
   await user.type(await screen.findByRole('searchbox', { name: 'Filter Workloads' }), 'wor{Enter}')
   expect(router.state.location.href).toBe('/workloads?scope=namespace:shop&q=wor')
@@ -96,4 +96,30 @@ test('trust footer hatches stale feeds and links exceptions and settings at clus
   expect(within(rail).getByText('4/6')).toBeInTheDocument()
   expect(within(rail).getByRole('link', { name: 'Exceptions' })).toHaveAttribute('href', '/exceptions')
   expect(within(rail).getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings')
+})
+
+test('a long parent trail ends in an ellipsis with the whole trail as its title', async () => {
+  mockApi().on(
+    '/scope',
+    scopeCard({
+      scope: { scope: 'workload:Deployment/shop/web', kind: 'workload', label: 'web' },
+      title: 'web',
+      breadcrumbs: [
+        { scope: 'cluster', kind: 'cluster', label: 'test' },
+        { scope: 'namespace:shop', kind: 'namespace', label: 'shop' },
+      ],
+    }),
+  )
+  renderApp('/vulnerabilities?scope=workload:Deployment/shop/web')
+  const rail = await screen.findByRole('complementary', { name: 'Scope' })
+  const trail = await within(rail).findByRole('navigation', { name: 'Parent scopes' })
+  expect(trail).toHaveAttribute('title', 'test › shop')
+  expect(trail).toHaveClass('truncate')
+  // Inline links, so the ellipsis applies; atomic inline-flex boxes would clip without one.
+  // Padded to a 40 px touch target below lg: py-3.5 (28 px) around the ~12 px inline text box.
+  for (const a of within(trail).getAllByRole('link')) {
+    expect(a.className).not.toMatch(/inline-flex/)
+    expect(a).toHaveClass('max-lg:py-3.5')
+  }
+  expect(trail).toHaveClass('max-lg:leading-10')
 })

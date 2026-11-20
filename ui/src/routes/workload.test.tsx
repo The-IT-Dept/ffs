@@ -1,5 +1,6 @@
 import { screen, waitFor, within } from '@testing-library/react'
 import { expect, test } from 'vitest'
+import { copy } from '@/lib/copy'
 import { workloadPath } from '@/lib/links'
 import { mockApi } from '@/test/api'
 import { counts, exposureEdge, findingRow, findingsPage, fixAction, groupRow, transitionsPage, workloadDetail, workloadRef } from '@/test/fixtures'
@@ -97,4 +98,11 @@ test('view tabs and the group switch write the URL', async () => {
   await user.click(screen.getByRole('tab', { name: 'History' }))
   expect(router.state.location.search).toEqual({ group: 'advisory', view: 'history' })
   await waitFor(() => expect(api.calls('/transitions')[0].searchParams.get('scope')).toBe(scope))
+})
+
+test('an empty history says no changes are recorded, not that nothing needs attention', async () => {
+  mocks().on('/transitions', transitionsPage())
+  renderApp(`${workloadPath('Deployment', 'shop', 'web')}?view=history`)
+  expect(await screen.findByText(copy.emptyList.history)).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
 })
