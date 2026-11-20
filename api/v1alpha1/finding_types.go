@@ -115,7 +115,9 @@ type ExposureSummary struct {
 
 // SuggestionSummary describes a suggested image update.
 type SuggestionSummary struct {
-	// Target is the suggested image as repository:tag.
+	// Target is what to upgrade to, as alerts and Events name it: "nginx:1.30.7",
+	// "nginx:1.30.6 (new digest)" for a rebuilt tag, or "kubernetes v1.35.10" for the cluster.
+	// It is display text, not a pullable image reference.
 	Target string `json:"target,omitempty"`
 	// Digest is the digest of the suggested image.
 	Digest string `json:"digest,omitempty"`
