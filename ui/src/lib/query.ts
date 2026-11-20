@@ -272,6 +272,13 @@ export function stringifySearchParams(search: object): string {
   return pairs.length ? `?${pairs.join('&')}` : ''
 }
 
+// revalidate runs a route's search validator again over the search a page reads. The router
+// merges a route's validated search over the raw URL search, so a key or value the validator
+// dropped would otherwise come back (a group on /workloads, an image scope on /coverage).
+export function revalidate<T>(validate: (raw: Record<string, unknown>) => T, search: object): T {
+  return validate(search as Record<string, unknown>)
+}
+
 // Page search params, one parser per page with search state.
 export interface HomeSearch {
   group?: 'entry' | 'namespace' | 'node'
@@ -354,4 +361,15 @@ export function toggleExpand(expand: string | undefined, id: string): string | u
   const ids = (expand ?? '').split(',').filter((x) => x !== '')
   const next = ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id]
   return next.length ? next.join(',') : undefined
+}
+
+// parsePackageKey splits a package group key, "<ecosystem>/<name>@<version>": the ecosystem ends at
+// the first "/", the version starts after the last "@" ("npm/@scope/pkg@1.2.3" is "@scope/pkg").
+export function parsePackageKey(key: string): { ecosystem: string; name: string; version: string } {
+  const slash = key.indexOf('/')
+  const ecosystem = slash < 0 ? '' : key.slice(0, slash)
+  const rest = slash < 0 ? key : key.slice(slash + 1)
+  const at = rest.lastIndexOf('@')
+  if (at <= 0) return { ecosystem, name: rest, version: '' }
+  return { ecosystem, name: rest.slice(0, at), version: rest.slice(at + 1) }
 }

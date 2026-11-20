@@ -80,3 +80,92 @@ export function scopeCard(p?: Partial<S<'ScopeCard'>>): S<'ScopeCard'> {
 export function searchResult(p?: Partial<S<'SearchResult'>>): S<'SearchResult'> {
   return { ...ENV, query: 'web', hits: [], truncated: false, ...p }
 }
+
+export function settings(p?: Partial<S<'Settings'>>): S<'Settings'> {
+  return {
+    ...ENV,
+    version: 'v0.0.1',
+    clusterName: 'test',
+    feeds: [
+      { name: 'osv', enabled: true, interval: '1h0m0s', staleAfter: '6h0m0s' },
+      { name: 'kev', enabled: true, interval: '6h0m0s', staleAfter: '72h0m0s' },
+    ],
+    priority: { epssHigh: 0.5, epssBump: 0.1 },
+    exposure: { internalIngressClasses: [], internalGatewayClasses: [], internalGateways: [], internalLBAnnotations: {} },
+    crd: { minPriority: 'high', maxFindings: 100 },
+    events: { minPriority: 'urgent' },
+    openReports: { mode: 'off' },
+    exceptions: { maxDuration: '2160h0m0s' },
+    retention: { resolved: '720h0m0s' },
+    upgrades: { enabled: true, dailyAt: '03:00' },
+    ...p,
+  }
+}
+
+export function summary(p?: Partial<S<'Summary'>>): S<'Summary'> {
+  return {
+    ...ENV,
+    scope: { scope: 'cluster', kind: 'cluster', label: 'test' },
+    reachable: 0,
+    reachableUrgent: 0,
+    findings: counts(),
+    open: 0,
+    fixable: 0,
+    exploited: 0,
+    coverage: coverageFigure(),
+    feeds: feedFreshness(),
+    gaps: 0,
+    ...p,
+  }
+}
+
+export function workloadRow(p?: Partial<S<'WorkloadRow'>>): S<'WorkloadRow'> {
+  return {
+    workload: workloadRef('Deployment', 'shop', 'web'),
+    notRunning: false,
+    exposed: false,
+    privileged: false,
+    saPower: false,
+    counts: counts(),
+    open: 0,
+    fixable: 0,
+    exploited: 0,
+    coverage: coverageFigure(),
+    coverageClass: 'full',
+    pods: 2,
+    ...p,
+  }
+}
+
+export function imageRow(p?: Partial<S<'ImageRow'>>): S<'ImageRow'> {
+  return {
+    digest: 'sha256:' + 'a'.repeat(64),
+    repo: 'ghcr.io/example/web',
+    platform: 'linux/amd64',
+    status: 'catalogued',
+    statusReason: '',
+    source: 'registry',
+    coverage: 'full',
+    gaps: [],
+    workloads: 1,
+    counts: counts(),
+    fixable: 0,
+    ...p,
+  }
+}
+
+export function packageRow(p?: Partial<S<'PackageRow'>>): S<'PackageRow'> {
+  return { ecosystem: 'deb', name: 'openssl', version: '3.5.1-1', images: 1, workloads: 1, counts: counts(), worst: 'none', ...p }
+}
+
+export function workloadsPage(p?: Partial<S<'WorkloadsPage'>>): S<'WorkloadsPage'> {
+  return { ...ENV, total: 0, rows: [], next: null, facets: {}, ...p }
+}
+
+export function imagesPage(p?: Partial<S<'ImagesPage'>>): S<'ImagesPage'> {
+  return { ...ENV, total: 0, rows: [], next: null, facets: {}, ...p }
+}
+
+export function packagesPage(p?: Partial<S<'PackagesPage'>>): S<'PackagesPage'> {
+  return { ...ENV, total: 0, rows: [], next: null, facets: {}, ...p }
+}

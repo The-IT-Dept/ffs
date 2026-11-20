@@ -1,7 +1,7 @@
 import { vi } from 'vitest'
 import { endpointKinds } from '@/api/keys'
 import type { ApiData, ApiPath, ProblemCode, S } from '@/api/types'
-import { scopeCard } from './fixtures'
+import { scopeCard, settings } from './fixtures'
 
 export const ENV = { cluster: 'test', generatedAt: '2026-11-19T00:00:00Z' } as const
 
@@ -53,7 +53,8 @@ function toResponse(r: unknown): Response {
 
 // mockApi stubs fetch for the API. It records every request by its schema path; the last on() for
 // a path wins; a request no on() answers is recorded in unmatched and answered 404 not_found.
-// /scope, which the rail asks on every page, answers scopeCard() until a test sets its own.
+// /scope, which the rail asks on every page, answers scopeCard(), and /settings, which explorers
+// read for the EPSS threshold, answers settings(), until a test sets its own.
 export function mockApi(): MockApi {
   const replies = new Map<ApiPath, unknown>()
   const calls = new Map<ApiPath, URL[]>()
@@ -82,5 +83,5 @@ export function mockApi(): MockApi {
     },
     unmatched,
   }
-  return api.on('/scope', scopeCard())
+  return api.on('/scope', scopeCard()).on('/settings', settings())
 }
