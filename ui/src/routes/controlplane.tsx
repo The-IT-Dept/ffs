@@ -3,11 +3,12 @@ import { createLazyRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
-import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { EmptyState } from '@/components/layout/EmptyState'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { ControlPlaneBlock } from '@/components/nodes/ControlPlaneBlock'
+import { useScopeTrust } from '@/components/rail/query'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
 
@@ -24,7 +25,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function ControlPlanePage() {
   const list = useQuery(apiQuery('/nodegroups', {}))
-  const trust = useScopeTrust({ kind: 'controlplane', value: '' })
+  const { trust, pending } = useScopeTrust({ kind: 'controlplane', value: '' })
   return (
     <div>
       <PageHeader title={copy.page.controlplane} />
@@ -41,7 +42,7 @@ function ControlPlanePage() {
         <Skeleton className="h-24" />
       )}
       <Section title={copy.view('findings', 'controlplane')}>
-        <FixGroupFindings scope={SCOPE} empty={<EmptyState coverage={trust?.coverage} feeds={trust?.feeds} />} />
+        <FixGroupFindings scope={SCOPE} empty={<EmptyState coverage={trust?.coverage} feeds={trust?.feeds} pending={pending} />} />
       </Section>
     </div>
   )

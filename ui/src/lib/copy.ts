@@ -46,6 +46,10 @@ const relatedLabel: Record<RelatedSectionId, string> = {
   exceptions: 'Exceptions',
 }
 
+const openNavigation = 'Open navigation'
+
+const agentState = { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>
+
 // copy holds every user-facing string. The strings marked Contract are the Contract's Copy section
 // verbatim; change them there first.
 export const copy = {
@@ -202,7 +206,7 @@ export const copy = {
     },
     no_package_database: {
       gap: 'no package database (image-based OS)',
-      todo: 'Host packages are not inventoried on image-based operating systems.',
+      todo: 'Image-based operating systems have no package database; on any other OS, check nodeAgent.packageDatabases.',
     },
     content_store_unreadable: {
       gap: 'no containerd content store',
@@ -225,8 +229,8 @@ export const copy = {
   related: (id: RelatedSectionId, scope: Scope) =>
     id === 'siblings' && scope.kind === 'workload' ? `Siblings in ${scope.value.split('/')[1] ?? ''}` : relatedLabel[id],
   shell: {
-    openNavigation: 'Open navigation',
-    openNavigationTo: (scope: string) => (scope ? `Open navigation: ${scope}` : 'Open navigation'),
+    // The menu button's name, with the scope it opens on: "Open navigation: Cluster test".
+    openNavigationTo: (scope: string) => (scope ? `${openNavigation}: ${scope}` : openNavigation),
     navigation: 'Navigation',
     close: 'Close',
   },
@@ -434,7 +438,7 @@ export const copy = {
     nodeGroups: 'Affected node groups',
     nodeGroupCols: { group: 'Node group', nodes: 'Nodes', installed: 'Installed' },
   },
-  agentState: { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>,
+  agentState,
   nodes: {
     ready: 'Ready',
     notReady: 'Not ready',
@@ -449,7 +453,24 @@ export const copy = {
     gapNodes: (n: number, m: number) => `${formatCount(n)} of ${plural(m, 'node', 'nodes')}`,
     // A stale agent has no gap code of its own: its last report may be out of date.
     agentStale: 'node agent stopped reporting',
+    // An agent that reports but whose host inventory is not stored (host_not_inventoried); its last
+    // error, when it has one, says why.
+    hostPending: 'Host packages not inventoried yet',
     groupGap: 'ffs cannot see all of this group',
+    // A group's agents by state, zero parts left out: "7 reporting · 1 without host inventory · 1 not
+    // scheduled"; "—" when there are none.
+    agentCounts: (a: S<'AgentCounts'>) => {
+      const parts: [number, string][] = [
+        [a.reporting, agentState.reporting],
+        [a.reportingWithoutInventory, 'without host inventory'],
+        [a.stale, agentState.stale],
+        [a.never, agentState.never],
+        [a.unsupported, 'not scheduled'],
+        [a.disabled, agentState.disabled],
+      ]
+      const shown = parts.filter(([n]) => n > 0).map(([n, label]) => `${formatCount(n)} ${label}`)
+      return shown.length ? shown.join(' · ') : '—'
+    },
     kind: { agent: 'node agent', nodeinfo: 'node status' } satisfies Record<S<'NodeGroupKind'>, string>,
     groupCols: {
       group: 'Group',

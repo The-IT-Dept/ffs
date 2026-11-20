@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs'
-import { act, screen, waitFor, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { act, fireEvent, screen, waitFor, within } from '@testing-library/react'
+import { expect, test, vi } from 'vitest'
 import { keepWhileGroup } from '@/components/explorer/params'
 import { copy } from '@/lib/copy'
 import { workloadPath } from '@/lib/links'
@@ -11,11 +11,46 @@ import { renderApp } from '@/test/render'
 import { documentTitle } from './root'
 
 test('a new page starts #main at the top; back and forward restore it', async () => {
-  mockApi().on('/findings', findingsPage())
+  mockApi().on('/findings', findingsPage()).on('/workloads/{kind}/{namespace}/{name}', workloadDetail())
   const { router } = renderApp('/vulnerabilities')
-  expect(router.options.scrollRestoration).toBe(true)
-  expect(router.options.scrollToTopSelectors).toEqual(['#main'])
-  expect(await screen.findByRole('main')).toHaveAttribute('id', 'main')
+  const main = await screen.findByRole('main')
+  expect(main).toHaveAttribute('id', 'main')
+  // jsdom lays nothing out, so #main's offset is held here: the router reads it when it leaves a
+  // page, sets it when it comes back, and scrolls #main to the top of a new page.
+  let top = 0
+  Object.defineProperty(main, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => {
+      top = v
+    },
+  })
+  const scrollTo = vi.fn((o?: ScrollToOptions) => {
+    top = o?.top ?? top
+  })
+  main.scrollTo = scrollTo as typeof main.scrollTo
+  const scroll = (y: number) => {
+    top = y
+    fireEvent.scroll(main)
+  }
+
+  scroll(480)
+  await act(() => router.navigate({ href: workloadPath('Deployment', 'shop', 'web') }))
+  await waitFor(() => expect(router.state.location.pathname).toBe(workloadPath('Deployment', 'shop', 'web')))
+  expect(scrollTo).toHaveBeenLastCalledWith(expect.objectContaining({ top: 0, left: 0 }))
+  expect(top).toBe(0)
+
+  scroll(120)
+  scrollTo.mockClear()
+  await act(() => router.history.back())
+  await waitFor(() => expect(router.state.location.pathname).toBe('/vulnerabilities'))
+  await waitFor(() => expect(top).toBe(480))
+  expect(scrollTo).not.toHaveBeenCalled()
+
+  await act(() => router.history.forward())
+  await waitFor(() => expect(router.state.location.pathname).toBe(workloadPath('Deployment', 'shop', 'web')))
+  await waitFor(() => expect(top).toBe(120))
+  expect(scrollTo).not.toHaveBeenCalled()
 })
 
 test('placeholder rows are kept only while the grouping is unchanged', () => {

@@ -5,7 +5,7 @@ import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { EmptyState } from '@/components/layout/EmptyState'
 import { Field, FieldList } from '@/components/layout/FieldList'
 import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -13,6 +13,7 @@ import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { AgentGate, AgentMissing } from '@/components/nodes/AgentGate'
 import { NodeGapLines, NodeGapNotice, nodeGapsOf } from '@/components/nodes/NodeGaps'
 import { NodeImagesTable } from '@/components/nodes/NodeImagesTable'
+import { useScopeTrust } from '@/components/rail/query'
 import { PackageTable } from '@/components/sbom/PackageTable'
 import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
@@ -23,6 +24,7 @@ import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
 import { nodeGroupPath, nodePath } from '@/lib/links'
 import { type NodeGroupSearch, parseNodeGroupSearch, revalidate, stringifySearchParams } from '@/lib/query'
+import { formatScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 
 type View = NonNullable<NodeGroupSearch['view']>
@@ -286,7 +288,9 @@ function MembersView({ d, id }: { d: Detail; id: string }) {
 }
 
 function NodeGroupPage() {
-  // id is the group's stable name, as the app links groups, or its ID; the API resolves both.
+  // id is the group's key, as the API links groups (its stable name, qualified when other groups
+  // share it), or any other form the API resolves (a label, an ID). It is used as it is, never
+  // parsed.
   const { id } = Route.useParams()
   const search = revalidate(parseNodeGroupSearch, Route.useSearch())
   const navigate = Route.useNavigate()
@@ -295,18 +299,18 @@ function NodeGroupPage() {
     // Keep the page while compare changes, but never show another group's data.
     placeholderData: (prev, prevQuery) => ((prevQuery?.queryKey[2] as { path?: { id?: string } } | undefined)?.path?.id === id ? prev : undefined),
   })
-  const trust = useScopeTrust({ kind: 'nodegroup', value: id })
+  const { trust, pending } = useScopeTrust({ kind: 'nodegroup', value: id })
   const missing = q.error instanceof ApiProblem && q.error.code === 'not_found'
   useEffect(() => {
-    // A group no longer listed under this name or ID lands on the list instead, with a notice.
+    // A group no longer listed under this key lands on the list instead, with a notice.
     if (missing) void navigate({ to: '/nodes', replace: true, state: goneState('nodegroup') })
   }, [missing, navigate])
 
   const d = q.data
   const g = d?.group
   const view = search.view ?? 'findings'
-  // Queries scope by the group's current ID, which the detail resolved from the URL.
-  const scope = g ? `nodegroup:${g.id}` : ''
+  // Queries scope by the key the detail resolved the URL's id to.
+  const scope = g ? formatScope({ kind: 'nodegroup', value: g.id }) : ''
   const agents = d ? d.members.map((m) => m.agent) : []
   // What the agents cannot see on any member leads the page: under the header, and ahead of the
   // findings and host packages, because no findings is not proof that nothing needs attention.
@@ -317,6 +321,7 @@ function NodeGroupPage() {
       <EmptyState
         coverage={trust?.coverage}
         feeds={trust?.feeds}
+        pending={pending}
         lead={gaps.length > 0 ? <NodeGapLines gaps={gaps} total={agents.length} /> : undefined}
       />
     ) : (

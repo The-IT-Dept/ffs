@@ -12,10 +12,11 @@ import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import type { FixGroupKind } from '@/components/fix/FixGroupList'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { EmptyState } from '@/components/layout/EmptyState'
 import { Field, FieldList } from '@/components/layout/FieldList'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
+import { useScopeTrust } from '@/components/rail/query'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
@@ -132,7 +133,7 @@ function Containers({ d, scope }: { d: Detail; scope: string }) {
 }
 
 function FindingsView({ scope, group, coverage, onGroup }: { scope: Scope; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
-  const trust = useScopeTrust(scope)
+  const { trust, pending } = useScopeTrust(scope)
   // The request always groups (by fix unless the URL says otherwise); the URL leaves the default out.
   return (
     <div className="flex flex-col gap-2">
@@ -142,7 +143,7 @@ function FindingsView({ scope, group, coverage, onGroup }: { scope: Scope; group
         options={GROUPS.map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
         onChange={(v) => onGroup(v as FixGroupKind)}
       />
-      <FixGroupFindings scope={formatScope(scope)} group={group} empty={<EmptyState coverage={coverage} feeds={trust?.feeds} scope={scope} />} />
+      <FixGroupFindings scope={formatScope(scope)} group={group} empty={<EmptyState coverage={coverage} feeds={trust?.feeds} scope={scope} pending={pending} />} />
     </div>
   )
 }

@@ -6,13 +6,15 @@ import {
   advisoryPath,
   coverageHref,
   explorerHref,
+  hitKindLabel,
   hitPath,
   imagePath,
-  nodeGroupLinkIds,
+  nodeGroupPath,
   ownerHref,
   ownerLabel,
   relatedHref,
   scopePath,
+  viewHref,
   workloadPath,
 } from './links'
 import { CLUSTER, parseScope } from './scope'
@@ -63,17 +65,43 @@ test('cluster-level owners link to their own pages, never to a workload page', (
   expect(hitPath({ kind: 'workload', id: 'Cluster//test', label: 'test' })).toBe('/controlplane')
 })
 
-test('node groups link by stable name unless another listed group shares it', () => {
-  const ids = nodeGroupLinkIds([
-    { id: 'a1', name: 'ubuntu-24.04-k6.8' },
-    { id: 'b2', name: 'rocky-9-k5.14' },
-    { id: 'c3', name: 'rocky-9-k5.14' },
-    { id: 'd4', name: '' },
-  ])
-  expect(ids.get('a1')).toBe('ubuntu-24.04-k6.8')
-  expect(ids.get('b2')).toBe('b2')
-  expect(ids.get('c3')).toBe('c3')
-  expect(ids.get('d4')).toBe('d4')
+test('node group keys are used as they are: path-encoded in links, whole in scopes', async () => {
+  for (const [key, path] of [
+    ['ubuntu-24.04-k6.8', '/nodegroups/ubuntu-24.04-k6.8'],
+    ['ubuntu-24.04-k6.8-arm64', '/nodegroups/ubuntu-24.04-k6.8-arm64'],
+    ['ubuntu-24.04-k6.8-nodeinfo', '/nodegroups/ubuntu-24.04-k6.8-nodeinfo'],
+    ['ubuntu-24.04-k6.8@worker-1', '/nodegroups/ubuntu-24.04-k6.8%40worker-1'],
+  ] as const) {
+    expect(nodeGroupPath(key)).toBe(path)
+    const scope = parseScope(`nodegroup:${key}`)
+    expect(scope.value).toBe(key)
+    expect(scopePath(scope)).toBe(path)
+    expect(viewHref(scope, 'members')).toBe(`${path}?view=members`)
+    expect(relatedHref(scope, 'members')).toBe(`${path}?view=members`)
+    expect(hitPath({ kind: 'nodegroup', id: key, label: key, scope: `nodegroup:${key}` })).toBe(path)
+    expect(hitPath({ kind: 'nodegroup', id: key, label: key })).toBe(path)
+  }
+  // The router reads the key back whole.
+  const router = createAppRouter({ queryClient: createQueryClient(), history: createMemoryHistory({ initialEntries: [nodeGroupPath('ubuntu-24.04-k6.8@worker-1')] }) })
+  await router.load()
+  const leaf = router.state.matches[router.state.matches.length - 1]
+  expect(leaf.routeId).toBe('/nodegroups/$id')
+  expect(leaf.params).toEqual({ id: 'ubuntu-24.04-k6.8@worker-1' })
+})
+
+test('search hits for the control plane and Nodes open their pages and read by what they hold', () => {
+  // The Nodes hit has no scope; the control plane hit carries the controlplane scope.
+  const nodes = { kind: 'workload', id: 'Nodes//test', label: 'Nodes', detail: '3 nodes' } as const
+  const cp = { kind: 'workload', id: 'Cluster//test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' } as const
+  expect(hitPath(nodes)).toBe('/nodes')
+  expect(hitPath(cp)).toBe('/controlplane')
+  expect(hitKindLabel(nodes)).toBe('Nodes (host packages)')
+  expect(hitKindLabel(cp)).toBe('Control plane')
+  // A namespaced custom resource of kind Cluster is a workload.
+  const db = { kind: 'workload', id: 'Cluster/payments/db', label: 'db', scope: 'workload:Cluster/payments/db' } as const
+  expect(hitPath(db)).toBe('/workloads/Cluster/payments/db')
+  expect(hitKindLabel(db)).toBe('Workload')
+  expect(hitKindLabel({ kind: 'nodegroup', id: 'ubuntu-24.04-k6.8', label: 'ubuntu' })).toBe('Node group')
 })
 
 test('the coverage page of a scope keeps the scopes it covers', () => {

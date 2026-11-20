@@ -5,9 +5,10 @@ import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
-import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
+import { useScopeTrust } from '@/components/rail/query'
 import { PackageTable } from '@/components/sbom/PackageTable'
 import { hasImageGaps, ImageGaps, SbomCard } from '@/components/sbom/SbomCard'
 import { CoverageMark } from '@/components/signals/CoverageMark'
@@ -65,7 +66,7 @@ function ImagePage() {
   const scopeObj = { kind: 'image' as const, value: digest }
   const scope = formatScope(scopeObj)
   const detail = useQuery(apiQuery('/images/{digest}', { path: { digest } }))
-  const trust = useScopeTrust(scopeObj)
+  const { trust, pending } = useScopeTrust(scopeObj)
   const d = detail.data
   const view = search.view ?? 'findings'
 
@@ -131,7 +132,7 @@ function ImagePage() {
               ))}
             </TabsList>
             <TabsContent value="findings">
-              <FixGroupFindings scope={scope} empty={<EmptyState coverage={imageCoverage(d)} feeds={trust?.feeds} scope={scopeObj} />} />
+              <FixGroupFindings scope={scope} empty={<EmptyState coverage={imageCoverage(d)} feeds={trust?.feeds} scope={scopeObj} pending={pending} />} />
             </TabsContent>
             <TabsContent value="packages">
               <PackageTable

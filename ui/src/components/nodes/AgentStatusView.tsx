@@ -4,11 +4,16 @@ import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy } from '@/lib/copy'
+import { hostPendingReason } from './NodeGaps'
 
 // AgentStatusView is one node's agent: its state and reports, what it cannot read (hatched), and
-// any problems it reported.
+// any problems it reported. Host packages not inventoried yet read with their reason, the last
+// error when there is one, which is then not repeated below.
 export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
   const f = copy.nodes.agentFields
+  const pending = agent.gaps.some((g) => g.code === 'host_not_inventoried')
+  const gapLabel = (g: S<'NodeGap'>) => (g.code === 'host_not_inventoried' ? copy.nodes.hostPending : copy.gaps[g.code].gap)
+  const gapDetail = (g: S<'NodeGap'>) => (g.code === 'host_not_inventoried' ? hostPendingReason(agent) : g.detail)
   return (
     <div className="text-[12px]">
       <FieldList>
@@ -30,8 +35,8 @@ export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
         <ul className="mt-2 flex flex-col gap-1">
           {agent.gaps.map((g) => (
             <li key={`${g.code}:${g.detail}`} className="flex flex-wrap items-baseline gap-2">
-              <CoverageMark>{copy.gaps[g.code].gap}</CoverageMark>
-              {g.detail ? <span className="text-muted-foreground">{g.detail}</span> : null}
+              <CoverageMark>{gapLabel(g)}</CoverageMark>
+              {gapDetail(g) ? <span className="min-w-0 text-muted-foreground [overflow-wrap:anywhere]">{gapDetail(g)}</span> : null}
             </li>
           ))}
         </ul>
@@ -43,7 +48,7 @@ export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
           ))}
         </ul>
       ) : null}
-      {agent.lastError ? <p className="mt-2 text-muted-foreground">{agent.lastError}</p> : null}
+      {agent.lastError && !pending ? <p className="mt-2 text-muted-foreground">{agent.lastError}</p> : null}
     </div>
   )
 }

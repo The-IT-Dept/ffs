@@ -27,7 +27,7 @@ function NamespaceView({ namespace }: { namespace: string }) {
   if (exposure.data) {
     table =
       exposure.data.rows.length === 0 ? (
-        <EmptyState coverage={summary.data?.coverage} feeds={summary.data?.feeds} scope={scopeOf} />
+        <EmptyState coverage={summary.data?.coverage} feeds={summary.data?.feeds} scope={scopeOf} pending={summary.isPending} />
       ) : (
         <ExposureTable table={exposure.data} expand={expand} onToggle={(id) => setExpand((e) => toggleExpand(e, id))} />
       )

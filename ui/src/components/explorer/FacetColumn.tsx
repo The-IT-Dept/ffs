@@ -42,7 +42,7 @@ function FacetSection({
                 checked={on.includes(v.value)}
                 onCheckedChange={(c) => onToggle(name as keyof ExplorerSearch, v.value, c === true)}
               />
-              <span className="min-w-0 flex-1 truncate">{facetValueLabel(name, v.value, epssBump)}</span>{' '}
+              <span className="min-w-0 flex-1 truncate">{v.label || facetValueLabel(name, v.value, epssBump)}</span>{' '}
               <span className="text-muted-foreground tabular-nums">{formatCount(v.count)}</span>
             </label>
           </li>
@@ -61,7 +61,8 @@ function FacetSection({
   )
 }
 
-// FacetColumn lists each facet's values with the server's counts. A box is checked when the URL
+// FacetColumn lists each facet's values with the server's counts, each read by the server's label
+// when it gives one (the kind facet's cluster-level owners). A box is checked when the URL
 // selects its value (the state facet defaults to open). Folding long lists only hides rows. Below
 // the lg breakpoint the same list fills the filters sheet (className widens it).
 export function FacetColumn({

@@ -26,11 +26,14 @@ function member(name: string, agent: S<'AgentStatus'>): S<'NodeRow'> {
 const blocked = agentStatus({ gaps: [{ code: 'node_agent_blocked', detail: 'permission denied' }] })
 
 test('without the agent the nodes page lists nodeinfo groups and the agent-missing copy', async () => {
-  mockApi().on('/nodegroups', nodeGroupsList({ agentEnabled: false, groups: [nodeGroupRow({ id: 'n1', kind: 'nodeinfo', label: 'worker pool', members: 2 })] }))
+  mockApi().on(
+    '/nodegroups',
+    nodeGroupsList({ agentEnabled: false, groups: [nodeGroupRow({ id: 'worker-pool-a-nodeinfo', kind: 'nodeinfo', label: 'worker pool', members: 2 })] }),
+  )
   renderApp('/nodes')
   expect(await screen.findByText(copy.agentMissing)).toBeInTheDocument()
-  // Linked by its stable name, which survives the package updates that re-key a group.
-  expect(screen.getByRole('link', { name: /worker pool/ })).toHaveAttribute('href', '/nodegroups/worker-pool-a')
+  // Linked by the key the API gives it, which survives the package updates that re-key a group.
+  expect(screen.getByRole('link', { name: /worker pool/ })).toHaveAttribute('href', '/nodegroups/worker-pool-a-nodeinfo')
   expect(screen.getByRole('link', { name: /Control plane/ })).toHaveAttribute('href', '/controlplane')
   expect(screen.queryByRole('columnheader', { name: 'Agents' })).toBeNull()
 })
@@ -122,7 +125,9 @@ test('a node group with gaps leads its findings and host packages with them', as
   const group = await screen.findByRole('button', { name: /No fix yet/ })
   expect(note.compareDocumentPosition(group) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   await user.click(screen.getByRole('tab', { name: 'Host packages' }))
-  expect(within(await screen.findByRole('note')).getByText(copy.gaps.no_package_database.todo)).toBeInTheDocument()
+  expect(
+    within(await screen.findByRole('note')).getByText('Image-based operating systems have no package database; on any other OS, check nodeAgent.packageDatabases.'),
+  ).toBeInTheDocument()
   expect(await screen.findByText(copy.emptyList.hostPackages)).toBeInTheDocument()
 })
 
@@ -152,7 +157,7 @@ test.each([
   ['disabled', agentStatus({ state: 'disabled' }), copy.agentMissing],
   ['never reported', agentStatus({ state: 'never' }), copy.gaps.node_agent_missing.gap],
   ['blocked', blocked, copy.gaps.node_agent_blocked.gap],
-  ['reporting without a host inventory', agentStatus(), copy.gaps.host_not_inventoried.gap],
+  ['reporting without a host inventory', agentStatus(), copy.nodes.hostPending],
   ['unsupported', agentStatus({ state: 'never', gaps: [{ code: 'node_agent_unsupported', detail: 'arm' }] }), copy.gaps.node_agent_unsupported.gap],
 ] as const)('without agent data a group says why by its agents: %s', async (_, agent, text) => {
   mockApi().on('/nodegroups/{id}', nodeGroupDetail({ agentData: false, members: [member('worker-1', agent)] }))
@@ -161,6 +166,86 @@ test.each([
   expect((await within(main).findAllByText(text)).length).toBeGreaterThan(0)
   if (text !== copy.agentMissing) expect(within(main).queryByText(copy.agentMissing)).toBeNull()
   if (text === copy.gaps.node_agent_unsupported.gap) expect(within(main).queryByText(copy.gaps.node_agent_missing.gap)).toBeNull()
+})
+
+test('a nodeinfo group whose agents report without a host inventory says the host packages are not inventoried yet, and why', async () => {
+  const pending = (detail: string, lastError?: string) =>
+    agentStatus({ gaps: [{ code: 'host_not_inventoried', detail }], ...(lastError ? { lastError } : {}) })
+  mockApi()
+    .on(
+      '/nodegroups/{id}',
+      nodeGroupDetail({
+        agentData: false,
+        group: { ...nodeGroupDetail().group, id: 'worker-pool-a-nodeinfo', kind: 'nodeinfo' },
+        members: [
+          member('worker-1', pending('host inventory quarantined until 2026-11-21T07:10:00Z: scan failed', 'scan failed: disk full')),
+          member('worker-2', pending('no full host report received')),
+          member('worker-3', pending('host packages not inventoried yet')),
+        ],
+      }),
+    )
+    .on('/findings', findingsPage())
+  const { user } = renderApp('/nodegroups/worker-pool-a-nodeinfo')
+  const main = await screen.findByRole('main')
+  // Under the header, and in place of the findings.
+  await waitFor(() => expect(within(main).getAllByText(copy.nodes.hostPending)).toHaveLength(2))
+  for (const m of within(main).getAllByText(copy.nodes.hostPending)) expect(m.closest('.hatched')).not.toBeNull()
+  expect(within(main).getAllByText('3 of 3 nodes')).toHaveLength(2)
+  // The last error first; a detail that only repeats the headline is not a reason.
+  expect(within(main).getByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
+  expect(within(main).queryByText(/quarantined until/)).toBeNull()
+  expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
+  expect(within(main).queryByText(copy.gaps.host_not_inventoried.gap)).toBeNull()
+  expect(within(main).queryByText(copy.empty)).toBeNull()
+  for (const tab of ['Host packages', 'Cached images']) {
+    await user.click(screen.getByRole('tab', { name: tab }))
+    expect(await within(main).findByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
+    expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
+  }
+})
+
+test('a node whose agent reports without a host inventory says so with its last error, once', async () => {
+  mockApi().on(
+    '/nodes/{name}',
+    nodeDetail({
+      agent: agentStatus({ gaps: [{ code: 'host_not_inventoried', detail: 'scan failed: disk full' }], lastError: 'scan failed: disk full' }),
+      group: { id: 'worker-pool-a-nodeinfo', label: 'worker pool', kind: 'nodeinfo' },
+    }),
+  )
+  renderApp('/nodes/worker-1')
+  expect((await screen.findByText(copy.nodes.hostPending)).closest('.hatched')).not.toBeNull()
+  expect(screen.getAllByText('scan failed: disk full')).toHaveLength(1)
+  expect(screen.queryByText(/Enable the node agent/)).toBeNull()
+  expect(screen.getByRole('link', { name: 'worker pool' })).toHaveAttribute('href', '/nodegroups/worker-pool-a-nodeinfo')
+})
+
+test('the nodes page says a nodeinfo group whose agents report has not inventoried its hosts yet', async () => {
+  mockApi().on(
+    '/nodegroups',
+    nodeGroupsList({
+      groups: [
+        nodeGroupRow({
+          id: 'ubuntu-24.04-k6.8-nodeinfo',
+          kind: 'nodeinfo',
+          label: 'ubuntu a',
+          agents: { reporting: 0, reportingWithoutInventory: 2, stale: 0, never: 0, disabled: 0, unsupported: 0 },
+          gaps: ['host_not_inventoried'],
+        }),
+        nodeGroupRow({
+          id: 'talos-1.11-nodeinfo',
+          kind: 'nodeinfo',
+          label: 'talos b',
+          agents: { reporting: 0, reportingWithoutInventory: 0, stale: 0, never: 2, disabled: 0, unsupported: 0 },
+          gaps: ['node_agent_missing'],
+        }),
+      ],
+    }),
+  )
+  renderApp('/nodes')
+  const dashes = async (name: string) => within(await screen.findByRole('row', { name: new RegExp(name) })).getAllByText('—')
+  for (const d of await dashes('ubuntu a')) expect(d).toHaveAttribute('title', copy.nodes.hostPending)
+  for (const d of await dashes('talos b')) expect(d).toHaveAttribute('title', copy.gaps.node_agent_missing.gap)
+  expect(within(await screen.findByRole('row', { name: /ubuntu a/ })).getByText('2 without host inventory')).toBeInTheDocument()
 })
 
 test('empty lists that are not findings say what is empty', async () => {
@@ -178,7 +263,13 @@ test('the nodes page hatches the counts of groups ffs cannot fully see and shows
         groups: [
           nodeGroupRow({ id: 'g1', name: 'ubuntu-24.04-k6.8', label: 'ubuntu a' }),
           nodeGroupRow({ id: 'g2', name: 'rocky-9-k5.14', label: 'rocky b', counts: counts({ urgent: 2 }) }),
-          nodeGroupRow({ id: 'g3', name: 'debian-13-k6.12', label: 'debian c', agents: { reporting: 1, reportingWithoutInventory: 0, stale: 1, never: 0, disabled: 0, unsupported: 0 } }),
+          nodeGroupRow({
+            id: 'g3',
+            name: 'debian-13-k6.12',
+            label: 'debian c',
+            agents: { reporting: 1, reportingWithoutInventory: 0, stale: 1, never: 0, disabled: 0, unsupported: 0 },
+            gaps: ['node_agent_missing'],
+          }),
           nodeGroupRow({ id: 'n1', kind: 'nodeinfo', name: 'talos-1.11', label: 'talos d', agents: { reporting: 0, reportingWithoutInventory: 0, stale: 0, never: 2, disabled: 0, unsupported: 0 } }),
         ],
       }),
@@ -200,6 +291,84 @@ test('the nodes page hatches the counts of groups ffs cannot fully see and shows
   const dashes = within(talos).getAllByText('—')
   expect(dashes).toHaveLength(3)
   for (const d of dashes) expect(d.closest('.hatched')).not.toBeNull()
+})
+
+test.each([
+  ['node_agent_blocked', true],
+  ['no_package_database', true],
+  ['node_agent_missing', true],
+  ['host_not_inventoried', true],
+  ['node_agent_unsupported', true],
+  ['content_store_unreadable', false],
+] as const)('the nodes page hatches a group by its own gaps, beyond the rail: %s', async (code, hatched) => {
+  mockApi()
+    .on('/nodegroups', nodeGroupsList({ groups: [nodeGroupRow({ id: 'ubuntu-24.04-k6.8', label: 'ubuntu a', gaps: [code] })] }))
+    .on('/scope', scopeCard({ related: [{ id: 'nodegroups', more: 0, items: [] }] }))
+  renderApp('/nodes')
+  const row = await screen.findByRole('row', { name: /ubuntu a/ })
+  expect(row.querySelectorAll('.hatched')).toHaveLength(hatched ? 3 : 0)
+})
+
+test('the nodes page counts agents by state and leaves zero states out', async () => {
+  mockApi().on(
+    '/nodegroups',
+    nodeGroupsList({
+      groups: [
+        nodeGroupRow({
+          id: 'ubuntu-24.04-k6.8',
+          label: 'ubuntu a',
+          members: 9,
+          agents: { reporting: 7, reportingWithoutInventory: 1, stale: 0, never: 0, disabled: 0, unsupported: 1 },
+          gaps: ['host_not_inventoried', 'node_agent_unsupported'],
+        }),
+        nodeGroupRow({
+          id: 'rocky-9-k5.14',
+          label: 'rocky b',
+          members: 3,
+          agents: { reporting: 0, reportingWithoutInventory: 0, stale: 1, never: 1, disabled: 1, unsupported: 0 },
+          gaps: ['node_agent_missing'],
+        }),
+        nodeGroupRow({ id: 'debian-13-k6.12', label: 'debian c', members: 2 }),
+      ],
+    }),
+  )
+  renderApp('/nodes')
+  const agentsCell = async (name: string) => {
+    const row = await screen.findByRole('row', { name: new RegExp(name) })
+    const col = screen.getAllByRole('columnheader').findIndex((h) => h.textContent === 'Agents')
+    return within(row).getAllByRole('cell')[col]
+  }
+  expect(await agentsCell('ubuntu a')).toHaveTextContent(/^7 reporting · 1 without host inventory · 1 not scheduled$/)
+  expect(await agentsCell('rocky b')).toHaveTextContent(/^1 stale · 1 never reported · 1 disabled$/)
+  expect(await agentsCell('debian c')).toHaveTextContent(/^2 reporting$/)
+})
+
+test('a node group key is used as it is in its link, its page request and its scope', async () => {
+  const key = 'ubuntu-24.04-k6.8@worker-1'
+  const api = mockApi()
+    .on('/nodegroups', nodeGroupsList({ groups: [nodeGroupRow({ id: key, label: 'ubuntu a' })] }))
+    .on('/nodegroups/{id}', nodeGroupDetail({ agentData: true, group: { ...nodeGroupDetail().group, id: key, label: 'ubuntu a' } }))
+    .on('/findings', findingsPage())
+  const { router, user } = renderApp('/nodes')
+  const link = await screen.findByRole('link', { name: /ubuntu a/ })
+  expect(link).toHaveAttribute('href', '/nodegroups/ubuntu-24.04-k6.8%40worker-1')
+  await user.click(link)
+  await waitFor(() => expect(api.calls('/findings').length).toBeGreaterThan(0))
+  expect(router.state.location.pathname).toBe('/nodegroups/ubuntu-24.04-k6.8%40worker-1')
+  expect(api.calls('/nodegroups/{id}')[0].pathname).toBe('/api/v1/nodegroups/ubuntu-24.04-k6.8%40worker-1')
+  // The scope goes out query-encoded and comes back whole.
+  const findings = api.calls('/findings')[0]
+  expect(findings.searchParams.get('scope')).toBe(`nodegroup:${key}`)
+  expect(findings.search).toContain('%40')
+  expect(api.calls('/scope').some((u) => u.searchParams.get('scope') === `nodegroup:${key}`)).toBe(true)
+})
+
+test('an explorer scoped to a node that no longer exists hands over to /nodes with a notice', async () => {
+  mockApi().on('/findings', problem(404, 'not_found', 'node worker-9 not found')).on('/nodegroups', nodeGroupsList())
+  const { router } = renderApp('/vulnerabilities?scope=node:worker-9')
+  await waitFor(() => expect(router.state.location.pathname).toBe('/nodes'))
+  expect(router.state.location.search).toEqual({})
+  expect(await screen.findByRole('status')).toHaveTextContent('That node no longer exists.')
 })
 
 test('compare writes the URL and shows the drift detail', async () => {

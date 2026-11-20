@@ -9,7 +9,7 @@ import { Command, CommandEmpty, CommandInput, CommandItem, CommandList } from '@
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { copy } from '@/lib/copy'
 import { useDebounced } from '@/lib/hooks'
-import { hitPath } from '@/lib/links'
+import { hitKindLabel, hitPath } from '@/lib/links'
 
 export const SEARCH_DEBOUNCE_MS = 150
 
@@ -86,7 +86,7 @@ export function CommandMenu({ compact = false }: { compact?: boolean }) {
                     setOpenAndReset(false)
                   }}
                 >
-                  <span className="w-20 shrink-0 text-[11px] text-muted-foreground">{copy.command.kind[hit.kind]}</span>
+                  <span className="w-20 shrink-0 text-[11px] leading-tight text-muted-foreground">{hitKindLabel(hit)}</span>
                   <span className="min-w-0 flex-1 truncate">
                     {hit.label}
                     {hit.detail ? <span className="ml-2 text-muted-foreground">{hit.detail}</span> : null}

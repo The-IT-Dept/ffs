@@ -1,9 +1,14 @@
 import { screen, waitFor, within } from '@testing-library/react'
-import { expect, test, vi } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
 import { searchResult } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
+
+// The platform spy is restored even when a test fails, so later tests see jsdom's own platform.
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 test('opens with Ctrl-K, searches once after typing and jumps to the hit', async () => {
   const api = mockApi().on('/search', (u) =>
@@ -32,6 +37,27 @@ test('jumps to a placeholder image in one path segment', async () => {
   expect(router.state.location.pathname).toBe('/images/unknown%3Aghcr.io%2Fexample%2Fprivate%3A1.0')
 })
 
+test('the Nodes and control plane hits open their pages and read by what they hold', async () => {
+  mockApi().on(
+    '/search',
+    searchResult({
+      hits: [
+        { kind: 'workload', id: 'Nodes//test', label: 'Nodes', detail: '3 nodes', worst: 'high' },
+        { kind: 'workload', id: 'Cluster//test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' },
+      ],
+    }),
+  )
+  const { router, user } = renderApp('/')
+  await user.keyboard('{Control>}k{/Control}')
+  await user.type(within(await screen.findByRole('dialog')).getByRole('combobox'), 'no')
+  const nodes = await screen.findByRole('option', { name: /3 nodes/ })
+  expect(nodes).toHaveTextContent(/^Nodes \(host packages\)Nodes/)
+  expect(screen.getByRole('option', { name: /Kubernetes 1\.35\.1/ })).toHaveTextContent(/^Control planeControl plane/)
+  expect(screen.queryByText(copy.command.kind.workload)).toBeNull()
+  await user.click(nodes)
+  expect(router.state.location.pathname).toBe('/nodes')
+})
+
 test('says to refine the search when more objects matched than are listed', async () => {
   mockApi().on('/search', searchResult({ hits: [{ kind: 'namespace', id: 'kube-system', label: 'kube-system' }], truncated: true }))
   const { user } = renderApp('/')
@@ -54,5 +80,4 @@ test('the search hint is ⌘K on Apple platforms and Ctrl K elsewhere', async ()
   vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel')
   renderApp('/')
   expect(await screen.findByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
-  vi.restoreAllMocks()
 })
