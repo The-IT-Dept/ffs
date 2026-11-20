@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -108,4 +110,106 @@ func (s *Store) OwnersOfAgentImages(ctx context.Context) ([]string, error) {
 		JOIN owners w ON w.key = o.owner_key
 		WHERE i.status = ? AND i.source = 'agent' AND w.namespace <> '' ORDER BY o.owner_key`,
 		string(model.ImageCatalogued))
+}
+
+// metaControllerVersion is the meta key of the version of the controller that last started.
+const metaControllerVersion = "controller_version"
+
+// crashReasons match (SQL LIKE, case-insensitive) the failure reasons a crash or stall of ffs itself
+// records, which a new controller version may well not repeat: the controller or the cataloguer
+// stopping during the work (an out-of-memory kill), match runs that never completed, timeouts, and
+// agent work that never came back. Deterministic failures (an SBOM that cannot be decoded, one too
+// large, an image beyond the scratch limit, a recovered panic) match none of them.
+var crashReasons = []string{
+	"%stopped while processing%",                  // the controller (image or host inventory) or the cataloguer stopped mid-job
+	"%did not complete%",                          // match runs that kept stopping the controller
+	"%timed out%",                                 // the cataloguer's own timeout
+	"%did not finish within%",                     // an acquisition past its deadline
+	"%deadline exceeded%",                         // a context deadline
+	"%out of memory%",                             // an out-of-memory kill, as reported
+	"%oomkilled%",                                 // the same, as Kubernetes names it
+	"%signal: killed%",                            // a cataloguer process killed by the kernel
+	"%sent no result before the request expired%", // agent work whose collector stopped
+}
+
+// crashCond is the SQL condition that col holds a crash or stall reason, with its arguments.
+func crashCond(col string) (string, []any) {
+	parts := make([]string, len(crashReasons))
+	args := make([]any, len(crashReasons))
+	for i, r := range crashReasons {
+		parts[i], args[i] = col+` LIKE ?`, r
+	}
+	return `(` + strings.Join(parts, ` OR `) + `)`, args
+}
+
+// CrashReset counts what ResetCrashQuarantines cleared.
+type CrashReset struct {
+	Previous string // the controller version stored before; "" when none was
+	Images   int    // catalogue quarantines lifted (the images are pending again)
+	Jobs     int    // agent job records deleted: node host inventories (nodehost:<node>) and agent image work
+	Inflight int    // acquisitions a stopped controller left in flight
+	Matches  int    // images whose interrupted first-match runs no longer count
+	Errors   int    // node agent errors that named a lifted quarantine
+}
+
+// Cleared is how many records were cleared in all.
+func (r CrashReset) Cleared() int { return r.Images + r.Jobs + r.Inflight + r.Matches + r.Errors }
+
+// ResetCrashQuarantines runs once at controller start. When version differs from the stored
+// controller version (or none is stored), it lifts what a crash or stall of the previous controller
+// counted against images and nodes, since the new version may not repeat it, in one transaction:
+//   - catalogFailed images whose reason is a crash or stall (crashReasons) become pending, with no
+//     attempts and no quarantine, so they are acquired again;
+//   - agent job records whose last error is one, for node host inventories and agent image work;
+//   - every acquisition record left in flight, which would otherwise count as another crash;
+//   - the match runs counted against images whose first match has not completed;
+//   - a node agent error that names a lifted host inventory quarantine.
+//
+// Deterministic failures stay quarantined. version is then stored. With an unchanged version it
+// changes nothing, so a build that keeps crashing is still quarantined. changed reports whether the
+// version changed.
+func (s *Store) ResetCrashQuarantines(ctx context.Context, version string) (r CrashReset, changed bool, err error) {
+	err = s.inTx(ctx, func(tx *sql.Tx) error {
+		err := tx.QueryRowContext(ctx, `SELECT value FROM meta WHERE key = ?`, metaControllerVersion).Scan(&r.Previous)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+		case err != nil:
+			return err
+		case r.Previous == version:
+			return nil
+		}
+		changed = true
+		imageCrash, imageArgs := crashCond("status_reason")
+		jobCrash, jobArgs := crashCond("last_error")
+		for _, step := range []struct {
+			n     *int
+			query string
+			args  []any
+		}{
+			{&r.Images, `UPDATE images SET status = ?, status_reason = '', attempts = 0, quarantined_until = NULL
+				WHERE status = ? AND ` + imageCrash, append([]any{string(model.ImagePending), string(model.ImageCatalogFailed)}, imageArgs...)},
+			{&r.Errors, `UPDATE nodes_agent SET last_error = '' WHERE last_error LIKE 'host inventory quarantined until %' AND ` + jobCrash,
+				jobArgs},
+			{&r.Jobs, `DELETE FROM agent_jobs WHERE ` + jobCrash, jobArgs},
+			{&r.Inflight, `DELETE FROM acquisitions_inflight`, nil},
+			{&r.Matches, `UPDATE images_unmatched SET attempts = 0 WHERE attempts > 0`, nil},
+		} {
+			res, err := tx.ExecContext(ctx, step.query, step.args...)
+			if err != nil {
+				return err
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return err
+			}
+			*step.n = int(n)
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+			metaControllerVersion, version)
+		return err
+	})
+	if err != nil {
+		return CrashReset{}, false, fmt.Errorf("store: reset crash quarantines: %w", err)
+	}
+	return r, changed, nil
 }

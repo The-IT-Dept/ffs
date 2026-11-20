@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/go-logr/logr"
 	orv1alpha1 "github.com/openreports/reports-api/apis/openreports.io/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +35,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/feeds/grypedb"
 	"github.com/the-it-dept/ffs/internal/inventory"
 	"github.com/the-it-dept/ffs/internal/store"
+	"github.com/the-it-dept/ffs/internal/version"
 )
 
 // leaderElectionID names the leader-election Lease.
@@ -118,6 +120,21 @@ func leaderLock(rc *rest.Config, ns string) (resourcelock.Interface, error) {
 		resourcelock.ResourceLockConfig{Identity: host + "_" + string(uuid.NewUUID())})
 }
 
+// resetCrashQuarantines lifts, once per new controller version and before anything acquires, what
+// crashes of the previous version counted against images and node host inventories
+// (Store.ResetCrashQuarantines), so a release that fixes a crash retries at once.
+func resetCrashQuarantines(ctx context.Context, st *store.Store, ver string, log logr.Logger) error {
+	r, changed, err := st.ResetCrashQuarantines(ctx, ver)
+	if err != nil {
+		return err
+	}
+	if changed {
+		log.Info("controller version changed; quarantines from crashes of the previous version cleared", "previous", r.Previous,
+			"version", ver, "cleared", r.Cleared(), "images", r.Images, "agentJobs", r.Jobs, "inflight", r.Inflight, "matchRuns", r.Matches)
+	}
+	return nil
+}
+
 // Run builds the manager, wires every component into it and runs it until ctx is done. The store
 // is closed after the manager has stopped.
 func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
@@ -149,6 +166,9 @@ func Run(ctx context.Context, rc *rest.Config, o Options) (err error) {
 			err = errors.Join(err, fmt.Errorf("close store: %w", cerr))
 		}
 	}()
+	if err := resetCrashQuarantines(ctx, st, version.Version, log); err != nil {
+		return err
+	}
 
 	scheme, err := NewScheme()
 	if err != nil {

@@ -122,3 +122,122 @@ func TestOwnersOfAgentImages(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"Pod/apps/web"}, got)
 }
+
+// FC-4: a new controller version lifts what crashes and stalls of the previous one counted against
+// images and node host inventories, and keeps deterministic failures quarantined; the same version
+// starting again changes nothing.
+func TestResetCrashQuarantines_OnVersionChange(t *testing.T) {
+	s := newStore(t)
+	now := time.Date(2026, 11, 20, 7, 10, 0, 0, time.UTC)
+	until := now.Add(24 * time.Hour)
+	failed := func(digest, reason string) model.Image {
+		return model.Image{Digest: digest, Repo: "ghcr.io/example/" + digest[7:], Status: model.ImageCatalogFailed, StatusReason: reason,
+			Attempts: 2, QuarantinedUntil: until}
+	}
+	images := []model.Image{
+		failed("sha256:stopped", "the controller stopped while processing the image"),
+		failed("sha256:catstopped", "cataloguer stopped while processing the image"),
+		failed("sha256:match", "matching the image did not complete"),
+		failed("sha256:timeout", "cataloguer timed out after 10m0s"),
+		failed("sha256:decode", "decoding SBOM"),
+		failed("sha256:large", "SBOM of 70000000 bytes is larger than the 67108864 byte limit"),
+		failed("sha256:scratch", "image unpacked beyond the cataloguer scratch limit"),
+		{Digest: "sha256:unresolvable", Repo: "ghcr.io/example/private", Status: model.ImageUnresolvable, StatusReason: "stopped while processing",
+			QuarantinedUntil: until},
+	}
+	for _, img := range images {
+		require.NoError(t, s.UpsertImage(ctx, img))
+	}
+	job := func(digest, node, reason string) {
+		t.Helper()
+		for range 2 {
+			_, err := s.RecordAgentJobFailure(ctx, digest, node, reason, now, 2, 24*time.Hour)
+			require.NoError(t, err)
+		}
+	}
+	job("nodehost:worker-1", "worker-1", "the controller stopped while processing the host inventory")
+	job("nodehost:worker-2", "worker-2", "decoding SBOM: unexpected end of JSON input")
+	job("nodehost:worker-3", "worker-3", "preparing the host inventory: panic: runtime error")
+	job("sha256:agent-expired", "worker-1", "the node agent sent no result before the request expired")
+	job("sha256:agent-oom", "worker-2", "catalog: cataloguer OOMKilled")
+	job("sha256:agent-large", "worker-2", "SBOM of 70000000 bytes is larger than the 67108864 byte limit")
+	for _, n := range []string{"worker-1", "worker-2"} {
+		_, err := s.AcceptAgentReport(ctx, AgentReport{Node: n, BootID: "b", StartedAt: now, Seq: 1, At: now})
+		require.NoError(t, err)
+	}
+	require.NoError(t, s.SetAgentError(ctx, "worker-1",
+		"host inventory quarantined until 2026-11-21T07:10:00Z: the controller stopped while processing the host inventory"))
+	require.NoError(t, s.SetAgentError(ctx, "worker-2", "host inventory quarantined until 2026-11-21T07:10:00Z: decoding SBOM: unexpected end"))
+	_, err := s.BeginAcquire(ctx, "sha256:inflight", now)
+	require.NoError(t, err)
+	_, err = s.BeginAcquire(ctx, "nodehost:worker-1", now)
+	require.NoError(t, err)
+	require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: "sha256:unmatched", Repo: "ghcr.io/example/unmatched", Status: model.ImageCatalogued}))
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:unmatched", now))
+	for range 2 {
+		_, err := s.BeginMatch(ctx, "sha256:unmatched")
+		require.NoError(t, err)
+	}
+
+	r, changed, err := s.ResetCrashQuarantines(ctx, "v0.0.1-rc.7")
+	require.NoError(t, err)
+	require.True(t, changed, "no version was stored")
+	require.Equal(t, CrashReset{Images: 4, Jobs: 3, Inflight: 2, Matches: 1, Errors: 1}, r)
+	require.Equal(t, 11, r.Cleared())
+
+	for _, d := range []string{"sha256:stopped", "sha256:catstopped", "sha256:match", "sha256:timeout"} {
+		img, ok, err := s.GetImage(ctx, d)
+		require.NoError(t, err)
+		require.True(t, ok)
+		require.Equal(t, model.ImagePending, img.Status, d)
+		require.Empty(t, img.StatusReason, d)
+		require.Zero(t, img.Attempts, d)
+		require.True(t, img.QuarantinedUntil.IsZero(), d)
+	}
+	for _, d := range []string{"sha256:decode", "sha256:large", "sha256:scratch"} {
+		img, _, err := s.GetImage(ctx, d)
+		require.NoError(t, err)
+		require.Equal(t, model.ImageCatalogFailed, img.Status, "a deterministic failure stays quarantined: %s", d)
+		require.True(t, img.QuarantinedUntil.Equal(until), d)
+	}
+	unresolvable, _, err := s.GetImage(ctx, "sha256:unresolvable")
+	require.NoError(t, err)
+	require.Equal(t, model.ImageUnresolvable, unresolvable.Status)
+
+	for digest, kept := range map[string]bool{"nodehost:worker-1": false, "nodehost:worker-2": true, "nodehost:worker-3": true,
+		"sha256:agent-expired": false, "sha256:agent-oom": false, "sha256:agent-large": true} {
+		j, ok, err := s.AgentJobOf(ctx, digest)
+		require.NoError(t, err)
+		require.Equal(t, kept, ok, digest)
+		if kept {
+			require.True(t, j.QuarantinedUntil.Equal(until), digest)
+		}
+	}
+	agents, err := s.AgentNodes(ctx)
+	require.NoError(t, err)
+	require.Len(t, agents, 2)
+	require.Empty(t, agents[0].LastError, "worker-1: the lifted quarantine is no longer named")
+	require.Contains(t, agents[1].LastError, "decoding SBOM", "worker-2")
+	stale, err := s.BeginAcquire(ctx, "sha256:inflight", now)
+	require.NoError(t, err)
+	require.False(t, stale, "the previous controller's in-flight record does not count as a crash")
+	un, err := s.UnmatchedImages(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []UnmatchedImage{{Digest: "sha256:unmatched"}}, un)
+
+	// The same version starting again: a crash of this build still counts.
+	require.NoError(t, s.UpsertImage(ctx, failed("sha256:again", "the controller stopped while processing the image")))
+	r, changed, err = s.ResetCrashQuarantines(ctx, "v0.0.1-rc.7")
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Equal(t, CrashReset{Previous: "v0.0.1-rc.7"}, r)
+	again, _, err := s.GetImage(ctx, "sha256:again")
+	require.NoError(t, err)
+	require.Equal(t, model.ImageCatalogFailed, again.Status)
+
+	r, changed, err = s.ResetCrashQuarantines(ctx, "v0.0.1")
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "v0.0.1-rc.7", r.Previous)
+	require.Equal(t, 1, r.Images)
+}
