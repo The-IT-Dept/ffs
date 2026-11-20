@@ -155,17 +155,7 @@ func TestPackagesByNameQuery_Indexed(t *testing.T) {
 		bySource bool
 	}{{nil, true}, {nil, false}, {d12, true}, {d12, false}} {
 		q, args := packagesByNameQuery("deb", tc.distro, []string{"openssl", "linux"}, tc.bySource)
-		rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+q, args...)
-		require.NoError(t, err)
-		var plan []string
-		for rows.Next() {
-			var id, parent, unused int
-			var detail string
-			require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
-			plan = append(plan, detail)
-		}
-		require.NoError(t, rows.Err())
-		require.NoError(t, rows.Close())
+		plan := planOf(t, s, q, args...)
 		searches := 0
 		for _, d := range plan {
 			if !strings.Contains(d, "packages") {

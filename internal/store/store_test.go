@@ -128,3 +128,20 @@ func TestOpen_WALAndIdempotentMigrations(t *testing.T) {
 	require.NoError(t, s.rdb.QueryRowContext(ctx, `SELECT applied_at FROM schema_migrations WHERE name = '001_init.sql'`).Scan(&again))
 	require.Equal(t, appliedAt, again) // not re-applied
 }
+
+// planOf returns the detail column of EXPLAIN QUERY PLAN for q on the read pool.
+func planOf(t *testing.T, s *Store, q string, args ...any) []string {
+	t.Helper()
+	rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+q, args...)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, rows.Close()) }()
+	var plan []string
+	for rows.Next() {
+		var id, parent, unused int
+		var detail string
+		require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+		plan = append(plan, detail)
+	}
+	require.NoError(t, rows.Err())
+	return plan
+}
