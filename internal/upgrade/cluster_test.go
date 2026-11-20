@@ -204,6 +204,64 @@ func TestAdviseCluster_AlreadyLatest(t *testing.T) {
 	require.Equal(t, "", got.Suggestion.EOL) // cycle 1.35 ends 2027-02-28, outside the warning window
 }
 
+func TestAdviseCluster_DistributionNoteOnlyWithTarget(t *testing.T) {
+	cr := newClusterRig(t, "k3s", []string{"1.35.10"}, twoMinors)
+	require.NoError(t, cr.r.AdviseCluster(rctx, cr.owner()))
+	sg := cr.suggestion(clusterKey, "kubernetes").Suggestion
+	require.Equal(t, model.TierNone, sg.Tier)
+	require.Empty(t, sg.Notes, "no target, so no advice to upgrade to the matching k3s release")
+
+	cr = newClusterRig(t, "rke2", []string{"1.35.1"}, twoMinors)
+	cr.sc.byDigest["k8s:1.35.10"] = []model.Finding{cf(advK, model.PriorityHigh)} // the patch fixes nothing
+	require.NoError(t, cr.r.AdviseCluster(rctx, cr.owner()))
+	sg = cr.suggestion(clusterKey, "kubernetes").Suggestion
+	require.Equal(t, model.TierNone, sg.Tier)
+	require.NotContains(t, sg.Notes, "upgrade to the matching rke2 release")
+}
+
+func TestAdviseCluster_NoVersionWithdraws(t *testing.T) {
+	cr := newClusterRig(t, "", []string{"1.35.1"}, twoMinors)
+	cr.sc.byDigest["k8s:1.35.10"] = nil
+	require.NoError(t, cr.r.AdviseCluster(rctx, cr.owner()))
+	cr.suggestion(clusterKey, "kubernetes")
+
+	o := cr.owner()
+	o.Containers[0].Digest = "k8s:unknown"
+	require.NoError(t, cr.r.AdviseCluster(rctx, o))
+	_, ok, err := cr.st.GetSuggestion(rctx, clusterKey, "kubernetes")
+	require.NoError(t, err)
+	require.False(t, ok, "with no Kubernetes version to read, the stored suggestion is withdrawn")
+
+	rt := newRuntimeRig(t, []string{"2.2.2"})
+	rt.sc.byDigest["runtime:containerd@2.2.2"] = nil
+	require.NoError(t, rt.r.AdviseRuntime(rctx, rt.runtimeOwner()))
+	rt.suggestion(rtKey, "containerd")
+	ro := rt.runtimeOwner()
+	ro.Containers[0].Digest = "containerd"
+	require.NoError(t, rt.r.AdviseRuntime(rctx, ro))
+	_, ok, err = rt.st.GetSuggestion(rctx, rtKey, "containerd")
+	require.NoError(t, err)
+	require.False(t, ok, "with no runtime version to read, the stored suggestion is withdrawn")
+}
+
+func TestAdviseCluster_NewerMinorNote(t *testing.T) {
+	cr := newClusterRig(t, "", []string{"1.35.10"}, twoMinors) // already on the latest patch
+	fs, err := cr.st.FindingsForOwner(rctx, clusterKey)
+	require.NoError(t, err)
+	require.Len(t, fs, 1)
+	f := fs[0]
+	f.Packages = []model.FindingPackage{{Name: "kubernetes", Installed: "1.35.10", Fixed: []string{"1.34.20", "v1.37.1", "1.36.4", "1.37.0-rc.1"}}}
+	other := f
+	other.AdvisoryID, other.Fingerprint = "CVE-2026-2009", model.FindingFingerprint("default", clusterRef, "kubernetes", "CVE-2026-2009")
+	other.Packages = []model.FindingPackage{{Name: "kubernetes", Installed: "1.35.10", Fixed: []string{"1.36.1"}}}
+	require.NoError(t, cr.st.ApplyFindings(rctx, []model.Finding{f, other}, nil))
+
+	require.NoError(t, cr.r.AdviseCluster(rctx, cr.owner()))
+	sg := cr.suggestion(clusterKey, "kubernetes").Suggestion
+	require.Equal(t, model.TierNone, sg.Tier)
+	require.Equal(t, []string{"fixed in a newer minor: v1.36"}, sg.Notes)
+}
+
 func TestAdviseCluster_ReleaseServerDown(t *testing.T) {
 	cr := newClusterRig(t, "", []string{"1.35.1"}, nil)
 	cr.sc.byDigest["k8s:1.35.10"] = nil

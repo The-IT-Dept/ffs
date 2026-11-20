@@ -93,25 +93,38 @@ func (r *Resolver) scoreTargets(ctx context.Context, o model.Owner, repo string,
 	return Scored{Fixes: fixes, Remaining: remaining, Introduces: introduces, FixedIDs: fixedIDs, ClearsUrgentHigh: clears}, nil
 }
 
+// adviceNotes are the notes of a cluster-level suggestion: always added, added only when there is a
+// recommendation, and added only when there is none.
+type adviceNotes struct{ always, withTarget, withoutTarget []string }
+
 // storeAdvice records the recommendation of scored (none when nothing helps) with its candidate rows.
-func (r *Resolver) storeAdvice(ctx context.Context, key, repo, fromTag string, scored []Scored, rows []store.CandidateDigest, notes []string, eolText string) error {
+func (r *Resolver) storeAdvice(ctx context.Context, key, repo, fromTag string, scored []Scored, rows []store.CandidateDigest, notes adviceNotes, eolText string) error {
 	sg := model.Suggestion{Repo: repo, FromTag: fromTag, Tier: model.TierNone, ComputedAt: r.now()}
 	rec, alts := Recommend(scored)
+	extra := notes.withoutTarget
 	if rec != nil {
-		sg = suggestionOf(repo, fromTag, *rec, sg.ComputedAt)
+		sg, extra = suggestionOf(repo, fromTag, *rec, sg.ComputedAt), notes.withTarget
 	}
 	for _, a := range alts {
 		sg.Alternatives = append(sg.Alternatives, suggestionOf(repo, fromTag, a, sg.ComputedAt))
 	}
-	sg.Notes, sg.EOL = notes, eolText
+	sg.Notes, sg.EOL = append(slices.Clone(notes.always), extra...), eolText
 	if err := r.o.Store.PutSuggestion(ctx, key, sg, rows); err != nil {
 		return fmt.Errorf("upgrade: store suggestion of %s on %s: %w", key, repo, err)
 	}
 	return nil
 }
 
+// withdraw deletes the owner's suggestion on repo.
+func (r *Resolver) withdraw(ctx context.Context, key, repo string) error {
+	if err := r.o.Store.DeleteSuggestions(ctx, key, []string{repo}); err != nil {
+		return fmt.Errorf("upgrade: delete suggestions of %s: %w", key, err)
+	}
+	return nil
+}
+
 // distributionNote is the advice for k3s and rke2 clusters, whose Kubernetes and runtime ship
-// together; nil for any other distribution.
+// together; nil for any other distribution. It goes only with a recommendation.
 func distributionNote(ci model.ClusterInfo) []string {
 	if ci.Distribution == "k3s" || ci.Distribution == "rke2" {
 		return []string{"upgrade to the matching " + ci.Distribution + " release"}
@@ -150,7 +163,9 @@ type k8sMinor struct {
 // AdviseCluster stores the patch-release advice for a Cluster owner: per Kubernetes minor it runs,
 // the newest stable patch (the release server, else the end-of-life data), scored by cloning the
 // current synthetic image onto the target version and matching it. The suggestion moves the highest
-// version that is behind; other minors are named in its notes.
+// version that is behind; other minors are named in its notes. When no patch helps, a note names the
+// newer minor that fixes the open findings, from their fixed versions. With no Kubernetes version to
+// read, a stored suggestion is withdrawn.
 func (r *Resolver) AdviseCluster(ctx context.Context, o model.Owner) error {
 	key := o.Ref.Key()
 	before, err := r.openOn(ctx, o, k8sRepo)
@@ -184,7 +199,7 @@ func (r *Resolver) AdviseCluster(ctx context.Context, o model.Owner) error {
 		}
 	}
 	if highest == "" {
-		return nil
+		return r.withdraw(ctx, key, k8sRepo)
 	}
 	for _, m := range minors {
 		slices.SortFunc(m.current, func(a, b string) int { return compareVersions(b, a) })
@@ -201,7 +216,7 @@ func (r *Resolver) AdviseCluster(ctx context.Context, o model.Owner) error {
 	slices.SortFunc(moving, func(a, b *k8sMinor) int { return compareVersions(b.current[0], a.current[0]) })
 
 	eolText := r.eolOf(eol.ClusterProduct(ci.Distribution, highest))
-	var notes []string
+	var notes adviceNotes
 	var scored []Scored
 	var rows []store.CandidateDigest
 	fromTag := "v" + highest
@@ -235,13 +250,47 @@ func (r *Resolver) AdviseCluster(ctx context.Context, o model.Owner) error {
 			mt, _ := ParseTag(m.target)
 			rows = append(rows, store.CandidateDigest{Tag: "v" + m.target, Tier: TierBetween(mc, mt), Digest: k8sPrefix + m.target})
 			if m != primary && m.key != primary.key {
-				notes = append(notes, fmt.Sprintf("kubelets on %s: v%s", m.key, m.target))
+				notes.always = append(notes.always, fmt.Sprintf("kubelets on %s: v%s", m.key, m.target))
 			}
 		}
-		slices.Sort(notes)
+		slices.Sort(notes.always)
 	}
-	notes = append(notes, distributionNote(ci)...)
+	notes.withTarget = distributionNote(ci)
+	notes.withoutTarget = newerMinorNote(before, highest)
 	return r.storeAdvice(ctx, key, k8sRepo, fromTag, scored, rows, notes, eolText)
+}
+
+// newerMinorNote names the Kubernetes minor above running's that fixes every open finding in before
+// that has a fixed release in a newer minor: per finding the lowest such release (prereleases are
+// skipped), and the highest minor of those. It is nil when no fixed release is in a newer minor.
+func newerMinorNote(before []model.Finding, running string) []string {
+	run, ok := ParseTag(running)
+	if !ok || len(run.Release) < 2 {
+		return nil
+	}
+	newer := func(tv TagVersion) bool {
+		return len(tv.Release) >= 2 && tv.Pre == "" && tv.Suffix == "" &&
+			(tv.Release[0] > run.Release[0] || tv.Release[0] == run.Release[0] && tv.Release[1] > run.Release[1])
+	}
+	var need TagVersion
+	for _, f := range before {
+		var lowest TagVersion
+		for _, p := range f.Packages {
+			for _, v := range p.Fixed {
+				tv, ok := ParseTag(strings.TrimPrefix(v, "v"))
+				if ok && newer(tv) && (lowest.Release == nil || Compare(tv, lowest) < 0) {
+					lowest = tv
+				}
+			}
+		}
+		if lowest.Release != nil && (need.Release == nil || Compare(need, lowest) < 0) {
+			need = lowest
+		}
+	}
+	if need.Release == nil {
+		return nil
+	}
+	return []string{fmt.Sprintf("fixed in a newer minor: v%d.%d", need.Release[0], need.Release[1])}
 }
 
 // patchTarget returns the patch to move m's versions to: the newest stable release of the minor,
@@ -290,7 +339,8 @@ func goCompare(a, b string) (int, bool) {
 
 // AdviseRuntime stores the advice for a ContainerRuntime owner (containerd or CRI-O): the lowest
 // release that fixes each open finding, preferring one in the running minor, and the highest of
-// those as the target. The target is scored on a synthetic copy of the running runtime.
+// those as the target. The target is scored on a synthetic copy of the running runtime. With no
+// runtime version to read, a stored suggestion is withdrawn.
 func (r *Resolver) AdviseRuntime(ctx context.Context, o model.Owner) error {
 	key, name := o.Ref.Key(), o.Ref.Name
 	before, err := r.openOn(ctx, o, name)
@@ -311,10 +361,10 @@ func (r *Resolver) AdviseRuntime(ctx context.Context, o model.Owner) error {
 		}
 	}
 	if cur == "" {
-		return nil
+		return r.withdraw(ctx, key, name)
 	}
 
-	var notes []string
+	var notes adviceNotes
 	var scored []Scored
 	var rows []store.CandidateDigest
 	target, err := r.runtimeTarget(ctx, before, curDigest, cur)
@@ -335,9 +385,9 @@ func (r *Resolver) AdviseRuntime(ctx context.Context, o model.Owner) error {
 		s.Tag, s.IndexDigest, s.Tier = target, td, TierBetween(tc, tt)
 		scored = []Scored{s}
 		rows = []store.CandidateDigest{{Tag: target, Tier: s.Tier, Digest: td}}
-		notes = append(notes, name+" >= "+target)
+		notes.always = append(notes.always, name+" >= "+target)
 	}
-	notes = append(notes, distributionNote(ci)...)
+	notes.withTarget = distributionNote(ci)
 	var eolText string
 	if pv, ok := eol.ContainerRuntimeProduct(name, cur); ok {
 		eolText = r.eolOf(pv)

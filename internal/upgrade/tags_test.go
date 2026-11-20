@@ -96,6 +96,15 @@ func TestCompare(t *testing.T) {
 	require.Negative(t, Compare(pp(bn, "17.5.0-debian-12-r9"), pp(bn, "17.5.0-debian-12-r20")))
 }
 
+func TestCompare_PrereleaseNumeric(t *testing.T) {
+	require.Positive(t, Compare(mustParse(t, "19rc10"), mustParse(t, "19rc2")), "rc10 follows rc2")
+	require.Negative(t, Compare(mustParse(t, "19rc9"), mustParse(t, "19rc10")))
+	require.Negative(t, Compare(mustParse(t, "19beta3"), mustParse(t, "19rc1")), "letters decide first")
+	require.Negative(t, Compare(mustParse(t, "19rc"), mustParse(t, "19rc1")), "no number comes first")
+	require.Zero(t, Compare(mustParse(t, "19rc02"), mustParse(t, "19rc2")))
+	require.Negative(t, Compare(mustParse(t, "19rc10"), mustParse(t, "19")), "stable follows every prerelease")
+}
+
 func TestFloatingVersion(t *testing.T) {
 	v, ok := FloatingVersion("stable-alpine", "1.30.7")
 	require.True(t, ok)
@@ -239,4 +248,31 @@ func TestParser_ConfigOverride(t *testing.T) {
 
 	_, err = NewParser(map[string]config.TagOverride{"x": {Pattern: "("}})
 	require.ErrorContains(t, err, "x")
+}
+
+func TestParser_OverrideKeysAndGlobPrecedence(t *testing.T) {
+	p, err := NewParser(map[string]config.TagOverride{
+		"postgres":                     {Pattern: `^pg-(?P<version>\d+)$`},
+		"bitnami/*":                    {Pattern: `^any-(?P<version>\d+)$`},
+		"docker.io/bitnami/postgres*":  {Pattern: `^pgfamily-(?P<version>\d+)$`},
+		"docker.io/bitnami/postgresql": {Pattern: `^exact-(?P<version>\d+)$`},
+		"docker.io/bitnami/p*":         {Pattern: `^p-(?P<version>\d+)$`},
+	})
+	require.NoError(t, err)
+	parses := func(repo, tag string) bool {
+		_, ok := p.Parse(repo, tag)
+		return ok
+	}
+	require.True(t, parses("docker.io/library/postgres", "pg-17"), "a bare key is normalised like an image reference")
+	require.True(t, parses("docker.io/bitnami/postgresql", "exact-17"), "an exact key wins over every glob")
+	require.False(t, parses("docker.io/bitnami/postgresql", "pgfamily-17"))
+	require.True(t, parses("docker.io/bitnami/postgres-ha", "pgfamily-17"), "the longest literal prefix wins")
+	require.False(t, parses("docker.io/bitnami/postgres-ha", "p-17"))
+	require.True(t, parses("docker.io/bitnami/pgpool", "p-17"))
+	require.True(t, parses("docker.io/bitnami/redis", "any-7"), "bitnami/* is docker.io/bitnami/*")
+
+	_, err = NewParser(map[string]config.TagOverride{"docker.io/x": {Pattern: `^(?P<version>\d+)$`, Ignore: []string{"["}}})
+	require.ErrorContains(t, err, "docker.io/library/x")
+	_, err = NewParser(map[string]config.TagOverride{"docker.io/[x": {Pattern: `^(?P<version>\d+)$`}})
+	require.ErrorContains(t, err, "repository glob")
 }

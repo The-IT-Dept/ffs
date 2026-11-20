@@ -2,6 +2,7 @@
 package upgrade
 
 import (
+	"cmp"
 	"regexp"
 	"strconv"
 	"strings"
@@ -77,7 +78,7 @@ func firstDiff(a, b TagVersion) int {
 	return -1
 }
 
-// Compare orders by Release, then Pre (stable > any pre), then Revision.
+// Compare orders by Release, then Pre (stable > any pre; see comparePre), then Revision.
 func Compare(a, b TagVersion) int {
 	if i := firstDiff(a, b); i >= 0 {
 		if releaseAt(a, i) < releaseAt(b, i) {
@@ -92,7 +93,7 @@ func Compare(a, b TagVersion) int {
 		case b.Pre == "":
 			return -1
 		}
-		return strings.Compare(a.Pre, b.Pre)
+		return comparePre(a.Pre, b.Pre)
 	}
 	switch {
 	case a.Revision < b.Revision:
@@ -101,6 +102,30 @@ func Compare(a, b TagVersion) int {
 		return 1
 	}
 	return 0
+}
+
+// comparePre orders two prerelease labels ("rc2", "beta", "alpha10") by their letters, then by their
+// number compared as a number, so rc10 follows rc2; a label without a number comes first.
+func comparePre(a, b string) int {
+	la, na := splitPre(a)
+	lb, nb := splitPre(b)
+	if c := strings.Compare(la, lb); c != 0 {
+		return c
+	}
+	return cmp.Compare(na, nb)
+}
+
+// splitPre splits a prerelease label into its letters and its number, -1 when it has none.
+func splitPre(p string) (letters string, n int) {
+	i := strings.IndexFunc(p, func(r rune) bool { return r >= '0' && r <= '9' })
+	if i < 0 {
+		return p, -1
+	}
+	n, err := strconv.Atoi(p[i:])
+	if err != nil {
+		return p, -1 // too long for an int: equal labels compare equal, others by letters
+	}
+	return p[:i], n
 }
 
 // TierBetween classifies the step from cur to cand.

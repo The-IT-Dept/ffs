@@ -118,6 +118,26 @@ func TestRecommend(t *testing.T) {
 	}
 }
 
+func TestRecommend_FirstRuleNeedsAMediumFixOrNoHarm(t *testing.T) {
+	// no urgent or high findings: clearing them is vacuous for every candidate
+	lowFixAddsMediums := Scored{Tag: "refresh", Tier: model.TierRefresh, Fixes: byPriority{low: 1},
+		Introduces: byPriority{medium: 2}, FixedIDs: []string{"L"}, ClearsUrgentHigh: true}
+	fixesMedium := Scored{Tag: "patch", Tier: model.TierPatch, Fixes: byPriority{medium: 1},
+		Introduces: byPriority{medium: 2}, FixedIDs: []string{"M"}, ClearsUrgentHigh: true}
+	rec, _ := Recommend([]Scored{lowFixAddsMediums, fixesMedium})
+	require.NotNil(t, rec)
+	require.Equal(t, model.TierPatch, rec.Tier, "a candidate that fixes a medium wins on the first rule")
+
+	noHarm := Scored{Tag: "minor", Tier: model.TierMinor, Fixes: byPriority{low: 2}, Introduces: byPriority{low: 1},
+		FixedIDs: []string{"L", "K"}, ClearsUrgentHigh: true}
+	rec, _ = Recommend([]Scored{lowFixAddsMediums, noHarm})
+	require.NotNil(t, rec)
+	require.Equal(t, model.TierMinor, rec.Tier, "a non-negative net medium and low change wins on the first rule")
+
+	rec, _ = Recommend([]Scored{lowFixAddsMediums})
+	require.Nil(t, rec, "fixing one low while introducing two mediums is no recommendation")
+}
+
 func TestNetChange(t *testing.T) {
 	require.Equal(t, "fixes 1 urgent, 2 high; introduces none",
 		NetChange(model.Suggestion{Fixes: byPriority{urgent: 1, high: 2, low: 0}, Introduces: byPriority{}}))
