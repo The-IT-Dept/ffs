@@ -103,7 +103,7 @@ Private images on EKS, GKE or AKS that the nodes pull with cloud workload identi
 
 ### Whether a LoadBalancer or Ingress is internet-facing
 
-ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account. A Gateway API route in another namespace than its backend Service counts only when a ReferenceGrant in the Service's namespace allows it, as for the Gateway itself; ffs needs to list ReferenceGrants for this, and while it may not, such routes are not counted.
+ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account. A Gateway API route in another namespace than its backend Service counts only when a ReferenceGrant in the Service's namespace allows it, as for the Gateway itself, and ffs must be able to list ReferenceGrants to check this. The chart's RBAC does not grant that access, so with the chart as installed such routes are not counted as exposure. To count them, grant the controller's service account `get`, `list` and `watch` on `referencegrants` in the `gateway.networking.k8s.io` API group; ffs checks for the access every 5 minutes and needs no restart.
 
 **What ffs shows:** the reason names the path, for example `exposed via HTTPRoute shop/web on Gateway edge/external`. Internal paths can be excluded with `exposure.internalIngressClasses`, `exposure.internalGatewayClasses`, `exposure.internalGateways` and `exposure.internalLBAnnotations`.
 
