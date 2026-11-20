@@ -178,8 +178,8 @@ test('the nodes page hatches the counts of groups ffs cannot fully see and shows
         groups: [
           nodeGroupRow({ id: 'g1', name: 'ubuntu-24.04-k6.8', label: 'ubuntu a' }),
           nodeGroupRow({ id: 'g2', name: 'rocky-9-k5.14', label: 'rocky b', counts: counts({ urgent: 2 }) }),
-          nodeGroupRow({ id: 'g3', name: 'debian-13-k6.12', label: 'debian c', agents: { reporting: 1, stale: 1, never: 0, disabled: 0 } }),
-          nodeGroupRow({ id: 'n1', kind: 'nodeinfo', name: 'talos-1.11', label: 'talos d', agents: { reporting: 0, stale: 0, never: 2, disabled: 0 } }),
+          nodeGroupRow({ id: 'g3', name: 'debian-13-k6.12', label: 'debian c', agents: { reporting: 1, reportingWithoutInventory: 0, stale: 1, never: 0, disabled: 0, unsupported: 0 } }),
+          nodeGroupRow({ id: 'n1', kind: 'nodeinfo', name: 'talos-1.11', label: 'talos d', agents: { reporting: 0, reportingWithoutInventory: 0, stale: 0, never: 2, disabled: 0, unsupported: 0 } }),
         ],
       }),
     )

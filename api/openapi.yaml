@@ -1525,12 +1525,14 @@ components:
 
     AgentCounts:
       type: object
-      required: [reporting, stale, never, disabled]
+      required: [reporting, reportingWithoutInventory, stale, never, disabled, unsupported]
       properties:
         reporting: {type: integer, description: Agents reporting whose host inventory is stored.}
+        reportingWithoutInventory: {type: integer, description: Agents reporting whose host inventory is not stored or not current.}
         stale: {type: integer}
         never: {type: integer}
         disabled: {type: integer}
+        unsupported: {type: integer, description: Nodes the node agent does not schedule on (architecture or node selector).}
 
     NodeGroupDetail:
       allOf:

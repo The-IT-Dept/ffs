@@ -1029,7 +1029,13 @@ type AgentCounts struct {
 
 	// Reporting Agents reporting whose host inventory is stored.
 	Reporting int `json:"reporting"`
-	Stale     int `json:"stale"`
+
+	// ReportingWithoutInventory Agents reporting whose host inventory is not stored or not current.
+	ReportingWithoutInventory int `json:"reportingWithoutInventory"`
+	Stale                     int `json:"stale"`
+
+	// Unsupported Nodes the node agent does not schedule on (architecture or node selector).
+	Unsupported int `json:"unsupported"`
 }
 
 // AgentProvenance defines model for AgentProvenance.

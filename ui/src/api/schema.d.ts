@@ -1080,9 +1080,13 @@ export interface components {
         AgentCounts: {
             /** @description Agents reporting whose host inventory is stored. */
             reporting: number;
+            /** @description Agents reporting whose host inventory is not stored or not current. */
+            reportingWithoutInventory: number;
             stale: number;
             never: number;
             disabled: number;
+            /** @description Nodes the node agent does not schedule on (architecture or node selector). */
+            unsupported: number;
         };
         NodeGroupDetail: components["schemas"]["Envelope"] & {
             group: components["schemas"]["NodeGroup"];

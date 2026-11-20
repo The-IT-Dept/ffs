@@ -328,7 +328,7 @@ export function nodeGroupRow(p?: Partial<S<'NodeGroupRow'>>): S<'NodeGroupRow'> 
     exposedNodes: 0,
     counts: counts(),
     fixable: 0,
-    agents: { reporting: 2, stale: 0, never: 0, disabled: 0 },
+    agents: { reporting: 2, reportingWithoutInventory: 0, stale: 0, never: 0, disabled: 0, unsupported: 0 },
     rebootPending: 0,
     drift: '',
     ...p,
