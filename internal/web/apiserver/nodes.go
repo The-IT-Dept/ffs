@@ -69,8 +69,10 @@ func groupKindRank(k model.NodeGroupKind) int {
 	return 1
 }
 
-// groupOf is the group a node belongs to: the stored group that lists it (Store.NodeGroupOfNode),
-// else the fallback group holding it, as nodeGroups shows them (members merged).
+// groupOf is the group a node belongs to, as nodeGroups shows them: the stored group that lists it
+// (the answer Store.NodeGroupOfNode gives), else the fallback group holding it. It searches
+// nodeGroups rather than calling Store.NodeGroupOfNode, so a node merged into a stored group from a
+// fallback group with the same ID resolves too.
 func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, bool, error) {
 	groups, err := s.nodeGroups(ctx)
 	if err != nil {
