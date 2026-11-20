@@ -154,3 +154,20 @@ func TestOSVListed(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
+
+func TestOSVRecordsModified(t *testing.T) {
+	s := newStore(t)
+	at := time.Date(2026, 11, 20, 19, 0, 20, 462181115, time.UTC)
+	for id, m := range map[string]time.Time{"A": at, "B": at.Add(-time.Hour), "C": at.Add(-time.Hour - time.Nanosecond)} {
+		_, err := s.PutOSVRecord(ctx, "PyPI", id, m, "h", []byte(`{}`))
+		require.NoError(t, err)
+	}
+	_, err := s.PutOSVRecord(ctx, "Go", "D", at, "h", []byte(`{}`))
+	require.NoError(t, err)
+	got, err := s.OSVRecordsModified(ctx, "PyPI", at.Add(-time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, map[string]time.Time{"A": at, "B": at.Add(-time.Hour)}, got, "at or after since, in that bucket, to the nanosecond")
+	got, err = s.OSVRecordsModified(ctx, "Debian", at.Add(-48*time.Hour))
+	require.NoError(t, err)
+	require.Empty(t, got)
+}

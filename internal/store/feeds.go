@@ -232,6 +232,28 @@ func (s *Store) ReplaceOSVListed(ctx context.Context, bucket string, listed map[
 	})
 }
 
+// OSVRecordsModified returns the cached records of eco whose stored modified time is at or after
+// since: record id to that time.
+func (s *Store) OSVRecordsModified(ctx context.Context, eco string, since time.Time) (map[string]time.Time, error) {
+	type row struct {
+		id string
+		at int64
+	}
+	rows, err := queryAll(ctx, s.rdb, func(r scanner) (row, error) {
+		var v row
+		err := r.Scan(&v.id, &v.at)
+		return v, err
+	}, `SELECT id, modified FROM osv_records WHERE ecosystem = ? AND modified >= ?`, eco, since.UTC().UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]time.Time, len(rows))
+	for _, r := range rows {
+		out[r.id] = time.Unix(0, r.at).UTC()
+	}
+	return out, nil
+}
+
 // OSVRecordsObserved returns, for each of ids cached in any bucket, the earliest time ffs observed
 // its current affected content. Ids not cached, or cached before observation times were kept and
 // never backfilled, are absent.
