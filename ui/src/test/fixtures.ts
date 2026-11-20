@@ -285,3 +285,126 @@ export function imagePackagesPage(p?: Partial<S<'ImagePackagesPage'>>): S<'Image
 export function transitionsPage(p?: Partial<S<'TransitionsPage'>>): S<'TransitionsPage'> {
   return { ...ENV, rows: [], next: null, ...p }
 }
+
+export function advisoryDetail(p?: Partial<S<'AdvisoryDetail'>>): S<'AdvisoryDetail'> {
+  return {
+    ...ENV,
+    id: 'CVE-2026-0001',
+    aliases: [],
+    title: 'Example advisory',
+    links: [],
+    malicious: false,
+    withdrawn: false,
+    severities: [],
+    kev: null,
+    epss: null,
+    timeline: {},
+    counts: counts(),
+    workloads: 0,
+    findings: 0,
+    byFix: [],
+    packages: [],
+    uncatalogued: 0,
+    ...p,
+  }
+}
+
+export function agentStatus(p?: Partial<S<'AgentStatus'>>): S<'AgentStatus'> {
+  return { state: 'reporting', agentVersion: 'v0.0.1', lastReport: NOW, rebootPending: false, gaps: [], problems: [], ...p }
+}
+
+export function nodeGroupRow(p?: Partial<S<'NodeGroupRow'>>): S<'NodeGroupRow'> {
+  return {
+    id: 'g1',
+    kind: 'agent',
+    name: 'worker-pool-a',
+    label: 'worker pool a',
+    osImage: 'Ubuntu 24.04.3 LTS',
+    kernelRelease: '6.8.0-40-generic',
+    containerRuntimeVersion: 'containerd://2.1.4',
+    kubeletVersion: 'v1.35.1',
+    arch: 'amd64',
+    members: 2,
+    exposedNodes: 0,
+    counts: counts(),
+    fixable: 0,
+    agents: { reporting: 2, stale: 0, never: 0, disabled: 0 },
+    rebootPending: 0,
+    drift: '',
+    ...p,
+  }
+}
+
+export function nodeGroupsList(p?: Partial<S<'NodeGroupsList'>>): S<'NodeGroupsList'> {
+  return {
+    ...ENV,
+    agentEnabled: true,
+    controlPlane: { kubernetes: [], runtimes: [], counts: counts(), fixable: 0, suggestions: [] },
+    groups: [],
+    ...p,
+  }
+}
+
+export function nodeGroupDetail(p?: Partial<S<'NodeGroupDetail'>>): S<'NodeGroupDetail'> {
+  return {
+    ...ENV,
+    group: {
+      id: 'g1',
+      kind: 'agent',
+      name: 'worker-pool-a',
+      label: 'worker pool a',
+      digest: 'nodegroup:g1',
+      osImage: 'Ubuntu 24.04.3 LTS',
+      kernelRelease: '6.8.0-40-generic',
+      containerRuntimeVersion: 'containerd://2.1.4',
+      kubeletVersion: 'v1.35.1',
+      arch: 'amd64',
+      binaries: [],
+      packageDb: 'dpkg',
+      packageCount: 0,
+    },
+    agentData: false,
+    members: [],
+    drift: [],
+    counts: counts(),
+    fixable: 0,
+    cachedImages: [],
+    ...p,
+  }
+}
+
+export function nodeDetail(p?: Partial<S<'NodeDetail'>>): S<'NodeDetail'> {
+  return {
+    ...ENV,
+    node: {
+      name: 'worker-1',
+      os: 'linux',
+      arch: 'amd64',
+      osImage: 'Ubuntu 24.04.3 LTS',
+      kernelVersion: '6.8.0-40-generic',
+      kubeletVersion: 'v1.35.1',
+      containerRuntimeVersion: 'containerd://2.1.4',
+      ready: true,
+    },
+    group: null,
+    agent: agentStatus(),
+    exposed: false,
+    counts: counts(),
+    fixable: 0,
+    cachedImages: [],
+    ...p,
+  }
+}
+
+export function exceptionsList(p?: Partial<S<'ExceptionsList'>>): S<'ExceptionsList'> {
+  return { ...ENV, exceptions: [], ...p }
+}
+
+export function feedsList(p?: Partial<S<'FeedsList'>>): S<'FeedsList'> {
+  return {
+    ...ENV,
+    feeds: [],
+    sources: [{ name: 'Example advisories', feed: 'osv', licence: 'CC-BY-4.0', attribution: 'Example project', url: 'https://feeds.example.com/osv' }],
+    ...p,
+  }
+}
