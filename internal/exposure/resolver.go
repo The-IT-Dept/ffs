@@ -34,12 +34,15 @@ var _ inventory.ContextResolver = (*Resolver)(nil)
 // New returns a Resolver reading from c (the manager cache).
 func New(c client.Reader, cfg config.ExposureConfig) *Resolver { return &Resolver{c: c, cfg: cfg} }
 
-// Context composes exposure, privilege and service-account power for w.
+// Context composes exposure, privilege and service-account power for w. Exposure lists every way in,
+// internal entry points included; Exposed and ExposurePaths count only the ones not marked internal.
 func (r *Resolver) Context(ctx context.Context, w *inventory.Workload) (model.WorkloadContext, error) {
-	paths, err := r.exposurePaths(ctx, w)
+	raw, err := r.exposureEdges(ctx, w)
 	if err != nil {
 		return model.WorkloadContext{}, err
 	}
+	edges := sortEdges(raw)
+	paths := pathsOf(edges)
 	priv := privilegeReasons(podSpecs(w))
 	sa, err := r.serviceAccountPower(ctx, w.Ref.Namespace, w.ServiceAccount)
 	if err != nil {
@@ -49,6 +52,7 @@ func (r *Resolver) Context(ctx context.Context, w *inventory.Workload) (model.Wo
 		Exposed: len(paths) > 0, ExposurePaths: paths,
 		Privileged: len(priv) > 0, PrivilegeReasons: priv,
 		PowerfulSA: len(sa) > 0, SAReasons: sa,
+		Exposure: edges,
 	}, nil
 }
 

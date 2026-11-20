@@ -122,6 +122,10 @@ type WorkloadContext struct {
 	PrivilegeReasons []string
 	PowerfulSA       bool
 	SAReasons        []string
+	// Exposure holds every way in to the workload, internal entry points included, sorted by Entry,
+	// EntryName, Listener, Hostname, Route, Service, Internal and Path; nil when there is none.
+	// Exposed and ExposurePaths derive from its edges that are not internal.
+	Exposure []ExposureEdge
 }
 
 type Owner struct {
@@ -197,6 +201,8 @@ type Finding struct {
 	LastSeen       time.Time
 	ResolvedAt     *time.Time
 	Suggestion     *Suggestion
+	Signals        FindingSignals // the priority inputs it was ranked with
+	Fix            *FixAction     // how it is cleared, short of an image-tag upgrade (EffectiveFix)
 }
 
 type Transition struct {

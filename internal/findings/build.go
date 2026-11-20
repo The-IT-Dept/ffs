@@ -297,19 +297,24 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 	}
 	f.Digests, fixed = sortedSet(digests), sortedSet(fixed)
 	f.FixAvailable = len(fixed) > 0 || f.FixState == model.FixFixed
+	f.Fix = fixAction(vs, fixed)
 	f.Severity, f.SeveritySource = severity(vs, adv)
 	b.rank(&f, adv, fixed)
 	return f
 }
 
 // carried returns the stored finding c, which the matches did not build because its repository
-// runs a digest not yet catalogued or not yet matched, as it stands now: its packages, digests and
-// fix state are kept, and its priority and exception are re-evaluated with the current advisory and
-// owner context, so a KEV listing or an expired exception still applies to it.
+// runs a digest not yet catalogued or not yet matched, as it stands now: its packages, digests,
+// fix state and fix action are kept, and its priority, signals and exception are re-evaluated with
+// the current advisory and owner context, so a KEV listing or an expired exception still applies to
+// it. A finding stored before Build set fix actions gets one from what it stored.
 func (b builder) carried(c model.Finding) model.Finding {
 	adv := b.in.Advisories[c.AdvisoryID]
 	f := c
 	f.State, f.ExceptedBy, f.ResolvedAt, f.LastSeen = model.StateOpen, "", nil, b.in.Now
+	if f.Fix == nil {
+		f.Fix = carriedFix(c)
+	}
 	if !adv.Published.IsZero() {
 		f.Published = adv.Published
 	}
@@ -328,8 +333,8 @@ func (b builder) carried(c model.Finding) model.Finding {
 	return f
 }
 
-// rank sets f's priority and reasons from its severity, fix and the owner's context, then applies
-// the first matching exception.
+// rank sets f's priority, reasons and signals from its severity, fix and the owner's context, then
+// applies the first matching exception.
 func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
 	pin := priority.Input{
 		Severity:         f.Severity,
@@ -348,6 +353,11 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
 		SAReasons:        b.ctx.SAReasons,
 		NotRunning:       b.in.Owner.NotRunning,
 		GoStdlib:         f.GoStdlib,
+	}
+	f.Signals = model.FindingSignals{
+		Exposed: pin.Exposed, Privileged: pin.Privileged, PowerfulSA: pin.PowerfulSA, NotRunning: pin.NotRunning,
+		KEV: pin.KEVAdded != nil, Malicious: pin.Malicious,
+		EPSSElevated: pin.EPSS >= b.in.PriorityConfig.EPSSBump, EPSS: pin.EPSS,
 	}
 	f.Priority, f.Reasons = priority.Evaluate(pin, b.in.PriorityConfig)
 	b.except(f, adv.Aliases, pin)
