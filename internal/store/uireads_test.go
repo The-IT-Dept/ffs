@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -415,4 +416,96 @@ func TestSBOMDescriptor_StreamsToDescriptor(t *testing.T) {
 	require.NoError(t, s.PutSBOM(ctx, "sha256:broken", []byte(`{"artifacts":[`), nil))
 	_, _, _, err = s.SBOMDescriptor(ctx, "sha256:broken")
 	require.Error(t, err)
+}
+
+// An image whose SBOM is stored but whose first match has not run is not seen into yet: it counts
+// as in use only, reads as pending in the images explorer and is a coverage gap, until the match.
+func TestCoverage_UnmatchedImagesAreNotSeenInto(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	cluster := model.Scope{Kind: model.ScopeCluster}
+	before, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:web", t0))
+
+	after, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: before.InUse, SeenInto: before.SeenInto - 1, Full: before.Full - 1}, after)
+	img, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:web"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: 1}, img)
+	owners, err := s.OwnerCoverage(ctx, []string{exWeb.Key()})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: 1}, owners[exWeb.Key()])
+	nss, err := s.NamespaceStats(ctx)
+	require.NoError(t, err)
+	for _, n := range nss {
+		if n.Namespace == "shop" {
+			require.Equal(t, CoverageFigure{InUse: 2, SeenInto: 1, Full: 1}, n.Coverage)
+		}
+	}
+	byOwner, err := s.OwnerImageCoverage(ctx, []string{exWeb.Key()})
+	require.NoError(t, err)
+	require.Equal(t, []DigestCoverage{{Digest: "sha256:web"}}, byOwner[exWeb.Key()])
+
+	page, err := s.ImagesPage(ctx, ImageQuery{Q: "example/web", Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Rows, 1)
+	require.Equal(t, model.ImagePending, page.Rows[0].Image.Status)
+	require.Equal(t, model.CoverageNone, page.Rows[0].Class)
+	gaps, err := s.CoverageImages(ctx, cluster)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(gaps, func(c CoverageImage) bool {
+		return c.Image.Digest == "sha256:web" && c.Image.Status == model.ImagePending
+	}), "the unmatched image is a pending gap")
+
+	require.NoError(t, s.MarkMatched(ctx, "sha256:web"))
+	matched, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.Equal(t, before, matched)
+}
+
+// An image's own coverage figure counts it in use only when an owner runs it.
+func TestCoverageOf_ImageInUseOnlyWhenRun(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	unused, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:unused"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{SeenInto: 1, Full: 1}, unused, "catalogued, but no owner runs it")
+	none, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:nowhere"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{}, none)
+}
+
+// A fully covered image holding classifier-found packages is listed, so the API can name the
+// packages matched against CPE data only; one without them is not.
+func TestCoverageImages_ListsFullImagesWithClassifierPackages(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	put(t, s, "sha256:worker", model.Package{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary",
+		Path: "/usr/local/bin/redis-server"})
+	put(t, s, "sha256:web", deb("openssl", ""))
+	imgs, err := s.CoverageImages(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"})
+	require.NoError(t, err)
+	require.Len(t, imgs, 1)
+	require.Equal(t, "sha256:worker", imgs[0].Image.Digest)
+	require.Equal(t, model.CoverageFull, CoverageClassOf(imgs[0].Image))
+}
+
+// Each owner's distinct container images, with how far ffs sees into each; synthetic digests are
+// left out.
+func TestOwnerImageCoverage_DistinctContainerImages(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	require.NoError(t, s.UpsertOwner(ctx, uiOwner(ref("Deployment", "shop", "web-canary"), func(o *model.Owner) {
+		o.Containers = append(o.Containers, model.ContainerUse{Name: "proxy", Digest: "sha256:web"})
+	})))
+	got, err := s.OwnerImageCoverage(ctx, []string{exWeb.Key(), "Deployment/shop/web-canary", exAPI.Key(), exReport.Key(), exNodes.Key()})
+	require.NoError(t, err)
+	require.Equal(t, map[string][]DigestCoverage{
+		exWeb.Key():                  {{Digest: "sha256:web", SeenInto: true, Full: true}},
+		"Deployment/shop/web-canary": {{Digest: "sha256:web", SeenInto: true, Full: true}, {Digest: "sha256:web-canary"}},
+		exAPI.Key():                  {{Digest: "sha256:api", SeenInto: true}},
+		exReport.Key():               {{Digest: placeholderDigest}},
+	}, got)
 }

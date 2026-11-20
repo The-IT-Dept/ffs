@@ -40,8 +40,8 @@ func (s *Store) NamespaceStats(ctx context.Context) ([]NamespaceStat, error) {
 	}, `WITH ns AS (SELECT namespace, count(*) AS workloads, sum(exposed) AS exposed FROM owners WHERE namespace != '' GROUP BY namespace),
 		st(namespace, `+ownerStatsCols+`) AS (SELECT namespace, `+ownerStatsSums+` FROM owner_stats WHERE namespace != '' GROUP BY namespace),
 		cov AS (SELECT o.namespace, count(DISTINCT oi.digest) AS in_use,
-			count(DISTINCT CASE WHEN i.status = 'catalogued' THEN oi.digest END) AS seen_into,
-			count(DISTINCT CASE WHEN i.cov_class = 'full' THEN oi.digest END) AS cov_full
+			count(DISTINCT CASE WHEN `+seenSQL("i", "oi.digest")+` THEN oi.digest END) AS seen_into,
+			count(DISTINCT CASE WHEN `+fullSQL("i", "oi.digest")+` THEN oi.digest END) AS cov_full
 			FROM owner_images oi JOIN owners o ON o.key = oi.owner_key LEFT JOIN images i ON i.digest = oi.digest
 			WHERE o.namespace != '' AND `+containerDigest("oi.digest")+` GROUP BY o.namespace)
 		SELECT ns.namespace, ns.workloads, ns.exposed, coalesce(cov.in_use, 0), coalesce(cov.seen_into, 0), coalesce(cov.cov_full, 0),
@@ -201,13 +201,19 @@ func (s *Store) BestFixes(ctx context.Context, keys []string) (map[string]FixSum
 
 // CoverageOf returns the coverage figure of a cluster, namespace or workload scope (its owners'
 // distinct in-use container digests; no images row counts as in use only), or of one image, whose
-// figure is its own (InUse 1).
+// figure is its own: in use when an owner runs it. An image is seen into once it is catalogued and
+// its first match has run.
 func (s *Store) CoverageOf(ctx context.Context, sc model.Scope) (CoverageFigure, error) {
 	var c CoverageFigure
 	if sc.Kind == model.ScopeImage {
-		err := s.rdb.QueryRowContext(ctx, `SELECT 1, coalesce(max(status = 'catalogued'), 0), coalesce(max(cov_class = 'full'), 0)
-			FROM images WHERE digest = ?`, sc.Value).Scan(&c.InUse, &c.SeenInto, &c.Full)
-		return c, err
+		err := s.rdb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM owner_images WHERE digest = ?),
+			coalesce((SELECT `+seenSQL("i", "i.digest")+` FROM images i WHERE i.digest = ?), 0),
+			coalesce((SELECT `+fullSQL("i", "i.digest")+` FROM images i WHERE i.digest = ?), 0)`,
+			sc.Value, sc.Value, sc.Value).Scan(&c.InUse, &c.SeenInto, &c.Full)
+		if err != nil {
+			return CoverageFigure{}, fmt.Errorf("store: coverage of %s: %w", sc, err)
+		}
+		return c, nil
 	}
 	var w where
 	w.add(containerDigest("oi.digest"))
@@ -220,8 +226,8 @@ func (s *Store) CoverageOf(ctx context.Context, sc model.Scope) (CoverageFigure,
 	default:
 		return CoverageFigure{}, scopeErr(sc)
 	}
-	err := s.rdb.QueryRowContext(ctx, `SELECT count(DISTINCT oi.digest), count(DISTINCT CASE WHEN i.status = 'catalogued' THEN oi.digest END),
-		count(DISTINCT CASE WHEN i.cov_class = 'full' THEN oi.digest END)
+	err := s.rdb.QueryRowContext(ctx, `SELECT count(DISTINCT oi.digest), count(DISTINCT CASE WHEN `+seenSQL("i", "oi.digest")+` THEN oi.digest END),
+		count(DISTINCT CASE WHEN `+fullSQL("i", "oi.digest")+` THEN oi.digest END)
 		FROM owner_images oi LEFT JOIN images i ON i.digest = oi.digest`+w.String(), w.args...).Scan(&c.InUse, &c.SeenInto, &c.Full)
 	if err != nil {
 		return CoverageFigure{}, fmt.Errorf("store: coverage of %s: %w", sc, err)
@@ -255,9 +261,10 @@ func (s *Store) OwnerCoverage(ctx context.Context, keys []string) (map[string]Co
 	return out, rows.Err()
 }
 
-// CoverageImage is an in-use container image not seen into in full detail, with the owners in scope
-// that run it. Without an images row, HasRow is false and the image is pending, with its repository
-// and platform from the container.
+// CoverageImage is an in-use container image not seen into in full detail, or one holding packages
+// a binary classifier found, with the owners in scope that run it. Without an images row, HasRow is
+// false and the image is pending, with its repository and platform from the container. A
+// catalogued image whose first match has not run is pending.
 type CoverageImage struct {
 	Image  model.Image
 	Owners []string
@@ -265,7 +272,8 @@ type CoverageImage struct {
 }
 
 // CoverageImages returns the in-use container images of a cluster, namespace or workload scope
-// that are not seen into in full detail, by repository and digest.
+// that are not seen into in full detail, and those that are but hold classifier-found packages
+// (which may be matched against CPE data only), by repository and digest.
 func (s *Store) CoverageImages(ctx context.Context, sc model.Scope) ([]CoverageImage, error) {
 	switch sc.Kind {
 	case model.ScopeCluster, "", model.ScopeNamespace, model.ScopeWorkload:
@@ -294,7 +302,48 @@ func (s *Store) CoverageImages(ctx context.Context, sc model.Scope) ([]CoverageI
 		return c, nil
 	}, cte+` SELECT `+imageCols+`, EXISTS (SELECT 1 FROM images x WHERE x.digest = im.digest),
 		(SELECT group_concat(u.owner_key, char(31)) FROM inuse u WHERE u.digest = im.digest)
-		FROM im WHERE cov != 'full' ORDER BY repo, digest`, args...)
+		FROM im WHERE cov != 'full' OR EXISTS (SELECT 1 FROM packages p WHERE p.digest = im.digest AND p.classifier != '')
+		ORDER BY repo, digest`, args...)
+}
+
+// DigestCoverage is how far ffs sees into one in-use container image.
+type DigestCoverage struct {
+	Digest         string
+	SeenInto, Full bool
+}
+
+// ownerImageCoverageQuery reads the distinct container images of the owners in the JSON key list,
+// with whether each is seen into and in full detail.
+//
+//nolint:gosec // G202: joins this package's SQL fragments; every value is a bound parameter
+var ownerImageCoverageQuery = `SELECT DISTINCT oi.owner_key, oi.digest, coalesce(` + seenSQL("i", "oi.digest") + `, 0),
+	coalesce(` + fullSQL("i", "oi.digest") + `, 0)
+	FROM owner_images oi LEFT JOIN images i ON i.digest = oi.digest
+	WHERE oi.owner_key IN (SELECT value FROM json_each(?)) AND ` + containerDigest("oi.digest") + ` ORDER BY oi.owner_key, oi.digest`
+
+// OwnerImageCoverage returns, per owner of keys, the distinct container images it runs and how far
+// ffs sees into each, by digest, so a group of owners can count shared images once.
+func (s *Store) OwnerImageCoverage(ctx context.Context, keys []string) (map[string][]DigestCoverage, error) {
+	out := map[string][]DigestCoverage{}
+	if len(keys) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, ownerImageCoverageQuery, idList(keys))
+	if err != nil {
+		return nil, fmt.Errorf("store: owner image coverage: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			key string
+			c   DigestCoverage
+		)
+		if err := rows.Scan(&key, &c.Digest, &c.SeenInto, &c.Full); err != nil {
+			return nil, err
+		}
+		out[key] = append(out[key], c)
+	}
+	return out, rows.Err()
 }
 
 // DigestsOfOwners returns every digest each owner of keys runs, synthetic ones included, sorted.
@@ -668,4 +717,13 @@ func skipValue(dec *json.Decoder) error {
 			return nil
 		}
 	}
+}
+
+// OwnerExists reports whether an owner is stored under key.
+func (s *Store) OwnerExists(ctx context.Context, key string) (bool, error) {
+	var ok bool
+	if err := s.rdb.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM owners WHERE key = ?)`, key).Scan(&ok); err != nil {
+		return false, fmt.Errorf("store: owner %s: %w", key, err)
+	}
+	return ok, nil
 }

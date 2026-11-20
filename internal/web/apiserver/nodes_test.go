@@ -39,7 +39,7 @@ func TestNodeGroups_ListsAgentThenNodeInfoWithControlPlane(t *testing.T) {
 	require.Len(t, got.Groups, 2)
 
 	g := got.Groups[0]
-	require.Equal(t, webtest.AgentGroupID, g.Id)
+	require.Equal(t, webtest.AgentGroupKey, g.Id, "a group is named by its stable name")
 	require.Equal(t, apigen.NodeGroupKindAgent, g.Kind)
 	require.Equal(t, "ubuntu-24.04-k6.8.0-88-3f9c1a", g.Label)
 	require.Equal(t, 2, g.Members)
@@ -47,10 +47,11 @@ func TestNodeGroups_ListsAgentThenNodeInfoWithControlPlane(t *testing.T) {
 	require.Equal(t, apigen.PriorityCounts{High: 1}, g.Counts)
 	require.Equal(t, 1, g.Fixable)
 	require.Equal(t, apigen.AgentCounts{Reporting: 1, Stale: 1}, g.Agents)
+	require.Equal(t, &[]apigen.GapCode{apigen.GapCodeNodeAgentMissing}, g.Gaps, "worker-2 is stale")
 	require.Empty(t, g.Drift, "the largest group of its architecture is the base")
 
 	cp := got.Groups[1]
-	require.Equal(t, webtest.CP1GroupID, cp.Id)
+	require.Equal(t, webtest.CP1GroupKey, cp.Id)
 	require.Equal(t, apigen.NodeGroupKindNodeinfo, cp.Kind)
 	require.Equal(t, 1, cp.Members)
 	require.Equal(t, apigen.PriorityCounts{}, cp.Counts)
@@ -77,6 +78,8 @@ func TestNodeGroups_ListsAgentThenNodeInfoWithControlPlane(t *testing.T) {
 func TestNodeGroup_MembersDriftAndCompare(t *testing.T) {
 	_, h := newAPI(t)
 	got := ok[apigen.NodeGroupDetail](t, get(t, h, "/api/v1/nodegroups/"+webtest.AgentGroupID+"?compare="+webtest.CP1GroupID))
+	require.Equal(t, webtest.AgentGroupKey, got.Group.Id)
+	require.Equal(t, "nodegroup:"+webtest.AgentGroupID, got.Group.Digest)
 	require.True(t, got.AgentData)
 	require.Len(t, got.Members, 2)
 	w1, w2 := got.Members[0], got.Members[1]
@@ -93,7 +96,7 @@ func TestNodeGroup_MembersDriftAndCompare(t *testing.T) {
 
 	require.Len(t, got.Drift, 1)
 	d := got.Drift[0]
-	require.Equal(t, apigen.GroupRef{Id: webtest.CP1GroupID, Kind: apigen.NodeGroupKindNodeinfo, Label: d.Other.Label}, d.Other)
+	require.Equal(t, apigen.GroupRef{Id: webtest.CP1GroupKey, Kind: apigen.NodeGroupKindNodeinfo, Label: d.Other.Label}, d.Other)
 	require.Contains(t, d.Fields, apigen.FieldDrift{Field: "kernel", From: "6.8.0-85-generic", To: "6.8.0-88-generic"},
 		"here (to) is this group, there (from) the other")
 	require.False(t, d.PackagesCompared)
@@ -101,8 +104,8 @@ func TestNodeGroup_MembersDriftAndCompare(t *testing.T) {
 
 	require.NotNil(t, got.Compare)
 	require.False(t, got.Compare.PackagesCompared)
-	require.Equal(t, webtest.CP1GroupID, got.Compare.From)
-	require.Equal(t, webtest.AgentGroupID, got.Compare.To)
+	require.Equal(t, webtest.CP1GroupKey, got.Compare.From)
+	require.Equal(t, webtest.AgentGroupKey, got.Compare.To)
 	require.Equal(t, d.Fields, got.Compare.Fields)
 	require.Contains(t, cachedDigests(got.CachedImages), webtest.DigestWeb)
 	require.NotNil(t, got.Group.Kernel)
@@ -128,7 +131,7 @@ func TestNode_ResolvesGroupAndAgent(t *testing.T) {
 	_, h := newAPI(t)
 	got := ok[apigen.NodeDetail](t, get(t, h, "/api/v1/nodes/worker-2"))
 	require.NotNil(t, got.Group)
-	require.Equal(t, webtest.AgentGroupID, got.Group.Id)
+	require.Equal(t, webtest.AgentGroupKey, got.Group.Id)
 	require.Equal(t, apigen.NodeGroupKindAgent, got.Group.Kind)
 	require.Equal(t, apigen.AgentStateStale, got.Agent.State)
 	require.False(t, got.Exposed)
@@ -193,7 +196,7 @@ func TestNodes_FallbackMergesIntoStoredGroup(t *testing.T) {
 	got := ok[apigen.NodeGroupsList](t, get(t, handlerOf(f), "/api/v1/nodegroups"))
 	var rows []apigen.NodeGroupRow
 	for _, g := range got.Groups {
-		if g.Id == webtest.CP1GroupID {
+		if g.Id == webtest.CP1GroupKey {
 			rows = append(rows, g)
 		}
 	}
@@ -203,7 +206,7 @@ func TestNodes_FallbackMergesIntoStoredGroup(t *testing.T) {
 
 	d := ok[apigen.NodeDetail](t, get(t, handlerOf(f), "/api/v1/nodes/cp-2"))
 	require.NotNil(t, d.Group)
-	require.Equal(t, webtest.CP1GroupID, d.Group.Id)
+	require.Equal(t, webtest.CP1GroupKey, d.Group.Id)
 }
 
 func TestNodes_CachedImagesOnlyFromLiveAgents(t *testing.T) {
@@ -239,7 +242,7 @@ func TestNodeScope_FindingsResolveToGroup(t *testing.T) {
 	require.Zero(t, got.Total)
 	require.Empty(t, got.Rows)
 
-	p := wantProblem(t, get(t, h, "/api/v1/findings?scope=node:missing"), 400, apigen.ProblemCodeInvalidScope)
+	p := wantProblem(t, get(t, h, "/api/v1/findings?scope=node:missing"), 404, apigen.ProblemCodeNotFound)
 	require.Contains(t, *p.Detail, "missing")
 
 	got = ok[apigen.FindingsPage](t, get(t, h, "/api/v1/findings?scope=nodegroup:"+webtest.AgentGroupID))
@@ -262,10 +265,10 @@ func TestNodeAgentFields(t *testing.T) {
 	require.Nil(t, web.Sbom.Agent, "a registry SBOM has no agent provenance")
 
 	res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q=ubuntu"))
-	hit := hitOf(t, res, apigen.SearchHitKindNodegroup, webtest.AgentGroupID)
+	hit := hitOf(t, res, apigen.SearchHitKindNodegroup, webtest.AgentGroupKey)
 	require.Equal(t, "ubuntu-24.04-k6.8.0-88-3f9c1a", hit.Label)
 	require.NotNil(t, hit.Scope)
-	require.Equal(t, "nodegroup:"+webtest.AgentGroupID, *hit.Scope)
+	require.Equal(t, "nodegroup:"+webtest.AgentGroupKey, *hit.Scope)
 	require.NotNil(t, hit.Detail)
 	require.Equal(t, "2 nodes", *hit.Detail)
 }

@@ -123,7 +123,7 @@ func TestScope_RailPerKind(t *testing.T) {
 	require.Equal(t, "worker-2", c.Title)
 	require.Equal(t, "ubuntu-24.04-k6.8.0-88-3f9c1a · Ready · agent stale", c.Summary)
 	require.Equal(t, []apigen.RelatedSectionId{apigen.RelatedSectionIdMembers}, relatedIDs(c))
-	require.Equal(t, []string{"cluster", "nodegroup:" + webtest.AgentGroupID}, crumbs(c))
+	require.Equal(t, []string{"cluster", "nodegroup:" + webtest.AgentGroupKey}, crumbs(c))
 	require.Equal(t, "worker-1", c.Related[0].Items[0].Label, "the other members")
 	require.Len(t, c.Related[0].Items, 1)
 

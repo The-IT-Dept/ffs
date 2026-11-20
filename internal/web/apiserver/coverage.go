@@ -12,29 +12,46 @@ import (
 )
 
 // scopeCoverage is how far ffs sees into a scope: its in-use container images for a cluster,
-// namespace or workload scope, and the image itself for an image scope. A node group (or a node,
-// through its group) is one host image, seen into in full when it is an agent group whose host
-// SBOM is catalogued. The control plane is its Kubernetes and runtime images, in full detail when
-// they carry no coverage note.
+// namespace or workload scope, and the image itself for an image scope. A node group is one host
+// image, seen into when it is an agent group whose host SBOM is catalogued and matched, and in full
+// detail only while none of its members has a host coverage gap (hostGap: an agent blocked, stale or
+// missing, no package database, a host inventory not stored). A node is its group's host image,
+// in full detail while the node itself has no such gap. The control plane is its Kubernetes and
+// runtime images, in full detail when they carry no coverage note.
 func (s *Server) scopeCoverage(ctx context.Context, sc model.Scope) (store.CoverageFigure, error) {
 	switch sc.Kind {
 	case model.ScopeNodeGroup, model.ScopeNode:
+		gs, err := s.groupSet(ctx)
+		if err != nil {
+			return store.CoverageFigure{}, err
+		}
 		var (
-			g   model.NodeGroup
-			ok  bool
-			err error
+			g       model.NodeGroup
+			ok      bool
+			members []string
 		)
 		if sc.Kind == model.ScopeNode {
-			g, ok, err = s.groupOf(ctx, sc.Value)
+			g, ok = gs.of(sc.Value)
+			members = []string{sc.Value}
 		} else {
-			g, ok, err = s.findGroup(ctx, sc.Value)
+			g, ok = gs.find(sc.Value)
+			members = g.Members
 		}
-		if err != nil || !ok || g.Kind != model.NodeGroupAgent || g.Digest == "" {
-			return store.CoverageFigure{InUse: 1}, err
+		if !ok || g.Kind != model.NodeGroupAgent || g.Digest == "" {
+			return store.CoverageFigure{InUse: 1}, nil
 		}
-		img, found, err := s.o.Store.GetImage(ctx, g.Digest)
+		img, found, err := s.imageRow(ctx, g.Digest)
 		if err != nil || !found || img.Status != model.ImageCatalogued {
 			return store.CoverageFigure{InUse: 1}, err
+		}
+		agents, err := s.agentView(ctx)
+		if err != nil {
+			return store.CoverageFigure{}, err
+		}
+		for _, m := range members {
+			if hostGap(agents.of(m)) {
+				return store.CoverageFigure{InUse: 1, SeenInto: 1}, nil
+			}
 		}
 		return store.CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}, nil
 	case model.ScopeControlPlane:
@@ -45,7 +62,7 @@ func (s *Server) scopeCoverage(ctx context.Context, sc model.Scope) (store.Cover
 		var c store.CoverageFigure
 		for _, d := range digests {
 			c.InUse++
-			img, ok, err := s.o.Store.GetImage(ctx, d)
+			img, ok, err := s.imageRow(ctx, d)
 			if err != nil {
 				return store.CoverageFigure{}, err
 			}
@@ -60,6 +77,23 @@ func (s *Server) scopeCoverage(ctx context.Context, sc model.Scope) (store.Cover
 	case model.ScopeCluster, model.ScopeNamespace, model.ScopeWorkload, model.ScopeImage:
 	}
 	return s.o.Store.CoverageOf(ctx, sc)
+}
+
+// imageRow is digest's images row, if any, as the API reads it: a catalogued image whose first
+// match has not run yet is pending, since its findings are not known.
+func (s *Server) imageRow(ctx context.Context, digest string) (model.Image, bool, error) {
+	img, ok, err := s.o.Store.GetImage(ctx, digest)
+	if err != nil || !ok || img.Status != model.ImageCatalogued {
+		return img, ok, err
+	}
+	unmatched, err := s.o.Store.UnmatchedDigests(ctx, []string{digest})
+	if err != nil {
+		return model.Image{}, false, err
+	}
+	if len(unmatched) > 0 {
+		img.Status, img.StatusReason = model.ImagePending, ""
+	}
+	return img, true, nil
 }
 
 // controlPlaneKeys are the owner keys of the control plane: the cluster, and the container runtime
@@ -106,6 +140,9 @@ func (s *Server) controlPlaneDigests(ctx context.Context) ([]string, error) {
 func (s *Server) GetCoverage(ctx context.Context, req apigen.GetCoverageRequestObject) (apigen.GetCoverageResponseObject, error) {
 	sc, err := scopeParam(req.Params.Scope, model.ScopeCluster, model.ScopeNamespace, model.ScopeWorkload)
 	if err != nil {
+		return nil, err
+	}
+	if _, err := s.resolveScope(ctx, sc); err != nil {
 		return nil, err
 	}
 	label, err := s.scopeTitle(ctx, sc)

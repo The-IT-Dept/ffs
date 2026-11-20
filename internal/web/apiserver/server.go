@@ -59,6 +59,7 @@ func New(o Options) *Server {
 // Handler returns the HTTP handler of every operation below BaseURL. Parameters the generated
 // router cannot bind are a 400 invalid_parameter problem, a handler error is the problem it maps to
 // (500 internal when it maps to none), and a path no operation matches is a 404 not_found problem.
+// Each request reads the node groups and agent statuses at most once.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -68,9 +69,9 @@ func (s *Server) Handler() http.Handler {
 		RequestErrorHandlerFunc:  s.paramError,
 		ResponseErrorHandlerFunc: s.responseError,
 	})
-	return apigen.HandlerWithOptions(strict, apigen.StdHTTPServerOptions{
+	return withMemo(apigen.HandlerWithOptions(strict, apigen.StdHTTPServerOptions{
 		BaseURL: BaseURL, BaseRouter: mux, ErrorHandlerFunc: s.paramError,
-	})
+	}))
 }
 
 // paramError answers a request whose parameters could not be bound.

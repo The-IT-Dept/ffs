@@ -116,19 +116,39 @@ func textParam(name string, p *string, maxLen int) (string, error) {
 	return *p, nil
 }
 
-// resolveScope narrows a parsed scope to one the store answers: a node scope is its group's
-// (host findings are per group), and a node in no group is 400 invalid_scope. Every other scope is
-// returned unchanged.
+// resolveScope narrows a parsed scope to one the store answers and checks that its object exists: a
+// node scope is its group's (host findings are per group), a node group scope names the group by
+// its ID (it may name it by its stable name or label), and a workload scope must name a stored
+// owner. An unknown node, node group or workload is 404 not_found. Every other scope is returned
+// unchanged.
 func (s *Server) resolveScope(ctx context.Context, sc model.Scope) (model.Scope, error) {
-	if sc.Kind != model.ScopeNode {
-		return sc, nil
+	switch sc.Kind {
+	case model.ScopeNode, model.ScopeNodeGroup:
+		gs, err := s.groupSet(ctx)
+		if err != nil {
+			return model.Scope{}, err
+		}
+		if sc.Kind == model.ScopeNode {
+			g, ok := gs.of(sc.Value)
+			if !ok {
+				return model.Scope{}, notFound("node " + sc.Value + " not found")
+			}
+			return model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, nil
+		}
+		g, ok := gs.find(sc.Value)
+		if !ok {
+			return model.Scope{}, notFound("node group " + sc.Value + " not found")
+		}
+		return model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, nil
+	case model.ScopeWorkload:
+		ok, err := s.o.Store.OwnerExists(ctx, sc.Value)
+		if err != nil {
+			return model.Scope{}, err
+		}
+		if !ok {
+			return model.Scope{}, notFound("workload " + sc.Value + " not found")
+		}
+	case model.ScopeCluster, model.ScopeNamespace, model.ScopeImage, model.ScopeControlPlane:
 	}
-	g, ok, err := s.groupOf(ctx, sc.Value)
-	if err != nil {
-		return model.Scope{}, err
-	}
-	if !ok {
-		return model.Scope{}, scopeProblem("node " + sc.Value + " not found")
-	}
-	return model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, nil
+	return sc, nil
 }

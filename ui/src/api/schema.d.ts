@@ -1069,11 +1069,14 @@ export interface components {
             counts: components["schemas"]["PriorityCounts"];
             fixable: number;
             agents: components["schemas"]["AgentCounts"];
+            /** @description The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full. */
+            gaps?: components["schemas"]["GapCode"][];
             rebootPending: number;
             /** @description Field differences against the largest group of the same architecture. */
             drift: string;
         };
         AgentCounts: {
+            /** @description Agents reporting whose host inventory is stored. */
             reporting: number;
             stale: number;
             never: number;
@@ -1816,11 +1819,12 @@ export interface operations {
     getNodeGroup: {
         parameters: {
             query?: {
-                /** @description ID of another node group to compare this group with. */
+                /** @description Stable name, label or ID of another node group to compare this group with. */
                 compare?: string;
             };
             header?: never;
             path: {
+                /** @description The group's stable name, which survives package updates, or its label or ID. */
                 id: string;
             };
             cookie?: never;

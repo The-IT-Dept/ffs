@@ -148,8 +148,44 @@ func (s *Store) ScopeStats(ctx context.Context, sc model.Scope) (OwnerStats, err
 	return st, nil
 }
 
+// OwnerDigestStats returns the rollup counts of one owner's findings on each digest it has
+// findings on: what the owner itself has on an image, not every owner running it.
+func (s *Store) OwnerDigestStats(ctx context.Context, owner string) (map[string]OwnerStats, error) {
+	rows, err := s.rdb.QueryContext(ctx, `SELECT d.digest, `+findingContributions+` FROM findings f
+		JOIN finding_digests d ON d.fingerprint = f.fingerprint WHERE f.owner_key = ? GROUP BY d.digest`, owner)
+	if err != nil {
+		return nil, fmt.Errorf("store: owner digest stats: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	out := map[string]OwnerStats{}
+	for rows.Next() {
+		var digest string
+		st, err := scanOwnerStats(rows, &digest)
+		if err != nil {
+			return nil, fmt.Errorf("store: owner digest stats: %w", err)
+		}
+		out[digest] = st
+	}
+	return out, rows.Err()
+}
+
 // nodeGroupDigestPrefix prefixes a node group ID to form the synthetic digest of its host packages.
 const nodeGroupDigestPrefix = "nodegroup:"
+
+// matchedSQL holds when the digest expression d has no pending first match: an image whose SBOM is
+// stored but not yet matched (images_unmatched) is not seen into until its first match completes,
+// since its findings are not known yet.
+func matchedSQL(d string) string {
+	return `NOT EXISTS (SELECT 1 FROM images_unmatched um WHERE um.digest = ` + d + `)`
+}
+
+// seenSQL is whether the images row aliased i, of digest d, is seen into: catalogued and matched.
+func seenSQL(i, d string) string {
+	return `(` + i + `.status = 'catalogued' AND ` + matchedSQL(d) + `)`
+}
+
+// fullSQL is whether the images row aliased i, of digest d, is seen into in full detail.
+func fullSQL(i, d string) string { return `(` + i + `.cov_class = 'full' AND ` + matchedSQL(d) + `)` }
 
 // controlPlaneOwners selects the Cluster and ContainerRuntime owners, over owner_stats or findings.
 const controlPlaneOwners = `owner_kind IN ('Cluster', 'ContainerRuntime') AND namespace = ''`

@@ -539,3 +539,63 @@ func TestImagePackages_SearchFindingsAndHostDigests(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []FacetValue{{"deb", 2}, {"npm", 1}}, eco)
 }
+
+// A host package and a container package at the same version: over the cluster the packages
+// explorer counts only the container image's finding, while a namespace scope counts its own.
+func TestPackagesPage_ClusterCountsContainerFindingsOnly(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	stdlib := model.Package{Ecosystem: "go-module", Name: "stdlib", Version: "go1.24.1", GoStdlib: true, Path: "/bin/app"}
+	put(t, s, "sha256:worker", stdlib)
+	put(t, s, "nodegroup:g1", stdlib)
+	onStdlib := func(digest string) func(*model.Finding) {
+		return func(f *model.Finding) {
+			f.Digests = []string{digest}
+			f.Packages = []model.FindingPackage{{Name: "stdlib", Ecosystem: "go-module", Installed: "go1.24.1"}}
+		}
+	}
+	apply(t, s,
+		uiFinding(exWorker, "ghcr.io/example/worker", "GO-2026-0001", model.PriorityMedium, onStdlib("sha256:worker")),
+		uiFinding(exNodes, model.HostRepo, "GO-2026-0001", model.PriorityUrgent, onStdlib("nodegroup:g1")),
+		uiFinding(exCluster, "kubernetes", "GO-2026-0002", model.PriorityHigh, onStdlib("k8s:1.35.1")),
+	)
+	row := func(sc model.Scope) PackageRow {
+		t.Helper()
+		page, err := s.PackagesPage(ctx, PackageEntityQuery{Scope: sc, Q: "stdlib", Limit: 200})
+		require.NoError(t, err)
+		require.Len(t, page.Rows, 1)
+		return page.Rows[0]
+	}
+	cluster := row(model.Scope{Kind: model.ScopeCluster})
+	require.Equal(t, PriorityCounts{Medium: 1}, cluster.Counts, "the host and Kubernetes findings are not on a container image")
+	require.Equal(t, model.PriorityMedium, cluster.Worst)
+	require.Equal(t, 1, cluster.Images, "the host SBOM is not an in-use container image")
+	require.Equal(t, PriorityCounts{Medium: 1}, row(model.Scope{Kind: model.ScopeNamespace, Value: "shop"}).Counts)
+
+	facets, err := s.PackageFacets(ctx, PackageEntityQuery{Q: "stdlib"}, []string{"priority"})
+	require.NoError(t, err)
+	require.Contains(t, facets["priority"], FacetValue{Value: "medium", Count: 1})
+	require.Contains(t, facets["priority"], FacetValue{Value: "urgent", Count: 0})
+}
+
+func TestInstalledVersions_ByDigestAndName(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "nodegroup:g1",
+		model.Package{Ecosystem: "deb", Name: "openssl", Version: "3.0.13-0ubuntu3", Arch: "amd64"},
+		model.Package{Ecosystem: "deb", Name: "libc6", Epoch: "1", Version: "2.39-0ubuntu8", Arch: "amd64"},
+		model.Package{Ecosystem: "deb", Name: "zlib1g", Version: "1.3", Arch: "amd64"})
+	put(t, s, "nodegroup:g2", model.Package{Ecosystem: "deb", Name: "openssl", Version: "3.0.13-0ubuntu3.1", Arch: "amd64"},
+		model.Package{Ecosystem: "rpm", Name: "openssl", Version: "3.2.2", Arch: "x86_64"})
+
+	got, err := s.InstalledVersions(ctx, []string{"nodegroup:g1", "nodegroup:g2", "nodegroup:none"},
+		[]PackageName{{Ecosystem: "deb", Name: "openssl"}, {Ecosystem: "deb", Name: "libc6"}})
+	require.NoError(t, err)
+	require.Equal(t, map[string][]InstalledVersion{
+		"nodegroup:g1": {{PackageName{"deb", "libc6"}, "1:2.39-0ubuntu8"}, {PackageName{"deb", "openssl"}, "3.0.13-0ubuntu3"}},
+		"nodegroup:g2": {{PackageName{"deb", "openssl"}, "3.0.13-0ubuntu3.1"}},
+	}, got, "versions are epoch-prefixed as findings record them; another ecosystem's openssl is left out")
+
+	empty, err := s.InstalledVersions(ctx, nil, []PackageName{{Ecosystem: "deb", Name: "openssl"}})
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}

@@ -66,15 +66,15 @@ var hitScopes = map[string]model.ScopeKind{
 // groupHits are the node groups whose label or name contains q, case-insensitively: prefix matches
 // first, at most searchPerKind.
 func (s *Server) groupHits(ctx context.Context, q string) ([]store.JumpHit, error) {
-	groups, err := s.nodeGroups(ctx)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return nil, err
 	}
 	lq := strings.ToLower(q)
 	var prefix, inside []store.JumpHit
-	for _, g := range groups {
+	for _, g := range gs.groups {
 		label, name := strings.ToLower(g.Label), strings.ToLower(g.Name)
-		hit := store.JumpHit{Kind: "nodegroup", ID: g.ID, Label: g.Label, Detail: fmt.Sprintf("%d nodes", len(g.Members))}
+		hit := store.JumpHit{Kind: "nodegroup", ID: gs.key(g), Label: g.Label, Detail: fmt.Sprintf("%d nodes", len(g.Members))}
 		switch {
 		case strings.HasPrefix(label, lq) || strings.HasPrefix(name, lq):
 			prefix = append(prefix, hit)

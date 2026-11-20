@@ -1024,8 +1024,10 @@ type AdvisoryTimeline struct {
 
 // AgentCounts defines model for AgentCounts.
 type AgentCounts struct {
-	Disabled  int `json:"disabled"`
-	Never     int `json:"never"`
+	Disabled int `json:"disabled"`
+	Never    int `json:"never"`
+
+	// Reporting Agents reporting whose host inventory is stored.
 	Reporting int `json:"reporting"`
 	Stale     int `json:"stale"`
 }
@@ -1725,11 +1727,14 @@ type NodeGroupRow struct {
 	Counts PriorityCounts `json:"counts"`
 
 	// Drift Field differences against the largest group of the same architecture.
-	Drift         string `json:"drift"`
-	ExposedNodes  int    `json:"exposedNodes"`
-	Fixable       int    `json:"fixable"`
-	Id            string `json:"id"`
-	KernelRelease string `json:"kernelRelease"`
+	Drift        string `json:"drift"`
+	ExposedNodes int    `json:"exposedNodes"`
+	Fixable      int    `json:"fixable"`
+
+	// Gaps The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full.
+	Gaps          *[]GapCode `json:"gaps,omitempty"`
+	Id            string     `json:"id"`
+	KernelRelease string     `json:"kernelRelease"`
 
 	// Kind agent groups come from node agent inventories; nodeinfo groups from the node status.
 	Kind           NodeGroupKind `json:"kind"`
@@ -2389,7 +2394,7 @@ type ListImagePackagesParams struct {
 
 // GetNodeGroupParams defines parameters for GetNodeGroup.
 type GetNodeGroupParams struct {
-	// Compare ID of another node group to compare this group with.
+	// Compare Stable name, label or ID of another node group to compare this group with.
 	Compare *string `form:"compare,omitempty" json:"compare,omitempty"`
 }
 

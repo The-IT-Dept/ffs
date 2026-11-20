@@ -72,11 +72,11 @@ func installedExpr(a string) string {
 		THEN ` + a + `.version ELSE ` + a + `.epoch || ':' || ` + a + `.version END`
 }
 
-// ownerCoverageCTE is owner_cov: each owner's distinct in-use container digests, those catalogued
-// and those seen into in full detail.
+// ownerCoverageCTE is owner_cov: each owner's distinct in-use container digests, those seen into
+// (catalogued and matched) and those seen into in full detail.
 var ownerCoverageCTE = `owner_cov(owner_key, in_use, seen_into, cov_full) AS (SELECT oi.owner_key, count(DISTINCT oi.digest),
-		count(DISTINCT CASE WHEN i.status = 'catalogued' THEN oi.digest END),
-		count(DISTINCT CASE WHEN i.cov_class = 'full' THEN oi.digest END)
+		count(DISTINCT CASE WHEN ` + seenSQL("i", "oi.digest") + ` THEN oi.digest END),
+		count(DISTINCT CASE WHEN ` + fullSQL("i", "oi.digest") + ` THEN oi.digest END)
 		FROM owner_images oi LEFT JOIN images i ON i.digest = oi.digest WHERE ` + containerDigest("oi.digest") + ` GROUP BY oi.owner_key)`
 
 // coverageClass is the class of a coverage figure: none when nothing is seen into, full when every
@@ -400,7 +400,8 @@ type ImagePage struct {
 
 // imagesCTE is im: one row per in-use container digest of the owners in q's scope and namespaces,
 // with its image columns (pending, and repo and platform from the container, without an images
-// row), the owners running it and their open findings on it.
+// row), the owners running it and their open findings on it. A catalogued image whose first match
+// has not run yet reads as pending, not seen into.
 func imagesCTE(q ImageQuery) (string, []any, error) {
 	var w where
 	w.add(containerDigest("oi.digest"))
@@ -436,10 +437,12 @@ func imagesCTE(q ImageQuery) (string, []any, error) {
 	cnt AS (` + counts + `),
 	im0 AS (SELECT d.digest, d.workloads, coalesce(i.index_digest, '') AS index_digest,
 		coalesce(i.repo, ` + container("Repo") + `, '') AS repo, coalesce(i.platform, ` + container("Platform") + `, '') AS platform,
-		coalesce(i.status, 'pending') AS status, coalesce(i.status_reason, '') AS status_reason, coalesce(i.source, '') AS source,
+		CASE WHEN i.status = 'catalogued' AND NOT ` + matchedSQL("d.digest") + ` THEN 'pending' ELSE coalesce(i.status, 'pending') END AS status,
+		coalesce(i.status_reason, '') AS status_reason, coalesce(i.source, '') AS source,
 		coalesce(i.version_annotation, '') AS version_annotation, coalesce(i.config_user, '') AS config_user,
 		coalesce(i.coverage, '{}') AS coverage, i.catalogued_at AS catalogued_at, coalesce(i.attempts, 0) AS attempts,
-		i.quarantined_until AS quarantined_until, coalesce(i.cov_class, 'none') AS cov,
+		i.quarantined_until AS quarantined_until,
+		CASE WHEN ` + matchedSQL("d.digest") + ` THEN coalesce(i.cov_class, 'none') ELSE 'none' END AS cov,
 		coalesce(c.u, 0) AS urgent, coalesce(c.h, 0) AS high, coalesce(c.m, 0) AS medium, coalesce(c.l, 0) AS low, coalesce(c.fx, 0) AS fixable
 		FROM d LEFT JOIN images i ON i.digest = d.digest LEFT JOIN cnt c ON c.digest = d.digest),
 	im AS (SELECT *, ` + worstSQL + ` AS worst FROM im0)`
@@ -676,8 +679,9 @@ var packageSorts = map[string][]keyCol{
 }
 
 // packagesCTE is pk: one row per (ecosystem, name, installed version) of the packages of q's scope
-// digests, with the digests holding it and its open findings in scope; and so, the scope's (digest,
-// owner) pairs, which packageWorkloads counts for the rows of a page only.
+// digests, with the digests holding it and its open findings in scope (over the cluster, those on
+// container images); and so, the scope's (digest, owner) pairs, which packageWorkloads counts for
+// the rows of a page only.
 //
 // The packages are first grouped by their stored (ecosystem, name, version, epoch), which over the
 // cluster streams through the packages_explore index (055) in its order, then by installed version.
@@ -714,7 +718,10 @@ func packagesCTE(sc model.Scope) (string, []any, error) {
 	if err != nil {
 		return "", nil, err
 	}
-	inScope := ""
+	// Over the cluster, only findings on container images count: a host package or the cluster's
+	// own Kubernetes package at the same version is not one of these packages.
+	inScope := ` AND fp.fingerprint IN (SELECT fd.fingerprint FROM finding_digests fd WHERE fd.state = 'open' AND ` +
+		containerDigest("fd.digest") + `)`
 	if len(fw.conds) > 0 {
 		inScope = ` AND fp.fingerprint IN (SELECT fingerprint FROM findings` + fw.String() + `)`
 	}
@@ -979,4 +986,50 @@ func (s *Store) ImageEcosystems(ctx context.Context, digest string) ([]FacetValu
 		return nil, fmt.Errorf("store: image ecosystems: %w", err)
 	}
 	return openFacet(counts, nil, 0), nil
+}
+
+// PackageName names a package within its ecosystem.
+type PackageName struct{ Ecosystem, Name string }
+
+// InstalledVersion is the installed version of a named package in one digest.
+type InstalledVersion struct {
+	PackageName
+	Version string // epoch-prefixed exactly as findings record it
+}
+
+// installedVersionsQuery reads the installed versions of the "<ecosystem>\x1f<name>" list (the
+// second argument) in the digests of the first.
+//
+//nolint:gosec // G202: joins this package's SQL fragments; every value is a bound parameter
+var installedVersionsQuery = `SELECT DISTINCT p.digest, p.ecosystem, p.name, ` + installedExpr("p") + ` AS installed FROM packages p
+	WHERE p.digest IN (SELECT value FROM json_each(?)) AND p.ecosystem || char(31) || p.name IN (SELECT value FROM json_each(?))
+	ORDER BY p.digest, p.name, installed, p.ecosystem`
+
+// InstalledVersions returns the installed versions of the named packages in each of digests, by
+// digest, then by name and version, each once.
+func (s *Store) InstalledVersions(ctx context.Context, digests []string, names []PackageName) (map[string][]InstalledVersion, error) {
+	out := map[string][]InstalledVersion{}
+	if len(digests) == 0 || len(names) == 0 {
+		return out, nil
+	}
+	keys := make([]string, len(names))
+	for i, n := range names {
+		keys[i] = n.Ecosystem + "\x1f" + n.Name
+	}
+	rows, err := s.rdb.QueryContext(ctx, installedVersionsQuery, idList(digests), idList(keys))
+	if err != nil {
+		return nil, fmt.Errorf("store: installed versions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var (
+			digest string
+			v      InstalledVersion
+		)
+		if err := rows.Scan(&digest, &v.Ecosystem, &v.Name, &v.Version); err != nil {
+			return nil, err
+		}
+		out[digest] = append(out[digest], v)
+	}
+	return out, rows.Err()
 }

@@ -200,7 +200,7 @@ func TestFindings_StatesAndScopes(t *testing.T) {
 	require.Zero(t, placeholder.Total)
 	require.Empty(t, placeholder.Rows)
 	wantProblem(t, get(t, h, "/api/v1/findings?scope=bogus"), 400, apigen.ProblemCodeInvalidScope)
-	wantProblem(t, get(t, h, "/api/v1/findings?scope=node:missing"), 400, apigen.ProblemCodeInvalidScope)
+	wantProblem(t, get(t, h, "/api/v1/findings?scope=node:missing"), 404, apigen.ProblemCodeNotFound)
 
 	require.Equal(t, []string{"F2"}, names(t, findingsAt(t, h, "?advisory=GHSA-aaaa-bbbb-cccc").Rows), "found by alias")
 	require.Equal(t, []string{"F4", "F6"}, names(t, findingsAt(t, h, "?package=traefik").Rows))

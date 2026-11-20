@@ -206,16 +206,12 @@ func (s *Server) nodeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, er
 	case model.ScopeNamespace, model.ScopeWorkload, model.ScopeImage, model.ScopeControlPlane:
 		return nil, nil
 	}
-	state, err := s.o.Store.NodesState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	agents, err := s.agentStatuses(ctx)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if nodes == nil {
-		nodes = slices.Sorted(maps.Keys(agents))
+		nodes = slices.Sorted(maps.Keys(agents.byNode))
 	}
 	type affected struct {
 		nodes  []string
@@ -223,11 +219,7 @@ func (s *Server) nodeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, er
 	}
 	byCode := map[string]*affected{}
 	for _, n := range slices.Sorted(slices.Values(nodes)) {
-		a, ok := agents[n]
-		if !ok {
-			a = missingAgent(n, state.AgentEnabled)
-		}
-		for _, g := range a.Coverage {
+		for _, g := range agents.of(n).Coverage {
 			x := byCode[g.Code]
 			if x == nil {
 				x = &affected{detail: g.Detail}

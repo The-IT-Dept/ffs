@@ -443,10 +443,11 @@ paths:
         - in: path
           name: id
           required: true
+          description: The group's stable name, which survives package updates, or its label or ID.
           schema: {type: string}
         - in: query
           name: compare
-          description: ID of another node group to compare this group with.
+          description: Stable name, label or ID of another node group to compare this group with.
           schema: {type: string, maxLength: 200}
       responses:
         '200':
@@ -1511,6 +1512,10 @@ components:
         counts: {$ref: '#/components/schemas/PriorityCounts'}
         fixable: {type: integer}
         agents: {$ref: '#/components/schemas/AgentCounts'}
+        gaps:
+          type: array
+          description: The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full.
+          items: {$ref: '#/components/schemas/GapCode'}
         rebootPending: {type: integer}
         drift: {type: string, description: Field differences against the largest group of the same architecture.}
 
@@ -1518,7 +1523,7 @@ components:
       type: object
       required: [reporting, stale, never, disabled]
       properties:
-        reporting: {type: integer}
+        reporting: {type: integer, description: Agents reporting whose host inventory is stored.}
         stale: {type: integer}
         never: {type: integer}
         disabled: {type: integer}

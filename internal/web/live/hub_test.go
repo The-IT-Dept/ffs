@@ -38,7 +38,8 @@ func TestHub_ObserverScopes(t *testing.T) {
 	fc.Step(coalesce)
 	_, _, data = readEvent(t, r)
 	require.Equal(t, strs("findings"), data["kinds"])
-	require.Equal(t, strs("cluster", "image:sha256:x", "node:*", "nodegroup:g1"), data["scopes"])
+	require.Equal(t, strs("cluster", "image:sha256:x", "node:*", "nodegroup:*"), data["scopes"],
+		"node groups are queried by their stable names, which the digest does not carry")
 }
 
 // fakeMarks returns the next marks of a script on each call: an error entry fails that call.
