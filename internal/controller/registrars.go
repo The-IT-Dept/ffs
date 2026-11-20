@@ -3,6 +3,7 @@ package controller
 import (
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 
+	"github.com/the-it-dept/ffs/internal/agentapi"
 	"github.com/the-it-dept/ffs/internal/controller/deps"
 	"github.com/the-it-dept/ffs/internal/notify"
 	"github.com/the-it-dept/ffs/internal/notify/sinks"
@@ -21,4 +22,5 @@ var registrars = []deps.Registrar{
 	func(m manager.Manager, d deps.Deps) error { return notify.Register(m, d, sinks.New) },
 	upgrade.Register,
 	web.Register,
+	agentapi.Register,
 }
