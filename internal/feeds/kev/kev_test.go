@@ -247,3 +247,72 @@ func TestKEV_NewMatchTakesCachedKEV(t *testing.T) {
 	a, _, _ = s.GetAdvisory(ctx, "CVE-2024-30000")
 	require.Nil(t, a.KEVAdded, "not in the catalogue")
 }
+
+// datedCatalogue returns a catalogue listing each CVE ID with its date added.
+func datedCatalogue(dates map[string]string) string {
+	s := `{"vulnerabilities":[`
+	first := true
+	for id, d := range dates {
+		if !first {
+			s += ","
+		}
+		first = false
+		s += `{"cveID":"` + id + `","dateAdded":"` + d + `"}`
+	}
+	return s + `]}`
+}
+
+// TestKEV_ListedAliasSetsKEVAdded (F63): an OSV advisory that names two CVEs is stored under the
+// lower one, with the other as an alias. A KEV entry for the alias marks the advisory, through the
+// hourly sync and through a new match alike, taking the earliest date when several of its ids are
+// listed.
+func TestKEV_ListedAliasSetsKEVAdded(t *testing.T) {
+	multi := model.Advisory{ID: "GHSA-3872-f48p-pxqj", Aliases: []string{"CVE-2026-1000", "CVE-2026-2000"}, Observed: time.Now()}
+	for name, tc := range map[string]struct {
+		dates map[string]string
+		want  time.Time
+	}{
+		"alias only": {map[string]string{"CVE-2026-2000": "2026-11-18"}, time.Date(2026, 11, 18, 0, 0, 0, 0, time.UTC)},
+		"earliest":   {map[string]string{"CVE-2026-1000": "2026-11-18", "CVE-2026-2000": "2026-10-01"}, time.Date(2026, 10, 1, 0, 0, 0, 0, time.UTC)},
+	} {
+		t.Run(name+"/sync", func(t *testing.T) {
+			s := newStore(t)
+			require.NoError(t, s.UpsertAdvisory(ctx, multi))
+			canon, err := s.Canonical(ctx, "GHSA-3872-f48p-pxqj")
+			require.NoError(t, err)
+			require.Equal(t, "CVE-2026-1000", canon, "the lower CVE is canonical; the other is an alias")
+			inUse(t, s, canon)
+			h := newFeed(t, s, newServer(t, datedCatalogue(tc.dates)), t.TempDir())
+
+			require.NoError(t, h.feed.Sync(ctx))
+			require.Equal(t, [][]string{{canon}}, h.got)
+			a, _, _ := s.GetAdvisory(ctx, canon)
+			require.NotNil(t, a.KEVAdded)
+			require.True(t, a.KEVAdded.Equal(tc.want), "KEVAdded %v", a.KEVAdded)
+
+			h.got = nil
+			require.NoError(t, h.feed.Sync(ctx))
+			require.Empty(t, h.got, "unchanged on the next sync")
+		})
+		t.Run(name+"/new match", func(t *testing.T) {
+			s := newStore(t)
+			dir := t.TempDir()
+			h := newFeed(t, s, newServer(t, datedCatalogue(tc.dates)), dir)
+			require.NoError(t, h.feed.Sync(ctx)) // nothing is in use yet
+
+			eng := engine.New(engine.Options{Store: s})
+			obs, ok := any(h.feed).(engine.Observer)
+			require.True(t, ok)
+			eng.AddObserver(obs)
+			require.NoError(t, s.UpsertAdvisory(ctx, multi))
+			d := "sha256:multi"
+			require.NoError(t, eng.OnMatchDelta(ctx, match.Delta{
+				Scope:   store.MatchScope{Source: model.SourceOSV, Digests: []string{d}},
+				Matches: []model.Match{{ImageDigest: d, PackageID: "p", AdvisoryID: "CVE-2026-1000", Source: model.SourceOSV, FixState: model.FixFixed}},
+			}, model.TriggerInventoryChange))
+			a, _, _ := s.GetAdvisory(ctx, "CVE-2026-1000")
+			require.NotNil(t, a.KEVAdded, "set when the match is stored")
+			require.True(t, a.KEVAdded.Equal(tc.want), "KEVAdded %v", a.KEVAdded)
+		})
+	}
+}

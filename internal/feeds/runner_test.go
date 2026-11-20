@@ -282,3 +282,114 @@ func TestRunner_StaleAfterMap(t *testing.T) {
 	r := feeds.NewRunner(newStore(t), []feeds.Feed{a, b}, feeds.RunnerOptions{})
 	require.Equal(t, map[string]time.Duration{"a": 2 * time.Hour, "b": 24 * time.Hour}, r.StaleAfter())
 }
+
+// TestRunner_RestartRetriesFailedFeedOnBackoff (F68, #6): after a restart, a feed whose last
+// attempt failed is retried on the failure backoff from that attempt, min(Interval,
+// 1m×2^(fails−1)), not a whole Interval later; the failure count is stored and carries on. A failed
+// attempt stored by v0.0.1, which kept no count, counts as one failure.
+func TestRunner_RestartRetriesFailedFeedOnBackoff(t *testing.T) {
+	for name, tc := range map[string]struct {
+		stored    store.FeedState
+		wantFirst time.Duration
+		wantFails int
+	}{
+		"three failures": {store.FeedState{Name: "fake", LastAttempt: t0.Add(-30 * time.Second), LastError: "boom", Fails: 3},
+			4*time.Minute - 30*time.Second, 4},
+		"stored by v0.0.1": {store.FeedState{Name: "fake", LastAttempt: t0.Add(-30 * time.Second), LastError: "boom"},
+			30 * time.Second, 2},
+		"capped at the interval": {store.FeedState{Name: "fake", LastAttempt: t0.Add(-30 * time.Second), LastError: "boom", Fails: 12},
+			24*time.Hour - 30*time.Second, 13},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newStore(t)
+			clk := newFakeTimer()
+			require.NoError(t, st.PutFeedState(ctx, tc.stored))
+			f := &fakeFeed{name: "fake", interval: 24 * time.Hour, staleAfter: 72 * time.Hour,
+				sync: func(context.Context) error { return errors.New("still down") }}
+			r := feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now, After: clk.After})
+			startRunner(t, r)
+
+			d := clk.nextAsk(t)
+			require.Equal(t, tc.wantFirst, d)
+			require.Zero(t, f.calls.Load())
+			clk.Advance(d)
+			next := clk.nextAsk(t)
+			require.Equal(t, int32(1), f.calls.Load())
+			require.Equal(t, min(24*time.Hour, time.Minute<<(tc.wantFails-1)), next, "the backoff carries on")
+			s, err := st.FeedState(ctx, "fake")
+			require.NoError(t, err)
+			require.Equal(t, tc.wantFails, s.Fails)
+		})
+	}
+}
+
+// TestRunner_NeverSyncedStaleAcrossRestarts (F67): the first attempt of a feed that never succeeded
+// is stored, and after a restart the feed is stale StaleAfter from it, not from the restart.
+func TestRunner_NeverSyncedStaleAcrossRestarts(t *testing.T) {
+	st := newStore(t)
+	clk := newFakeTimer()
+	f := &fakeFeed{name: "fake", interval: time.Hour, staleAfter: time.Hour,
+		sync: func(context.Context) error { return errors.New("unreachable") }}
+	require.Error(t, feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now}).SyncNow(ctx, "fake"))
+	s, err := st.FeedState(ctx, "fake")
+	require.NoError(t, err)
+	require.True(t, s.FirstAttempt.Equal(t0), "FirstAttempt %v", s.FirstAttempt)
+	require.Equal(t, 1, s.Fails)
+
+	clk.Advance(50 * time.Minute) // the controller restarts
+	started := make(chan struct{}, 1)
+	f.sync = func(ctx context.Context) error {
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	r := feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now, After: clk.After})
+	startRunner(t, r)
+	select {
+	case <-started: // the stored state is read before the retry starts
+	case <-time.After(10 * time.Second):
+		t.Fatal("the failed feed was not retried")
+	}
+	require.Empty(t, r.Stale())
+	clk.Advance(11 * time.Minute)
+	require.Equal(t, []string{"fake"}, r.Stale(), "an hour after the first attempt, though 11 minutes after the restart")
+	s, err = st.FeedState(ctx, "fake")
+	require.NoError(t, err)
+	require.True(t, s.FirstAttempt.Equal(t0))
+}
+
+// TestRunner_CancelledSyncNotRecorded (F54): a sync cut short by shutdown is not a failure: the
+// stored attempt, error and failure count stay as they were.
+func TestRunner_CancelledSyncNotRecorded(t *testing.T) {
+	st := newStore(t)
+	clk := newFakeTimer()
+	ok := atomic.Bool{}
+	ok.Store(true)
+	started := make(chan struct{}, 1)
+	f := &fakeFeed{name: "fake", interval: time.Hour, staleAfter: 24 * time.Hour, sync: func(ctx context.Context) error {
+		if ok.Load() {
+			return nil
+		}
+		started <- struct{}{}
+		<-ctx.Done()
+		return ctx.Err()
+	}}
+	r := feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now})
+	require.NoError(t, r.SyncNow(ctx, "fake"))
+	before, err := st.FeedState(ctx, "fake")
+	require.NoError(t, err)
+
+	ok.Store(false)
+	clk.Advance(time.Minute)
+	c, cancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- r.SyncNow(c, "fake") }()
+	<-started
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+	after, err := st.FeedState(ctx, "fake")
+	require.NoError(t, err)
+	require.Equal(t, before, after)
+	require.Empty(t, after.LastError)
+	require.Zero(t, after.Fails)
+}

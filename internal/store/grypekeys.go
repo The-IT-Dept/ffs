@@ -72,6 +72,18 @@ func (s *Store) LiveDigests(ctx context.Context) ([]string, error) {
 	return queryAll(ctx, s.rdb, scanString, `SELECT digest FROM owner_images UNION SELECT digest FROM candidates ORDER BY digest`)
 }
 
+// CataloguedLiveSBOMs counts the live digests (LiveDigests) with a catalogued SBOM, other than the
+// synthetic Kubernetes and runtime ones: the images and node groups a full Grype DB re-match reads.
+func (s *Store) CataloguedLiveSBOMs(ctx context.Context) (int, error) {
+	var n int
+	err := s.rdb.QueryRowContext(ctx, `
+		WITH live(digest) AS (SELECT digest FROM owner_images UNION SELECT digest FROM candidates)
+		SELECT COUNT(*) FROM live l JOIN images i ON i.digest = l.digest
+		WHERE i.status = ? AND l.digest NOT LIKE 'k8s:%' AND l.digest NOT LIKE 'runtime:%'`,
+		string(model.ImageCatalogued)).Scan(&n)
+	return n, err
+}
+
 // DigestsAwaitingGrype returns the sorted live (LiveDigests), catalogued, non-synthetic digests a
 // Grype DB built at built must re-match even though its diff did not touch their packages:
 //   - those with no grype search keys, catalogued while no DB was loaded;

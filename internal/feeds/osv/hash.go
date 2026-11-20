@@ -11,35 +11,60 @@ import (
 	"time"
 )
 
-// AffectedHash returns the hex sha256 of the parts of an OSV record that decide what it matches:
-// its affected entries as canonical JSON (object keys sorted, numbers kept verbatim), its sorted
-// aliases and its withdrawn time. published and modified are not part of it, so a record whose
-// only change is a timestamp hashes the same.
+// HashVersion names the AffectedHash recipe. Records cached under another version are rehashed
+// silently (see Feed.rehash) before anything compares hashes, so a change to the recipe does not
+// look like a change to every record and re-match the cluster.
+const HashVersion = "2"
+
+// AffectedHash returns the hex sha256 of the parts of an OSV record that decide what it matches and
+// how its findings are rated: its affected entries as canonical JSON (object keys sorted, numbers
+// kept verbatim), its sorted aliases, its withdrawn time, its top-level severity (CVSS vectors and
+// the Ubuntu priority) and its database_specific.severity (the GHSA rating). published and modified
+// are not part of it, so a record whose only change is a timestamp hashes the same; a rating-only
+// change does not.
 func AffectedHash(raw []byte) (string, error) {
 	var r struct {
-		Affected  json.RawMessage `json:"affected"`
-		Aliases   []string        `json:"aliases"`
-		Withdrawn string          `json:"withdrawn"`
+		Affected         json.RawMessage `json:"affected"`
+		Aliases          []string        `json:"aliases"`
+		Withdrawn        string          `json:"withdrawn"`
+		Severity         json.RawMessage `json:"severity"`
+		DatabaseSpecific struct {
+			Severity json.RawMessage `json:"severity"`
+		} `json:"database_specific"`
 	}
 	if err := json.Unmarshal(raw, &r); err != nil {
 		return "", fmt.Errorf("osv: record: %w", err)
 	}
-	var affected any
-	if len(r.Affected) > 0 {
-		d := json.NewDecoder(bytes.NewReader(r.Affected))
-		d.UseNumber()
-		if err := d.Decode(&affected); err != nil {
-			return "", fmt.Errorf("osv: record affected: %w", err)
+	parts := make([]string, 0, 3)
+	for _, f := range []struct {
+		name string
+		raw  json.RawMessage
+	}{{"affected", r.Affected}, {"severity", r.Severity}, {"database_specific.severity", r.DatabaseSpecific.Severity}} {
+		c, err := canonicalJSON(f.raw)
+		if err != nil {
+			return "", fmt.Errorf("osv: record %s: %w", f.name, err)
 		}
-	}
-	canonical, err := json.Marshal(affected)
-	if err != nil {
-		return "", fmt.Errorf("osv: record affected: %w", err)
+		parts = append(parts, c)
 	}
 	aliases := slices.Clone(r.Aliases)
 	slices.Sort(aliases)
-	sum := sha256.Sum256([]byte(string(canonical) + "\n" + strings.Join(aliases, ",") + "\n" + r.Withdrawn))
+	// v1 hashed affected, aliases and withdrawn; v2 appends the two ratings.
+	sum := sha256.Sum256([]byte(parts[0] + "\n" + strings.Join(aliases, ",") + "\n" + r.Withdrawn + "\n" + parts[1] + "\n" + parts[2]))
 	return hex.EncodeToString(sum[:]), nil
+}
+
+// canonicalJSON re-encodes raw with object keys sorted and numbers kept verbatim; absent is "null".
+func canonicalJSON(raw json.RawMessage) (string, error) {
+	var v any
+	if len(raw) > 0 {
+		d := json.NewDecoder(bytes.NewReader(raw))
+		d.UseNumber()
+		if err := d.Decode(&v); err != nil {
+			return "", err
+		}
+	}
+	out, err := json.Marshal(v)
+	return string(out), err
 }
 
 // recordInfo is the part of an OSV record the feed reads: its identity, modified time, and what

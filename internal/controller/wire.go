@@ -139,7 +139,8 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine, ev *eol.Evaluator) (fs []feeds.Feed, grypeFeed *grypedb.Feed) {
 	hc := feeds.NewHTTPClient(version.UserAgent())
 	if c := cfg.Feeds.GrypeDB; c.Enabled {
-		grypeFeed = grypedb.New(grypedb.Options{Config: c, DataDir: cfg.DataDir, Store: st, HTTP: hc, Handler: eng.OnGrypeDB})
+		grypeFeed = grypedb.New(grypedb.Options{Config: c.Feed(), DataDir: cfg.DataDir, Store: st, HTTP: hc, Handler: eng.OnGrypeDB,
+			Diff: grypedb.ExecDiffer(grypedb.DiffNice), DiffMinImages: c.DiffMinImages})
 		fs = append(fs, grypeFeed)
 	}
 	if c := cfg.Feeds.OSV; c.Enabled {

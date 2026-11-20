@@ -3,13 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/the-it-dept/ffs/internal/feeds/grypedb"
+	"github.com/the-it-dept/ffs/internal/feeds/grypedb/grypedbtest"
 )
 
 func TestVersionCommand(t *testing.T) {
@@ -124,4 +130,39 @@ func TestAgentCmd_CheckExitsWithItsMessage(t *testing.T) {
 	cmd = newRootCmd()
 	cmd.SetArgs([]string{"agent", "--distribution=auto"})
 	require.EqualError(t, cmd.ExecuteContext(context.Background()), `unknown distribution "auto": want containerd, k3s, rke2 or crio`)
+}
+
+// TestGrypeDBDiffCmd (#7): the hidden subcommand the controller re-executes diffs two builds and
+// writes the changed package keys as JSON.
+func TestGrypeDBDiffCmd(t *testing.T) {
+	root := newRootCmd()
+	cmd, _, err := root.Find([]string{grypedb.DiffCommand})
+	require.NoError(t, err)
+	require.Equal(t, grypedb.DiffCommand, cmd.Name())
+	require.True(t, cmd.Hidden)
+	var help bytes.Buffer
+	root.SetOut(&help)
+	root.SetArgs([]string{"--help"})
+	require.NoError(t, root.Execute())
+	require.NotContains(t, help.String(), grypedb.DiffCommand)
+
+	built := time.Date(2026, 11, 18, 18, 19, 44, 0, time.UTC)
+	oldDir := filepath.Join(t.TempDir(), "old")
+	require.NoError(t, os.CopyFS(oldDir, os.DirFS(grypedbtest.BuildDB(t, built, "**/debian-12/cve-2022-38178.json"))))
+	newDir := grypedbtest.BuildDB(t, built.Add(24*time.Hour))
+	out := filepath.Join(t.TempDir(), "keys.json")
+	root = newRootCmd()
+	root.SetArgs([]string{grypedb.DiffCommand, "--old", oldDir, "--new", newDir, "--out", out})
+	require.NoError(t, root.ExecuteContext(context.Background()))
+	data, err := os.ReadFile(out) //nolint:gosec // G304: test output path
+	require.NoError(t, err)
+	var keys []grypedb.PackageKey
+	require.NoError(t, json.Unmarshal(data, &keys))
+	require.Contains(t, keys, grypedb.PackageKey{Ecosystem: "deb", Name: "firefox-esr"})
+
+	root = newRootCmd()
+	root.SetOut(io.Discard)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{grypedb.DiffCommand, "--old", oldDir})
+	require.ErrorContains(t, root.ExecuteContext(context.Background()), "required flag")
 }

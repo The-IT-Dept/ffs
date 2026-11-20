@@ -29,6 +29,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `feeds.grypedb.url` | `https://grype.anchore.io/databases/v6/latest.json` | The database's `latest.json` URL. The download is checked against the sha256 it lists. |
 | `feeds.grypedb.interval` | `1h` | How often to check for a new database. New builds appear about daily. |
 | `feeds.grypedb.staleAfter` | `48h` | Age after which the feed is reported stale. Must be greater than `interval`. |
+| `feeds.grypedb.diffMinImages` | `1000` | Catalogued SBOMs (images and node groups) from which a new database is diffed against the current one, so that only the images whose packages changed are re-matched. The diff runs in a separate process at nice 10 and takes minutes of CPU. With fewer SBOMs, every one is re-matched instead, which costs less. `0` always diffs. Whatever this is set to, every SBOM is re-matched once a week. |
 | `feeds.osv.enabled` | `true` | Use OSV.dev, the fast path for new and changed advisories. |
 | `feeds.osv.url` | `https://osv-vulnerabilities.storage.googleapis.com` | Base URL of the OSV bucket. A Cloud Storage bucket (`https://<bucket>.storage.googleapis.com` or `https://storage.googleapis.com/<bucket>`) is read through the Cloud Storage JSON API, because the bucket host's cache can serve objects up to an hour old. Any other URL is a mirror, read as `<url>/<ecosystem>/<file>`. |
 | `feeds.osv.interval` | `5m` | How often to poll for changed records, per ecosystem present in the inventory. |

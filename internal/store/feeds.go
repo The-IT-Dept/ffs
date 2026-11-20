@@ -15,17 +15,22 @@ type FeedState struct {
 	LastSuccess, LastAttempt time.Time
 	LastError                string
 	Meta                     map[string]string
+	// FirstAttempt is when the feed's first sync started, kept across restarts: a feed that never
+	// succeeded is stale measured from it. Fails counts the syncs that failed since the last success.
+	FirstAttempt time.Time
+	Fails        int
 }
 
 // FeedState returns the stored state of the named feed, or FeedState{Name: name} when unknown.
 func (s *Store) FeedState(ctx context.Context, name string) (FeedState, error) {
 	st := FeedState{Name: name}
 	var (
-		success, attempt sql.NullInt64
-		meta             string
+		success, attempt, first sql.NullInt64
+		meta                    string
 	)
-	err := s.rdb.QueryRowContext(ctx, `SELECT watermark, last_success, last_attempt, last_error, meta FROM feeds WHERE name = ?`, name).
-		Scan(&st.Watermark, &success, &attempt, &st.LastError, &meta)
+	err := s.rdb.QueryRowContext(ctx, `SELECT watermark, last_success, last_attempt, last_error, meta, first_attempt, fails
+		FROM feeds WHERE name = ?`, name).
+		Scan(&st.Watermark, &success, &attempt, &st.LastError, &meta, &first, &st.Fails)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FeedState{Name: name}, nil
 	}
@@ -34,6 +39,7 @@ func (s *Store) FeedState(ctx context.Context, name string) (FeedState, error) {
 	}
 	st.LastSuccess = fromNanos(success)
 	st.LastAttempt = fromNanos(attempt)
+	st.FirstAttempt = fromNanos(first)
 	if err := json.Unmarshal([]byte(meta), &st.Meta); err != nil {
 		return FeedState{}, fmt.Errorf("store: feed %s meta: %w", name, err)
 	}
@@ -49,8 +55,9 @@ func (s *Store) PutFeedState(ctx context.Context, st FeedState) error {
 			return err
 		}
 	}
-	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO feeds(name, watermark, last_success, last_attempt, last_error, meta)
-		VALUES(?, ?, ?, ?, ?, ?)`, st.Name, st.Watermark, nanos(st.LastSuccess), nanos(st.LastAttempt), st.LastError, meta)
+	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO feeds(name, watermark, last_success, last_attempt, last_error, meta,
+		first_attempt, fails) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		st.Name, st.Watermark, nanos(st.LastSuccess), nanos(st.LastAttempt), st.LastError, meta, nanos(st.FirstAttempt), st.Fails)
 	return err
 }
 
@@ -112,6 +119,139 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
 		VALUES(?, ?, ?, ?, ?, ?)`, eco, id, nanos(modified), affectedHash, zstdEncode(raw), obs)
 	return changed, err
+}
+
+// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: enough
+// to keep the transactions few, few enough that 4 MiB records cannot hold much memory.
+const rehashPage = 64
+
+// RehashOSVRecords recomputes the affected hash of every cached OSV record with hash and stores it,
+// rehashPage records at a time, and returns how many hashes changed. Nothing else about a record
+// changes: not its raw, modified or observation time, and nothing is reported as changed. A record
+// hash cannot read keeps its stored hash.
+func (s *Store) RehashOSVRecords(ctx context.Context, hash func(raw []byte) (string, error)) (int, error) {
+	type rec struct {
+		eco, id, hash string
+		raw           []byte
+	}
+	var (
+		changed           int
+		afterEco, afterID string
+	)
+	for {
+		page, err := queryAll(ctx, s.rdb, func(r scanner) (rec, error) {
+			var (
+				v   rec
+				zst []byte
+			)
+			if err := r.Scan(&v.eco, &v.id, &v.hash, &zst); err != nil {
+				return v, err
+			}
+			raw, err := zstdDecode(zst)
+			v.raw = raw
+			return v, err
+		}, `SELECT ecosystem, id, affected_hash, raw_zst FROM osv_records WHERE (ecosystem, id) > (?, ?)
+			ORDER BY ecosystem, id LIMIT ?`, afterEco, afterID, rehashPage)
+		if err != nil {
+			return changed, err
+		}
+		if len(page) == 0 {
+			return changed, nil
+		}
+		afterEco, afterID = page[len(page)-1].eco, page[len(page)-1].id
+		var updates []rec
+		for _, r := range page {
+			if h, err := hash(r.raw); err == nil && h != r.hash {
+				updates = append(updates, rec{eco: r.eco, id: r.id, hash: h})
+			}
+		}
+		if len(updates) > 0 {
+			err = s.inTx(ctx, func(tx *sql.Tx) error {
+				for _, u := range updates {
+					if _, err := tx.ExecContext(ctx, `UPDATE osv_records SET affected_hash = ? WHERE ecosystem = ? AND id = ?`,
+						u.hash, u.eco, u.id); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return changed, err
+			}
+			changed += len(updates)
+		}
+		if len(page) < rehashPage {
+			return changed, nil
+		}
+	}
+}
+
+// OSVListed returns the rows of bucket's modified_id.csv recorded by ReplaceOSVListed: record id to
+// its listed modified time.
+func (s *Store) OSVListed(ctx context.Context, bucket string) (map[string]time.Time, error) {
+	type row struct {
+		id string
+		at int64
+	}
+	rows, err := queryAll(ctx, s.rdb, func(r scanner) (row, error) {
+		var v row
+		err := r.Scan(&v.id, &v.at)
+		return v, err
+	}, `SELECT id, modified FROM osv_listed WHERE bucket = ?`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]time.Time, len(rows))
+	for _, r := range rows {
+		out[r.id] = time.Unix(0, r.at).UTC()
+	}
+	return out, nil
+}
+
+// ReplaceOSVListed replaces the rows recorded for bucket with listed (record id to listed modified
+// time), in one transaction.
+func (s *Store) ReplaceOSVListed(ctx context.Context, bucket string, listed map[string]time.Time) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM osv_listed WHERE bucket = ?`, bucket); err != nil {
+			return err
+		}
+		if len(listed) == 0 {
+			return nil
+		}
+		ins, err := tx.PrepareContext(ctx, `INSERT INTO osv_listed(bucket, id, modified) VALUES(?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = ins.Close() }()
+		for id, at := range listed {
+			if _, err := ins.ExecContext(ctx, bucket, id, at.UTC().UnixNano()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// OSVRecordsModified returns the cached records of eco whose stored modified time is at or after
+// since: record id to that time.
+func (s *Store) OSVRecordsModified(ctx context.Context, eco string, since time.Time) (map[string]time.Time, error) {
+	type row struct {
+		id string
+		at int64
+	}
+	rows, err := queryAll(ctx, s.rdb, func(r scanner) (row, error) {
+		var v row
+		err := r.Scan(&v.id, &v.at)
+		return v, err
+	}, `SELECT id, modified FROM osv_records WHERE ecosystem = ? AND modified >= ?`, eco, since.UTC().UnixNano())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]time.Time, len(rows))
+	for _, r := range rows {
+		out[r.id] = time.Unix(0, r.at).UTC()
+	}
+	return out, nil
 }
 
 // OSVRecordsObserved returns, for each of ids cached in any bucket, the earliest time ffs observed

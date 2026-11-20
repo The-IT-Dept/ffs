@@ -36,14 +36,18 @@ import (
 // DefaultURL is the release asset base used when Config.URL is empty.
 const DefaultURL = "https://github.com/CVEProject/cvelistV5/releases/download"
 
+// maxZipBytes bounds a delta zip download; a bigger one is skipped (see Sync). Daily deltas are a
+// few megabytes. A variable so tests can lower it.
+var maxZipBytes int64 = 64 << 20
+
 const (
-	maxZipBytes         = 64 << 20
 	maxRecordBytes      = 2 << 20
 	handlerChunk        = 500
 	defaultBackfillDays = 30
-	// overlap re-reads records updated just before the watermark: a delta cut at HH:00 can miss a
-	// record committed in the minutes around it.
-	overlap = 5 * time.Minute
+	// overlap re-reads records updated in the hour before the watermark: a delta cut at HH:00
+	// lists the records committed by then, and cvelistV5's sync commits a record minutes after its
+	// dateUpdated. Those already taken are recognised by their stored Modified time (see ingest).
+	overlap = time.Hour
 	// endOfDayGrace is how long after a day ends the feed waits for its end-of-day delta before
 	// accepting what the hourly deltas had. The release normally appears within the hour.
 	endOfDayGrace = 24 * time.Hour
@@ -103,13 +107,14 @@ func (f *Feed) Interval() time.Duration { return f.o.Config.Interval }
 func (f *Feed) StaleAfter() time.Duration { return f.o.Config.StaleAfter }
 
 // Sync reads the deltas from the watermark's day to today, stores the records updated after the
-// watermark (less a 5-minute overlap) and hands their IDs, with any left pending, to the handler.
+// watermark (less a 1-hour overlap) and hands their IDs, with any left pending, to the handler.
 // The watermark becomes the cutoff of the newest delta read: the end of a past day, or the hour of
 // today's delta. A past day whose end-of-day delta is not out yet stops the walk at that day's
 // latest hourly delta, so its last hours are read again once the release appears, unless the day
 // ended more than a day ago. Records and the new watermark are stored before the handler runs, with
 // the IDs pending, so a handler failure redelivers them without downloading again. A failed
-// download keeps what came before it.
+// download keeps what came before it. A delta over the size limit is logged, counted in
+// ffs_feed_skipped_total and passed over, so one oversized day cannot hold the feed back for good.
 func (f *Feed) Sync(ctx context.Context) error {
 	st, err := f.o.Store.FeedState(ctx, feeds.NameCVEList)
 	if err != nil {
@@ -139,12 +144,16 @@ func (f *Feed) Sync(ctx context.Context) error {
 			syncErr = err
 			break
 		}
-		if got.body != nil {
-			taken, err := f.ingest(ctx, got.body, wm.Add(-overlap))
-			for _, id := range taken {
-				ids[id] = true
+		if got.tooLarge {
+			logr.FromContextOrDiscard(ctx).Error(nil, "cvelistV5 delta is over the size limit; skipping it",
+				"url", got.url, "limitBytes", maxZipBytes)
+			feeds.Skipped.WithLabelValues(feeds.NameCVEList, feeds.SkipTooLarge).Inc()
+			if got.cutoff.After(covered) {
+				covered = got.cutoff
 			}
-			if err != nil {
+		}
+		if got.body != nil {
+			if err := f.ingest(ctx, &st, ids, got.body, wm); err != nil {
 				syncErr = fmt.Errorf("cvelist: %s: %w", got.url, err)
 				break
 			}
@@ -183,9 +192,10 @@ func (f *Feed) Sync(ctx context.Context) error {
 
 // dayDelta is the delta read for one day.
 type dayDelta struct {
-	body   []byte    // nil when nothing newer than the watermark was found
-	url    string    // where body came from
-	cutoff time.Time // the time body covers the day up to
+	body     []byte    // nil when nothing newer than the watermark was found, or tooLarge
+	url      string    // where body came from
+	cutoff   time.Time // the time body covers the day up to
+	tooLarge bool      // the delta at url is over maxZipBytes and was not read
 	// missingEndOfDay reports a past day whose end-of-day delta is not published.
 	missingEndOfDay bool
 }
@@ -203,10 +213,12 @@ func (f *Feed) fetchDay(ctx context.Context, d, wm, now time.Time) (dayDelta, er
 		}
 		url := fmt.Sprintf("%s/cve_%s_at_end_of_day/%s_delta_CVEs_at_end_of_day.zip", f.base, date, date)
 		body, err := f.get(ctx, url)
-		if err == nil {
+		switch {
+		case err == nil:
 			return dayDelta{body: body, url: url, cutoff: d.Add(day)}, nil
-		}
-		if !errors.Is(err, feeds.ErrNotFound) {
+		case errors.Is(err, feeds.ErrTooLarge):
+			return dayDelta{url: url, cutoff: d.Add(day), tooLarge: true}, nil
+		case !errors.Is(err, feeds.ErrNotFound):
 			return out, err
 		}
 		out.missingEndOfDay, last = true, 23
@@ -218,10 +230,13 @@ func (f *Feed) fetchDay(ctx context.Context, d, wm, now time.Time) (dayDelta, er
 		}
 		url := fmt.Sprintf("%s/cve_%s_%02d00Z/%s_delta_CVEs_at_%02d00Z.zip", f.base, date, h, date, h)
 		body, err := f.get(ctx, url)
-		if errors.Is(err, feeds.ErrNotFound) {
+		switch {
+		case errors.Is(err, feeds.ErrNotFound):
 			continue
-		}
-		if err != nil {
+		case errors.Is(err, feeds.ErrTooLarge):
+			out.url, out.cutoff, out.tooLarge = url, cutoff, true
+			return out, nil
+		case err != nil:
 			return out, err
 		}
 		out.body, out.url, out.cutoff = body, url, cutoff
@@ -241,20 +256,47 @@ func (f *Feed) get(ctx context.Context, url string) ([]byte, error) {
 	return resp.Body, nil
 }
 
-// ingest stores the records of a delta zip updated after since (or with no update time) and
-// returns their IDs. Entries other than deltaCves/CVE-*.json of at most 2 MiB, records that do not
-// parse and records whose ID is not their file name are skipped.
-func (f *Feed) ingest(ctx context.Context, body []byte, since time.Time) ([]string, error) {
+// ingest stores the records of a delta zip that read selects and adds their IDs to ids. The IDs
+// are stored as pending, with every other ID in ids, before any record is: a record ingest stores
+// is then handed off even if the Sync ends before the next state write, and the overlap check of
+// the next Sync (see read) cannot pass it over unhanded.
+func (f *Feed) ingest(ctx context.Context, st *store.FeedState, ids map[string]bool, body []byte, wm time.Time) error {
+	recs, err := f.read(ctx, body, wm)
+	if err != nil || len(recs) == 0 {
+		return err
+	}
+	for _, rec := range recs {
+		ids[rec.ID] = true
+	}
+	feeds.SetPending(st, slices.Sorted(maps.Keys(ids)))
+	if err := f.o.Store.PutFeedState(ctx, *st); err != nil {
+		return err
+	}
+	for _, rec := range recs {
+		if err := f.put(ctx, rec); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// read returns the records of a delta zip to take in: those updated after wm less the overlap, or
+// with no update time. A record of the overlap (updated after wm less the overlap but not after wm)
+// is passed over when its advisory is stored with that update time as its Modified: a previous Sync
+// took it in. Entries other than deltaCves/CVE-*.json of at most 2 MiB, records that do not parse
+// and records whose ID is not their file name are skipped.
+func (f *Feed) read(ctx context.Context, body []byte, wm time.Time) ([]Record, error) {
+	since := wm.Add(-overlap)
 	// Insecure entry names are not an error here: entryName admits only deltaCves/CVE-*.json.
 	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
 	if err != nil && !errors.Is(err, zip.ErrInsecurePath) {
 		return nil, err
 	}
 	log := logr.FromContextOrDiscard(ctx)
-	var ids []string
+	var recs []Record
 	for _, zf := range zr.File {
 		if err := ctx.Err(); err != nil {
-			return ids, err
+			return nil, err
 		}
 		m := entryName.FindStringSubmatch(zf.Name)
 		if m == nil || !zf.Mode().IsRegular() {
@@ -266,7 +308,7 @@ func (f *Feed) ingest(ctx context.Context, body []byte, since time.Time) ([]stri
 			continue
 		}
 		if err != nil {
-			return ids, fmt.Errorf("%s: %w", zf.Name, err)
+			return nil, fmt.Errorf("%s: %w", zf.Name, err)
 		}
 		rec, err := ParseRecord(raw)
 		if err == nil && rec.ID != m[1] {
@@ -279,12 +321,26 @@ func (f *Feed) ingest(ctx context.Context, body []byte, since time.Time) ([]stri
 		if !rec.Updated.IsZero() && !rec.Updated.After(since) {
 			continue
 		}
-		if err := f.put(ctx, rec); err != nil {
-			return ids, err
+		if !rec.Updated.IsZero() && !rec.Updated.After(wm) {
+			taken, err := f.taken(ctx, rec)
+			if err != nil {
+				return nil, err
+			}
+			if taken {
+				continue
+			}
 		}
-		ids = append(ids, rec.ID)
+		recs = append(recs, rec)
 	}
-	return ids, nil
+	return recs, nil
+}
+
+// taken reports whether rec's advisory is stored with rec's update time as its Modified: this
+// version of the record was taken in already. An OSV record of the same advisory can have set
+// another Modified since; the record is then taken again, which is harmless.
+func (f *Feed) taken(ctx context.Context, rec Record) (bool, error) {
+	a, ok, err := f.o.Store.GetAdvisory(ctx, rec.ID)
+	return ok && a.Modified.Equal(rec.Updated), err
 }
 
 // put stores the advisory of rec and, per mapped product, its affected ranges (entries naming the

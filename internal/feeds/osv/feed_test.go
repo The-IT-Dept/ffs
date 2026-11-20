@@ -468,7 +468,15 @@ func TestOSVSync_RangeReadsStopAtWatermark(t *testing.T) {
 		}
 	}
 	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...)})
-	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-50 * time.Second)), "setdiff": ts(now)})
+	wm := now.Add(-50 * time.Second)
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(wm), "setdiff": ts(now), "listed.PyPI": ts(now)})
+	overlap := map[string]time.Time{} // the hour below the watermark, which earlier polls took in
+	for _, r := range rows {
+		if !r.ts.After(wm) && r.ts.After(wm.Add(-time.Hour)) {
+			overlap[r.id] = r.ts
+		}
+	}
+	require.NoError(t, e.st.ReplaceOSVListed(ctx, "PyPI", overlap))
 
 	require.NoError(t, e.feed().Sync(ctx))
 	require.Equal(t, []string{"bytes=0-262143"}, e.srv.rangesOf("PyPI"))
@@ -1391,3 +1399,235 @@ func TestOSVBootstrap_ZipBehindListing(t *testing.T) {
 	require.Contains(t, string(e.sink.lastDelivered(t, "GO-2026-0001").Raw), `"fixed":"1.22.6"`)
 	require.Equal(t, ts(tNew), e.meta(t)["wm.Go"])
 }
+
+// rated returns a PyPI GHSA record rated ghsa (database_specific.severity) with a top-level
+// severity entry of type Ubuntu scored ubuntu, fixed in 1.2.3.
+func rated(id, ghsa, ubuntu string, modified time.Time) []byte {
+	return fmt.Appendf(nil, `{"id":%q,"modified":%q,"aliases":["CVE-2026-%s"],"severity":[{"type":"Ubuntu","score":%q}],`+
+		`"database_specific":{"severity":%q},"affected":[{"package":{"ecosystem":"PyPI","name":"x-%s"},`+
+		`"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.3"}]}]}]}`,
+		id, modified.UTC().Format(time.RFC3339Nano), id, ubuntu, ghsa, id)
+}
+
+// TestAffectedHash_IncludesRatings (F64): the GHSA rating and the top-level severity (the Ubuntu
+// priority, CVSS vectors) are part of the hash, so a rating-only update is a change.
+func TestAffectedHash_IncludesRatings(t *testing.T) {
+	hash := func(raw []byte) string {
+		t.Helper()
+		h, err := osv.AffectedHash(raw)
+		require.NoError(t, err)
+		return h
+	}
+	base := hash(rated("GHSA-1", "MODERATE", "medium", now))
+	require.Equal(t, base, hash(rated("GHSA-1", "MODERATE", "medium", now.Add(time.Hour))), "timestamps still do not count")
+	require.NotEqual(t, base, hash(rated("GHSA-1", "HIGH", "medium", now)), "GHSA rating")
+	require.NotEqual(t, base, hash(rated("GHSA-1", "MODERATE", "high", now)), "Ubuntu priority")
+}
+
+// TestOSVSync_RatingOnlyChangeDelivered (F64): a record whose only change is its rating is handed
+// off, so findings take the new vendor severity without waiting for the weekly full re-match.
+func TestOSVSync_RatingOnlyChangeDelivered(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-10*time.Minute)
+	records := map[string][]byte{}
+	var rows []row
+	for _, id := range []string{"GHSA-a", "GHSA-b", "GHSA-c"} {
+		e.cache(t, "PyPI", id, t0, rated(id, "MODERATE", "medium", t0))
+		records[id] = rated(id, "MODERATE", "medium", t1)
+		rows = append(rows, row{t1, id})
+	}
+	records["GHSA-a"] = rated("GHSA-a", "HIGH", "medium", t1)
+	records["GHSA-b"] = rated("GHSA-b", "MODERATE", "high", t1)
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "hashver": osv.HashVersion})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []string{"PyPI/GHSA-a", "PyPI/GHSA-b"}, e.sink.keys())
+}
+
+// TestOSVSync_HashVersionUpgradeIsSilent (F64): records cached under the previous hash recipe are
+// rehashed on the first sync, without handing anything off, so the upgrade does not re-match the
+// cluster; their raw and observation times stay as they were.
+func TestOSVSync_HashVersionUpgradeIsSilent(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-10*time.Minute)
+	records := map[string][]byte{}
+	var (
+		rows []row
+		ids  []string
+	)
+	for i := range 150 { // more than one rehash page
+		id := fmt.Sprintf("GHSA-%03d", i)
+		ids = append(ids, id)
+		_, err := e.st.PutOSVRecordAt(ctx, "PyPI", id, t0, "v1-"+id, rated(id, "HIGH", "high", t0), t0) // an old recipe's hash
+		require.NoError(t, err)
+		records[id] = rated(id, "HIGH", "high", t1) // a timestamp-only change
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now)}) // no "hashver": cached by v0.0.1
+	before, err := e.st.OSVRecordsObserved(ctx, ids)
+	require.NoError(t, err)
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Empty(t, e.sink.all(), "an upgrade hands nothing off")
+	require.Equal(t, osv.HashVersion, e.meta(t)["hashver"])
+	after, err := e.st.OSVRecordsObserved(ctx, ids)
+	require.NoError(t, err)
+	require.Equal(t, before, after, "observation times are kept")
+	raw := rated("GHSA-007", "HIGH", "high", t1)
+	h, err := osv.AffectedHash(raw)
+	require.NoError(t, err)
+	changed, err := e.st.PutOSVRecord(ctx, "PyPI", "GHSA-007", t1, h, raw)
+	require.NoError(t, err)
+	require.False(t, changed, "the stored hash is the current recipe's")
+
+	// a later rating change is still delivered
+	records["GHSA-007"] = rated("GHSA-007", "CRITICAL", "high", now)
+	rows = append([]row{{now, "GHSA-007"}}, slices.DeleteFunc(rows, func(r row) bool { return r.id == "GHSA-007" })...)
+	e.srv.set("PyPI", &fakeBucket{gen: "2", csv: csvOf(rows...), records: records})
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []string{"PyPI/GHSA-007"}, e.sink.keys())
+}
+
+// TestOSVSync_OverlapTakesLateListedRecords (F65): modified_id.csv can list a record after rows
+// newer than it. A poll reads the hour below the watermark again and takes the rows a previous poll
+// did not record, without fetching the others again. The first poll after an upgrade, which has no
+// record of that hour yet, takes the rows whose listed version the cache lacks.
+func TestOSVSync_OverlapTakesLateListedRecords(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	a, b, c, d := now.Add(-10*time.Minute), now.Add(-30*time.Minute), now.Add(-2*time.Minute), now.Add(-20*time.Minute)
+	g, h := now.Add(-40*time.Minute), now.Add(-50*time.Minute)
+	records := map[string][]byte{
+		"PYSEC-a": pypi("PYSEC-a", "1.0", a), "PYSEC-b": pypi("PYSEC-b", "1.0", b),
+		"PYSEC-c": pypi("PYSEC-c", "1.0", c), "PYSEC-d": pypi("PYSEC-d", "1.0", d),
+		"PYSEC-g": pypi("PYSEC-g", "1.0", g), "PYSEC-h": pypi("PYSEC-h", "1.0", h),
+	}
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-15 * time.Minute)), "setdiff": ts(now), "hashver": osv.HashVersion})
+	// The version before the upgrade took in b, and an older version of h; g was listed late, after
+	// it had polled past the watermark, so it never read g.
+	e.cache(t, "PyPI", "PYSEC-b", b, records["PYSEC-b"])
+	e.cache(t, "PyPI", "PYSEC-h", h.Add(-2*time.Hour), pypi("PYSEC-h", "0.9", h.Add(-2*time.Hour)))
+	f := e.feed()
+
+	// After the upgrade: a, above the watermark, is taken. Of the hour below it, b is cached at its
+	// listed version and not fetched; g, not cached, and h, cached at an older version, are taken.
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: csvOf(row{a, "PYSEC-a"}, row{b, "PYSEC-b"}, row{g, "PYSEC-g"}, row{h, "PYSEC-h"}),
+		records: records})
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a", "PyPI/PYSEC-g", "PyPI/PYSEC-h"}, e.sink.keys())
+	require.Zero(t, e.srv.count("PyPI/PYSEC-b.json"))
+	require.Equal(t, ts(a), e.meta(t)["wm.PyPI"])
+
+	// d is listed late, older than a, which the last poll read: it is taken, and the rows the last
+	// poll read are not fetched again.
+	listing := csvOf(row{c, "PYSEC-c"}, row{a, "PYSEC-a"}, row{d, "PYSEC-d"}, row{b, "PYSEC-b"}, row{g, "PYSEC-g"}, row{h, "PYSEC-h"})
+	e.srv.set("PyPI", &fakeBucket{gen: "2", csv: listing, records: records})
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a", "PyPI/PYSEC-c", "PyPI/PYSEC-d", "PyPI/PYSEC-g", "PyPI/PYSEC-h"}, e.sink.keys())
+	for _, id := range []string{"PYSEC-a", "PYSEC-g", "PYSEC-h"} {
+		require.Equal(t, 1, e.srv.count("PyPI/"+id+".json"), id)
+	}
+	require.Zero(t, e.srv.count("PyPI/PYSEC-b.json"))
+	require.Equal(t, ts(c), e.meta(t)["wm.PyPI"])
+
+	// The same rows again: nothing is fetched.
+	e.srv.set("PyPI", &fakeBucket{gen: "3", csv: listing, records: records})
+	gets := e.srv.recordGETs("PyPI")
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, gets, e.srv.recordGETs("PyPI"))
+	require.Len(t, e.sink.all(), 5)
+}
+
+// TestOSVSync_OverlapAfterBootstrapTakesWhatTheZipLacked (F65): the poll after a Go or GIT
+// bootstrap takes a record listed late, below the watermark, that the bootstrap's all.zip lacked.
+// The rows all.zip held are not fetched again, except GIT rows outside GitRepos, which are never
+// cached: those are fetched by that one poll only.
+func TestOSVSync_OverlapAfterBootstrapTakesWhatTheZipLacked(t *testing.T) {
+	e := newEnv(t)
+	t1 := now.Add(-5 * time.Minute)
+	late := t1.Add(-10 * time.Minute)
+	goRecs := map[string][]byte{
+		"GO-2026-0001": record("GO-2026-0001", "Go", "stdlib", "1.22.5", t1),
+		"GO-2026-0002": record("GO-2026-0002", "Go", "golang.org/x/net", "0.33.0", late),
+	}
+	gitRecs := map[string][]byte{
+		"CVE-2026-1001": gitRecord("CVE-2026-1001", "https://github.com/php/php-src", t1),
+		"CVE-2026-1002": gitRecord("CVE-2026-1002", "https://github.com/php/php-src", late),
+		"CVE-2026-1003": gitRecord("CVE-2026-1003", "https://github.com/example/other", t1),
+	}
+	without := func(recs map[string][]byte, id string) map[string][]byte {
+		out := maps.Clone(recs)
+		delete(out, id)
+		return out
+	}
+	e.srv.set("Go", &fakeBucket{gen: "1", csv: csvOf(row{t1, "GO-2026-0001"}), records: goRecs,
+		zipRecords: without(goRecs, "GO-2026-0002")})
+	e.srv.set("GIT", &fakeBucket{gen: "1", csv: csvOf(row{t1, "CVE-2026-1001"}, row{t1, "CVE-2026-1003"}), records: gitRecs,
+		zipRecords: without(gitRecs, "CVE-2026-1002")})
+	e.putMeta(t, map[string]string{"setdiff": ts(now), "hashver": osv.HashVersion})
+	f := e.feed(func(o *osv.Options) { o.GitRepos = []string{"github.com/php/php-src"} })
+
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"GIT/CVE-2026-1001", "Go/GO-2026-0001"}, e.sink.keys())
+	require.Equal(t, ts(t1), e.meta(t)["wm.Go"])
+
+	// The late records are listed, older than the watermark.
+	e.srv.set("Go", &fakeBucket{gen: "2", csv: csvOf(row{t1, "GO-2026-0001"}, row{late, "GO-2026-0002"}), records: goRecs})
+	gitListing := csvOf(row{t1, "CVE-2026-1001"}, row{t1, "CVE-2026-1003"}, row{late, "CVE-2026-1002"})
+	e.srv.set("GIT", &fakeBucket{gen: "2", csv: gitListing, records: gitRecs})
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"GIT/CVE-2026-1001", "GIT/CVE-2026-1002", "Go/GO-2026-0001", "Go/GO-2026-0002"}, e.sink.keys())
+	require.Zero(t, e.srv.count("Go/GO-2026-0001.json"))
+	require.Zero(t, e.srv.count("GIT/CVE-2026-1001.json"))
+	require.Equal(t, 1, e.srv.count("GIT/CVE-2026-1003.json"), "a GIT record outside GitRepos is not cached")
+	require.Equal(t, []string{"CVE-2026-1001", "CVE-2026-1002"}, e.ids(t, "GIT"))
+
+	// From then on the overlap is recorded: nothing is fetched again.
+	e.srv.set("GIT", &fakeBucket{gen: "3", csv: gitListing, records: gitRecs})
+	gets := e.srv.recordGETs("GIT")
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, gets, e.srv.recordGETs("GIT"))
+	require.Len(t, e.sink.all(), 4)
+}
+
+// TestOSVSync_MissingRecordRetried (F54): a record modified_id.csv lists but the bucket answers 404
+// for is held as missing in the feed's meta and asked for again at later syncs, after the
+// watermark has moved past its row, until it is found or a day has passed.
+func TestOSVSync_MissingRecordRetried(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "hashver": osv.HashVersion})
+	listing := csvOf(row{t1, "PYSEC-a"}, row{t1, "PYSEC-b"}, row{t1, "PYSEC-c"})
+	records := map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1)} // b and c are not uploaded yet
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: listing, records: records})
+	clock := now
+	f := e.feed(func(o *osv.Options) { o.Now = func() time.Time { return clock } })
+
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a"}, e.sink.keys())
+	require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"], "the watermark moves past the missing rows")
+	require.Equal(t, "PYSEC-b "+now.Format(time.RFC3339)+"\nPYSEC-c "+now.Format(time.RFC3339), e.meta(t)["missing.PyPI"])
+
+	// b appears; the listing is unchanged, so only the retry reads it.
+	records["PYSEC-b"] = pypi("PYSEC-b", "1.0", t1)
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: listing, records: records})
+	clock = now.Add(5 * time.Minute)
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a", "PyPI/PYSEC-b"}, e.sink.keys())
+	require.Equal(t, "PYSEC-c "+now.Format(time.RFC3339), e.meta(t)["missing.PyPI"], "c keeps when it was first missed")
+	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
+
+	// A day after it was first missed, c is given up on.
+	clock = now.Add(missingFor)
+	require.NoError(t, f.Sync(ctx))
+	require.NotContains(t, e.meta(t), "missing.PyPI")
+	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
+	require.Len(t, e.sink.all(), 2)
+}
+
+const missingFor = 24 * time.Hour

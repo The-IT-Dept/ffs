@@ -1,6 +1,7 @@
 // Package grypedb keeps the Grype vulnerability database current: it polls latest.json, downloads
-// and verifies a new build, installs it beside the current one, diffs the two and hands the result
-// to a handler before making the new build current.
+// and verifies a new build, installs it beside the current one, diffs the two (or, in a small
+// cluster, skips the diff for a full re-match) and hands the result to a handler before making the
+// new build current.
 package grypedb
 
 import (
@@ -20,7 +21,6 @@ import (
 	"time"
 
 	v6 "github.com/anchore/grype/grype/db/v6"
-	"github.com/anchore/grype/grype/db/v6/diff"
 	"github.com/go-logr/logr"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -62,7 +62,9 @@ type Update struct {
 	Path    string // DB directory holding vulnerability.db
 	Built   time.Time
 	Changed []PackageKey // packages whose records changed since the previous build; empty when Full
-	Full    bool         // re-match everything: first install, or the last full re-match is over 7 days old
+	// Full re-matches everything: on the first install, when the last full re-match is over 7 days
+	// old, and when fewer SBOMs are catalogued than Options.DiffMinImages.
+	Full bool
 }
 
 // Handler consumes an Update. Until it returns nil the build is not current and the next Sync
@@ -77,6 +79,13 @@ type Options struct {
 	HTTP    *http.Client // nil = feeds.NewHTTPClient(version.UserAgent())
 	Handler Handler
 	Now     func() time.Time // nil = time.Now
+	// Diff diffs a copy of the current build against a new one; nil diffs in this process (Diff).
+	// The controller passes ExecDiffer.
+	Diff Differ
+	// DiffMinImages is the number of catalogued SBOMs (store.CataloguedLiveSBOMs) below which a new
+	// build is a full re-match instead of a diff: re-matching a few images costs less than the diff.
+	// 0 always diffs.
+	DiffMinImages int
 }
 
 // Feed is the Grype DB feed. It implements feeds.Feed.
@@ -95,6 +104,9 @@ func New(o Options) *Feed {
 	}
 	if o.Now == nil {
 		o.Now = time.Now
+	}
+	if o.Diff == nil {
+		o.Diff = Diff
 	}
 	return &Feed{o: o, root: filepath.Join(o.DataDir, "grypedb")}
 }
@@ -189,9 +201,15 @@ func (f *Feed) Sync(ctx context.Context) error {
 	lastFull, _ := time.Parse(time.RFC3339, st.Meta[metaLastFull])
 	u := Update{Path: newDir, Built: l.Built, Full: current == "" || f.o.Now().Sub(lastFull) > fullInterval}
 	// A full re-match ignores Changed, and the diff of two production builds takes minutes and
-	// gigabytes of SQLite temp space: run it only when its result is used.
+	// gigabytes of SQLite temp space: run it only when its result is used, and not when re-matching
+	// every SBOM costs less.
 	if !u.Full && current != name {
-		if u.Changed, err = f.changedPackages(filepath.Join(f.root, current), newDir); err != nil {
+		if u.Full, err = f.fewSBOMs(ctx); err != nil {
+			return err
+		}
+	}
+	if !u.Full && current != name {
+		if u.Changed, err = f.changedPackages(ctx, filepath.Join(f.root, current), newDir); err != nil {
 			return err
 		}
 	}
@@ -316,16 +334,36 @@ func (f *Feed) prune(keep ...string) error {
 	return nil
 }
 
-// changedPackages diffs two DB directories and returns the deduplicated, lowercased packages whose
-// vulnerability records were added, removed or modified.
+// fewSBOMs reports whether fewer SBOMs are catalogued than Options.DiffMinImages, so a new build
+// is cheaper to re-match in full than to diff.
+func (f *Feed) fewSBOMs(ctx context.Context) (bool, error) {
+	if f.o.DiffMinImages <= 0 {
+		return false, nil
+	}
+	n, err := f.o.Store.CataloguedLiveSBOMs(ctx)
+	if err != nil {
+		return false, fmt.Errorf("grypedb: count the catalogued SBOMs: %w", err)
+	}
+	if n < f.o.DiffMinImages {
+		logr.FromContextOrDiscard(ctx).V(1).Info("re-matching every SBOM with the new Grype DB instead of diffing the builds",
+			"sboms", n, "diffMinImages", f.o.DiffMinImages)
+		return true, nil
+	}
+	return false, nil
+}
+
+// changedPackages diffs two DB directories with Options.Diff, under a timeout of twice the
+// interval, and returns the deduplicated, lowercased packages whose vulnerability records were
+// added, removed or modified.
 //
-// The differ opens both databases for writing first (it hydrates them: migrations and ANALYZE). Grype
-// opens every database with SQLite's shared cache, which is one cache per file per process, and the
-// Grype matcher in this process holds oldDir's database open read-only, so a writable connection to that
-// file joins a read-only cache and fails ("attempt to write a readonly database"). The diff therefore
-// reads a copy of oldDir, on the same volume, removed when it ends (and by prune after a crash). newDir is
-// not open in this process until the handler takes the update.
-func (f *Feed) changedPackages(oldDir, newDir string) (_ []PackageKey, err error) {
+// The differ opens both databases for writing first (it hydrates them: migrations and ANALYZE). The
+// Grype matcher holds oldDir's database open read-only, and Grype opens every database with SQLite's
+// shared cache, which is one cache per file per process: a writable connection to that file in this
+// process joins a read-only cache and fails ("attempt to write a readonly database"), and one in
+// another process would change the file under the matcher. The diff therefore reads a copy of
+// oldDir, on the same volume, removed when it ends (and by prune after a crash). newDir is not open
+// in this process until the handler takes the update.
+func (f *Feed) changedPackages(ctx context.Context, oldDir, newDir string) ([]PackageKey, error) {
 	oldCopy := filepath.Join(f.root, diffOldDir)
 	if err := os.RemoveAll(oldCopy); err != nil {
 		return nil, fmt.Errorf("grypedb: diff: %w", err)
@@ -334,27 +372,14 @@ func (f *Feed) changedPackages(oldDir, newDir string) (_ []PackageKey, err error
 	if err := os.CopyFS(oldCopy, os.DirFS(oldDir)); err != nil {
 		return nil, fmt.Errorf("grypedb: diff: copy the current database: %w", err)
 	}
-	d, err := diff.NewDBDiffer(diff.Config{OldDB: oldCopy, NewDB: newDir, Include: diff.Includes{Packages: true}})
+	if iv := f.o.Config.Interval; iv > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 2*iv)
+		defer cancel()
+	}
+	keys, err := f.o.Diff(ctx, oldCopy, newDir)
 	if err != nil {
 		return nil, fmt.Errorf("grypedb: diff: %w", err)
 	}
-	defer func() {
-		if cerr := d.Close(); cerr != nil && err == nil {
-			err = fmt.Errorf("grypedb: diff: %w", cerr)
-		}
-	}()
-	res, err := d.Diff()
-	if err != nil {
-		return nil, fmt.Errorf("grypedb: diff: %w", err)
-	}
-	seen := make(map[PackageKey]bool, len(res.Packages))
-	var out []PackageKey
-	for _, pd := range res.Packages {
-		k := PackageKey{Ecosystem: strings.ToLower(pd.Ecosystem), Name: strings.ToLower(pd.Name)}
-		if !seen[k] {
-			seen[k] = true
-			out = append(out, k)
-		}
-	}
-	return out, nil
+	return keys, nil
 }
