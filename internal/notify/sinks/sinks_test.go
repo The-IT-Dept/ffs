@@ -162,9 +162,15 @@ func TestTeams_DropsItemsToFit(t *testing.T) {
 func TestFormat_Lines(t *testing.T) {
 	assert.Equal(t, "Deployment/x", ownerLine(model.OwnerRef{Kind: "Deployment", Name: "x"}))
 	assert.Equal(t, "web 1 (no fix yet)", pkgLine(model.FindingPackage{Name: "web", Installed: "1"}, plain))
-	assert.Equal(t, "Suggested: r:1 → 2 (minor), fixes 2 high, 1 medium, introduces none",
+	assert.Equal(t, "Suggested: upgrade to r:2 (minor), fixes 2 high, 1 medium, introduces none",
 		suggestionLine(&model.Suggestion{Repo: "r", FromTag: "1", ToTag: "2", Tier: model.TierMinor,
 			Fixes: map[model.Priority]int{model.PriorityMedium: 1, model.PriorityHigh: 2}}, plain))
+	assert.Equal(t, "Suggested: upgrade to nginx:1.30.6 (new digest), fixes 1 high, introduces none",
+		suggestionLine(&model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "1.30.6",
+			Tier: model.TierRefresh, Fixes: map[model.Priority]int{model.PriorityHigh: 1}}, plain))
+	assert.Equal(t, "Suggested: upgrade to nginx:1.30.7 (patch), fixes 1 high, introduces none",
+		suggestionLine(&model.Suggestion{Repo: "docker.io/library/nginx", ToTag: "1.30.7",
+			Tier: model.TierPatch, Fixes: map[model.Priority]int{model.PriorityHigh: 1}}, plain))
 	assert.Equal(t, "Published 2026-11-17 03:04 UTC, seen by ffs 2026-11-19 03:04 UTC", timesLine(item("X", 1)))
 }
 
@@ -224,7 +230,7 @@ func TestFormat_TierNoneHasNoSuggestedLine(t *testing.T) {
 		assert.NotContains(t, l, "(none)")
 	}
 	it = item("CVE-2026-0001", 1)
-	assert.Contains(t, itemLines(it, plain), "Suggested: docker.io/x/app:1.0 → 1.1 (patch), fixes 2 high, 1 medium, introduces none")
+	assert.Contains(t, itemLines(it, plain), "Suggested: upgrade to x/app:1.1 (patch), fixes 2 high, 1 medium, introduces none")
 }
 
 func TestFormat_NodeGroupsLine(t *testing.T) {

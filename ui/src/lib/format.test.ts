@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
 import { NOW } from '@/test/fixtures'
-import { formatAge, formatBytes, formatCompact, formatCount, formatPercent, plural, shortDigest } from './format'
+import { eolText, formatAge, formatBytes, formatCompact, formatCount, formatPercent, plural, shortDigest } from './format'
 
 test('formats counts, percentages, ages and digests', () => {
   expect(formatCount(1356)).toBe('1,356')
@@ -21,4 +21,12 @@ test('formats counts, percentages, ages and digests', () => {
   expect(shortDigest('unknown:ghcr.io/example/private:1.0')).toBe('unknown:ghcr.io/example/private:1.0')
   expect(formatBytes(1536)).toBe('1.5 KiB')
   expect(plural(1, 'finding', 'findings')).toBe('1 finding')
+})
+
+test('eolText is the lifecycle text, else the override note', () => {
+  const e = { product: 'alpine', cycle: 'rolling', eolDate: '', isEol: false, latest: '', note: 'rolling release', text: '' }
+  expect(eolText(e)).toBe('rolling release')
+  expect(eolText({ ...e, text: 'Alpine Linux: rolling release' })).toBe('Alpine Linux: rolling release')
+  expect(eolText({ ...e, note: '' })).toBe('')
+  expect(eolText(undefined)).toBe('')
 })

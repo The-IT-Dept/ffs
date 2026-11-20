@@ -713,6 +713,31 @@ func TestNotify_FeedStaleBeforeReady(t *testing.T) {
 	assert.Len(t, h.sink.ofKind(notify.KindBaseline), 2, "the baselines of ops and quiet follow Ready")
 }
 
+// TestNotify_FeedStaleFromFirstAttempt (F67): a feed that never synced is stale measured from its
+// stored first attempt, so a controller restarted more often than staleAfter still alerts; a first
+// attempt after the engine started counts from the start.
+func TestNotify_FeedStaleFromFirstAttempt(t *testing.T) {
+	h := newHarness(t, func(o *notify.Options) {
+		o.FeedStaleAfter = map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 2 * time.Hour}
+	})
+	h.target("ops", func(c *notify.TargetConfig) { c.NotifyOnFeedStale = true })
+	h.process() // baseline
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "grypedb", FirstAttempt: h.now.Add(-49 * time.Hour),
+		LastAttempt: h.now.Add(-time.Minute), LastError: "connection refused"}))
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "kev", FirstAttempt: h.now.Add(time.Hour)}))
+	h.now = h.now.Add(90 * time.Minute)
+	h.process()
+	stale := h.sink.ofKind(notify.KindFeedStale)
+	require.Len(t, stale, 1, "grypedb is stale from its first attempt; kev, first tried after the start, is not yet")
+	assert.Equal(t, "Feed grypedb has never synced successfully", stale[0].Title)
+
+	h.now = h.now.Add(time.Hour) // 2h30m after the engine started, 1h30m after kev's first attempt
+	h.process()
+	stale = h.sink.ofKind(notify.KindFeedStale)
+	require.Len(t, stale, 2)
+	assert.Equal(t, "Feed kev has never synced successfully", stale[1].Title)
+}
+
 func TestNotify_UnregisterAndRetainDeleteState(t *testing.T) {
 	h := newHarness(t)
 	h.target("ops")

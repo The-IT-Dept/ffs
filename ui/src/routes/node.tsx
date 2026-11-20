@@ -12,6 +12,7 @@ import { Mono } from '@/components/signals/Mono'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
+import { eolText } from '@/lib/format'
 import { nodeGroupPath } from '@/lib/links'
 import { cn, touchLink } from '@/lib/utils'
 
@@ -29,6 +30,7 @@ function NodePage() {
   const q = useQuery(apiQuery('/nodes/{name}', { path: { name } }))
   const d = q.data
   const n = d?.node
+  const osEol = eolText(n?.osEol)
   const sub = n ? (
     <span className="inline-flex flex-wrap items-center gap-x-1.5">
       {[
@@ -38,7 +40,7 @@ function NodePage() {
         n.kubeletVersion ? <span key="kubelet">{n.kubeletVersion}</span> : null,
         n.arch ? <span key="arch">{n.arch}</span> : null,
         <span key="ready">{n.ready ? copy.nodes.ready : copy.nodes.notReady}</span>,
-        n.osEol?.text ? <span key="eol">{n.osEol.text}</span> : null,
+        osEol ? <span key="eol">{osEol}</span> : null,
       ]
         .filter((x) => x !== null)
         .flatMap((x, i) => (i > 0 ? [<span key={`sep${i}`} aria-hidden="true">·</span>, x] : [x]))}

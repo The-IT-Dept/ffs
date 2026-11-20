@@ -89,11 +89,15 @@ func TestBuildReport_Properties(t *testing.T) {
 	assert.Equal(t, "9.8", p["score"])
 	assert.Equal(t, "urgent", p["ffs.priority"])
 	assert.Equal(t, "actively exploited (CISA KEV, added 2026-11-02); exposed via Service shop/web type LoadBalancer", p["ffs.reasons"])
-	assert.Equal(t, "docker.io/library/nginx:1.27.4", p["ffs.suggestedImage"])
+	assert.Equal(t, "nginx:1.27.4", p["ffs.suggestedImage"]) // F107: upgrade.Target
 	assert.Equal(t, "CVE-2026-0001", r.Results[0].Policy)
 	assert.Equal(t, "docker.io/library/nginx", r.Results[0].Rule)
 	assert.Equal(t, "CVE-2026-0001", r.Results[0].Description) // no advisory title
 	assert.Equal(t, orv1alpha1.ResultSeverity("critical"), r.Results[0].Severity)
+
+	f.Suggestion = &model.Suggestion{Repo: "ghcr.io/org/app", FromTag: "2.1.0", ToTag: "2.1.0", Tier: model.TierRefresh}
+	r, _ = openreports.BuildReport(downer, []model.Finding{f}, advs, 100, "ffs")
+	assert.Equal(t, "ghcr.io/org/app:2.1.0 (new digest)", r.Results[0].Properties["ffs.suggestedImage"])
 
 	g := finding("CVE-2026-0002", model.PriorityMedium, model.SeverityNegligible)
 	g.Suggestion = &model.Suggestion{Repo: "r", ToTag: "2", Tier: model.TierNone}

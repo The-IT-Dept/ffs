@@ -85,3 +85,24 @@ test('a fully seen image with no packages says its SBOM lists none', async () =>
   expect(await screen.findByText(copy.emptyList.packages)).toBeInTheDocument()
   expect(screen.queryByText(copy.empty)).toBeNull()
 })
+
+test('the SBOM view shows each lifecycle with its note when there is no end-of-life date', async () => {
+  const d = 'sha256:' + '1'.repeat(64)
+  const eol = { eolDate: '', isEol: false, latest: '', note: '', text: '' }
+  mockApi().on(
+    '/images/{digest}',
+    imageDetail({
+      digest: d,
+      eol: [
+        { ...eol, product: 'wolfi', cycle: 'rolling', note: 'rolling release', text: 'Wolfi: rolling release' },
+        { ...eol, product: 'python', cycle: '3.13', eolDate: '2029-10-31', text: 'Python 3.13 supported until 2029-10-31' },
+        { ...eol, product: 'azure-linux', cycle: '3.0', note: 'lifecycle published by Microsoft' },
+      ],
+    }),
+  )
+  renderApp(`${imagePath(d)}?view=sbom`)
+  expect(await screen.findByText(copy.image.lifecycle)).toBeInTheDocument()
+  expect(screen.getByText('Wolfi: rolling release')).toBeInTheDocument()
+  expect(screen.getByText('Python 3.13 supported until 2029-10-31')).toBeInTheDocument()
+  expect(screen.getByText('lifecycle published by Microsoft')).toBeInTheDocument()
+})

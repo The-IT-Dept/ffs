@@ -237,8 +237,15 @@ func TestFindingStatus_Suggestion(t *testing.T) {
 	f.Suggestion = &model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "1.30.7", ToDigest: "sha256:d2",
 		Tier: model.TierPatch, Fixes: map[model.Priority]int{model.PriorityUrgent: 1}}
 	st := findingStatus("default", f, model.Owner{}, model.Advisory{})
-	require.Equal(t, &v1alpha1.SuggestionSummary{Target: "docker.io/library/nginx:1.30.7", Digest: "sha256:d2", Tier: "patch",
+	require.Equal(t, &v1alpha1.SuggestionSummary{Target: "nginx:1.30.7", Digest: "sha256:d2", Tier: "patch",
 		Fixes: map[string]int32{"urgent": 1}}, st.Suggestion)
+
+	// F107: the target reads as upgrade.Target, never as the raw repository and tag.
+	f.Suggestion = &model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "1.30.6", ToDigest: "sha256:d3",
+		Tier: model.TierRefresh}
+	require.Equal(t, "nginx:1.30.6 (new digest)", findingStatus("default", f, model.Owner{}, model.Advisory{}).Suggestion.Target)
+	f.Suggestion = &model.Suggestion{Repo: "kubernetes", FromTag: "v1.35.9", ToTag: "v1.35.10", Tier: model.TierPatch}
+	require.Equal(t, "kubernetes v1.35.10", findingStatus("default", f, model.Owner{}, model.Advisory{}).Suggestion.Target)
 
 	f.Suggestion.Tier = model.TierNone
 	require.Nil(t, findingStatus("default", f, model.Owner{}, model.Advisory{}).Suggestion)

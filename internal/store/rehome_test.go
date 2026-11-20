@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -83,6 +84,58 @@ func TestRehome_MovesFindingsLedgerAndOwnersAtomically(t *testing.T) {
 	require.Equal(t, []string{nodes.Key()}, keys)
 	_, ok, _ = s.GetSuggestion(ctx, rt.Key(), "containerd")
 	require.False(t, ok)
+}
+
+// TestRehome_LedgerKeepsTheHigherPriority (F73): a move onto a fingerprint whose target already has a
+// ledger row (its finding resolved, or gone) merges the two rows as an alias re-key does. The higher
+// max_priority is kept, so the move never lowers what a target was told and a repeat escalation alert
+// cannot follow; the state and time come from the row updated last.
+func TestRehome_LedgerKeepsTheHigherPriority(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.PutNotifyTarget(ctx, "uid-a", "a", ""))
+	require.NoError(t, s.PutNotifyTarget(ctx, "uid-b", "b", ""))
+	rt := model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Name: "containerd"}
+	nodes := model.NodesOwner("test")
+	fp := func(o model.OwnerRef, repo, adv string) string { return model.FindingFingerprint("test", o, repo, adv) }
+	moved := model.Finding{Fingerprint: fp(rt, "containerd", "CVE-2026-0001"), Owner: rt, ImageRepo: "containerd",
+		AdvisoryID: "CVE-2026-0001", State: model.StateOpen, Priority: model.PriorityHigh}
+	resolved := model.Finding{Fingerprint: fp(nodes, model.HostRepo, "CVE-2026-0001"), Owner: nodes, ImageRepo: model.HostRepo,
+		AdvisoryID: "CVE-2026-0001", State: model.StateResolved, Priority: model.PriorityUrgent}
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{moved, resolved}, nil))
+	entry := func(target, fp string, p model.Priority, st model.FindingState, at time.Time) LedgerEntry {
+		return LedgerEntry{Target: target, Fingerprint: fp, MaxPriority: p, LastState: st, UpdatedAt: at}
+	}
+	// Target a was told urgent about the target fingerprint, later than high about the moved one; target
+	// b was told high about the target fingerprint, earlier than urgent about the moved one.
+	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-a", Ledger: []LedgerEntry{
+		entry("uid-a", resolved.Fingerprint, model.PriorityUrgent, model.StateResolved, t0.Add(-time.Hour)),
+		entry("uid-a", moved.Fingerprint, model.PriorityHigh, model.StateOpen, t0.Add(-2*time.Hour)),
+	}}))
+	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-b", Ledger: []LedgerEntry{
+		entry("uid-b", resolved.Fingerprint, model.PriorityHigh, model.StateResolved, t0.Add(-2*time.Hour)),
+		entry("uid-b", moved.Fingerprint, model.PriorityUrgent, model.StateOpen, t0.Add(-time.Hour)),
+	}}))
+
+	require.NoError(t, s.Rehome(ctx, nil, []FindingMove{{OldFingerprint: moved.Fingerprint, NewFingerprint: resolved.Fingerprint,
+		Owner: nodes, ImageRepo: model.HostRepo}}, nil))
+	got, err := s.FindingsByFingerprint(ctx, []string{moved.Fingerprint, resolved.Fingerprint})
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Equal(t, model.StateOpen, got[resolved.Fingerprint].State, "the moved finding replaces the resolved one")
+
+	a, err := s.Ledger(ctx, "uid-a", []string{moved.Fingerprint, resolved.Fingerprint})
+	require.NoError(t, err)
+	require.Len(t, a, 1, "the moved row merged into the target's")
+	require.Equal(t, model.PriorityUrgent, a[resolved.Fingerprint].MaxPriority, "a move never lowers what a target was told")
+	require.Equal(t, model.StateResolved, a[resolved.Fingerprint].LastState, "the state of the row updated last")
+	require.True(t, a[resolved.Fingerprint].UpdatedAt.Equal(t0.Add(-time.Hour)))
+
+	b, err := s.Ledger(ctx, "uid-b", []string{moved.Fingerprint, resolved.Fingerprint})
+	require.NoError(t, err)
+	require.Len(t, b, 1)
+	require.Equal(t, model.PriorityUrgent, b[resolved.Fingerprint].MaxPriority, "the moved row's higher priority is kept")
+	require.Equal(t, model.StateOpen, b[resolved.Fingerprint].LastState)
+	require.True(t, b[resolved.Fingerprint].UpdatedAt.Equal(t0.Add(-time.Hour)))
 }
 
 // TestRehomeWithState_WritesStateWithTheMoves: the runtime cutover's state is written in the moves'

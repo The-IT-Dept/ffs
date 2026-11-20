@@ -3,6 +3,7 @@ import { AppLink } from '@/components/layout/AppLink'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy, facetValueLabel } from '@/lib/copy'
+import { eolText } from '@/lib/format'
 import { ownerHref, ownerLabel } from '@/lib/links'
 import { cn, touchLink } from '@/lib/utils'
 import { EcosystemBreakdown } from './EcosystemBreakdown'
@@ -73,7 +74,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
         <>
           <Heading>{copy.image.lifecycle}</Heading>
           {image.eol.map((e) => (
-            <p key={`${e.product}:${e.cycle}`}>{e.text}</p>
+            <p key={`${e.product}:${e.cycle}`}>{eolText(e)}</p>
           ))}
         </>
       ) : null}

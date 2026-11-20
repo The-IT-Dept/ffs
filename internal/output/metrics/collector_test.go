@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/feeds"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/output/metrics"
@@ -128,7 +129,7 @@ func TestCollector_FeedFreshness(t *testing.T) {
 # TYPE ffs_feed_last_success_timestamp_seconds gauge
 ffs_feed_last_success_timestamp_seconds{feed="kev"} 0
 ffs_feed_last_success_timestamp_seconds{feed="osv"} %d
-# HELP ffs_feed_lag_seconds Seconds since a feed last synced successfully, or since ffs started if it never has.
+# HELP ffs_feed_lag_seconds Seconds since a feed last synced successfully, or if it never has, since its first attempt or since ffs started, whichever is earlier.
 # TYPE ffs_feed_lag_seconds gauge
 ffs_feed_lag_seconds{feed="kev"} 90000
 ffs_feed_lag_seconds{feed="osv"} 1800
@@ -137,6 +138,43 @@ ffs_feed_lag_seconds{feed="osv"} 1800
 ffs_feed_stale_after_seconds{feed="kev"} 86400
 ffs_feed_stale_after_seconds{feed="osv"} 7200
 `, osvLast.Unix()))))
+}
+
+// TestCollector_NeverSyncedLagsFromFirstAttempt (F67): a feed that never succeeded lags from its
+// stored first attempt when that is before the collector started, so a restart does not reset it;
+// a first attempt after the start counts from the start.
+func TestCollector_NeverSyncedLagsFromFirstAttempt(t *testing.T) {
+	st := newStore(t)
+	now := t0
+	c := metrics.NewCollector(st, metrics.CollectorOptions{
+		FeedStaleAfter: map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 24 * time.Hour},
+		Now:            func() time.Time { return now },
+	})
+	now = t0.Add(time.Hour) // the collector started an hour ago
+	require.NoError(t, st.PutFeedState(ctx, store.FeedState{Name: "grypedb", FirstAttempt: t0.Add(-71 * time.Hour),
+		LastAttempt: t0, LastError: "connection refused"}))
+	require.NoError(t, st.PutFeedState(ctx, store.FeedState{Name: "kev", FirstAttempt: t0.Add(30 * time.Minute)}))
+	require.NoError(t, c.Refresh(ctx))
+	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP ffs_feed_lag_seconds Seconds since a feed last synced successfully, or if it never has, since its first attempt or since ffs started, whichever is earlier.
+# TYPE ffs_feed_lag_seconds gauge
+ffs_feed_lag_seconds{feed="grypedb"} 259200
+ffs_feed_lag_seconds{feed="kev"} 3600
+`), "ffs_feed_lag_seconds"))
+}
+
+// TestMetrics_NamesListsFeedSkipped (F66): the counter the feeds package registers itself is an
+// exported family, so the shipped alerts and dashboards may use it.
+func TestMetrics_NamesListsFeedSkipped(t *testing.T) {
+	feeds.Skipped.WithLabelValues("test", feeds.SkipTooLarge)
+	t.Cleanup(func() { feeds.Skipped.DeleteLabelValues("test", feeds.SkipTooLarge) })
+	reg := prometheus.NewRegistry()
+	require.NoError(t, reg.Register(feeds.Skipped))
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.Len(t, mfs, 1)
+	assert.Equal(t, "ffs_feed_skipped_total", mfs[0].GetName())
+	assert.Contains(t, metrics.Names(), mfs[0].GetName())
 }
 
 func TestCollector_ServesSnapshotBetweenRefreshes(t *testing.T) {

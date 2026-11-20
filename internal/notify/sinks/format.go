@@ -9,6 +9,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/notify"
+	"github.com/the-it-dept/ffs/internal/upgrade"
 )
 
 const (
@@ -86,9 +87,16 @@ func netCounts(c map[model.Priority]int) string {
 	return strings.Join(parts, ", ")
 }
 
+// suggestionLine is "Suggested: upgrade to nginx:1.30.7 (minor), fixes …, introduces …". The
+// target is upgrade.Target, so a refresh reads "nginx:1.30.6 (new digest)" (no tier: Target says
+// it) and a digest-only reference has no empty "from" side.
 func suggestionLine(s *model.Suggestion, esc escaper) string {
-	return fmt.Sprintf("Suggested: %s:%s → %s (%s), fixes %s, introduces %s",
-		esc(s.Repo), esc(s.FromTag), esc(s.ToTag), s.Tier, netCounts(s.Fixes), netCounts(s.Introduces))
+	tier := " (" + string(s.Tier) + ")"
+	if s.Tier == model.TierRefresh {
+		tier = ""
+	}
+	return fmt.Sprintf("Suggested: upgrade to %s%s, fixes %s, introduces %s",
+		esc(upgrade.Target(*s)), tier, netCounts(s.Fixes), netCounts(s.Introduces))
 }
 
 func fmtTime(t time.Time) string { return t.UTC().Format("2006-01-02 15:04 UTC") }

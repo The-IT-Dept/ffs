@@ -3,15 +3,17 @@ import { AppLink } from '@/components/layout/AppLink'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { copy } from '@/lib/copy'
+import { eolText } from '@/lib/format'
 import { cn, touchLink } from '@/lib/utils'
 
 function Version({ name, version, nodes, eol }: { name?: string; version: string; nodes: number; eol?: S<'EOL'> }) {
+  const lifecycle = eolText(eol)
   return (
     <li className="flex flex-wrap items-baseline gap-2">
       {name ? <span>{name}</span> : null}
       <Mono>{version}</Mono>
       <span className="text-muted-foreground">{copy.nodes.nodesCount(nodes)}</span>
-      {eol?.text ? <span className="text-muted-foreground">{eol.text}</span> : null}
+      {lifecycle ? <span className="text-muted-foreground">{lifecycle}</span> : null}
     </li>
   )
 }

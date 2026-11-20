@@ -21,8 +21,10 @@ type FindingMove struct {
 // fingerprints differ:
 //   - no finding, or a resolved one, at NewFingerprint: that row is deleted and the moved finding takes
 //     its place, with its owner_key, namespace and data ($.Fingerprint, $.Owner, $.ImageRepo)
-//     rewritten. Its notification ledger rows move with it and replace any already there, so the moved
-//     finding and its ledger win and a later recompute is not a reopening;
+//     rewritten. Its notification ledger rows move with it and merge with any already there, as an
+//     alias re-key's do (moveLedger): the higher max_priority is kept, so a move never lowers what a
+//     target was told and an escalation already sent is not sent again, and the state and time come
+//     from the row updated last;
 //   - an open or excepted finding at NewFingerprint (the target already reported it): that finding is
 //     kept and the moved one deleted. Its ledger rows move only where the target has none for the new
 //     fingerprint; each target keeps the ledger it already has, and the leftovers are deleted.
@@ -110,7 +112,5 @@ func moveFinding(ctx context.Context, tx *sql.Tx, m FindingMove) error {
 		m.NewFingerprint, m.Owner.Key(), m.Owner.Namespace, m.NewFingerprint, owner, m.ImageRepo, m.OldFingerprint); err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE OR REPLACE notified SET fingerprint = ? WHERE fingerprint = ?`,
-		m.NewFingerprint, m.OldFingerprint)
-	return err
+	return moveLedger(ctx, tx, m.OldFingerprint, m.NewFingerprint)
 }

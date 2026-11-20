@@ -644,11 +644,16 @@ func (e *Engine) feedStale(ctx context.Context, t *target, now time.Time) error 
 	return nil
 }
 
-// feedStatus reports a feed's freshness. A feed that never synced is measured from engine start.
+// feedStatus reports a feed's freshness. A feed that never synced is measured from its first
+// attempt, stored across restarts, or from engine start when that is earlier, as the feed runner
+// measures it.
 func (e *Engine) feedStatus(fs store.FeedState, staleAfter time.Duration, now time.Time) FeedStatus {
 	since := fs.LastSuccess
 	if since.IsZero() {
 		since = e.started
+		if !fs.FirstAttempt.IsZero() && fs.FirstAttempt.Before(since) {
+			since = fs.FirstAttempt
+		}
 	}
 	return FeedStatus{Name: fs.Name, LastSuccess: fs.LastSuccess, StaleAfter: staleAfter,
 		Stale: staleAfter > 0 && now.Sub(since) > staleAfter, LastError: fs.LastError}

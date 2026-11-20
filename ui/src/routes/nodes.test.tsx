@@ -448,3 +448,41 @@ test('the control plane page lists Kubernetes versions and its findings by fix',
   expect(screen.getByText('containerd')).toBeInTheDocument()
   await waitFor(() => expect(api.calls('/findings')[0].searchParams.get('scope')).toBe('controlplane'))
 })
+
+test('the control plane shows each version with its lifecycle, the note when there is no end-of-life date', async () => {
+  const eol = { eolDate: '', isEol: false, latest: '', note: '', text: '' }
+  mockApi()
+    .on(
+      '/nodegroups',
+      nodeGroupsList({
+        controlPlane: {
+          kubernetes: [{ version: '1.35.1', nodes: 3, eol: { ...eol, product: 'kubernetes', cycle: '1.35', eolDate: '2027-02-28', text: 'Kubernetes 1.35 supported until 2027-02-28' } }],
+          runtimes: [
+            { name: 'containerd', version: '2.1.4', nodes: 2, eol: { ...eol, product: 'containerd', cycle: '2.1', note: 'supported while 2.1 is the latest minor release' } },
+            { name: 'cri-o', version: '1.35.0', nodes: 1, eol: { ...eol, product: 'cri-o', cycle: '1.35', note: 'rolling release', text: 'CRI-O 1.35: rolling release' } },
+          ],
+          counts: counts(),
+          fixable: 0,
+          suggestions: [],
+        },
+      }),
+    )
+    .on('/findings', findingsPage())
+  renderApp('/controlplane')
+  expect(await screen.findByText('Kubernetes 1.35 supported until 2027-02-28')).toBeInTheDocument()
+  expect(screen.getByText('supported while 2.1 is the latest minor release')).toBeInTheDocument()
+  expect(screen.getByText('CRI-O 1.35: rolling release')).toBeInTheDocument()
+})
+
+test.each([
+  ['its text', { note: 'rolling release', text: 'Talos Linux 1.9: rolling release' }, 'Talos Linux 1.9: rolling release'],
+  ['its note without text', { note: 'security updates for the two latest minor releases', text: '' }, 'security updates for the two latest minor releases'],
+])('a node page shows the OS lifecycle by %s', async (_, e, want) => {
+  const n = nodeDetail().node
+  mockApi().on(
+    '/nodes/{name}',
+    nodeDetail({ node: { ...n, osImage: 'Talos (v1.9.5)', osEol: { product: 'talos', cycle: '1.9', eolDate: '', isEol: false, latest: '', ...e } } }),
+  )
+  renderApp('/nodes/worker-1')
+  expect(await screen.findByText(want)).toBeInTheDocument()
+})

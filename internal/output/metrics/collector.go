@@ -27,7 +27,8 @@ var (
 	feedSuccessDesc = prometheus.NewDesc("ffs_feed_last_success_timestamp_seconds",
 		"Unix time of the last successful sync of a feed, or 0 if it has never succeeded.", []string{"feed"}, nil)
 	feedLagDesc = prometheus.NewDesc("ffs_feed_lag_seconds",
-		"Seconds since a feed last synced successfully, or since ffs started if it never has.", []string{"feed"}, nil)
+		"Seconds since a feed last synced successfully, or if it never has, since its first attempt or since ffs started, whichever is earlier.",
+		[]string{"feed"}, nil)
 	feedStaleDesc = prometheus.NewDesc("ffs_feed_stale_after_seconds",
 		"Seconds after which a feed counts as stale.", []string{"feed"}, nil)
 	nodeAgentNodesDesc = prometheus.NewDesc("ffs_node_agent_nodes",
@@ -122,7 +123,12 @@ func (c *Collector) Refresh(ctx context.Context) error {
 			return fmt.Errorf("metrics: feed state %s: %w", feed, err)
 		}
 		var last float64
+		// A feed that never succeeded lags from its first attempt, stored across restarts, or from
+		// the collector's start when that is earlier, as the feed runner measures staleness.
 		lag := now.Sub(c.started)
+		if !fstate.FirstAttempt.IsZero() && fstate.FirstAttempt.Before(c.started) {
+			lag = now.Sub(fstate.FirstAttempt)
+		}
 		if !fstate.LastSuccess.IsZero() {
 			last, lag = float64(fstate.LastSuccess.Unix()), now.Sub(fstate.LastSuccess)
 		}

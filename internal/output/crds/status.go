@@ -13,6 +13,7 @@ import (
 
 	"github.com/the-it-dept/ffs/api/v1alpha1"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/upgrade"
 )
 
 // maxTopOwners is how many affected owners a Vulnerability lists; the full list is in the API.
@@ -83,12 +84,14 @@ func containersFor(owner model.Owner, repo string) []string {
 }
 
 // suggestionSummary maps an upgrade suggestion; nil when there is none or no tier fixes anything.
+// Its Target is upgrade.Target, as the Events and alerts name it: "nginx:1.30.7",
+// "nginx:1.30.6 (new digest)" for a refresh, "kubernetes v1.35.10" for the cluster.
 func suggestionSummary(s *model.Suggestion) *v1alpha1.SuggestionSummary {
 	if s == nil || s.Tier == model.TierNone {
 		return nil
 	}
 	return &v1alpha1.SuggestionSummary{
-		Target:     s.Repo + ":" + s.ToTag,
+		Target:     upgrade.Target(*s),
 		Digest:     s.ToDigest,
 		Tier:       string(s.Tier),
 		Fixes:      priorityCounts(s.Fixes),

@@ -16,6 +16,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/upgrade"
 )
 
 const (
@@ -195,7 +196,7 @@ func properties(f model.Finding, adv model.Advisory) map[string]string {
 	set("ffs.priority", f.Priority.String())
 	set("ffs.reasons", strings.Join(f.Reasons, "; "))
 	if s := f.Suggestion; s != nil && s.Tier != model.TierNone && s.ToTag != "" {
-		set("ffs.suggestedImage", s.Repo+":"+s.ToTag)
+		set("ffs.suggestedImage", upgrade.Target(*s))
 	}
 	return p
 }

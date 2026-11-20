@@ -1,3 +1,5 @@
+import type { S } from '@/api/types'
+
 const counter = new Intl.NumberFormat('en-US')
 
 export function formatCount(n: number): string {
@@ -60,4 +62,10 @@ export function formatBytes(n: number): string {
 
 export function plural(n: number, one: string, many: string): string {
   return `${formatCount(n)} ${n === 1 ? one : many}`
+}
+
+// eolText is what a lifecycle status says: its text ("Debian 12 supported until 2028-06-30",
+// "Alpine Linux: rolling release"), else its override note, else nothing.
+export function eolText(e: S<'EOL'> | undefined): string {
+  return e ? e.text || e.note : ''
 }

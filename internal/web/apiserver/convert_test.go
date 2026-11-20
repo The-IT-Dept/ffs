@@ -97,8 +97,11 @@ func TestConvert_SharedShapes(t *testing.T) {
 	require.Equal(t, apigen.EOL{Product: "kubernetes", Cycle: "1.34", EolDate: "2026-10-27", IsEol: true, Latest: "1.34.13",
 		Text: "kubernetes 1.34 reached end of life 2026-10-27"},
 		eolOf(eol.Status{Product: "kubernetes", Cycle: "1.34", EOLDate: &eolDate, IsEOL: true, Latest: "1.34.13"}, at))
-	require.Equal(t, apigen.EOL{Product: "alpine", Cycle: "rolling", Note: "rolling release"},
-		eolOf(eol.Status{Product: "alpine", Cycle: "rolling", Note: "rolling release"}, at))
+	// F105: a status with no date still has text, its labelled note or "supported".
+	require.Equal(t, apigen.EOL{Product: "alpine", Cycle: "rolling", Note: "rolling release", Text: "Alpine Linux: rolling release"},
+		eolOf(eol.Status{Product: "alpine", Label: "Alpine Linux", Cycle: "rolling", Note: "rolling release"}, at))
+	require.Equal(t, apigen.EOL{Product: "debian", Cycle: "13", Text: "Debian 13 supported"},
+		eolOf(eol.Status{Product: "debian", Label: "Debian", Cycle: "13"}, at))
 }
 
 func TestImagePackageRow_InstalledForm(t *testing.T) {

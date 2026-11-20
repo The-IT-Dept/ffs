@@ -118,9 +118,10 @@ func findingPackages(ps []model.FindingPackage) []apigen.FindingPackage {
 	return out
 }
 
-// eolOf shapes a lifecycle status, with the sentence the notifications use.
+// eolOf shapes a lifecycle status. Its text is eol.Support, so a status with no end-of-life date
+// still says something: "Debian 12 supported until 2028-06-30", "Alpine Linux: rolling release".
 func eolOf(st eol.Status, now time.Time) apigen.EOL {
-	out := apigen.EOL{Product: st.Product, Cycle: st.Cycle, IsEol: st.IsEOL, Latest: st.Latest, Note: st.Note, Text: eol.Text(st, now)}
+	out := apigen.EOL{Product: st.Product, Cycle: st.Cycle, IsEol: st.IsEOL, Latest: st.Latest, Note: st.Note, Text: eol.Support(st, now)}
 	if st.EOLDate != nil {
 		out.EolDate = st.EOLDate.UTC().Format(dateFmt)
 	}

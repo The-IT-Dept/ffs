@@ -83,14 +83,15 @@ var AgentRejectReasons = []string{AgentRejectUnauthenticated, AgentRejectRateLim
 	AgentRejectTooLarge}
 
 // crsDropped and crNameCollisions are the names of the gauges the crds package defines and registers
-// itself.
+// itself, and feedSkipped the counter the feeds package does.
 const (
 	crsDropped       = "ffs_finding_crs_dropped"
 	crNameCollisions = "ffs_finding_cr_name_collisions"
+	feedSkipped      = "ffs_feed_skipped_total"
 )
 
-// Register registers c and every metric variable of this package on reg. The crds package registers
-// its own gauges.
+// Register registers c and every metric variable of this package on reg. The crds and feeds packages
+// register their own.
 func Register(reg prometheus.Registerer, c *Collector) error {
 	for _, col := range []prometheus.Collector{c, RematchDuration, CatalogQueueDepth, CatalogFailures, RegistryBudgetRemaining,
 		NotifyDeliveries, AgentReports, AgentIngestBytesInFlight} {
@@ -115,6 +116,7 @@ func Names() []string {
 		"ffs_feed_last_success_timestamp_seconds",
 		"ffs_feed_lag_seconds",
 		"ffs_feed_stale_after_seconds",
+		feedSkipped,
 		"ffs_rematch_duration_seconds",
 		"ffs_catalog_queue_depth",
 		"ffs_catalog_failures_total",
