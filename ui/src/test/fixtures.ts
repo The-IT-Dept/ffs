@@ -61,3 +61,22 @@ export function groupRow(p?: Partial<S<'FindingGroupRow'>>): S<'FindingGroupRow'
 export function findingsPage(p?: Partial<S<'FindingsPage'>>): S<'FindingsPage'> {
   return { ...ENV, total: 0, groups: 0, findings: 0, rows: [], groupRows: [], next: null, facets: {}, ...p }
 }
+
+export function scopeCard(p?: Partial<S<'ScopeCard'>>): S<'ScopeCard'> {
+  return {
+    ...ENV,
+    scope: { scope: 'cluster', kind: 'cluster', label: 'test' },
+    clusters: ['test'],
+    title: 'test',
+    summary: 'Kubernetes 1.35.0 · 3 nodes · 4 namespaces',
+    breadcrumbs: [],
+    views: [{ id: 'exposure', count: 2, gap: false }],
+    related: [],
+    trust: { feeds: feedFreshness(), coverage: coverageFigure(), settings: true },
+    ...p,
+  }
+}
+
+export function searchResult(p?: Partial<S<'SearchResult'>>): S<'SearchResult'> {
+  return { ...ENV, query: 'web', hits: [], truncated: false, ...p }
+}

@@ -1,5 +1,50 @@
-import type { GapCode, S } from '@/api/types'
+import type { GapCode, S, ViewId } from '@/api/types'
 import { formatCount, formatPercent, plural } from './format'
+import type { Scope, ScopeKind } from './scope'
+
+type RelatedSectionId = S<'RelatedSection'>['id']
+
+const viewLabel: Record<ViewId, string> = {
+  exposure: 'Exposure',
+  vulnerabilities: 'Vulnerabilities',
+  workloads: 'Workloads',
+  images: 'Images',
+  packages: 'Packages',
+  nodes: 'Nodes',
+  coverage: 'Coverage',
+  findings: 'Findings',
+  upgrades: 'Upgrades',
+  rbac: 'Service account & RBAC',
+  history: 'History',
+  sbom: 'Coverage & SBOM',
+  hostPackages: 'Host packages',
+  kernel: 'Kernel & runtime',
+  cachedImages: 'Cached images',
+  members: 'Nodes',
+}
+
+const scopeKindLabel: Record<ScopeKind, string> = {
+  cluster: 'Cluster',
+  namespace: 'Namespace',
+  workload: 'Workload',
+  image: 'Image',
+  nodegroup: 'Node group',
+  node: 'Node',
+  controlplane: 'Control plane',
+}
+
+const relatedLabel: Record<RelatedSectionId, string> = {
+  namespaces: 'Namespaces',
+  nodegroups: 'Node groups',
+  controlplane: 'Control plane',
+  workloads: 'Workloads',
+  containers: 'Containers',
+  siblings: 'Siblings',
+  usedBy: 'Used by',
+  notablePackages: 'Notable packages',
+  members: 'Nodes',
+  exceptions: 'Exceptions',
+}
 
 // copy holds every user-facing string. The strings marked Contract are the Contract's Copy section
 // verbatim; change them there first.
@@ -148,6 +193,42 @@ export const copy = {
     feed_stale: { gap: 'feed out of date', todo: 'Check that ffs can reach the {feed} feed; the last error is shown.' },
   } satisfies Record<GapCode, { gap: string; todo: string }>,
   theme: { light: 'Light', dark: 'Dark', system: 'System' },
+  // The kind label of a scope; a workload shows its owner kind, e.g. Deployment.
+  scopeKind: (s: Scope) => (s.kind === 'workload' ? s.value.split('/')[0] || scopeKindLabel.workload : scopeKindLabel[s.kind]),
+  view: (id: ViewId, kind: ScopeKind) => (id === 'upgrades' && kind === 'image' ? 'Upgrade candidates' : viewLabel[id]),
+  related: (id: RelatedSectionId, scope: Scope) =>
+    id === 'siblings' && scope.kind === 'workload' ? `Siblings in ${scope.value.split('/')[1] ?? ''}` : relatedLabel[id],
+  rail: {
+    views: 'Views',
+    filter: 'Filter',
+    more: (n: number) => `+ ${formatCount(n)} more`,
+    gap: 'gap',
+    switchCluster: 'Switch cluster',
+    unavailable: 'Scope details are unavailable.',
+  },
+  trust: {
+    feedsFresh: 'Feeds fresh',
+    feedsStale: (names: string[]) => `Feeds stale: ${names.join(', ')}`,
+    coverage: 'Coverage',
+    sbom: (source: string, tool?: string) => (tool ? `SBOM from ${source} · ${tool}` : `SBOM from ${source}`),
+    unattributed: (n: number) => `${plural(n, 'executable', 'executables')} not attributed`,
+    exceptions: 'Exceptions',
+    settings: 'Settings',
+  },
+  command: {
+    open: 'Search',
+    placeholder: 'Search workloads, images, advisories, packages and nodes',
+    empty: 'No matches.',
+    kind: {
+      workload: 'Workload',
+      namespace: 'Namespace',
+      image: 'Image',
+      advisory: 'Advisory',
+      package: 'Package',
+      nodegroup: 'Node group',
+      node: 'Node',
+    } satisfies Record<S<'SearchHit'>['kind'], string>,
+  },
 }
 
 export type CountNoun = 'advisories' | 'workloads' | 'images' | 'packages' | 'namespaces' | 'fixes'

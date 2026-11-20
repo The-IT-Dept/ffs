@@ -1,4 +1,6 @@
 import type { ReactNode } from 'react'
+import { CommandMenu } from '@/components/command/CommandMenu'
+import { Rail } from '@/components/rail/Rail'
 import { AppLink } from './AppLink'
 import { ThemeToggle } from './ThemeToggle'
 
@@ -10,11 +12,14 @@ export function AppShell({ children }: { children: ReactNode }) {
           ffs
         </AppLink>
         <div className="ml-auto flex items-center gap-2">
+          <CommandMenu />
           <ThemeToggle />
         </div>
       </header>
       <div className="flex min-h-0 flex-1">
-        <aside aria-label="Scope" className="w-[200px] shrink-0 overflow-y-auto border-r bg-muted/40" />
+        <aside aria-label="Scope" className="w-[200px] shrink-0 overflow-y-auto border-r bg-muted/40">
+          <Rail />
+        </aside>
         <main className="min-w-0 flex-1 overflow-y-auto px-6 py-4">{children}</main>
       </div>
     </div>
