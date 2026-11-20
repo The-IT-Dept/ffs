@@ -186,6 +186,41 @@ func TestAcquirer_TransientBackoff(t *testing.T) {
 	require.Equal(t, time.Minute, a.transientDelay(ctx, "d"))
 }
 
+// TestAcquirer_StatsCountRetryWaits (R3): an image waiting out the delay before its next attempt is
+// neither queued nor in flight, so Stats counts it as retrying until it is queued again; readiness
+// must not take that gap for a finished catalogue.
+func TestAcquirer_StatsCountRetryWaits(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+	}{{"waiting", time.Hour}, {"retried", 10 * time.Millisecond}} {
+		t.Run(tc.name, func(t *testing.T) {
+			st, clock := acqStore(t), acqClock()
+			var calls atomic.Int32
+			src := &fakeSource{name: "registry"}
+			src.script = func(context.Context, int, Request) (*Result, error) {
+				if calls.Add(1) == 1 {
+					return nil, &AcquireError{Kind: FailTransient, Reason: "registry unavailable"}
+				}
+				return &Result{SyftJSON: syftBytes(t, ""), Source: "registry"}, nil
+			}
+			a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Now: clock.Now, RetryAfter: tc.delay})
+			startAcq(t, a)
+			a.Enqueue(acqReq())
+			if tc.delay == time.Hour {
+				require.Eventually(t, func() bool {
+					s := a.Stats()
+					return calls.Load() == 1 && s.Queued == 0 && s.InFlight == 0 && s.Retrying == 1
+				}, 5*time.Second, time.Millisecond, "neither queued nor in flight, but waiting to retry")
+				return
+			}
+			require.Eventually(t, func() bool { return getImgOrZero(st, acqReq().Digest).Status == model.ImageCatalogued },
+				5*time.Second, 5*time.Millisecond)
+			require.Equal(t, 0, a.Stats().Retrying, "no longer waiting once queued again")
+		})
+	}
+}
+
 // TestAcquirer_CataloguerDeathRetriesOverlappingImageAlone (F14): when the catalog container dies with
 // two jobs in flight, neither is counted; each runs again alone, so only the image that kills the
 // cataloguer on its own is quarantined.

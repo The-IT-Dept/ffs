@@ -128,7 +128,8 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 
 	d.Registry, d.Engine, d.Acquirer, d.Feeds, d.EOL = reg, eng, acq, runner, ev
 	d.Ready = newReady(readyOptions{Synced: inv.Synced, Stats: acq.Stats, Idle: eng.Idle,
-		GrypeOK: grypeReady(cfg.Feeds.GrypeDB.Enabled, st, log), Wait: readyWait, Log: log.WithName("ready")})
+		GrypeOK: grypeReady(cfg.Feeds.GrypeDB.Enabled, st, log), Wait: readyWait,
+		Stall: max(readyStall, cfg.Catalog.Timeout+acquireSlack), Log: log.WithName("ready")})
 	return d, nil
 }
 
@@ -209,35 +210,52 @@ func grypeReady(enabled bool, st feedStater, log logr.Logger) func(ctx context.C
 	}
 }
 
-// readyWait bounds how long notifications wait, once the inventory has synced, for the initial
-// catalogue and match (the cataloguing queue, the engine and the first Grype DB sync). After it
-// they start with what is matched so far, and the reason is logged: a Grype DB that cannot be
-// downloaded, or work that never drains, must not hold back every alert for good.
-const readyWait = time.Hour
+// readyWait and readyStall bound how long notifications wait, once the inventory has synced, for the
+// initial catalogue and match (the cataloguing queue, the engine and the first Grype DB sync). The
+// wait is a liveness fallback, not a deadline: once readyWait has passed, notifications start with
+// what is matched so far only when cataloguing has also made no progress (no image catalogued or
+// failed) for readyStall, and the reason is logged. A Grype DB that cannot be downloaded, or work
+// that never drains, must not hold back every alert for good; a large first catalogue that is still
+// progressing must not be cut short either, or the baseline covers only part of the cluster and
+// the findings of the rest each alert as new.
+const (
+	readyWait  = time.Hour
+	readyStall = 30 * time.Minute
+)
 
-// readyOptions are the conditions of Deps.Ready and the bound on waiting for them.
+// readyOptions are the conditions of Deps.Ready and the bounds on waiting for them.
 type readyOptions struct {
 	Synced  func() bool
 	Stats   func() sbom.AcquirerStats
 	Idle    func() bool
 	GrypeOK func(ctx context.Context) bool
 	Wait    time.Duration
-	Now     func() time.Time // time.Now when nil
-	Log     logr.Logger
+	// Stall is how long cataloguing must have made no progress, once Wait has passed, before the
+	// conditions are given up on. It should exceed the longest one acquisition may take; readyStall
+	// when zero.
+	Stall time.Duration
+	Now   func() time.Time // time.Now when nil
+	Log   logr.Logger
 }
 
 // newReady returns the sticky readiness of Deps.Ready. It never holds before the inventory has
-// synced. After that it holds, for good, once the acquirer has nothing queued or in flight, the
-// engine is idle and GrypeOK holds, or once Wait has passed since the inventory was first seen
-// synced, whichever comes first.
+// synced. After that it holds, for good, once the acquirer has nothing queued, in flight or waiting
+// to retry, the engine is idle and GrypeOK holds; or, as a fallback, once Wait has passed since the
+// inventory was first seen synced and the acquirer has reported no outcome (an image catalogued,
+// failed or quarantined) for Stall.
 func newReady(o readyOptions) func(ctx context.Context) bool {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
+	if o.Stall <= 0 {
+		o.Stall = readyStall
+	}
 	var (
-		ready atomic.Bool
-		mu    sync.Mutex
-		since time.Time // when the inventory was first seen synced
+		ready    atomic.Bool
+		mu       sync.Mutex
+		since    time.Time // when the inventory was first seen synced
+		progress time.Time // when the acquirer's outcome counts were last seen to move
+		outcomes [3]uint64 // the acquirer's outcome counts then
 	)
 	return func(ctx context.Context) bool {
 		if ready.Load() {
@@ -246,22 +264,26 @@ func newReady(o readyOptions) func(ctx context.Context) bool {
 		if !o.Synced() {
 			return false
 		}
-		pending := o.pending(ctx)
+		stats := o.Stats()
+		pending := o.pending(ctx, stats)
 		mu.Lock()
 		defer mu.Unlock()
 		if ready.Load() {
 			return true
 		}
 		now := o.Now()
+		if n := [3]uint64{stats.Catalogued, stats.Failed, stats.Quarantined}; since.IsZero() || n != outcomes {
+			progress, outcomes = now, n
+		}
 		if since.IsZero() {
 			since = now
 		}
 		switch {
 		case len(pending) == 0:
 			o.Log.Info("initial catalogue and match finished; notifications start")
-		case now.Sub(since) >= o.Wait:
+		case now.Sub(since) >= o.Wait && now.Sub(progress) >= o.Stall:
 			o.Log.Info("notifications start before the initial catalogue and match finished",
-				"waited", o.Wait.String(), "waitingFor", pending)
+				"waited", now.Sub(since).String(), "noProgressFor", now.Sub(progress).String(), "waitingFor", pending)
 		default:
 			return false
 		}
@@ -271,10 +293,11 @@ func newReady(o readyOptions) func(ctx context.Context) bool {
 }
 
 // pending names the conditions of readiness that do not hold yet, besides the inventory sync.
-func (o readyOptions) pending(ctx context.Context) []string {
+func (o readyOptions) pending(ctx context.Context, s sbom.AcquirerStats) []string {
 	var out []string
-	if s := o.Stats(); s.Queued != 0 || s.InFlight != 0 {
-		out = append(out, fmt.Sprintf("image cataloguing (%d queued, %d in progress)", s.Queued, s.InFlight))
+	if s.Queued != 0 || s.InFlight != 0 || s.Retrying != 0 {
+		out = append(out, fmt.Sprintf("image cataloguing (%d queued, %d in progress, %d waiting to retry)",
+			s.Queued, s.InFlight, s.Retrying))
 	}
 	if !o.Idle() {
 		out = append(out, "finding recompute")

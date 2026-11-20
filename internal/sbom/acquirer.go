@@ -70,9 +70,10 @@ type AcquirerOptions struct {
 	Log               logr.Logger
 }
 
-// AcquirerStats is a snapshot for metrics.
+// AcquirerStats is a snapshot for metrics and readiness. Retrying counts the images waiting out the
+// delay before their next attempt, which are neither queued nor in flight meanwhile.
 type AcquirerStats struct {
-	Queued, InFlight                int
+	Queued, InFlight, Retrying      int
 	Catalogued, Failed, Quarantined uint64
 }
 
@@ -111,6 +112,7 @@ type Acquirer struct {
 	jobs      map[string]*job
 	running   map[*job]struct{}
 	inFlight  int
+	retrying  int             // retries scheduled but not yet queued
 	solo      map[string]bool // digests whose next attempt runs alone
 	soloBusy  bool            // a solo job is running
 	transient map[string]int  // consecutive transient failures per digest
@@ -152,6 +154,11 @@ func NewAcquirer(o AcquirerOptions) *Acquirer {
 func (a *Acquirer) Enqueue(r Request) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	a.enqueue(r)
+}
+
+// enqueue is Enqueue; the caller holds mu.
+func (a *Acquirer) enqueue(r Request) {
 	if _, ok := a.jobs[r.Digest]; ok {
 		return
 	}
@@ -191,9 +198,9 @@ func (a *Acquirer) NeedLeaderElection() bool { return true }
 // Stats returns a snapshot of queue depth and outcome counters.
 func (a *Acquirer) Stats() AcquirerStats {
 	a.mu.Lock()
-	queued, inFlight := len(a.high)+len(a.low), a.inFlight
+	queued, inFlight, retrying := len(a.high)+len(a.low), a.inFlight, a.retrying
 	a.mu.Unlock()
-	return AcquirerStats{Queued: queued, InFlight: inFlight, Catalogued: a.catalogued.Load(),
+	return AcquirerStats{Queued: queued, InFlight: inFlight, Retrying: retrying, Catalogued: a.catalogued.Load(),
 		Failed: a.failed.Load(), Quarantined: a.quarantined.Load()}
 }
 
@@ -289,8 +296,12 @@ func (a *Acquirer) worker(ctx context.Context) {
 			return processed{res, retry, err}, nil
 		})
 		p := v.(processed)
+		retry := p.retry > 0 && ctx.Err() == nil
 		a.mu.Lock()
 		a.inFlight--
+		if retry {
+			a.retrying++ // in the same step, so Stats never sees the image neither in flight nor waiting
+		}
 		delete(a.running, j)
 		if j.solo {
 			a.soloBusy = false
@@ -303,11 +314,14 @@ func (a *Acquirer) worker(ctx context.Context) {
 		for _, w := range waiters {
 			w <- outcome{p.res, p.err}
 		}
-		if p.retry > 0 && ctx.Err() == nil {
+		if retry {
 			req := j.req
 			time.AfterFunc(p.retry, func() {
+				a.mu.Lock()
+				defer a.mu.Unlock()
+				a.retrying--
 				if ctx.Err() == nil {
-					a.Enqueue(req)
+					a.enqueue(req)
 				}
 			})
 		}

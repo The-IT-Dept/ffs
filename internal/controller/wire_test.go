@@ -108,6 +108,54 @@ func TestReady_BoundedWait(t *testing.T) {
 	}
 }
 
+// TestReady_WaitsWhileCatalogueProgresses (R3): the wait is a liveness fallback, not a deadline. A
+// large first catalogue that is still making progress when the wait has passed holds notifications
+// back until it has finished, so the baseline covers every image rather than those catalogued in
+// the first hour.
+func TestReady_WaitsWhileCatalogueProgresses(t *testing.T) {
+	ctx := context.Background()
+	start := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC)
+	now, stats := start, sbom.AcquirerStats{Queued: 20, InFlight: 2}
+	ready := newReady(readyOptions{Synced: func() bool { return true }, Stats: func() sbom.AcquirerStats { return stats },
+		Idle: func() bool { return true }, GrypeOK: grypeReady(false, nil, logr.Discard()), Wait: time.Hour,
+		Now: func() time.Time { return now }, Log: logr.Discard()})
+	require.False(t, ready(ctx))
+
+	// Two images catalogued every ten minutes, for well over the wait.
+	for stats.Queued > 0 {
+		now = now.Add(10 * time.Minute)
+		stats.Queued -= 2
+		stats.Catalogued += 2
+		require.False(t, ready(ctx), "cataloguing still progressing after %s", now.Sub(start))
+	}
+	now = now.Add(10 * time.Minute)
+	stats.InFlight, stats.Failed = 0, 2
+	require.True(t, ready(ctx), "ready once the catalogue has finished")
+}
+
+// TestReady_StallAfterTheWait (R3): once the wait has passed, a catalogue that stops making progress
+// is given up on after the stall time, counted from its last outcome; an image waiting out a retry
+// delay is still work to wait for.
+func TestReady_StallAfterTheWait(t *testing.T) {
+	ctx := context.Background()
+	start := time.Date(2026, 11, 19, 0, 0, 0, 0, time.UTC)
+	now, stats := start, sbom.AcquirerStats{Queued: 10, InFlight: 2}
+	ready := newReady(readyOptions{Synced: func() bool { return true }, Stats: func() sbom.AcquirerStats { return stats },
+		Idle: func() bool { return true }, GrypeOK: grypeReady(false, nil, logr.Discard()), Wait: time.Hour,
+		Stall: 30 * time.Minute, Now: func() time.Time { return now }, Log: logr.Discard()})
+	require.False(t, ready(ctx))
+
+	// Progress until 70 minutes in, then the registry stops answering: the rest wait out retries.
+	now, stats.Queued, stats.Catalogued = start.Add(70*time.Minute), 4, 6
+	require.False(t, ready(ctx))
+	now, stats.Queued, stats.InFlight, stats.Retrying = start.Add(80*time.Minute), 0, 0, 6
+	require.False(t, ready(ctx), "nothing queued or in flight, but images wait to retry")
+	now = start.Add(99 * time.Minute)
+	require.False(t, ready(ctx), "29 minutes without progress")
+	now = start.Add(100 * time.Minute)
+	require.True(t, ready(ctx), "30 minutes without progress after the wait")
+}
+
 func TestWire_OSVGitRepos(t *testing.T) {
 	repos := osvGitRepos()
 	require.Contains(t, repos, "github.com/php/php-src")
