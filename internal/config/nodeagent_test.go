@@ -11,12 +11,49 @@ import (
 func TestNodeAgent_DefaultsAndLoad(t *testing.T) {
 	require.Equal(t, NodeAgentConfig{Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent",
 		ServiceAccount: "ffs-agent", MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
-		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute}, Default().NodeAgent)
+		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
+		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}, Default().NodeAgent)
 	c, err := Load(writeFile(t, "nodeAgent:\n  staleAfter: 1h\n  exposedNodes: node-role.example.com/edge\n"))
 	require.NoError(t, err)
 	require.Equal(t, time.Hour, c.NodeAgent.StaleAfter)
 	require.Equal(t, "node-role.example.com/edge", c.NodeAgent.ExposedNodes)
 	require.Equal(t, 5*time.Minute, c.NodeAgent.ImageListInterval) // siblings keep defaults
+}
+
+// TestNodeAgent_SchedulingDefaultsMatchTheChart: the defaults are the chart's ([amd64], kubernetes.io/os:
+// linux); a value in the file replaces them rather than merging, and an explicitly empty or null value
+// means every node.
+func TestNodeAgent_SchedulingDefaultsMatchTheChart(t *testing.T) {
+	arm := map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "arm64"}
+	windows := map[string]string{"kubernetes.io/os": "windows", "kubernetes.io/arch": "amd64"}
+	ok, _ := Default().NodeAgent.ScheduledOn(arm, "arm64")
+	require.False(t, ok, "the default schedules on amd64 only")
+	ok, _ = Default().NodeAgent.ScheduledOn(windows, "amd64")
+	require.False(t, ok, "the default schedules on Linux only")
+
+	for name, tc := range map[string]struct {
+		yaml     string
+		arch     []string
+		selector map[string]string
+	}{
+		"absent keeps the defaults": {"nodeAgent:\n  staleAfter: 1h\n", []string{"amd64"}, map[string]string{"kubernetes.io/os": "linux"}},
+		"explicitly empty":          {"nodeAgent:\n  architectures: []\n  nodeSelector: {}\n", []string{}, map[string]string{}},
+		"null":                      {"nodeAgent:\n  architectures: null\n  nodeSelector:\n", nil, nil},
+		"set replaces, not merges": {"nodeAgent:\n  architectures: [arm64]\n  nodeSelector:\n    pool: general\n",
+			[]string{"arm64"}, map[string]string{"pool": "general"}},
+	} {
+		c, err := Load(writeFile(t, tc.yaml))
+		require.NoError(t, err, name)
+		require.Equal(t, tc.arch, c.NodeAgent.Architectures, name)
+		require.Equal(t, tc.selector, c.NodeAgent.NodeSelector, name)
+		if len(tc.arch) == 0 {
+			ok, why := c.NodeAgent.ScheduledOn(windows, "arm64")
+			require.True(t, ok, "%s: empty means every node", name)
+			require.Empty(t, why, name)
+		}
+	}
+	require.Equal(t, map[string]string{"kubernetes.io/os": "linux"}, Default().NodeAgent.NodeSelector,
+		"loading never changes the defaults of a later Default()")
 }
 
 func TestNodeAgent_Validate(t *testing.T) {

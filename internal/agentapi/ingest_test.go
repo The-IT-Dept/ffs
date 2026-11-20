@@ -35,7 +35,8 @@ var (
 
 // testNode is a Ready node as the manager's cache holds it.
 func testNode(name, osImage string, images ...corev1.ContainerImage) *corev1.Node {
-	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}, Status: corev1.NodeStatus{
+	return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name,
+		Labels: map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}}, Status: corev1.NodeStatus{
 		NodeInfo: corev1.NodeSystemInfo{OSImage: osImage, ContainerRuntimeVersion: "containerd://2.2.1", KubeletVersion: "v1.37.1",
 			Architecture: "amd64", KernelVersion: runningKernel},
 		Conditions: []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}},

@@ -401,7 +401,7 @@ func TestReconciler_NodesOwnerShape(t *testing.T) {
 	// Exposed nodes by label selector.
 	var w1 corev1.Node
 	require.NoError(t, f.cl.Get(ctx, client.ObjectKey{Name: "worker-1"}, &w1))
-	w1.Labels = map[string]string{"node-role.kubernetes.io/edge": "true"}
+	w1.Labels["node-role.kubernetes.io/edge"] = "true"
 	require.NoError(t, f.cl.Update(ctx, &w1))
 	f.setConfig(func(c *config.Config) { c.NodeAgent.ExposedNodes = "node-role.kubernetes.io/edge=true" })
 	f.pass(t)
