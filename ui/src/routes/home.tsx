@@ -60,7 +60,7 @@ function HomePage() {
   if (exposure.data) {
     table =
       exposure.data.rows.length === 0 ? (
-        <EmptyState coverage={summary.data?.coverage} feeds={summary.data?.feeds} />
+        <EmptyState coverage={summary.data?.coverage} feeds={summary.data?.feeds} pending={summary.isPending} />
       ) : (
         <ExposureTable
           table={exposure.data}

@@ -48,8 +48,9 @@ test('row rules sit on the cells, which border-separate draws', () => {
   // The header's rule comes from its row's cells alone.
   expect(head.className).not.toMatch(/border/)
   expect(screen.getAllByRole('row')[0]).toHaveClass('[&>*]:border-b')
-  // The footer rules its cells, not itself.
-  expect(foot).toHaveClass('[&>tr>*]:border-t')
+  // The footer rules its first row's cells once, not itself and not every row.
+  expect(foot).toHaveClass('[&>tr:first-child>*]:border-t')
+  expect(foot).not.toHaveClass('[&>tr>*]:border-t')
   expect(foot).not.toHaveClass('border-t')
 })
 

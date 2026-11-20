@@ -5,7 +5,7 @@ import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { AppLink } from '@/components/layout/AppLink'
-import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { EmptyState } from '@/components/layout/EmptyState'
 import { Field, FieldList } from '@/components/layout/FieldList'
 import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -13,6 +13,7 @@ import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { AgentGate, AgentMissing } from '@/components/nodes/AgentGate'
 import { NodeGapLines, NodeGapNotice, nodeGapsOf } from '@/components/nodes/NodeGaps'
 import { NodeImagesTable } from '@/components/nodes/NodeImagesTable'
+import { useScopeTrust } from '@/components/rail/query'
 import { PackageTable } from '@/components/sbom/PackageTable'
 import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
@@ -298,7 +299,7 @@ function NodeGroupPage() {
     // Keep the page while compare changes, but never show another group's data.
     placeholderData: (prev, prevQuery) => ((prevQuery?.queryKey[2] as { path?: { id?: string } } | undefined)?.path?.id === id ? prev : undefined),
   })
-  const trust = useScopeTrust({ kind: 'nodegroup', value: id })
+  const { trust, pending } = useScopeTrust({ kind: 'nodegroup', value: id })
   const missing = q.error instanceof ApiProblem && q.error.code === 'not_found'
   useEffect(() => {
     // A group no longer listed under this key lands on the list instead, with a notice.
@@ -320,6 +321,7 @@ function NodeGroupPage() {
       <EmptyState
         coverage={trust?.coverage}
         feeds={trust?.feeds}
+        pending={pending}
         lead={gaps.length > 0 ? <NodeGapLines gaps={gaps} total={agents.length} /> : undefined}
       />
     ) : (

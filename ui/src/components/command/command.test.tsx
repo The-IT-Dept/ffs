@@ -1,9 +1,14 @@
 import { screen, waitFor, within } from '@testing-library/react'
-import { expect, test, vi } from 'vitest'
+import { afterEach, expect, test, vi } from 'vitest'
 import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
 import { searchResult } from '@/test/fixtures'
 import { renderApp } from '@/test/render'
+
+// The platform spy is restored even when a test fails, so later tests see jsdom's own platform.
+afterEach(() => {
+  vi.restoreAllMocks()
+})
 
 test('opens with Ctrl-K, searches once after typing and jumps to the hit', async () => {
   const api = mockApi().on('/search', (u) =>
@@ -75,5 +80,4 @@ test('the search hint is ⌘K on Apple platforms and Ctrl K elsewhere', async ()
   vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel')
   renderApp('/')
   expect(await screen.findByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
-  vi.restoreAllMocks()
 })

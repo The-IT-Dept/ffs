@@ -8,6 +8,7 @@ import { EmptyState } from '@/components/layout/EmptyState'
 import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
+import { railQuery } from '@/components/rail/query'
 import { CoverageFigureText } from '@/components/signals/CoverageFigureText'
 import { Button } from '@/components/ui/button'
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from '@/components/ui/sheet'
@@ -26,7 +27,7 @@ import {
   toApiQuery,
   withFacet,
 } from '@/lib/query'
-import { CLUSTER, parseScope, type Scope, scopeParam } from '@/lib/scope'
+import { CLUSTER, parseScope, type Scope } from '@/lib/scope'
 import { type Column, ExplorerTable } from './ExplorerTable'
 import { FacetColumn } from './FacetColumn'
 import { FilterChips } from './FilterChips'
@@ -116,8 +117,8 @@ export function ExplorerPage<K extends ExplorerKind>({
   const settings = useQuery(apiQuery('/settings', {}))
   const epssBump = settings.data?.priority.epssBump ?? 0.1
   const scope = scopeOf(search)
-  // The same key the rail asks, so the coverage beside the count costs no request.
-  const card = useQuery(apiQuery('/scope', { query: scopeParam(scope) }))
+  // The rail's own query, so the coverage beside the count costs no request.
+  const card = useQuery(railQuery(scope))
   const pages = useCursorPages(JSON.stringify(toApiQuery(withoutCursor(search), [])), search.cursor)
 
   const rejected = q.error instanceof ApiProblem && q.error.code === 'invalid_cursor' && search.cursor !== undefined
@@ -166,7 +167,7 @@ export function ExplorerPage<K extends ExplorerKind>({
   let body
   if (rejected || gone || (!data && !q.error)) body = <TableSkeleton />
   else if (q.error && !data) body = <ProblemNotice error={q.error} />
-  else if (data && data.total === 0) body = <EmptyState coverage={coverage} feeds={feeds} scope={scope} filtered={chips.length > 0} />
+  else if (data && data.total === 0) body = <EmptyState coverage={coverage} feeds={feeds} scope={scope} filtered={chips.length > 0} pending={card.isPending} />
   else if (data && grouped && findingsData && search.group)
     body = <GroupTable group={search.group} rows={findingsData.groupRows} search={search} />
   else if (data)

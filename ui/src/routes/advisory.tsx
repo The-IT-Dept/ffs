@@ -204,6 +204,7 @@ function AdvisoryPage() {
               <EmptyState
                 coverage={coverage}
                 feeds={summary.data?.feeds}
+                pending={summary.isPending}
                 lead={!coverage && a.uncatalogued > 0 ? <Uncatalogued n={a.uncatalogued} /> : undefined}
               />
             )}

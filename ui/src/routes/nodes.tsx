@@ -9,6 +9,7 @@ import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { ControlPlaneBlock } from '@/components/nodes/ControlPlaneBlock'
 import { HOST_GAP_CODES } from '@/components/nodes/NodeGaps'
+import { railQuery } from '@/components/rail/query'
 import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCount } from '@/components/signals/PriorityCount'
@@ -17,7 +18,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { copy } from '@/lib/copy'
 import { formatCount } from '@/lib/format'
 import { nodeGroupPath } from '@/lib/links'
-import { formatScope } from '@/lib/scope'
+import { CLUSTER, formatScope } from '@/lib/scope'
 import { cn } from '@/lib/utils'
 import { rootRoute } from './root'
 
@@ -142,8 +143,8 @@ function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'Scop
 
 function NodesPage() {
   const q = useQuery(apiQuery('/nodegroups', {}))
-  // The cluster rail, asked with the rail's own key.
-  const rail = useQuery(apiQuery('/scope', { query: {} }))
+  // The cluster rail, asked through the rail's own query.
+  const rail = useQuery(railQuery(CLUSTER))
   return (
     <div>
       <PageHeader title={copy.page.nodes} />

@@ -1,4 +1,4 @@
-import { screen } from '@testing-library/react'
+import { screen, waitFor } from '@testing-library/react'
 import { expect, test } from 'vitest'
 import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
@@ -33,6 +33,13 @@ test('a stale ranking feed alone does not stop an empty view from reading clean'
   renderWithRouter(<EmptyState coverage={coverageFigure()} feeds={feedFreshness({ fresh: false, stale: ['kev', 'epss'] })} />)
   expect(await screen.findByText(copy.empty)).toBeInTheDocument()
   expect(screen.queryByRole('link', { name: 'Feeds' })).toBeNull()
+})
+
+test('an empty view does not read clean while its coverage and feeds are loading', async () => {
+  const { router } = renderWithRouter(<EmptyState pending />)
+  await waitFor(() => expect(router.state.status).toBe('idle'))
+  expect(document.querySelector('[data-slot="skeleton"]')).not.toBeNull()
+  expect(screen.queryByText(copy.empty)).toBeNull()
 })
 
 test('the coverage link of an empty view carries its scope', async () => {

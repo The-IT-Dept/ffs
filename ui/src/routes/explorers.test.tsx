@@ -1,5 +1,5 @@
 import { screen, waitFor, within } from '@testing-library/react'
-import { expect, test } from 'vitest'
+import { expect, test, vi } from 'vitest'
 import { copy } from '@/lib/copy'
 import { mockApi } from '@/test/api'
 import {
@@ -102,6 +102,28 @@ test('an empty explorer leads with a stale matching feed from the scope trust', 
   expect(await screen.findByText('feed out of date: grypedb')).toBeInTheDocument()
   expect(screen.getByRole('link', { name: 'Feeds' })).toHaveAttribute('href', '/feeds')
   expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('an empty explorer does not read clean before the scope trust has answered', async () => {
+  mockApi().on('/findings', findingsPage())
+  // The rail's /scope answer is held until the test releases it.
+  let release = () => {}
+  const held = new Promise<void>((r) => {
+    release = r
+  })
+  const answer = globalThis.fetch
+  vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit) => {
+    if (new URL(input instanceof Request ? input.url : String(input)).pathname === '/api/v1/scope') await held
+    return answer(input, init)
+  })
+  renderApp('/vulnerabilities')
+  const main = await screen.findByRole('main')
+  expect(await within(main).findByText('0 findings')).toBeInTheDocument()
+  expect(main.querySelector('.border-dashed [data-slot="skeleton"]')).not.toBeNull()
+  expect(within(main).queryByText(copy.empty)).toBeNull()
+  release()
+  expect(await within(main).findByText(copy.empty)).toBeInTheDocument()
+  expect(main.querySelector('.border-dashed [data-slot="skeleton"]')).toBeNull()
 })
 
 test('host and control-plane findings link to their own pages and name the node groups a host finding affects', async () => {

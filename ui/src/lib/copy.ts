@@ -46,6 +46,8 @@ const relatedLabel: Record<RelatedSectionId, string> = {
   exceptions: 'Exceptions',
 }
 
+const openNavigation = 'Open navigation'
+
 const agentState = { reporting: 'reporting', stale: 'stale', never: 'never reported', disabled: 'disabled' } satisfies Record<S<'AgentState'>, string>
 
 // copy holds every user-facing string. The strings marked Contract are the Contract's Copy section
@@ -227,8 +229,8 @@ export const copy = {
   related: (id: RelatedSectionId, scope: Scope) =>
     id === 'siblings' && scope.kind === 'workload' ? `Siblings in ${scope.value.split('/')[1] ?? ''}` : relatedLabel[id],
   shell: {
-    openNavigation: 'Open navigation',
-    openNavigationTo: (scope: string) => (scope ? `Open navigation: ${scope}` : 'Open navigation'),
+    // The menu button's name, with the scope it opens on: "Open navigation: Cluster test".
+    openNavigationTo: (scope: string) => (scope ? `${openNavigation}: ${scope}` : openNavigation),
     navigation: 'Navigation',
     close: 'Close',
   },

@@ -1,9 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 import { useRouterState } from '@tanstack/react-router'
-import { apiQuery } from '@/api/client'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
-import { scopeParam } from '@/lib/scope'
+import { railQuery } from './query'
 import { RelatedList } from './RelatedList'
 import { routeScope } from './routescope'
 import { ScopeCard } from './ScopeCard'
@@ -31,7 +30,7 @@ export function useRailScope() {
     structuralSharing: true,
   })
   const rs = routeScope(leaf.routeId, leaf.params, { scope: leaf.scope, view: leaf.view, from: leaf.from })
-  const q = useQuery(apiQuery('/scope', { query: { ...scopeParam(rs.scope), ...(rs.from ? { from: rs.from } : {}) } }))
+  const q = useQuery(railQuery(rs.scope, rs.from))
   return { rs, q }
 }
 
