@@ -31,10 +31,18 @@ var offeredClasses = []model.UnresolvableClass{
 	model.UnresolvableSideLoaded, model.UnresolvableAuth, model.UnresolvableUnreachable, model.UnresolvableNotFound,
 }
 
+// AgentImageIngest stores an image SBOM one node's agent catalogued, with its provenance; *sbom.Acquirer
+// implements it.
+type AgentImageIngest interface {
+	IngestFromNode(ctx context.Context, prov store.AgentProvenance, r sbom.Request, res *sbom.Result) error
+}
+
+var _ AgentImageIngest = (*sbom.Acquirer)(nil)
+
 // WorkOptions configures a WorkQueue.
 type WorkOptions struct {
 	Store           *store.Store
-	Acquirer        AgentIngest
+	Acquirer        AgentImageIngest
 	Pods            PodIndex
 	PerReport       int           // images offered per report at most; 0 offers none
 	Timeout         time.Duration // how long an offer is held for its node
@@ -207,23 +215,13 @@ func heldComplete(rows []model.NodeImage, d, indexDigest string) bool {
 	return false
 }
 
-// SBOM applies a node agent's result for one image. It is accepted only from a node a pod of which runs the
-// image (or its index), whether or not the image was offered to it; anything else is ErrForbidden with
-// nothing written.
+// SBOM applies a node agent's result for one image. It is accepted only for a live offer of the image to
+// that node: one Offer made to the node whose deadline has not passed. Anything else is ErrForbidden with
+// nothing written, so a node cannot supply, fail or decline an image it was not asked for. A handled result
+// releases the offer; a transient failure keeps it, so the agent can send the result again.
 func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult) error {
 	if res.Node != id.Node {
 		return fmt.Errorf("%w: result is for node %s, not %s", ErrForbidden, res.Node, id.Node)
-	}
-	img, ok, err := q.o.Store.GetImage(ctx, res.Digest)
-	if err != nil {
-		return err
-	}
-	pods, err := q.o.Pods.DigestsOnNode(ctx, id.Node)
-	if err != nil {
-		return err
-	}
-	if !pods[res.Digest] && (!ok || img.IndexDigest == "" || !pods[img.IndexDigest]) {
-		return fmt.Errorf("%w: no pod on %s runs %s", ErrForbidden, id.Node, res.Digest)
 	}
 	hasSyft := len(bytes.TrimSpace(res.SyftJSON)) > 0 && !bytes.Equal(bytes.TrimSpace(res.SyftJSON), []byte("null"))
 	set := 0
@@ -240,46 +238,58 @@ func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult)
 	default:
 		return fmt.Errorf("%w: unknown unavailable reason %q", ErrBadRequest, res.Unavailable)
 	}
-	if !ok {
-		return nil // no longer tracked
-	}
 	now := q.o.Now()
 	q.mu.Lock()
-	if o, live := q.offers[res.Digest]; live && o.node == id.Node {
+	o, live := q.offers[res.Digest]
+	q.mu.Unlock()
+	if !live || o.node != id.Node || !o.deadline.After(now) {
+		return fmt.Errorf("%w: %s was not offered to %s, or its offer has expired", ErrForbidden, res.Digest, id.Node)
+	}
+	img, ok, err := q.o.Store.GetImage(ctx, res.Digest)
+	if err != nil {
+		return err
+	}
+	if ok {
+		log := q.o.Log.WithValues("node", id.Node, "digest", res.Digest)
+		switch {
+		case hasSyft:
+			err = q.ingest(ctx, id, res, img, now, log)
+		case res.Failure != "":
+			log.Info("node agent could not catalogue the image", "failure", res.Failure)
+			_, err = q.o.Store.RecordAgentJobFailure(ctx, res.Digest, id.Node, res.Failure, now, q.o.QuarantineAfter, q.o.QuarantineFor)
+		default:
+			err = q.unavailable(ctx, id, res, img, now, log)
+		}
+	}
+	if err != nil && !errors.Is(err, ErrForbidden) {
+		return err // transient: the offer stays for the agent's retry
+	}
+	q.mu.Lock()
+	if cur, still := q.offers[res.Digest]; still && cur.id == o.id {
 		delete(q.offers, res.Digest)
 	}
 	q.mu.Unlock()
-
-	log := q.o.Log.WithValues("node", id.Node, "digest", res.Digest)
-	switch {
-	case hasSyft:
-		return q.ingest(ctx, id, res, img, now, log)
-	case res.Failure != "":
-		log.Info("node agent could not catalogue the image", "failure", res.Failure)
-		_, err := q.o.Store.RecordAgentJobFailure(ctx, res.Digest, id.Node, res.Failure, now, q.o.QuarantineAfter, q.o.QuarantineFor)
-		return err
-	default:
-		return q.unavailable(ctx, id, res, img, now, log)
-	}
+	return err
 }
 
-// ingest stores an agent SBOM through the acquirer and records where it came from. A refused document counts
+// ingest stores an agent SBOM, with where it came from, through the acquirer. A refused document counts
 // toward the image's quarantine (at once when the refusal is deterministic); a transient failure is returned.
+// An image already catalogued from another node's agent SBOM is ErrForbidden: it is never replaced.
 func (q *WorkQueue) ingest(ctx context.Context, id Identity, res *wire.SBOMResult, img model.Image, now time.Time,
 	log logr.Logger) error {
-	err := q.o.Acquirer.Ingest(ctx,
+	err := q.o.Acquirer.IngestFromNode(ctx,
+		store.AgentProvenance{Digest: res.Digest, Node: id.Node, AgentVersion: res.AgentVersion, ReceivedAt: now},
 		sbom.Request{Repo: img.Repo, Digest: res.Digest, IndexDigest: img.IndexDigest, Platform: img.Platform},
 		&sbom.Result{SyftJSON: res.SyftJSON, Coverage: res.Coverage, Source: sbom.SourceAgent})
 	switch {
 	case err == nil:
-		if err := q.o.Store.PutAgentProvenance(ctx, store.AgentProvenance{Digest: res.Digest, Node: id.Node,
-			AgentVersion: res.AgentVersion, ReceivedAt: now}); err != nil {
-			return err
-		}
 		log.Info("stored the node agent's SBOM", "agentVersion", res.AgentVersion)
 		return q.o.Store.ClearAgentJob(ctx, res.Digest)
 	case errors.Is(err, sbom.ErrSuperseded):
 		return nil
+	case errors.Is(err, sbom.ErrOtherNode):
+		log.Info("node agent SBOM refused: the image is catalogued from another node's SBOM")
+		return fmt.Errorf("%w: %s is catalogued from another node's SBOM", ErrForbidden, res.Digest)
 	}
 	kind := sbom.KindOf(err)
 	if kind == sbom.FailTransient {

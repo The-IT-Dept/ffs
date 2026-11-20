@@ -155,41 +155,87 @@ func (f *workFixture) live(digest string) bool {
 	return ok
 }
 
+// offered gives node a live offer of each digest, as Offer would, without Offer's selection rules.
+func (f *workFixture) offered(node string, digests ...string) {
+	f.q.mu.Lock()
+	defer f.q.mu.Unlock()
+	for _, d := range digests {
+		f.q.offers[d] = offer{id: "offer-" + node + "-" + d[len(d)-4:], node: node, deadline: f.clk.Now().Add(30 * time.Minute)}
+	}
+}
+
 func sideloadDoc(t *testing.T) []byte {
 	t.Helper()
 	return syftDoc(t, ubuntu, debPkg("libsideload1", "2.0-1"))
 }
 
-func TestWork_RejectsSBOMForDigestNoPodRunsOnNode(t *testing.T) {
+func TestWork_SBOMNeedsALiveOfferToThatNode(t *testing.T) {
 	f := newWorkFixture(t)
 	ctx := context.Background()
 	doc := sideloadDoc(t)
 	before := f.image(t, dig1)
+	f.pods.run("worker-2", dig1)
 
-	err := f.q.SBOM(ctx, worker2, &wire.SBOMResult{ID: "0123", Node: "worker-2", AgentVersion: "v0.0.1", Digest: dig1, SyftJSON: doc})
-	require.ErrorIs(t, err, ErrForbidden)
-	require.Contains(t, err.Error(), "no pod on worker-2 runs "+dig1)
+	// Never offered, though a pod on worker-1 runs it: refused, whatever the outcome.
+	for name, res := range map[string]*wire.SBOMResult{
+		"syft":        {Node: "worker-1", AgentVersion: "v0.0.1", Digest: dig1, SyftJSON: doc},
+		"failure":     {Node: "worker-1", Digest: dig1, Failure: "cataloguer exceeded its memory limit"},
+		"unavailable": {Node: "worker-1", Digest: dig1, Unavailable: wire.UnavailableLayersDiscarded},
+	} {
+		err := f.q.SBOM(ctx, worker1, res)
+		require.ErrorIs(t, err, ErrForbidden, name)
+		require.Contains(t, err.Error(), dig1+" was not offered to worker-1", name)
+	}
 	require.Zero(t, f.ingest.count())
 	f.requireUntouched(t, dig1, before)
 
-	err = f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-2", AgentVersion: "v0.0.1", Digest: dig1, SyftJSON: doc})
+	// A result naming another node than the token's.
+	err := f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-2", AgentVersion: "v0.0.1", Digest: dig1, SyftJSON: doc})
 	require.ErrorIs(t, err, ErrForbidden)
+	require.Zero(t, f.ingest.count())
+
+	// Offered to worker-1: worker-2, which also runs it, may not answer for it.
+	work, err := f.q.Offer(ctx, "worker-1")
+	require.NoError(t, err)
+	require.Equal(t, dig1, work[0].Digest)
+	err = f.q.SBOM(ctx, worker2, &wire.SBOMResult{ID: work[0].ID, Node: "worker-2", AgentVersion: "v0.0.1", Digest: dig1, SyftJSON: doc})
+	require.ErrorIs(t, err, ErrForbidden)
+	require.Contains(t, err.Error(), dig1+" was not offered to worker-2")
+	require.Zero(t, f.ingest.count())
+	f.requireUntouched(t, dig1, before)
+	require.True(t, f.live(dig1), "worker-1's offer stands")
+
+	// worker-1's offer expired: refused too.
+	f.clk.Add(30 * time.Minute)
+	require.ErrorIs(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{ID: work[0].ID, Node: "worker-1", Digest: dig1, SyftJSON: doc}),
+		ErrForbidden)
 	require.Zero(t, f.ingest.count())
 	f.requireUntouched(t, dig1, before)
 
-	// Never offered, but a pod on worker-1 runs it: accepted.
+	// A live offer to worker-1: accepted, with its provenance.
+	f.offered("worker-1", dig1)
 	require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", AgentVersion: "v0.0.2", Digest: dig1, SyftJSON: doc}))
 	require.Equal(t, 1, f.ingest.count())
 	p, ok := f.provenance(t, dig1)
 	require.True(t, ok)
-	require.Equal(t, store.AgentProvenance{Digest: dig1, Node: "worker-1", AgentVersion: "v0.0.2", ReceivedAt: t0}, p)
+	require.Equal(t, store.AgentProvenance{Digest: dig1, Node: "worker-1", AgentVersion: "v0.0.2", ReceivedAt: f.clk.Now()}, p)
+	require.False(t, f.live(dig1), "the offer is released")
+	stored := f.image(t, dig1)
 
-	// dig2 is trusted on worker-1 through its index: the pod's imageID names digIndex.
-	require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", AgentVersion: "v0.0.2", Digest: dig2, SyftJSON: doc}))
-	require.Equal(t, 2, f.ingest.count())
-	p, ok = f.provenance(t, dig2)
-	require.True(t, ok)
+	// The image is catalogued from worker-1's SBOM: an offer to worker-2 cannot replace it.
+	f.offered("worker-2", dig1)
+	other := syftDoc(t, ubuntu)
+	err = f.q.SBOM(ctx, worker2, &wire.SBOMResult{Node: "worker-2", AgentVersion: "v0.0.2", Digest: dig1, SyftJSON: other})
+	require.ErrorIs(t, err, ErrForbidden)
+	require.Contains(t, err.Error(), "another node")
+	require.Equal(t, stored, f.image(t, dig1))
+	p, _ = f.provenance(t, dig1)
 	require.Equal(t, "worker-1", p.Node)
+	pkgs, err := f.st.PackagesForImage(ctx, dig1)
+	require.NoError(t, err)
+	require.Len(t, pkgs, 1, "worker-1's packages stand")
+	_, ok = f.job(t, dig1)
+	require.False(t, ok, "a refused replacement is not counted against the image")
 }
 
 func TestWork_OfferRules(t *testing.T) {
@@ -255,6 +301,8 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		require.Len(t, f.ingest.calls, 1)
 		require.Equal(t, sbom.Request{Repo: workRepo, Digest: dig1, Platform: "linux/amd64"}, f.ingest.calls[0].req)
 		require.Equal(t, sbom.Result{SyftJSON: doc, Coverage: cov, Source: sbom.SourceAgent}, f.ingest.calls[0].res)
+		require.Equal(t, &store.AgentProvenance{Digest: dig1, Node: "worker-1", AgentVersion: "v0.0.1", ReceivedAt: t0},
+			f.ingest.calls[0].prov)
 		p, ok := f.provenance(t, dig1)
 		require.True(t, ok)
 		require.Equal(t, store.AgentProvenance{Digest: dig1, Node: "worker-1", AgentVersion: "v0.0.1", ReceivedAt: t0}, p)
@@ -262,6 +310,7 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		require.False(t, ok, "an earlier failure is cleared")
 		require.False(t, f.live(dig1), "the offer is released")
 
+		f.offered("worker-1", dig2)
 		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", AgentVersion: "v0.0.1", Digest: dig2, SyftJSON: doc}))
 		require.Equal(t, sbom.Request{Repo: workRepo, Digest: dig2, IndexDigest: digIndex, Platform: "linux/amd64"}, f.ingest.calls[1].req)
 	})
@@ -270,14 +319,18 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		f := newWorkFixture(t)
 		f.ingest.setErr(sbom.ErrSuperseded)
 		before := f.image(t, dig1)
+		f.offered("worker-1", dig1)
 		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: doc}))
 		f.requireUntouched(t, dig1, before)
+		require.False(t, f.live(dig1))
 	})
 
 	t.Run("failures quarantine after two", func(t *testing.T) {
 		f := newWorkFixture(t)
 		res := &wire.SBOMResult{Node: "worker-1", Digest: dig3, Failure: "cataloguer exceeded its memory limit"}
+		f.offered("worker-1", dig3)
 		require.NoError(t, f.q.SBOM(ctx, worker1, res))
+		require.False(t, f.live(dig3))
 		j, ok := f.job(t, dig3)
 		require.True(t, ok)
 		require.Equal(t, 1, j.Attempts)
@@ -285,6 +338,7 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		require.Equal(t, "cataloguer exceeded its memory limit", j.LastError)
 		require.Equal(t, "worker-1", j.LastNode)
 
+		f.offered("worker-1", dig3)
 		require.NoError(t, f.q.SBOM(ctx, worker1, res))
 		j, _ = f.job(t, dig3)
 		require.Equal(t, 2, j.Attempts)
@@ -296,7 +350,9 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 	t.Run("refused SBOMs count", func(t *testing.T) {
 		f := newWorkFixture(t)
 		f.ingest.setErr(&sbom.AcquireError{Kind: sbom.FailCounted, Reason: "decoding SBOM"})
+		f.offered("worker-1", dig1, dig3)
 		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: doc}))
+		require.False(t, f.live(dig1), "a counted refusal releases the offer")
 		j, ok := f.job(t, dig1)
 		require.True(t, ok)
 		require.Equal(t, 1, j.Attempts)
@@ -317,23 +373,31 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		f := newWorkFixture(t)
 		f.ingest.setErr(&sbom.AcquireError{Kind: sbom.FailTransient, Reason: "acquisition in progress"})
 		before := f.image(t, dig1)
+		f.offered("worker-1", dig1)
 		err := f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: doc})
 		require.Error(t, err)
 		require.NotErrorIs(t, err, ErrForbidden)
 		require.NotErrorIs(t, err, ErrBadRequest)
 		f.requireUntouched(t, dig1, before)
+		require.True(t, f.live(dig1), "the offer stays for the agent's retry")
+
+		f.ingest.setErr(nil)
+		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: doc}))
+		require.False(t, f.live(dig1))
 	})
 
 	t.Run("layers discarded on every holder", func(t *testing.T) {
 		f := newWorkFixture(t)
 		res := &wire.SBOMResult{Node: "worker-1", Digest: dig4, Unavailable: wire.UnavailableLayersDiscarded}
 		before := f.image(t, dig4)
+		f.offered("worker-1", dig4)
 		require.NoError(t, f.q.SBOM(ctx, worker1, res))
 		f.requireUntouched(t, dig4, before) // worker-2 still holds it complete
 
 		require.NoError(t, f.st.ReplaceNodeImages(ctx, "worker-2", []model.NodeImage{
 			{Digest: dig4, Kind: "manifest", Source: "content-store"}, // held, but incomplete
 		}))
+		f.offered("worker-1", dig4)
 		require.NoError(t, f.q.SBOM(ctx, worker1, res))
 		img := f.image(t, dig4)
 		require.Equal(t, inventory.ReasonLayersDiscarded, img.StatusReason)
@@ -379,11 +443,12 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 		require.Zero(t, f.ingest.count())
 	})
 
-	t.Run("an untracked image is acknowledged", func(t *testing.T) {
+	t.Run("an image no longer tracked is acknowledged", func(t *testing.T) {
 		f := newWorkFixture(t)
 		gone := hexDigest("e")
-		f.pods.run("worker-1", gone)
+		f.offered("worker-1", gone) // offered, then pruned
 		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: gone, SyftJSON: doc}))
+		require.False(t, f.live(gone))
 		require.Zero(t, f.ingest.count())
 		_, ok := f.provenance(t, gone)
 		require.False(t, ok)

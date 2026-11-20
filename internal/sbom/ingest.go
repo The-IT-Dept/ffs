@@ -9,6 +9,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/registry"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 // SourceAgent is the Result and image Source of an SBOM a node agent catalogued.
@@ -17,6 +18,10 @@ const SourceAgent = "agent"
 // ErrSuperseded means Ingest was refused because the image is already catalogued from another
 // source: a registry SBOM is never replaced by an agent one.
 var ErrSuperseded = errors.New("sbom: image already catalogued from a registry source")
+
+// ErrOtherNode means IngestFromNode was refused because the image is already catalogued from an SBOM
+// another node's agent supplied: one node never replaces the image inventory another node supplied.
+var ErrOtherNode = errors.New("sbom: image already catalogued from another node's agent")
 
 const (
 	// reasonInProgress is the transient refusal of a digest that is queued, running or being ingested.
@@ -34,6 +39,7 @@ const (
 //
 // Nothing is written when it fails:
 //   - ErrSuperseded: the image is catalogued from a source other than "agent";
+//   - ErrOtherNode (IngestFromNode only): the image is catalogued from another node's agent SBOM;
 //   - an *AcquireError of kind FailTransient with Reason reasonInProgress: the digest is queued,
 //     running or being ingested. It must not be counted against the image;
 //   - FailCounted with Reason reasonControllerStopped: an acquisition of the digest was recorded and
@@ -42,7 +48,28 @@ const (
 //   - FailCounted with Reason "decoding SBOM": the SBOM does not decode;
 //   - FailTransient: a store failure;
 //   - a plain error when res is nil or its Source is not SourceAgent.
+//
+// Ingest is for SBOMs no single node owns (a node group's host SBOM); IngestFromNode is for an image
+// SBOM one node's agent catalogued.
 func (a *Acquirer) Ingest(ctx context.Context, r Request, res *Result) error {
+	return a.ingest(ctx, nil, r, res)
+}
+
+// IngestFromNode is Ingest for an image SBOM the agent on prov.Node catalogued. It is also refused with
+// ErrOtherNode, writing nothing, when the image is already catalogued from an agent SBOM whose recorded
+// provenance names another node; a registry SBOM still replaces any agent SBOM (Supersede). A stored
+// SBOM records prov (its Digest set to r.Digest) as the image's agent provenance, under the same claim
+// on the digest as the check.
+func (a *Acquirer) IngestFromNode(ctx context.Context, prov store.AgentProvenance, r Request, res *Result) error {
+	if prov.Node == "" {
+		return errors.New("sbom: ingest: no node")
+	}
+	prov.Digest = r.Digest
+	return a.ingest(ctx, &prov, r, res)
+}
+
+// ingest is Ingest and IngestFromNode; prov is nil for Ingest.
+func (a *Acquirer) ingest(ctx context.Context, prov *store.AgentProvenance, r Request, res *Result) error {
 	switch {
 	case res == nil:
 		return errors.New("sbom: ingest: no result")
@@ -78,8 +105,23 @@ func (a *Acquirer) Ingest(ctx context.Context, r Request, res *Result) error {
 	if ok && img.Status == model.ImageCatalogued && img.Source != SourceAgent {
 		return ErrSuperseded
 	}
+	if ok && img.Status == model.ImageCatalogued && prov != nil {
+		// Checked under the digest's ingest claim, so no other node's SBOM lands between the check and the write.
+		stored, has, err := st.AgentProvenanceOf(ctx, r.Digest)
+		if err != nil {
+			return storeErr("reading the agent provenance", err)
+		}
+		if has && stored.Node != prov.Node {
+			return ErrOtherNode
+		}
+	}
 	if _, err := a.store(ctx, img, r, res); err != nil {
 		return err
+	}
+	if prov != nil {
+		if err := st.PutAgentProvenance(ctx, *prov); err != nil {
+			return storeErr("recording the agent provenance", err)
+		}
 	}
 	select {
 	case a.ingested <- r.Digest:

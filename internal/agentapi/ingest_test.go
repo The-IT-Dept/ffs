@@ -51,8 +51,9 @@ func (f fakeNodes) GetNode(_ context.Context, name string) (*corev1.Node, bool, 
 }
 
 type ingestCall struct {
-	req sbom.Request
-	res sbom.Result
+	req  sbom.Request
+	res  sbom.Result
+	prov *store.AgentProvenance // IngestFromNode only
 }
 
 // fakeIngest records Ingest calls and, unless err is set, stores the image catalogued with its packages as
@@ -66,8 +67,19 @@ type fakeIngest struct {
 }
 
 func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Result) error {
+	return f.ingest(ctx, nil, r, res)
+}
+
+// IngestFromNode is Ingest that, like the acquirer, refuses an image catalogued from another node's agent
+// SBOM and records prov for a stored SBOM.
+func (f *fakeIngest) IngestFromNode(ctx context.Context, prov store.AgentProvenance, r sbom.Request, res *sbom.Result) error {
+	prov.Digest = r.Digest
+	return f.ingest(ctx, &prov, r, res)
+}
+
+func (f *fakeIngest) ingest(ctx context.Context, prov *store.AgentProvenance, r sbom.Request, res *sbom.Result) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, ingestCall{req: r, res: *res})
+	f.calls = append(f.calls, ingestCall{req: r, res: *res, prov: prov})
 	err, during := f.err, f.during
 	f.mu.Unlock()
 	if during != nil {
@@ -75,6 +87,19 @@ func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Resul
 	}
 	if err != nil {
 		return err
+	}
+	if prov != nil {
+		img, ok, err := f.st.GetImage(ctx, r.Digest)
+		if err != nil {
+			return err
+		}
+		stored, has, err := f.st.AgentProvenanceOf(ctx, r.Digest)
+		if err != nil {
+			return err
+		}
+		if ok && img.Status == model.ImageCatalogued && has && stored.Node != prov.Node {
+			return sbom.ErrOtherNode
+		}
 	}
 	doc, err := sbom.DecodeSyftJSON(res.SyftJSON)
 	if err != nil {
@@ -84,8 +109,14 @@ func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Resul
 	if err := f.st.PutSBOM(ctx, r.Digest, res.SyftJSON, pkgs); err != nil {
 		return err
 	}
-	return f.st.UpsertImage(ctx, model.Image{Digest: r.Digest, Repo: r.Repo, Platform: r.Platform, Status: model.ImageCatalogued,
-		Source: sbom.SourceAgent, Coverage: cov, CataloguedAt: t0})
+	if err := f.st.UpsertImage(ctx, model.Image{Digest: r.Digest, Repo: r.Repo, Platform: r.Platform, Status: model.ImageCatalogued,
+		Source: sbom.SourceAgent, Coverage: cov, CataloguedAt: t0}); err != nil {
+		return err
+	}
+	if prov != nil {
+		return f.st.PutAgentProvenance(ctx, *prov)
+	}
+	return nil
 }
 
 func (f *fakeIngest) setErr(err error) {
