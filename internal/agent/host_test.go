@@ -253,6 +253,30 @@ func TestStageHost_UnreadableEntriesAreSkipped(t *testing.T) {
 	require.ElementsMatch(t, []string{"etc/os-release", "var/lib/dpkg/status", "usr/bin/containerd"}, stagedFiles(t, in.Dir))
 }
 
+// TestStageHost_UnsearchableBinDirIsOneProblem: a bin dir that exists but cannot be searched is one problem,
+// not one for each binary name looked for in it; the other bin dirs are still searched.
+func TestStageHost_UnsearchableBinDirIsOneProblem(t *testing.T) {
+	host, scratch := t.TempDir(), t.TempDir()
+	writeHostFile(t, host, "var/lib/dpkg/status", "Package: openssl\n")
+	writeHostFile(t, host, "usr/bin/containerd", "containerd")
+	hostSymlink(t, host, "usr/local/bin", "bin") // ELOOP when resolved
+	if os.Geteuid() != 0 {
+		writeHostFile(t, host, "usr/sbin/runc", "runc")
+		sbin := filepath.Join(host, "usr/sbin")
+		require.NoError(t, os.Chmod(sbin, 0o600))       //nolint:gosec // G302: a dir the agent may not search
+		t.Cleanup(func() { _ = os.Chmod(sbin, 0o750) }) //nolint:gosec // G302: let the test clean up
+	}
+
+	in, err := StageHost(context.Background(), HostRoot(host), PathsFor(DistContainerd), scratch+"/host-1", 1<<20)
+	require.NoError(t, err)
+	require.Equal(t, []wire.Binary{{Name: "containerd", Path: "/usr/bin/containerd", Size: 10}}, in.Binaries)
+	want := []wire.Problem{{Code: "scratch", Path: "/usr/local/bin", Detail: "not staged: too many levels of symbolic links"}}
+	if os.Geteuid() != 0 {
+		want = append([]wire.Problem{{Code: "permission_denied", Path: "/usr/sbin", Detail: "permission denied"}}, want...)
+	}
+	require.Equal(t, want, in.Problems)
+}
+
 func TestStageHost_UnreadableDatabaseIsNotMissing(t *testing.T) {
 	host, scratch := t.TempDir(), t.TempDir()
 	hostSymlink(t, host, "var/lib/dpkg/status", "status") // the only database, and it cannot be read

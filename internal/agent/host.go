@@ -20,6 +20,9 @@ import (
 // procDir is where KernelRelease and BootID read the kernel's view of the host; tests point it at a fixture tree.
 var procDir = "/proc"
 
+// stageMkdir creates a directory in the stage dir; tests make it fail as a full or unwritable scratch volume does.
+var stageMkdir = os.Mkdir
+
 // maxSymlinks bounds the links Resolve follows, as the kernel's ELOOP limit does.
 const maxSymlinks = 40
 
@@ -381,7 +384,7 @@ func (s *stager) mkdirs(d string) error {
 	if err := s.mkdirs(filepath.Dir(d)); err != nil {
 		return err
 	}
-	if err := os.Mkdir(d, 0o755); err != nil && !errors.Is(err, fs.ErrExist) { //nolint:gosec // G301: the non-root cataloguer reads staged files
+	if err := stageMkdir(d, 0o755); err != nil && !errors.Is(err, fs.ErrExist) { //nolint:gosec // G301: the non-root cataloguer reads staged files
 		return err
 	}
 	return os.Chmod(d, 0o755) //nolint:gosec // G302: the non-root cataloguer reads staged files
@@ -415,14 +418,34 @@ func (s *stager) packageDBFiles(family, d string) (files []string, blocked bool)
 
 // binDir is the host bin dir d with its "*" segments expanded. When d is missing and has a fallback, the
 // fallback stands in for it: RKE2's bin dir is its link to the current data dir, and only without that link is
-// the newest data dir used. ok is false when there is nothing to search.
+// the newest data dir used. ok is false when there is nothing to search, or the dir cannot be searched.
 func (s *stager) binDir(d, fallback string) (string, bool) {
 	if fallback != "" {
 		if _, err := s.root.resolve(d); errors.Is(err, fs.ErrNotExist) {
-			return s.expand(fallback)
+			d = fallback
 		}
 	}
-	return s.expand(d)
+	dir, ok := s.expand(d)
+	return dir, ok && s.searchable(dir)
+}
+
+// searchable reports whether names can be looked up in the host dir d. A dir that exists but cannot be searched
+// (permission denied, or a link loop) records one problem, rather than one for each binary name; a missing dir,
+// or a file where the dir should be, records none.
+func (s *stager) searchable(d string) bool {
+	resolved, err := s.root.resolve(d)
+	if err == nil {
+		// Looking up "." in the dir needs the same search permission as looking up a binary's name in it.
+		_, err = os.Lstat(s.root.join(resolved) + "/.")
+	}
+	switch {
+	case err == nil:
+		return true
+	case errors.Is(err, syscall.ENOTDIR):
+		return false // not a dir: there is nothing to search, as when it is missing
+	}
+	s.readErr(d, err)
+	return false
 }
 
 // expand replaces each "*" segment of the host dir d by the child directory whose name sorts highest in

@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -610,19 +611,29 @@ func TestNewAgent_ScratchDirReadableByCataloguer(t *testing.T) {
 	require.Equal(t, fs.FileMode(0o755), fi.Mode().Perm())
 }
 
+// TestCollectHost_ScratchFailureIsAScratchProblem: the stage dir is created, but writing into it fails with
+// EACCES while the host inputs are copied (V33): a scratch problem, retried, never the host denying access.
 func TestCollectHost_ScratchFailureIsAScratchProblem(t *testing.T) {
-	if os.Geteuid() == 0 {
-		t.Skip("root writes to read-only dirs")
-	}
 	e := newEnv(t)
 	e.startCataloguer(t)
 	a := newTestAgent(t, e)
-	require.NoError(t, os.Chmod(e.scratch, 0o500))       //nolint:gosec // G302: a scratch dir the collector cannot write
-	t.Cleanup(func() { _ = os.Chmod(e.scratch, 0o700) }) //nolint:gosec // G302: let the test clean up
+	stageDir := filepath.Join(e.scratch, "host-1")
+	old := stageMkdir
+	t.Cleanup(func() { stageMkdir = old })
+	stageMkdir = func(name string, perm os.FileMode) error {
+		if strings.HasPrefix(name, stageDir+string(filepath.Separator)) {
+			return &fs.PathError{Op: "mkdir", Path: name, Err: syscall.EACCES}
+		}
+		return old(name, perm)
+	}
 	inv, problems, retry := a.collectHost(context.Background())
 	require.Nil(t, inv)
 	require.True(t, retry)
 	require.Len(t, problems, 1)
 	require.Equal(t, "scratch", problems[0].Code, "never permission_denied: the host is not what refused")
-	require.True(t, strings.HasPrefix(problems[0].Detail, "host inputs not staged: "), problems[0].Detail)
+	require.Equal(t, "host inputs not staged: staging /etc/os-release: writing the stage dir: mkdir "+stageDir+
+		"/etc: permission denied", problems[0].Detail)
+	require.Empty(t, e.runner.requests(), "nothing is catalogued")
+	_, err := os.Stat(stageDir)
+	require.ErrorIs(t, err, fs.ErrNotExist, "the stage dir is removed")
 }

@@ -191,8 +191,13 @@ func (c *Client) Report(ctx context.Context, r wire.Report, hostSBOM *sbomFile) 
 	if err != nil {
 		return wire.ReportResponse{}, err
 	}
+	return c.sendReport(ctx, &body)
+}
+
+// sendReport sends an encoded report (encodeReport) to POST /agent/v1/report.
+func (c *Client) sendReport(ctx context.Context, body *splicedBody) (wire.ReportResponse, error) {
 	var resp wire.ReportResponse
-	err = c.do(ctx, http.MethodPost, wire.PathReport, &body, &resp)
+	err := c.do(ctx, http.MethodPost, wire.PathReport, body, &resp)
 	return resp, err
 }
 

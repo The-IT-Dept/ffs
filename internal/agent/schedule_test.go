@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -153,6 +154,55 @@ func TestRun_FullRetryReusesHostInventory(t *testing.T) {
 	require.Equal(t, int32(1), hosts.Load(), "the host is staged and catalogued once")
 	require.Eventually(t, func() bool { return len(spooled(t, e.scratch)) == 0 }, waitFor, 5*time.Millisecond,
 		"the spooled host SBOM is removed once the controller stored it")
+}
+
+// TestRun_HostKeptForResendOnlyWhenTheControllerMayTakeIt: a full report the controller deferred (429), failed
+// (5xx) or never answered is resent with the host inventory it carried; one it refused (400, 403, 413) would be
+// refused again, so the next full report collects the host afresh.
+func TestRun_HostKeptForResendOnlyWhenTheControllerMayTakeIt(t *testing.T) {
+	for _, tc := range []struct {
+		code int
+		kept bool
+	}{
+		{http.StatusTooManyRequests, true},
+		{http.StatusServiceUnavailable, true},
+		{http.StatusBadRequest, false},
+		{http.StatusForbidden, false},
+		{http.StatusRequestEntityTooLarge, false},
+	} {
+		t.Run(http.StatusText(tc.code), func(t *testing.T) {
+			e := newEnv(t)
+			hosts := countingHost(e)
+			var fulls atomic.Int32
+			e.ctl.setAnswer(answerFull(func(wire.Report) (int, wire.ReportResponse) {
+				if fulls.Add(1) == 1 {
+					return tc.code, wire.ReportResponse{}
+				}
+				return http.StatusOK, wire.ReportResponse{Applied: true, Config: testConfig()}
+			}))
+			e.startCataloguer(t)
+			e.run(t)
+
+			first, second := e.ctl.nextFull(t), e.ctl.nextFull(t)
+			require.NotNil(t, first.Host)
+			require.NotNil(t, second.Host)
+			if tc.kept {
+				require.JSONEq(t, string(first.Host.SyftJSON), string(second.Host.SyftJSON), "the resend carries the same inventory")
+				require.Equal(t, int32(1), hosts.Load(), "the host is catalogued once")
+				return
+			}
+			require.NotEqual(t, string(first.Host.SyftJSON), string(second.Host.SyftJSON), "a fresh inventory")
+			require.Equal(t, int32(2), hosts.Load(), "the host is catalogued again")
+		})
+	}
+}
+
+func TestKeepHostAfter(t *testing.T) {
+	require.True(t, keepHostAfter(syscall.ECONNREFUSED), "the controller did not answer")
+	require.True(t, keepHostAfter(&net.OpError{Op: "dial", Err: errors.New("i/o timeout")}))
+	require.True(t, keepHostAfter(&StatusError{Code: http.StatusBadGateway}))
+	require.False(t, keepHostAfter(&StatusError{Code: http.StatusUnauthorized}))
+	require.False(t, keepHostAfter(fmt.Errorf("%w: %w", errEncoding, errors.New("json: unsupported value"))))
 }
 
 func TestRun_ImagesSuccessDoesNotResetFullBackoff(t *testing.T) {
