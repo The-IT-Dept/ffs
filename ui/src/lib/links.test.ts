@@ -69,6 +69,7 @@ test('node group keys are used as they are: path-encoded in links, whole in scop
     ['ubuntu-24.04-k6.8', '/nodegroups/ubuntu-24.04-k6.8'],
     ['ubuntu-24.04-k6.8-arm64', '/nodegroups/ubuntu-24.04-k6.8-arm64'],
     ['ubuntu-24.04-k6.8-nodeinfo', '/nodegroups/ubuntu-24.04-k6.8-nodeinfo'],
+    ['ubuntu-24.04-k6.8-nodeinfo@worker-9', '/nodegroups/ubuntu-24.04-k6.8-nodeinfo%40worker-9'],
     ['ubuntu-24.04-k6.8@worker-1', '/nodegroups/ubuntu-24.04-k6.8%40worker-1'],
   ] as const) {
     expect(nodeGroupPath(key)).toBe(path)

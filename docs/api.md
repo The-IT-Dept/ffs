@@ -131,7 +131,7 @@ Errors are RFC 9457 problem documents, `application/problem+json`, with `type`, 
 | `/api/v1/images/{digest}/packages` | A page of one image's packages, searchable with `q` and filtered by `ecosystem`. |
 | `/api/v1/packages` | The packages explorer: package versions in the scope's images, with facets. Scopes: `cluster`, `namespace`, `workload`, `image`. |
 | `/api/v1/nodegroups` | The control plane and the node groups, with node agent status. |
-| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. `id` is the group's key: its stable name, with `-<arch>`, `-nodeinfo` or `@<member node>` added when other groups share the name, which survives package updates; a label or ID is also accepted. |
+| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. `id` is the group's key: its stable name, with `-<arch>`, `-nodeinfo@<member node>` or `@<member node>` added when other groups share the name. The key survives package updates, and a key with a member node opens the group of that name that holds the node; a label or ID, or a key without its member node, is also accepted. |
 | `/api/v1/nodes/{name}` | One node: its group, node agent status, counts and cached images. |
 | `/api/v1/coverage` | The coverage funnel and every coverage gap, with a remedy code; see [coverage.md](coverage.md#gaps-and-what-to-do). Scopes: `cluster`, `namespace`, `workload`. |
 | `/api/v1/feeds` | Feed freshness, and the data sources with their licences and attribution. |

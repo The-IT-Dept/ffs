@@ -24,7 +24,7 @@ export function namespacePath(ns: string): string {
 }
 
 // nodeGroupPath is a node group's page. id is the group's key as the API gives it (a stable name,
-// possibly qualified as <name>-<arch>, <name>-nodeinfo or <name>@<node>), used as it is.
+// possibly qualified as <name>-<arch>, <name>-nodeinfo@<node> or <name>@<node>), used as it is.
 export function nodeGroupPath(id: string): string {
   return `/nodegroups/${enc(id)}`
 }
