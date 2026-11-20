@@ -239,6 +239,24 @@ func (s *Store) CoverageOf(ctx context.Context, sc model.Scope) (CoverageFigure,
 	return c, nil
 }
 
+// DigestsSeenInto returns which of digests ffs sees into, each true: its images row is catalogued
+// and its first match has run (CoverageOf's seen-into test). The others are absent.
+func (s *Store) DigestsSeenInto(ctx context.Context, digests []string) (map[string]bool, error) {
+	out := map[string]bool{}
+	if len(digests) == 0 {
+		return out, nil
+	}
+	seen, err := queryAll(ctx, s.rdb, scanString, `SELECT i.digest FROM images i
+		WHERE i.digest IN (SELECT value FROM json_each(?)) AND `+seenSQL("i", "i.digest"), idList(digests))
+	if err != nil {
+		return nil, fmt.Errorf("store: digests seen into: %w", err)
+	}
+	for _, d := range seen {
+		out[d] = true
+	}
+	return out, nil
+}
+
 // OwnerCoverage returns the coverage figure of each owner of keys that runs a container image;
 // the others are absent, so they read as zero.
 func (s *Store) OwnerCoverage(ctx context.Context, keys []string) (map[string]CoverageFigure, error) {

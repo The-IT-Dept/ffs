@@ -2,12 +2,18 @@ package apiserver_test
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/registry"
+	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
+	"github.com/the-it-dept/ffs/internal/web/apiserver"
 	"github.com/the-it-dept/ffs/internal/web/webtest"
 )
 
@@ -87,3 +93,71 @@ func TestCoverage_FunnelAndGaps(t *testing.T) {
 }
 
 func intPtr(n int) *int { return &n }
+
+// #15: the cluster rail reads every node group's coverage in one pass. Each figure is the one the
+// group's own scope gives, whatever state its host image and members are in: no host image, no
+// images row, a failed catalogue, a first match not run yet, a member whose agent never reported or
+// is stale, and seen into in full; and the rail's gap marks follow them.
+func TestRailGroupCoverage_MatchesPerGroup(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	// Small's agent group keeps worker-1, whose agent reports; worker-2's is stale.
+	members := map[string]string{"worker-1": webtest.AgentGroupID, "cp-1": webtest.CP1GroupID}
+	add := func(prefix, name string, digest bool, status model.ImageStatus, node string) model.NodeGroup {
+		t.Helper()
+		id := prefix + strings.Repeat("0", 64-len(prefix))
+		g := model.NodeGroup{ID: id, Kind: model.NodeGroupAgent, Name: name, Label: nodegroup.GroupLabel(name, id), Arch: "amd64"}
+		if digest {
+			g.Digest = nodegroup.GroupDigest(id)
+		}
+		require.NoError(t, f.Store.PutNodeGroup(ctx, g, webtest.Now))
+		if status != "" {
+			require.NoError(t, f.Store.UpsertImage(ctx, model.Image{Digest: g.Digest, Repo: model.HostRepo, Platform: "linux/amd64",
+				Status: status, Source: "agent", CataloguedAt: webtest.Now}))
+		}
+		members[node] = id
+		return g
+	}
+	add("a1", "pool-no-digest", false, "", "pool-a-1")
+	add("b1", "pool-no-row", true, "", "pool-b-1")
+	add("c1", "pool-failed", true, model.ImageCatalogFailed, "pool-c-1")
+	unmatched := add("d1", "pool-unmatched", true, model.ImageCatalogued, "pool-d-1")
+	require.NoError(t, f.Store.MarkUnmatched(ctx, unmatched.Digest, webtest.Now))
+	add("e1", "pool-agentless", true, model.ImageCatalogued, "pool-e-1")
+	add("f1", "pool-stale", true, model.ImageCatalogued, "worker-2")
+	nodes, err := f.Store.ListNodes(ctx)
+	require.NoError(t, err)
+	var cp []model.Node
+	for _, n := range nodes {
+		if n.Name == "cp-1" {
+			cp = append(cp, n)
+		}
+	}
+	require.NoError(t, f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{Members: members, Fallback: nodegroup.FallbackGroups(cp, webtest.Now),
+		Now: webtest.Now}))
+
+	keys, batched, perGroup, err := apiserver.New(f.Options()).RailGroupCoverage(ctx)
+	require.NoError(t, err)
+	require.Len(t, keys, 8)
+	require.Equal(t, perGroup, batched)
+	got := map[string]store.CoverageFigure{}
+	for i, k := range keys {
+		got[k] = batched[i]
+	}
+	for _, k := range []string{"pool-no-digest", "pool-no-row", "pool-failed", "pool-unmatched", webtest.CP1GroupKey} {
+		require.Equal(t, store.CoverageFigure{InUse: 1}, got[k], k)
+	}
+	require.Equal(t, store.CoverageFigure{InUse: 1, SeenInto: 1}, got["pool-agentless"], "its member's agent has not reported")
+	require.Equal(t, store.CoverageFigure{InUse: 1, SeenInto: 1}, got["pool-stale"], "its member's agent is stale")
+	require.Equal(t, store.CoverageFigure{InUse: 1, SeenInto: 1, Full: 1}, got[webtest.AgentGroupKey])
+
+	card := scopeCard(t, handlerOf(f), "")
+	i := slices.IndexFunc(card.Related, func(r apigen.RelatedSection) bool { return r.Id == apigen.RelatedSectionIdNodegroups })
+	require.GreaterOrEqual(t, i, 0)
+	require.Len(t, card.Related[i].Items, len(keys))
+	for _, item := range card.Related[i].Items {
+		require.NotNil(t, item.Scope)
+		k := strings.TrimPrefix(*item.Scope, "nodegroup:")
+		require.Equal(t, got[k].Full < got[k].InUse, item.Gap, k)
+	}
+}
