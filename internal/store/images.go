@@ -229,18 +229,34 @@ func (s *Store) PackagesForImage(ctx context.Context, digest string) ([]model.Pa
 // version must match and the codename is ignored. With bySource it matches the source package
 // name, treating an empty source name as equal to the binary name (dpkg omits Source then).
 func (s *Store) PackagesByName(ctx context.Context, ecosystem string, distro *model.Distro, name string, bySource bool) ([]model.Package, error) {
-	var w where
-	w.add(`ecosystem = ?`, ecosystem)
-	if distro != nil {
-		w.add(`distro_id = ? AND distro_version = ?`, distro.ID, distro.VersionID)
+	q, args := packagesByNameQuery(ecosystem, distro, name, bySource)
+	return queryAll(ctx, s.rdb, scanPackage, q, args...)
+}
+
+// packagesByNameQuery is the SQL of PackagesByName. The source-name lookup is two indexed SELECTs
+// joined by UNION ALL, not one OR: SQLite serves the OR form by reading every package of the
+// ecosystem, which made the OSV fast path's lookups for a large record take seconds.
+func packagesByNameQuery(ecosystem string, distro *model.Distro, name string, bySource bool) (string, []any) {
+	sel := func(cond string, args ...any) (string, []any) {
+		var w where
+		w.add(`ecosystem = ?`, ecosystem)
+		if distro != nil {
+			w.add(`distro_id = ? AND distro_version = ?`, distro.ID, distro.VersionID)
+		}
+		w.add(cond, args...)
+		return `SELECT ` + packageCols + ` FROM packages` + w.String(), w.args
 	}
-	if bySource {
-		w.add(`(source_name = ? OR (source_name = '' AND name = ?))`, name, name)
-	} else {
-		w.add(`name = ?`, name)
+	const order = ` ORDER BY digest, name, version, id`
+	if !bySource {
+		q, args := sel(`name = ?`, name)
+		return q + order, args
 	}
-	return queryAll(ctx, s.rdb, scanPackage,
-		`SELECT `+packageCols+` FROM packages`+w.String()+` ORDER BY digest, name, version, id`, w.args...)
+	q, args := sel(`source_name = ?`, name)
+	if name != "" { // with an empty name the first SELECT already holds every empty source name
+		q2, args2 := sel(`source_name = '' AND name = ?`, name)
+		q, args = q+` UNION ALL `+q2, append(args, args2...)
+	}
+	return q + order, args
 }
 
 // foldedEcosystems are the package ecosystems whose packages have a folded name.

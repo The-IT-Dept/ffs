@@ -113,6 +113,50 @@ func TestPackagesByName(t *testing.T) {
 	require.Equal(t, []EcosystemKey{{"deb", "debian", "11"}, {"deb", "debian", "12"}, {"npm", "", ""}, {"npm", "debian", "12"}}, ecos)
 }
 
+// TestPackagesByName_EmptySourceAndName pins the empty-name case of the source lookup: every
+// package with an empty source name, once.
+func TestPackagesByName_EmptySourceAndName(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "sha256:a", pkg("deb", nil, "zlib1g", ""), pkg("deb", nil, "libssl3", "openssl"))
+	got, err := s.PackagesByName(ctx, "deb", nil, "", true)
+	require.NoError(t, err)
+	require.Equal(t, []string{"zlib1g"}, names(got))
+}
+
+// TestPackagesByNameQuery_Indexed guards the OSV fast path's apply time: every lookup must search an
+// index on the name it asks for. A plan that only narrows by ecosystem reads every package of it,
+// for each affected entry of every changed record.
+func TestPackagesByNameQuery_Indexed(t *testing.T) {
+	s := newStore(t)
+	d12 := &model.Distro{ID: "debian", VersionID: "12"}
+	for _, tc := range []struct {
+		distro   *model.Distro
+		bySource bool
+	}{{nil, true}, {nil, false}, {d12, true}, {d12, false}} {
+		q, args := packagesByNameQuery("deb", tc.distro, "openssl", tc.bySource)
+		rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+q, args...)
+		require.NoError(t, err)
+		var plan []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			require.NoError(t, rows.Scan(&id, &parent, &unused, &detail))
+			plan = append(plan, detail)
+		}
+		require.NoError(t, rows.Err())
+		require.NoError(t, rows.Close())
+		searches := 0
+		for _, d := range plan {
+			if !strings.Contains(d, "packages") {
+				continue
+			}
+			require.Regexp(t, `^SEARCH packages USING (COVERING )?INDEX \S+ \(.*name=\?`, d, "distro %v bySource %v: %v", tc.distro, tc.bySource, plan)
+			searches++
+		}
+		require.Positive(t, searches, plan)
+	}
+}
+
 func TestPackagesByFoldedName(t *testing.T) {
 	s := newStore(t)
 	put(t, s, "sha256:a", pkg("python", nil, "Jinja2", ""), pkg("python", nil, "typing_extensions", ""),
