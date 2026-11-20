@@ -57,7 +57,15 @@ const (
 	metaZipBehind   = "zipbehind." // + bucket: when its all.zip was first seen older than modified_id.csv
 	metaGitRepos    = "repos.GIT"
 	metaSetDiff     = "setdiff"
+	metaHashVersion = "hashver" // the HashVersion of the cached records' affected hashes
+	metaListed      = "listed." // + bucket: when its overlap rows were first recorded (store.OSVListed)
 )
+
+// pollOverlap is how far below the watermark a poll reads modified_id.csv again. The listing is
+// sorted by modified time, but a record can be listed after rows newer than it (its export lagged
+// the next one); the rows of the overlap a previous poll took in are recorded (store.OSVListed), and
+// only the others are fetched.
+const pollOverlap = time.Hour
 
 // pendingSaveEvery is how often a hand-off records the chunks the handler has taken: often enough
 // that a crash costs little, rarely enough that a backlog of 200,000 records does not rewrite its
@@ -167,6 +175,9 @@ func (f *Feed) Sync(ctx context.Context) error {
 	if st.Meta == nil {
 		st.Meta = map[string]string{}
 	}
+	if err := f.rehash(ctx, &st); err != nil {
+		return err
+	}
 	if err := f.redeliver(ctx, &st); err != nil {
 		return err
 	}
@@ -269,6 +280,24 @@ func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string)
 	return f.save(ctx, st)
 }
 
+// rehash brings the cached records' affected hashes to HashVersion when they were stored under
+// another, handing nothing off: the recipe changed, not the records. Without it the first poll
+// after an upgrade would see every record it reads as changed and re-match the cluster. A rating
+// that changed upstream while an older version ran reaches findings through the weekly full
+// re-match, as it did then.
+func (f *Feed) rehash(ctx context.Context, st *store.FeedState) error {
+	if st.Meta[metaHashVersion] == HashVersion {
+		return nil
+	}
+	n, err := f.o.Store.RehashOSVRecords(ctx, AffectedHash)
+	if err != nil {
+		return fmt.Errorf("osv: rehash the cached records: %w", err)
+	}
+	logr.FromContextOrDiscard(ctx).Info("rehashed the cached OSV records for a new hash version", "version", HashVersion, "records", n)
+	st.Meta[metaHashVersion] = HashVersion
+	return f.save(ctx, st)
+}
+
 func (f *Feed) save(ctx context.Context, st *store.FeedState) error {
 	return f.o.Store.PutFeedState(ctx, *st)
 }
@@ -293,10 +322,15 @@ func (f *Feed) redeliver(ctx context.Context, st *store.FeedState) error {
 	return f.save(ctx, st)
 }
 
-// poll reads b's modified_id.csv down to the watermark and hands off the records whose affected
-// set changed. Once every listed record is cached, the watermark and generation advance in the same
-// write that records the changed ones as pending, before they are handed off: a hand-off cut short
-// resumes from pending (redeliver) instead of reading the backlog again.
+// poll reads b's modified_id.csv down to an hour below the watermark (pollOverlap) and hands off
+// the records whose affected set changed. Rows newer than the watermark are taken; rows of the
+// overlap are taken unless a previous poll recorded them (store.OSVListed), which catches a record
+// listed after rows newer than it. Until the overlap rows of b have been recorded once (after an
+// upgrade, or a bootstrap), the overlap is only recorded: the polls before took it in already, and
+// fetching an hour of Ubuntu records again would cost hundreds of megabytes. Once every listed
+// record is cached, the watermark and generation advance in the same write that records the
+// changed ones as pending, before they are handed off: a hand-off cut short resumes from pending
+// (redeliver) instead of reading the backlog again.
 func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 	rd := newCSVReader(f.o.HTTP, f.bucketURL(b, "modified_id.csv"))
 	rows, err := rd.next(ctx)
@@ -306,23 +340,34 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 	if rd.gen != "" && rd.gen == st.Meta[metaGeneration+b] {
 		return nil
 	}
+	seen, err := f.o.Store.OSVListed(ctx, b)
+	if err != nil {
+		return err
+	}
+	recorded := st.Meta[metaListed+b] != ""
 	wm := f.watermark(*st, b)
+	floor := wm.Add(-pollOverlap)
 	newest := wm
-	want := map[string]time.Time{} // ID → modified time of its newest row
+	read := map[string]time.Time{} // ID → modified time of its newest row, for the rows above floor
+	want := map[string]time.Time{} // the rows of read to take
 	for {
 		stop := false
 		for _, row := range rows {
 			if row.ts.After(newest) {
 				newest = row.ts
 			}
-			if !row.ts.After(wm) {
+			if !row.ts.After(floor) {
 				stop = true
 				break
 			}
-			if _, dup := want[row.id]; row.id == "" || SkipID(b, row.id) || dup {
+			if _, dup := read[row.id]; row.id == "" || SkipID(b, row.id) || dup {
 				continue
 			}
-			want[row.id] = row.ts
+			read[row.id] = row.ts
+			at, ok := seen[row.id]
+			if taken := ok && at.Equal(row.ts); row.ts.After(wm) || (recorded && !taken) {
+				want[row.id] = row.ts
+			}
 		}
 		if stop || rd.done {
 			break
@@ -338,6 +383,13 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		return f.save(ctx, st)
 	}
 	if takeErr == nil {
+		if err := f.o.Store.ReplaceOSVListed(ctx, b, overlapRows(read, newest)); err != nil {
+			takeErr = err
+		} else if !recorded {
+			st.Meta[metaListed+b] = f.o.Now().UTC().Format(time.RFC3339)
+		}
+	}
+	if takeErr == nil {
 		if newest.After(wm) {
 			st.Meta[metaWatermark+b] = newest.Format(time.RFC3339Nano)
 		}
@@ -351,6 +403,19 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		return errors.Join(takeErr, f.save(ctx, st))
 	}
 	return f.save(ctx, st)
+}
+
+// overlapRows returns the rows of read that the next poll's overlap covers: those newer than an
+// hour below wm, the watermark it will start from.
+func overlapRows(read map[string]time.Time, wm time.Time) map[string]time.Time {
+	floor := wm.Add(-pollOverlap)
+	out := make(map[string]time.Time, len(read))
+	for id, at := range read {
+		if at.After(floor) {
+			out[id] = at
+		}
+	}
+	return out
 }
 
 // watermark returns b's watermark, or now − 72h before its first poll.
@@ -845,6 +910,7 @@ func (f *Feed) bootstrap(ctx context.Context, st *store.FeedState, b string) err
 	// redelivers them without downloading all.zip again.
 	st.Meta[metaBootstrap+b] = now.Format(time.RFC3339)
 	st.Meta[metaWatermark+b] = wm.Format(time.RFC3339Nano)
+	delete(st.Meta, metaListed+b) // all.zip held the records below wm: the next poll only records its overlap
 	setMeta(st, metaGeneration+b, gen)
 	if b == BucketGIT {
 		st.Meta[metaGitRepos] = f.reposKey

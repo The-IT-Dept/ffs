@@ -114,6 +114,117 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	return changed, err
 }
 
+// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: enough
+// to keep the transactions few, few enough that 4 MiB records cannot hold much memory.
+const rehashPage = 64
+
+// RehashOSVRecords recomputes the affected hash of every cached OSV record with hash and stores it,
+// rehashPage records at a time, and returns how many hashes changed. Nothing else about a record
+// changes: not its raw, modified or observation time, and nothing is reported as changed. A record
+// hash cannot read keeps its stored hash.
+func (s *Store) RehashOSVRecords(ctx context.Context, hash func(raw []byte) (string, error)) (int, error) {
+	type rec struct {
+		eco, id, hash string
+		raw           []byte
+	}
+	var (
+		changed           int
+		afterEco, afterID string
+	)
+	for {
+		page, err := queryAll(ctx, s.rdb, func(r scanner) (rec, error) {
+			var (
+				v   rec
+				zst []byte
+			)
+			if err := r.Scan(&v.eco, &v.id, &v.hash, &zst); err != nil {
+				return v, err
+			}
+			raw, err := zstdDecode(zst)
+			v.raw = raw
+			return v, err
+		}, `SELECT ecosystem, id, affected_hash, raw_zst FROM osv_records WHERE (ecosystem, id) > (?, ?)
+			ORDER BY ecosystem, id LIMIT ?`, afterEco, afterID, rehashPage)
+		if err != nil {
+			return changed, err
+		}
+		if len(page) == 0 {
+			return changed, nil
+		}
+		afterEco, afterID = page[len(page)-1].eco, page[len(page)-1].id
+		var updates []rec
+		for _, r := range page {
+			if h, err := hash(r.raw); err == nil && h != r.hash {
+				updates = append(updates, rec{eco: r.eco, id: r.id, hash: h})
+			}
+		}
+		if len(updates) > 0 {
+			err = s.inTx(ctx, func(tx *sql.Tx) error {
+				for _, u := range updates {
+					if _, err := tx.ExecContext(ctx, `UPDATE osv_records SET affected_hash = ? WHERE ecosystem = ? AND id = ?`,
+						u.hash, u.eco, u.id); err != nil {
+						return err
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return changed, err
+			}
+			changed += len(updates)
+		}
+		if len(page) < rehashPage {
+			return changed, nil
+		}
+	}
+}
+
+// OSVListed returns the rows of bucket's modified_id.csv recorded by ReplaceOSVListed: record id to
+// its listed modified time.
+func (s *Store) OSVListed(ctx context.Context, bucket string) (map[string]time.Time, error) {
+	type row struct {
+		id string
+		at int64
+	}
+	rows, err := queryAll(ctx, s.rdb, func(r scanner) (row, error) {
+		var v row
+		err := r.Scan(&v.id, &v.at)
+		return v, err
+	}, `SELECT id, modified FROM osv_listed WHERE bucket = ?`, bucket)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]time.Time, len(rows))
+	for _, r := range rows {
+		out[r.id] = time.Unix(0, r.at).UTC()
+	}
+	return out, nil
+}
+
+// ReplaceOSVListed replaces the rows recorded for bucket with listed (record id to listed modified
+// time), in one transaction.
+func (s *Store) ReplaceOSVListed(ctx context.Context, bucket string, listed map[string]time.Time) error {
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM osv_listed WHERE bucket = ?`, bucket); err != nil {
+			return err
+		}
+		if len(listed) == 0 {
+			return nil
+		}
+		ins, err := tx.PrepareContext(ctx, `INSERT INTO osv_listed(bucket, id, modified) VALUES(?, ?, ?)`)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = ins.Close() }()
+		for id, at := range listed {
+			if _, err := ins.ExecContext(ctx, bucket, id, at.UTC().UnixNano()); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 // OSVRecordsObserved returns, for each of ids cached in any bucket, the earliest time ffs observed
 // its current affected content. Ids not cached, or cached before observation times were kept and
 // never backfilled, are absent.

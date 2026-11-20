@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -259,8 +261,9 @@ func TestCVEList_SyncDeltaChain(t *testing.T) {
 	setWatermark(t, st, "2026-11-18T22:00:00Z")
 	srv := newReleaseServer(t, map[string][]byte{
 		endOfDay("2026-11-18"): deltaZip(t, [][]byte{
-			record("CVE-2026-1001", "2026-11-18T10:00:00.000Z"), // before the watermark
-			record("CVE-2026-1002", "2026-11-18T21:55:00.000Z"), // at watermark − 5m
+			record("CVE-2026-1001", "2026-11-18T10:00:00.000Z"), // before the overlap
+			record("CVE-2026-1006", "2026-11-18T21:00:00.000Z"), // at watermark − 1h
+			record("CVE-2026-1002", "2026-11-18T21:05:00.000Z"), // inside the overlap
 			record("CVE-2026-1003", "2026-11-18T21:57:30.000Z"), // inside the overlap
 			record("CVE-2026-1004", "2026-11-18T23:10:00.000Z"),
 		}),
@@ -275,7 +278,7 @@ func TestCVEList_SyncDeltaChain(t *testing.T) {
 
 	require.NoError(t, f.Sync(ctx))
 	require.Equal(t, []string{endOfDay("2026-11-18"), hourly("2026-11-19", 1)}, srv.requests())
-	require.Equal(t, []string{"CVE-2026-1003", "CVE-2026-1004", "CVE-2026-1005"}, h.ids)
+	require.Equal(t, []string{"CVE-2026-1002", "CVE-2026-1003", "CVE-2026-1004", "CVE-2026-1005"}, h.ids)
 	fst := feedState(t, st)
 	require.Equal(t, "2026-11-19T01:00:00Z", fst.Watermark)
 	require.Empty(t, feeds.Pending(fst))
@@ -510,4 +513,71 @@ func TestCVEList_RejectedClearsUpstreamRanges(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, ok)
 	require.True(t, a.Withdrawn)
+}
+
+// TestCVEList_OverlapSkipsTakenRecords (F69): a delta is read from an hour below the watermark,
+// since cvelistV5 commits a record minutes after its dateUpdated and an hourly cut can miss it. A
+// record of that hour is taken again only when the stored advisory does not have its update time.
+func TestCVEList_OverlapSkipsTakenRecords(t *testing.T) {
+	st := newStore(t)
+	setWatermark(t, st, "2026-11-19T01:00:00Z")
+	stored := func(id string, modified time.Time) {
+		t.Helper()
+		require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: id, Modified: modified, Observed: time.Now()}))
+	}
+	stored("CVE-2026-4001", time.Date(2026, 11, 19, 0, 30, 0, 0, time.UTC)) // this version was taken
+	stored("CVE-2026-4003", time.Date(2026, 11, 19, 0, 10, 0, 0, time.UTC)) // an older version was
+	srv := newReleaseServer(t, map[string][]byte{
+		hourly("2026-11-19", 2): deltaZip(t, [][]byte{
+			record("CVE-2026-4000", "2026-11-18T23:30:00.000Z"), // below the overlap
+			record("CVE-2026-4001", "2026-11-19T00:30:00.000Z"), // in the overlap, taken already
+			record("CVE-2026-4002", "2026-11-19T00:45:00.000Z"), // in the overlap, committed after the 01:00 cut
+			record("CVE-2026-4003", "2026-11-19T00:50:00.000Z"), // in the overlap, newer than the stored version
+			record("CVE-2026-4004", "2026-11-19T01:30:00.000Z"), // after the watermark
+		}),
+	})
+	h := &handed{}
+	require.NoError(t, newFeed(st, srv, "2026-11-19T02:20:00Z", h).Sync(ctx))
+	require.Equal(t, []string{"CVE-2026-4002", "CVE-2026-4003", "CVE-2026-4004"}, h.ids)
+	require.Equal(t, "2026-11-19T02:00:00Z", feedState(t, st).Watermark)
+	a, _, err := st.GetAdvisory(ctx, "CVE-2026-4003")
+	require.NoError(t, err)
+	require.Equal(t, time.Date(2026, 11, 19, 0, 50, 0, 0, time.UTC), a.Modified)
+}
+
+// TestCVEList_OversizedDeltaSkipped (F66): a delta over the size cap is logged, counted and passed
+// over, and the feed moves on past its day instead of failing every Sync there.
+func TestCVEList_OversizedDeltaSkipped(t *testing.T) {
+	cvelist.SetMaxZipBytes(t, 4<<10)
+	st := newStore(t)
+	setWatermark(t, st, "2026-11-17T22:00:00Z")
+	noise := make([]byte, 16<<10) // incompressible, so the zip is over the cap
+	for i := 0; i < len(noise); i += sha256.Size {
+		sum := sha256.Sum256([]byte{byte(i), byte(i >> 8)})
+		copy(noise[i:], sum[:])
+	}
+	srv := newReleaseServer(t, map[string][]byte{
+		endOfDay("2026-11-17"): deltaZip(t, [][]byte{record("CVE-2026-5001", "2026-11-17T23:00:00.000Z")},
+			entry{"deltaCves/padding.bin", noise}),
+		endOfDay("2026-11-18"):  deltaZip(t, [][]byte{record("CVE-2026-5002", "2026-11-18T12:00:00.000Z")}),
+		hourly("2026-11-19", 0): deltaZip(t, nil),
+	})
+	skipped := func() float64 {
+		return testutil.ToFloat64(feeds.Skipped.WithLabelValues(feeds.NameCVEList, feeds.SkipTooLarge))
+	}
+	before := skipped()
+	h := &handed{}
+	require.NoError(t, newFeed(st, srv, "2026-11-19T01:30:00Z", h).Sync(ctx))
+	require.Equal(t, []string{"CVE-2026-5002"}, h.ids)
+	require.Equal(t, "2026-11-19T00:00:00Z", feedState(t, st).Watermark)
+	require.InDelta(t, 1, skipped()-before, 1e-9)
+	_, ok, err := st.GetAdvisory(ctx, "CVE-2026-5001")
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// The feed has moved past the oversized day: it is not fetched again.
+	n := len(srv.requests())
+	require.NoError(t, newFeed(st, srv, "2026-11-19T01:50:00Z", h).Sync(ctx))
+	require.NotContains(t, srv.requests()[n:], endOfDay("2026-11-17"))
+	require.InDelta(t, 1, skipped()-before, 1e-9)
 }

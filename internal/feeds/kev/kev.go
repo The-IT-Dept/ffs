@@ -22,6 +22,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/feeds"
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/version"
 )
@@ -121,7 +122,7 @@ func (f *Feed) Sync(ctx context.Context) error {
 		set[id] = true
 	}
 	for _, id := range inUse {
-		want, listed := dates[id]
+		want, listed := kevDate(dates, id, have[id])
 		cur := have[id].KEVAdded
 		if listed == (cur != nil) && (!listed || cur.Equal(want)) {
 			continue
@@ -172,21 +173,19 @@ func (f *Feed) applyCached(ctx context.Context, digests []string) error {
 		return nil
 	}
 	ids, err := f.o.Store.AdvisoryIDsOnDigests(ctx, digests)
-	if err != nil {
+	if err != nil || len(ids) == 0 {
 		return err
 	}
-	ids = slices.DeleteFunc(ids, func(id string) bool { _, ok := dates[id]; return !ok })
-	if len(ids) == 0 {
-		return nil
-	}
+	// Every advisory is read, not only those the catalogue lists by id: the catalogue can list one
+	// of an advisory's aliases instead.
 	have, err := f.o.Store.Advisories(ctx, ids)
 	if err != nil {
 		return err
 	}
 	for _, id := range ids {
 		a, ok := have[id]
-		want := dates[id]
-		if !ok || (a.KEVAdded != nil && a.KEVAdded.Equal(want)) {
+		want, listed := kevDate(dates, id, a)
+		if !ok || !listed || (a.KEVAdded != nil && a.KEVAdded.Equal(want)) {
 			continue
 		}
 		if err := f.o.Store.SetAdvisoryKEV(ctx, id, &want); err != nil {
@@ -194,6 +193,23 @@ func (f *Feed) applyCached(ctx context.Context, digests []string) error {
 		}
 	}
 	return nil
+}
+
+// kevDate returns the earliest date the catalogue lists for id, the stored advisory a's canonical
+// id or any of its aliases, and whether it lists any of them. An advisory with several CVE aliases
+// (a GHSA covering two CVEs, say) has one of them as its canonical id; the catalogue can list
+// another.
+func kevDate(dates map[string]time.Time, id string, a model.Advisory) (time.Time, bool) {
+	var (
+		out    time.Time
+		listed bool
+	)
+	for _, c := range append([]string{id, a.ID}, a.Aliases...) {
+		if d, ok := dates[c]; ok && (!listed || d.Before(out)) {
+			out, listed = d, true
+		}
+	}
+	return out, listed
 }
 
 // cached returns the catalogue last applied, reading the cached copy on first use after a restart;
