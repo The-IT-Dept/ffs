@@ -974,6 +974,52 @@ func TestOSVSetDiff_VanishedMarkedWithdrawn(t *testing.T) {
 	require.Len(t, e.sink.all(), 2)
 }
 
+// TestOSVSetDiff_BoundsRecordReads is the regression for reading every vanished record of a bucket
+// at once: a listing that drops 40 records of 1 MiB reads them 16 at a time (16 MiB at the bucket's
+// measured size), yet the handler gets the same chunks as from one read of all of them.
+func TestOSVSetDiff_BoundsRecordReads(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0 := now.Add(-48 * time.Hour)
+	const n = 40
+	for i := range n {
+		id := fmt.Sprintf("PYSEC-2026-%03d", i)
+		e.cache(t, "PyPI", id, t0, bigPyPI(id, t0, 1<<20))
+	}
+	e.cache(t, "PyPI", "PYSEC-2026-999", t0, pypi("PYSEC-2026-999", "1.0.0", t0))
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(row{t0, "PYSEC-2026-999"})})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now), "mal.PyPI": ts(now), "size.PyPI": fmt.Sprint(1 << 20),
+		"setdiff": ts(now.Add(-8 * 24 * time.Hour))})
+	loads := osv.WatchRecordLoads(t)
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []int{16, 16, 8}, *loads)
+	got := e.sink.all()
+	require.Len(t, got, n)
+	for i, c := range got {
+		require.Equal(t, fmt.Sprintf("PYSEC-2026-%03d", i), c.ID)
+		require.Contains(t, string(c.Raw), `"withdrawn"`)
+	}
+	// The chunks one deliver of every withdrawn record makes: at most 500 records and 16 MiB each.
+	var want []int
+	for rest := got; len(rest) > 0; {
+		k, size := 0, 0
+		for k < len(rest) && k < 500 && (k == 0 || size+len(rest[k].Raw) <= 16<<20) {
+			size += len(rest[k].Raw)
+			k++
+		}
+		want, rest = append(want, k), rest[k:]
+	}
+	var calls []int
+	for _, c := range e.sink.calls {
+		calls = append(calls, len(c))
+	}
+	require.Equal(t, want, calls)
+	require.Equal(t, []int{15, 15, 10}, calls, "handler chunks cut across reads")
+	requireBoundedCalls(t, e.sink.calls)
+	require.Equal(t, []string{"PYSEC-2026-999"}, e.ids(t, "PyPI"))
+}
+
 func TestOSVRetention_PrunesNonAuthorityOnly(t *testing.T) {
 	e := newEnv(t)
 	e.inUse(t, python)
