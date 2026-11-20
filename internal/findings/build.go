@@ -11,6 +11,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/priority"
 )
 
@@ -72,8 +73,12 @@ type Result struct {
 }
 
 // Build returns the owner's findings, one per (image repository, canonical advisory), sorted by
-// fingerprint. Matches on rejected CVEs (Advisory.Withdrawn), unknown packages and digests the owner
-// does not run are ignored. All findings are open or excepted; Diff decides what resolved.
+// fingerprint. Matches on rejected CVEs (Advisory.Withdrawn), unknown packages, digests the owner
+// does not run and Go modules in Owner.SuppressModules are ignored. All findings are open or
+// excepted; Diff decides what resolved.
+//
+// A Nodes owner's findings are ranked with a context of their own (nodesContext): exposed through
+// the node groups whose digests they affect, never privileged and with no service account.
 func Build(in BuildInput) []model.Finding { return BuildResult(in).Findings }
 
 // BuildResult is Build, also reporting which findings grype's not-affected verdict removed.
@@ -84,7 +89,8 @@ func BuildResult(in BuildInput) Result {
 		if in.Advisories[m.AdvisoryID].Withdrawn || len(repos[m.ImageDigest]) == 0 {
 			continue
 		}
-		if _, ok := in.Packages[m.PackageID]; !ok {
+		p, ok := in.Packages[m.PackageID]
+		if !ok || suppressed(in.Owner, p) {
 			continue
 		}
 		t := triple{m.ImageDigest, m.PackageID, m.AdvisoryID}
@@ -115,7 +121,10 @@ func BuildResult(in BuildInput) Result {
 		}
 	}
 
-	b := builder{in: in, ctx: ownerContext(in.Owner, in.ImageUsers), rules: sortRules(in.Exceptions)}
+	b := builder{in: in, rules: sortRules(in.Exceptions)}
+	if !isNodesOwner(in.Owner.Ref) {
+		b.ctx = ownerContext(in.Owner, in.ImageUsers)
+	}
 	out := make([]model.Finding, 0, len(groups)+len(in.Carry))
 	built := make(map[string]bool, len(groups))
 	for k, vs := range groups {
@@ -138,6 +147,31 @@ func BuildResult(in BuildInput) Result {
 		}
 	}
 	return Result{Findings: out, NotAffected: gone}
+}
+
+// suppressed reports whether p is a Go module whose matches the owner ignores (Owner.SuppressModules):
+// on the Nodes owner, modules that the Cluster or ContainerRuntime owner already reports.
+func suppressed(o model.Owner, p model.Package) bool {
+	return p.Ecosystem == "go-module" && slices.Contains(o.SuppressModules, p.Name)
+}
+
+// isNodesOwner reports whether r is the cluster-level Nodes owner, whose findings each take the
+// context of the node groups they affect.
+func isNodesOwner(r model.OwnerRef) bool { return r.ClusterLevel() && r.Kind == model.OwnerKindNodes }
+
+// nodesContext is the context of a Nodes finding on digests: exposed when any container (node
+// group) running one of them has exposure paths, with their sorted union. Node findings are never
+// privileged and have no service account.
+func nodesContext(cs []model.ContainerUse, digests []string) model.WorkloadContext {
+	var c model.WorkloadContext
+	for _, u := range cs {
+		if len(u.ExposurePaths) > 0 && slices.Contains(digests, u.Digest) {
+			c.ExposurePaths = append(c.ExposurePaths, u.ExposurePaths...)
+		}
+	}
+	c.ExposurePaths = sortedSet(c.ExposurePaths)
+	c.Exposed = len(c.ExposurePaths) > 0
+	return c
 }
 
 // digestRepos maps each non-empty container digest to the sorted repositories it runs as.
@@ -298,7 +332,7 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 	f.Digests, fixed = sortedSet(digests), sortedSet(fixed)
 	f.FixAvailable = len(fixed) > 0 || f.FixState == model.FixFixed
 	f.Severity, f.SeveritySource = severity(vs, adv)
-	b.rank(&f, adv, fixed)
+	b.rank(&f, adv, fixed, b.contextOf(f.Digests))
 	return f
 }
 
@@ -324,13 +358,22 @@ func (b builder) carried(c model.Finding) model.Finding {
 	for _, p := range f.Packages {
 		fixed = append(fixed, p.Fixed...)
 	}
-	b.rank(&f, adv, sortedSet(fixed))
+	b.rank(&f, adv, sortedSet(fixed), b.contextOf(f.Digests))
 	return f
 }
 
-// rank sets f's priority and reasons from its severity, fix and the owner's context, then applies
-// the first matching exception.
-func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
+// contextOf is the context a finding on digests is ranked with: the owner's, or for a Nodes owner
+// that of the node groups running those digests.
+func (b builder) contextOf(digests []string) model.WorkloadContext {
+	if isNodesOwner(b.in.Owner.Ref) {
+		return nodesContext(b.in.Owner.Containers, digests)
+	}
+	return b.ctx
+}
+
+// rank sets f's priority and reasons from its severity, fix and ctx, then applies the first
+// matching exception.
+func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string, ctx model.WorkloadContext) {
 	pin := priority.Input{
 		Severity:         f.Severity,
 		SeverityPending:  f.Severity == model.SeverityUnknown,
@@ -340,12 +383,12 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
 		KEVAdded:         adv.KEVAdded,
 		Malicious:        adv.Malicious,
 		EPSS:             adv.EPSS,
-		Exposed:          b.ctx.Exposed,
-		ExposurePaths:    b.ctx.ExposurePaths,
-		Privileged:       b.ctx.Privileged,
-		PrivilegeReasons: b.ctx.PrivilegeReasons,
-		PowerfulSA:       b.ctx.PowerfulSA,
-		SAReasons:        b.ctx.SAReasons,
+		Exposed:          ctx.Exposed,
+		ExposurePaths:    ctx.ExposurePaths,
+		Privileged:       ctx.Privileged,
+		PrivilegeReasons: ctx.PrivilegeReasons,
+		PowerfulSA:       ctx.PowerfulSA,
+		SAReasons:        ctx.SAReasons,
 		NotRunning:       b.in.Owner.NotRunning,
 		GoStdlib:         f.GoStdlib,
 	}
@@ -356,8 +399,14 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string) {
 // except applies the first matching exception rule. A tenant rule cannot except an urgent finding:
 // the finding stays open and says why (spec §6.8). Only the tenant check uses the priority computed
 // without VEX; a not_affected rule then re-ranks the excepted finding.
+//
+// Exceptions follow the runtime cutover in both directions: a rule matches a finding when it
+// matches the finding itself or its cutoverAlias, so re-homing never opens an excepted finding.
 func (b builder) except(f *model.Finding, aliases []string, pin priority.Input) {
-	i := slices.IndexFunc(b.rules, func(r ExceptionRule) bool { return r.Matches(*f, aliases, b.in.Now) })
+	alias, hasAlias := b.cutoverAlias(*f)
+	i := slices.IndexFunc(b.rules, func(r ExceptionRule) bool {
+		return r.Matches(*f, aliases, b.in.Now) || (hasAlias && r.Matches(alias, aliases, b.in.Now))
+	})
 	if i < 0 {
 		return
 	}
@@ -372,6 +421,26 @@ func (b builder) except(f *model.Finding, aliases []string, pin priority.Input) 
 		pin.VEXNotAffected = true
 		f.Priority, f.Reasons = priority.Evaluate(pin, b.in.PriorityConfig)
 	}
+}
+
+// cutoverAlias returns f as it reads on the other side of the runtime cutover. A Nodes finding on a
+// container runtime's module (nodegroup.RuntimeOwnerName) reads as a finding of that
+// ContainerRuntime owner on the runtime's repository; a ContainerRuntime finding reads as a Nodes
+// finding on the host repository. Other findings have no alias.
+func (b builder) cutoverAlias(f model.Finding) (model.Finding, bool) {
+	switch {
+	case isNodesOwner(f.Owner):
+		name, ok := nodegroup.RuntimeOwnerName(f.Packages)
+		if !ok {
+			return model.Finding{}, false
+		}
+		f.Owner, f.ImageRepo = model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Name: name}, name
+		return f, true
+	case f.Owner.ClusterLevel() && f.Owner.Kind == model.OwnerKindContainerRuntime:
+		f.Owner, f.ImageRepo = model.NodesOwner(b.in.Cluster), model.HostRepo
+		return f, true
+	}
+	return model.Finding{}, false
 }
 
 // packages lists the affected packages, one entry per (name, ecosystem, installed, path) with the
