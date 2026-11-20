@@ -268,12 +268,13 @@ func TestChart_AgentDaemonSetShape(t *testing.T) {
 	arch := func(ps corev1.PodSpec) []corev1.NodeSelectorRequirement {
 		return ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions
 	}
+	// Published images are amd64 and arm64 (#17).
 	require.Equal(t, []corev1.NodeSelectorRequirement{{Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn,
-		Values: []string{"amd64"}}}, arch(ps))
+		Values: []string{"amd64", "arm64"}}}, arch(ps))
 	require.Empty(t, ps.PriorityClassName)
 
-	ps = daemonSet(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.priorityClassName=system-node-critical").Spec.Template.Spec
-	require.Equal(t, []string{"amd64", "arm64"}, arch(ps)[0].Values)
+	ps = daemonSet(t, "nodeAgent.architectures={arm64}", "nodeAgent.priorityClassName=system-node-critical").Spec.Template.Spec
+	require.Equal(t, []string{"arm64"}, arch(ps)[0].Values)
 	require.Equal(t, "system-node-critical", ps.PriorityClassName)
 
 	_, err := renderErr(t, "nodeAgent.port=8443")

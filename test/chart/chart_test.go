@@ -219,7 +219,11 @@ func TestChart_ConfigRoundTrips(t *testing.T) {
 	path := writeTemp(t, renderedConfig(t, render(t)))
 	got, err := config.Load(path)
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(config.Default(), got, cmpopts.EquateEmpty()))
+	want := config.Default()
+	// The chart schedules the agent on amd64 and arm64 nodes (#17); the built-in default, for configurations the
+	// chart does not render, is amd64 only.
+	want.NodeAgent.Architectures = []string{"amd64", "arm64"}
+	require.Empty(t, cmp.Diff(want, got, cmpopts.EquateEmpty()))
 }
 
 func hasPath(m map[string]any, path string) bool {
@@ -696,13 +700,13 @@ func TestChart_NodeAgentConfig(t *testing.T) {
 	require.Equal(t, config.NodeAgentConfig{Enabled: false, Listen: ":9444", CertDir: "/etc/ffs/agent-tls",
 		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
 		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
-		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64"},
+		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64", "arm64"},
 		NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}, c.NodeAgent)
 
-	o = render(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.nodeSelector.pool=general")
+	o = render(t, "nodeAgent.architectures={arm64}", "nodeAgent.nodeSelector.pool=general")
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
 	require.NoError(t, err)
-	require.Equal(t, []string{"amd64", "arm64"}, c.NodeAgent.Architectures)
+	require.Equal(t, []string{"arm64"}, c.NodeAgent.Architectures)
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", "pool": "general"}, c.NodeAgent.NodeSelector)
 
 	o = render(t, "config.nodeAgent.listen=:1") // the top-level nodeAgent values win

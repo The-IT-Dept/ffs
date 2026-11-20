@@ -11,33 +11,73 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  image:
+  # The gate: a tag publishes only a commit on main whose tests pass.
+  test:
     runs-on: ubuntu-24.04
     permissions:
       contents: read
-      packages: write
-      id-token: write
-      attestations: write
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
       version: ${{ steps.meta.outputs.version }}
+      short: ${{ steps.meta.outputs.short }}
+      source-date-epoch: ${{ steps.meta.outputs.source-date-epoch }}
+    env:
+      GOFLAGS: -p=4
+      CGO_ENABLED: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0 # every branch, so origin/main is there for the ancestry check
+      - name: Require the tagged commit to be on main
+        run: |
+          set -euo pipefail
+          if ! git merge-base --is-ancestor HEAD origin/main; then
+            echo "::error::${GITHUB_REF_NAME} tags $(git rev-parse HEAD), which is not on main; only commits on main are released" >&2
+            exit 1
+          fi
       - id: meta
         name: Compute version, short SHA and source date
         run: |
           set -euo pipefail
-          VERSION="${GITHUB_REF_NAME#v}"
-          SHORT="$(git rev-parse --short=7 HEAD)"
-          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
           {
-            echo "VERSION=${VERSION}"
-            echo "SHORT=${SHORT}"
-            echo "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
-          } >> "$GITHUB_ENV"
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+            echo "version=${GITHUB_REF_NAME#v}"
+            echo "short=$(git rev-parse --short=7 HEAD)"
+            echo "source-date-epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.22.1
+      - run: make test
+        env:
+          FFS_REQUIRE_HELM: "1"
+
+  # One image per platform, each built natively on its own runner and pushed by digest only; the image job
+  # merges them into the tagged index.
+  build:
+    needs: test
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ needs.test.outputs.version }}
+      SHORT: ${{ needs.test.outputs.short }}
+      SOURCE_DATE_EPOCH: ${{ needs.test.outputs.source-date-epoch }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -45,66 +85,133 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - id: build
-        name: Build and push the image
+        name: Build and push the image by digest
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
-        env:
-          SOURCE_DATE_EPOCH: ${{ env.SOURCE_DATE_EPOCH }}
         with:
           context: .
-          # amd64 only for now; add linux/arm64 back here when arm64 images are wanted.
-          platforms: linux/amd64
-          tags: |
-            ghcr.io/the-it-dept/ffs:${{ env.VERSION }}
-            ghcr.io/the-it-dept/ffs:sha-${{ env.SHORT }}
+          platforms: linux/${{ matrix.arch }}
           build-args: |
             VERSION=${{ github.ref_name }}
             COMMIT=${{ env.SHORT }}
           annotations: |
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.source=https://github.com/The-IT-Dept/ffs
-          outputs: type=registry,rewrite-timestamp=true
+          outputs: type=image,name=ghcr.io/the-it-dept/ffs,push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true
           # No buildx in-index attestations: they add unknown/unknown entries to the index.
-          # Signatures, SBOMs and provenance come from cosign and GitHub attestations below.
+          # Signatures, SBOMs and provenance come from cosign and GitHub attestations in the image job.
           provenance: false
           sbom: false
           no-cache: true
-      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
-        with:
-          cosign-release: v3.1.4
-      - name: Sign the index and every platform manifest
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes --recursive "ghcr.io/the-it-dept/ffs@${DIGEST}"
-      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
-        with:
-          syft-version: v1.57.2
-      - name: Attest an SPDX SBOM on every platform manifest
+      - name: Record the digest
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
           set -euo pipefail
-          raw="$(docker buildx imagetools inspect --raw "ghcr.io/the-it-dept/ffs@${DIGEST}")"
-          if jq -e '.manifests' <<<"${raw}" >/dev/null; then
-            manifests="$(jq -r '.manifests[] | "\(.platform.os)-\(.platform.architecture) \(.digest)"' <<<"${raw}")"
-          else
-            # Single-platform build: the pushed digest is the platform manifest itself.
-            manifests="linux-amd64 ${DIGEST}"
-          fi
-          test -n "${manifests}"
-          if grep -q unknown <<<"${manifests}"; then
-            echo "unexpected attestation manifest in the index: ${manifests}" >&2
+          [[ "${DIGEST}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          mkdir -p digests
+          echo "${DIGEST}" > "digests/${ARCH}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 1
+
+  image:
+    needs: [test, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+      version: ${{ needs.test.outputs.version }}
+    env:
+      VERSION: ${{ needs.test.outputs.version }}
+      SHORT: ${{ needs.test.outputs.short }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: digests
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: index
+        name: Merge the platform images into the tagged index
+        run: |
+          set -euo pipefail
+          amd64="$(cat digests/amd64)"
+          arm64="$(cat digests/arm64)"
+          for d in "${amd64}" "${arm64}"; do
+            [[ "${d}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          done
+          docker buildx imagetools create \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/The-IT-Dept/ffs" \
+            -t "ghcr.io/the-it-dept/ffs:${VERSION}" -t "ghcr.io/the-it-dept/ffs:sha-${SHORT}" \
+            "ghcr.io/the-it-dept/ffs@${amd64}" "ghcr.io/the-it-dept/ffs@${arm64}"
+          digest="$(docker buildx imagetools inspect "ghcr.io/the-it-dept/ffs:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          # The index holds exactly the two platform images, and nothing else (no unknown/unknown entries).
+          got="$(docker buildx imagetools inspect --raw "ghcr.io/the-it-dept/ffs@${digest}" \
+            | jq -r '.manifests[] | "\(.platform.os)/\(.platform.architecture) \(.digest)"' | sort)"
+          want="$(printf 'linux/amd64 %s\nlinux/arm64 %s' "${amd64}" "${arm64}")"
+          if [[ "${got}" != "${want}" ]]; then
+            printf 'unexpected index manifests:\n%s\nwant:\n%s\n' "${got}" "${want}" >&2
             exit 1
           fi
-          while read -r PLAT PD; do
-            syft scan "registry:ghcr.io/the-it-dept/ffs@${PD}" -o "spdx-json=sbom-${PLAT}.spdx.json"
-            cosign attest --yes --type spdxjson --predicate "sbom-${PLAT}.spdx.json" "ghcr.io/the-it-dept/ffs@${PD}"
-          done <<<"${manifests}"
+          {
+            echo "digest=${digest}"
+            echo "amd64=${amd64}"
+            echo "arm64=${arm64}"
+          } >> "$GITHUB_OUTPUT"
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      - name: Sign the index and every platform image
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: cosign sign --yes --recursive "ghcr.io/the-it-dept/ffs@${DIGEST}"
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          syft-version: v1.57.2
+      - name: Attest an SPDX SBOM on every platform image
+        env:
+          AMD64: ${{ steps.index.outputs.amd64 }}
+          ARM64: ${{ steps.index.outputs.arm64 }}
+        run: |
+          set -euo pipefail
+          for p in "amd64 ${AMD64}" "arm64 ${ARM64}"; do
+            read -r arch pd <<<"${p}"
+            syft scan --platform "linux/${arch}" "registry:ghcr.io/the-it-dept/ffs@${pd}" -o "spdx-json=sbom-linux-${arch}.spdx.json"
+            cosign attest --yes --type spdxjson --predicate "sbom-linux-${arch}.spdx.json" "ghcr.io/the-it-dept/ffs@${pd}"
+          done
+      # SLSA build provenance for the index and for each platform image.
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-name: ghcr.io/the-it-dept/ffs
-          subject-digest: ${{ steps.build.outputs.digest }}
+          subject-digest: ${{ steps.index.outputs.digest }}
           push-to-registry: true
           # Storage records need artifact-metadata: write; they are not used.
+          create-storage-record: false
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/the-it-dept/ffs
+          subject-digest: ${{ steps.index.outputs.amd64 }}
+          push-to-registry: true
+          create-storage-record: false
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/the-it-dept/ffs
+          subject-digest: ${{ steps.index.outputs.arm64 }}
+          push-to-registry: true
           create-storage-record: false
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -215,12 +322,14 @@ jobs:
           ID="https://github.com/The-IT-Dept/ffs/.github/workflows/release.yml@refs/tags/$TAG"
           ISS=https://token.actions.githubusercontent.com
           cosign verify ghcr.io/the-it-dept/ffs@$D --certificate-identity "$ID" --certificate-oidc-issuer $ISS
-          # Every platform manifest of the index; a single-platform push is its own platform manifest.
-          for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r --arg d "$D" '(.manifests // [{digest: $d}])[].digest'); do
+          gh attestation verify oci://ghcr.io/the-it-dept/ffs@$D -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
+          # The index holds linux/amd64 and linux/arm64; each platform image has its signature, SBOM and provenance.
+          test "$(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '[.manifests[].platform | .os + "/" + .architecture] | sort | join(" ")')" = "linux/amd64 linux/arm64"
+          for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '.manifests[].digest'); do
             cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
             cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
+            gh attestation verify oci://ghcr.io/the-it-dept/ffs@$pd -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
           done
-          gh attestation verify oci://ghcr.io/the-it-dept/ffs@$D -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
           cosign verify ghcr.io/the-it-dept/charts/ffs@$CD --certificate-identity "$ID" --certificate-oidc-issuer $ISS
           gh attestation verify oci://ghcr.io/the-it-dept/charts/ffs@$CD -R The-IT-Dept/ffs
           test "$(helm show values oci://ghcr.io/the-it-dept/charts/ffs --version $V | yq .image.digest)" = "$D" && echo pinned

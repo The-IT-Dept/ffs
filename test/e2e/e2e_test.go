@@ -140,12 +140,13 @@ func setup(t *testing.T) *suite {
 		"persistence": map[string]any{"size": "2Gi"},
 		// 1800 MiB, below the 2Gi emptyDir limit.
 		"catalog": map[string]any{"scratchSizeLimit": "2Gi", "scratchLimit": 1887436800},
-		// The e2e image is built for the host's architecture. maxImageBytes keeps the kind-loaded ffs
-		// image (well over 16 MiB) out of agent cataloguing, so it stays unresolvable; the side-loaded
-		// fixture is a few MiB. The chart wants scratchSizeLimit of at least 1280Mi with that
-		// maxImageBytes, and workTimeout plus imageListInterval shorter than staleAfter.
+		// The e2e image is built for the host's architecture, amd64 or arm64, both of which the agent
+		// schedules on by default. maxImageBytes keeps the kind-loaded ffs image (well over 16 MiB) out
+		// of agent cataloguing, so it stays unresolvable; the side-loaded fixture is a few MiB. The chart
+		// wants scratchSizeLimit of at least 1280Mi with that maxImageBytes, and workTimeout plus
+		// imageListInterval shorter than staleAfter.
 		"nodeAgent": map[string]any{
-			"architectures": []string{"amd64", "arm64"}, "maxImageBytes": "16Mi", "scratchSizeLimit": "2Gi",
+			"maxImageBytes": "16Mi", "scratchSizeLimit": "2Gi",
 			"reportInterval": "10m", "imageListInterval": "20s", "staleAfter": "2m", "runtimeGrace": "2m", "workTimeout": "90s",
 		},
 		"config": map[string]any{

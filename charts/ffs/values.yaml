@@ -150,8 +150,8 @@ nodeAgent:
     extraBinDirs: []
     # containerd root directory (absolute), such as /var/lib/k0s/containerd for k0s; empty uses the distribution's.
     containerdRoot: ""
-  # Node architectures to schedule on, at least one; published images are amd64 only, so other architectures are skipped.
-  architectures: [amd64]
+  # Node architectures to schedule on, at least one; published images are amd64 and arm64.
+  architectures: [amd64, arm64]
   # Node selector of the agent pods.
   nodeSelector:
     kubernetes.io/os: linux
