@@ -94,7 +94,8 @@ func (s *Store) ListImages(ctx context.Context, f ImageFilter) ([]model.Image, e
 // candidate: a superseded rollout digest or a stale candidate. Each unused image is marked unused
 // from now the first time PruneImages sees it so (UpsertImage clears the mark too), an image used
 // again loses its mark, and an image marked before now-unusedFor is deleted with its packages, SBOM,
-// matches and grype keys. Synthetic digests are kept. It returns the number of images deleted.
+// matches, grype keys and acquisition records (images_unmatched, acquisitions_inflight), so a digest
+// that comes back starts clean. Synthetic digests are kept. It returns the number of images deleted.
 func (s *Store) PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error) {
 	if now.IsZero() {
 		return 0, errors.New("store: prune images without a time")
@@ -122,6 +123,8 @@ func (s *Store) PruneImages(ctx context.Context, now time.Time, unusedFor time.D
 			`DELETE FROM sboms WHERE digest IN (SELECT value FROM json_each(?))`,
 			`DELETE FROM matches WHERE digest IN (SELECT value FROM json_each(?))`,
 			`DELETE FROM grype_keys WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM images_unmatched WHERE digest IN (SELECT value FROM json_each(?))`,
+			`DELETE FROM acquisitions_inflight WHERE digest IN (SELECT value FROM json_each(?))`,
 			`DELETE FROM images WHERE digest IN (SELECT value FROM json_each(?))`,
 		} {
 			if _, err := tx.ExecContext(ctx, q, list); err != nil {

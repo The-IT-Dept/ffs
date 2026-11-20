@@ -178,6 +178,13 @@ func TestStore_PruneImages(t *testing.T) {
 	require.NoError(t, s.PutSuggestion(ctx, "Deployment/shop/web", model.Suggestion{Repo: "ghcr.io/x", Tier: model.TierPatch, ComputedAt: now},
 		[]CandidateDigest{{Tag: "1.1", Tier: model.TierPatch, Platform: "linux/amd64", Digest: cand}}))
 
+	// Acquisition records of an image that is pruned go with it; a used image keeps its own.
+	for _, d := range []string{old, used} {
+		require.NoError(t, s.MarkUnmatched(ctx, d, now))
+		_, err := s.BeginAcquire(ctx, d, now)
+		require.NoError(t, err)
+	}
+
 	week := 7 * 24 * time.Hour
 	n, err := s.PruneImages(ctx, now, week)
 	require.NoError(t, err)
@@ -215,6 +222,15 @@ func TestStore_PruneImages(t *testing.T) {
 	keyed, err := s.GrypeDigests(ctx)
 	require.NoError(t, err)
 	require.ElementsMatch(t, []string{used, cand, revived, synthetic}, keyed)
+	unmatched, err := s.UnmatchedDigests(ctx, []string{old, used})
+	require.NoError(t, err)
+	require.Equal(t, []string{used}, unmatched)
+	stale, err := s.BeginAcquire(ctx, old, now)
+	require.NoError(t, err)
+	require.False(t, stale, "a pruned image that comes back is not charged for an acquisition before its prune")
+	stale, err = s.BeginAcquire(ctx, used, now)
+	require.NoError(t, err)
+	require.True(t, stale)
 
 	_, err = s.PruneImages(ctx, time.Time{}, week)
 	require.Error(t, err)
