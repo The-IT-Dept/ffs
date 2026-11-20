@@ -83,6 +83,10 @@ var errZipBehind = errors.New("osv: all.zip is older than modified_id.csv")
 // GET per record instead. A variable so tests can lower it.
 var maxZipBytes int64 = 1 << 30
 
+// loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
+// the batches.
+var loadRecords = (*store.Store).OSVRecordsByID
+
 // Changed is a new or changed OSV record. Ecosystem is the bucket it came from ("Debian", "PyPI",
 // "Go", "GIT", ...).
 type Changed struct {
@@ -887,7 +891,7 @@ func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recK
 		for i, k := range chunk {
 			ids[i] = k.id
 		}
-		raws, err := f.o.Store.OSVRecordsByID(ctx, ids)
+		raws, err := loadRecords(f.o.Store, ctx, ids)
 		if err != nil {
 			return err
 		}
@@ -944,18 +948,34 @@ func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recK
 // deliver calls the handler with recs in chunks of at most 500 records and handlerBytes, except
 // that a single larger record is a chunk of its own.
 func (f *Feed) deliver(ctx context.Context, recs []Changed) error {
+	_, err := f.deliverChunks(ctx, recs, true)
+	return err
+}
+
+// deliverFull is deliver for the records read so far of a longer run: it holds back the last chunk
+// unless it is full, so that the records read next can join it, and returns the records held back.
+// Delivering a run read by read this way, then what is held back with deliver, calls the handler
+// with the same chunks as delivering the whole run at once.
+func (f *Feed) deliverFull(ctx context.Context, recs []Changed) ([]Changed, error) {
+	return f.deliverChunks(ctx, recs, false)
+}
+
+func (f *Feed) deliverChunks(ctx context.Context, recs []Changed, all bool) ([]Changed, error) {
 	for len(recs) > 0 {
 		n, size := 0, 0
 		for n < len(recs) && n < handlerChunk && (n == 0 || size+len(recs[n].Raw) <= handlerBytes) {
 			size += len(recs[n].Raw)
 			n++
 		}
+		if !all && n == len(recs) && n < handlerChunk {
+			return slices.Clone(recs), nil // a copy, so the delivered records can be freed
+		}
 		if err := f.o.Handler(ctx, recs[:n]); err != nil {
-			return fmt.Errorf("osv: handler: %w", err)
+			return nil, fmt.Errorf("osv: handler: %w", err)
 		}
 		recs = recs[n:]
 	}
-	return nil
+	return nil, nil
 }
 
 // keyChunks splits keys into consecutive chunks of at most 500 keys whose records are estimated, at
@@ -988,6 +1008,8 @@ func keyChunks(st store.FeedState, keys []recKey) iter.Seq[[]recKey] {
 // setDiff runs weekly. It reads each polled bucket's whole modified_id.csv and withdraws the cached
 // records no longer listed: each is delivered with a "withdrawn" time (unless it is still cached and
 // listed in another polled bucket, whose copy is delivered instead), then removed from the cache.
+// The vanished records are read in keyChunks and handed off as they fill handler chunks, so a
+// listing that drops most of a bucket costs a few chunks of memory, not the bucket.
 func (f *Feed) setDiff(ctx context.Context, st *store.FeedState, buckets []string) error {
 	now := f.o.Now().UTC()
 	if last, err := time.Parse(time.RFC3339, st.Meta[metaSetDiff]); err == nil && now.Sub(last) < setDiffInterval {
@@ -1024,24 +1046,37 @@ func (f *Feed) setDiff(ctx context.Context, st *store.FeedState, buckets []strin
 
 	var recs []Changed
 	for _, b := range slices.Sorted(maps.Keys(vanished)) {
-		raws, err := f.o.Store.OSVRecordsByID(ctx, vanished[b])
-		if err != nil {
-			return err
+		keys := make([]recKey, len(vanished[b]))
+		for i, id := range vanished[b] {
+			keys[i] = recKey{bucket: b, id: id}
 		}
-		for _, raw := range raws {
-			info, err := parseRecord(raw)
+		for chunk := range keyChunks(*st, keys) {
+			ids := make([]string, len(chunk))
+			for i, k := range chunk {
+				ids[i] = k.id
+			}
+			raws, err := loadRecords(f.o.Store, ctx, ids)
 			if err != nil {
-				continue
+				return err
 			}
-			if other := listedElsewhere(cached, b, info.ID); other != "" {
-				recs = append(recs, Changed{Ecosystem: other, ID: info.ID, Raw: raw})
-				continue
+			for _, raw := range raws {
+				info, err := parseRecord(raw)
+				if err != nil {
+					continue
+				}
+				if other := listedElsewhere(cached, b, info.ID); other != "" {
+					recs = append(recs, Changed{Ecosystem: other, ID: info.ID, Raw: raw})
+					continue
+				}
+				w, err := withdraw(raw, now)
+				if err != nil {
+					continue
+				}
+				recs = append(recs, Changed{Ecosystem: b, ID: info.ID, Raw: w})
 			}
-			w, err := withdraw(raw, now)
-			if err != nil {
-				continue
+			if recs, err = f.deliverFull(ctx, recs); err != nil {
+				return err
 			}
-			recs = append(recs, Changed{Ecosystem: b, ID: info.ID, Raw: w})
 		}
 	}
 	if err := f.deliver(ctx, recs); err != nil {
