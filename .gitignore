@@ -9,6 +9,7 @@ cover.out
 /.cache/
 /internal/web/ui/dist/*
 !/internal/web/ui/dist/.keep
+/internal/web/ui/bundle-packages.json
 /ui/node_modules/
 /ui/test-results/
 /ui/playwright-report/
