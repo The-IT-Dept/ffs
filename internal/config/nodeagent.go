@@ -2,6 +2,7 @@ package config
 
 import (
 	"net"
+	"slices"
 	"strings"
 	"time"
 
@@ -24,6 +25,10 @@ type NodeAgentConfig struct {
 	WorkPerReport     int           `yaml:"workPerReport"`
 	WorkTimeout       time.Duration `yaml:"workTimeout"`
 	ExposedNodes      string        `yaml:"exposedNodes"` // node label selector; "" exposes no node
+	// Architectures and NodeSelector are where the agent DaemonSet schedules, as the chart renders it: the
+	// controller shows other nodes as not scheduled rather than as missing an agent. Empty: every node.
+	Architectures []string          `yaml:"architectures"`
+	NodeSelector  map[string]string `yaml:"nodeSelector"`
 }
 
 func defaultNodeAgent() NodeAgentConfig {
@@ -80,4 +85,26 @@ func (n NodeAgentConfig) validate(bad func(format string, a ...any)) {
 	if _, err := n.ExposedSelector(); err != nil {
 		bad("nodeAgent.exposedNodes: %v", err)
 	}
+	for _, a := range n.Architectures {
+		if strings.TrimSpace(a) == "" {
+			bad("nodeAgent.architectures: must not hold an empty entry")
+		}
+	}
+}
+
+// ScheduledOn reports whether the agent DaemonSet schedules on a node with these labels and architecture
+// (its kubernetes.io/arch label, else arch), as far as the configuration tells: its architecture is one of
+// Architectures and its labels match NodeSelector. Taints are not known here. When it does not, reason
+// says why.
+func (n NodeAgentConfig) ScheduledOn(nodeLabels map[string]string, arch string) (ok bool, reason string) {
+	if a := nodeLabels["kubernetes.io/arch"]; a != "" {
+		arch = a
+	}
+	if len(n.Architectures) > 0 && !slices.Contains(n.Architectures, arch) {
+		return false, "architecture " + arch + " is not in nodeAgent.architectures"
+	}
+	if len(n.NodeSelector) > 0 && !labels.SelectorFromSet(n.NodeSelector).Matches(labels.Set(nodeLabels)) {
+		return false, "node labels do not match nodeAgent.nodeSelector"
+	}
+	return true, ""
 }

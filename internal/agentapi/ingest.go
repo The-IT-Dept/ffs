@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,7 +154,11 @@ func (i *Ingester) Report(ctx context.Context, id Identity, r *wire.Report) (wir
 	if stored != nil {
 		storedGaps = stored.Coverage
 	}
-	rep.Coverage = coverageOf(r, storedGaps)
+	var osr *osRelease
+	if gate.prep != nil {
+		osr = gate.prep.OS
+	}
+	rep.Coverage = coverageOf(r, storedGaps, imageBasedOS(osr, node.Status.NodeInfo.OSImage))
 	for _, p := range r.Problems {
 		rep.Problems = append(rep.Problems, problemText(p))
 	}
@@ -302,6 +307,21 @@ func (i *Ingester) prepareInSlot(ctx context.Context, hk, node string, r *wire.R
 	return gate, nil
 }
 
+// hostNotSent is the last error of a full report that carried no host inventory, with the agent's catalog
+// and scratch problems, which say why.
+func hostNotSent(problems []wire.Problem) string {
+	var why []string
+	for _, p := range problems {
+		if p.Code == wire.ProblemCatalog || p.Code == wire.ProblemScratch {
+			why = append(why, problemText(p))
+		}
+	}
+	if len(why) == 0 {
+		return "host inventory not sent with the full report"
+	}
+	return "host inventory not collected: " + strings.Join(why, "; ")
+}
+
 func quarantineText(job store.AgentJob) string {
 	return fmt.Sprintf("host inventory quarantined until %s: %s", job.QuarantinedUntil.UTC().Format(time.RFC3339), job.LastError)
 }
@@ -311,8 +331,11 @@ func quarantineText(job store.AgentJob) string {
 func (i *Ingester) storeHost(ctx context.Context, node string, r *wire.Report, gate hostGate, now time.Time) error {
 	st := i.o.Store
 	switch {
-	case r.Kind != wire.KindFull || r.Host == nil:
+	case r.Kind != wire.KindFull:
 		return nil
+	case r.Host == nil:
+		// The node shows host_not_inventoried with this text until a full report carries its host part.
+		return st.SetAgentError(ctx, node, hostNotSent(r.Problems))
 	case gate.skipErr != "":
 		return st.SetAgentError(ctx, node, gate.skipErr)
 	case gate.prepErr != nil:

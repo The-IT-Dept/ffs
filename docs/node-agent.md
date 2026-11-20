@@ -37,6 +37,8 @@ The kernel release and boot ID come from `/proc`, with no mount. The content sto
 
 Only the running kernel's packages are matched. Other installed kernels are left out of the node's inventory, and a newer one shows the node as reboot pending: `installed kernel <release> is newer than the running kernel <release>`.
 
+A node whose agent reports but whose host inventory is not stored, or not current, shows the `host_not_inventoried` coverage gap with the reason: not inventoried yet, a host inventory that could not be read or stored, a quarantined host inventory, or no full report for longer than `nodeAgent.reportInterval` (with its jitter) plus `nodeAgent.staleAfter`. It is counted apart from fully reporting nodes.
+
 ## What it never does
 
 - It has no Kubernetes API access. Its ServiceAccount has no Role or ClusterRole bindings; on OpenShift it has only permission to use its own SecurityContextConstraints. Its only credential is a projected token for the audience `ffs-agent`, which the Kubernetes API server does not accept.
@@ -80,7 +82,7 @@ containerd and cri-o findings move between the `ContainerRuntime` owner and `Nod
 
 Exceptions written for the container runtime (owner `ContainerRuntime/containerd` or repository `containerd`) keep applying when its findings move to `Nodes/<cluster>` and back, so neither switch reopens an excepted finding.
 
-The first agent data on a cluster is a baseline: each AlertTarget gets one summary of the node findings instead of one alert per finding. Re-enabling the agent baselines again.
+The first agent data on a cluster is a baseline: each AlertTarget gets one summary of the node findings instead of one alert per finding. The baseline waits until every node the agent runs on is in a matched node group, or until 10 minutes (at most `nodeAgent.staleAfter`) after the first agent report, so node pools that report minutes apart share one summary. Re-enabling the agent baselines again.
 
 ## Distributions
 
@@ -96,11 +98,11 @@ In a cluster with mixed distributions, `auto` uses the most common one, and the 
 ## Platforms
 
 - **GKE Autopilot** does not allow `hostPath` volumes. Install with `--set nodeAgent.enabled=false`.
-- **Managed nodes** that run no DaemonSets, such as EKS Fargate, virtual nodes and Windows nodes, are not covered. They show the `node_agent_missing` gap.
-- **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled.
+- **Managed nodes** that run no DaemonSets, such as EKS Fargate and virtual nodes, are not covered. They show the `node_agent_missing` gap.
+- **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled. Nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector` (Windows nodes, for example) show `not scheduled by the node agent: <reason>` (`node_agent_unsupported`), and do not hold back the switch from node status to the agent. ffs cannot see node taints, so a node the tolerations exclude shows `node_agent_missing`.
 - **SELinux.** On SELinux-enforcing nodes the agent shows `node agent cannot read <path>: permission denied` until `nodeAgent.seLinuxType: spc_t` is set, which runs the collector, and only the collector, with that SELinux type.
 - **OpenShift** needs `nodeAgent.openshift.scc: true`, which creates a SecurityContextConstraints for the agent and lets its ServiceAccount use it.
-- **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one.
+- **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one. A node of any other OS whose package database the agent cannot find shows `package database not mounted; set nodeAgent.packageDatabases`.
 - **Private registries.** The agent pods use the top-level `imagePullSecrets`, and those Secrets must also exist in the agent namespace.
 
 ## Package database mounts
@@ -124,11 +126,11 @@ The NetworkPolicy `ffs-agent-api` (`nodeAgent.networkPolicy.enabled`) allows the
 
 The controller exports:
 
-- `ffs_node_agent_nodes{state}`: nodes by agent state, `reporting`, `stale`, `never` or `disabled`;
+- `ffs_node_agent_nodes{state}`: nodes by agent state, `reporting`, `reporting_without_inventory` (reporting, but with the `host_not_inventoried` gap), `stale`, `never`, `disabled` or `unsupported` (not scheduled by the DaemonSet);
 - `ffs_node_groups{kind}`: node groups by kind, `agent` or `nodeinfo`;
 - `ffs_agent_reports_total{result}`: reports received, `applied`, `duplicate` or `rejected`.
 
-With `prometheusRule.enabled`, the alert `FFSNodeAgentNotReporting` fires when node agents have stopped reporting (state `stale`) for 30 minutes. Nodes the DaemonSet never schedules (other architectures, Windows or virtual nodes) stay `never`. They show in the gauge and in the node coverage gap, and do not fire the alert.
+With `prometheusRule.enabled`, the alert `FFSNodeAgentNotReporting` fires when node agents have stopped reporting (state `stale`) for 30 minutes. Nodes the DaemonSet does not schedule (other architectures, or a `nodeAgent.nodeSelector` mismatch) are `unsupported`, never `stale`, and do not fire it.
 
 ## Chart values
 

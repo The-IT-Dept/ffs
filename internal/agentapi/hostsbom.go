@@ -23,10 +23,40 @@ const pendingDigest = "nodegroup:pending"
 
 // Coverage gap details (copy).
 const (
-	detailNoPackageDatabase = "no package database (image-based OS)"
-	detailContentStore      = "no containerd content store on this node; side-loaded images cannot be catalogued from it"
-	detailBlockedFmt        = "node agent cannot read %s: permission denied"
+	detailNoPackageDatabase   = "no package database (image-based OS)"
+	detailPackageDBNotMounted = "package database not mounted; set nodeAgent.packageDatabases"
+	detailContentStore        = "no containerd content store on this node; side-loaded images cannot be catalogued from it"
+	detailBlockedFmt          = "node agent cannot read %s: permission denied"
 )
+
+// imageBasedIDs are the os-release IDs of image-based operating systems, which have no package database:
+// Talos, Flatcar (and the CoreOS Container Linux it derives from), Bottlerocket and Container-Optimized OS.
+var imageBasedIDs = []string{"talos", "flatcar", "coreos", "bottlerocket", "cos"}
+
+// imageBasedOSImages are the same systems as node.status.nodeInfo.osImage names them (os-release's
+// PRETTY_NAME), for a report whose host SBOM was not read.
+var imageBasedOSImages = []string{"talos", "flatcar", "bottlerocket", "container-optimized os"}
+
+// osRelease is what coverage needs of the host's os-release: its ID and ID_LIKE.
+type osRelease struct {
+	ID     string
+	IDLike []string
+}
+
+// imageBasedOS reports whether the host runs an image-based OS: by its os-release ID or ID_LIKE when the
+// host SBOM gave one, else by the node's OS image.
+func imageBasedOS(rel *osRelease, osImage string) bool {
+	if rel != nil && rel.ID != "" {
+		for _, id := range append([]string{rel.ID}, rel.IDLike...) {
+			if slices.Contains(imageBasedIDs, strings.ToLower(id)) {
+				return true
+			}
+		}
+		return false
+	}
+	lower := strings.ToLower(osImage)
+	return slices.ContainsFunc(imageBasedOSImages, func(name string) bool { return strings.Contains(lower, name) })
+}
 
 // Media types of image indexes in a content store.
 var indexMediaTypes = []string{"application/vnd.oci.image.index.v1+json", "application/vnd.docker.distribution.manifest.list.v2+json"}
@@ -38,6 +68,7 @@ type hostPrep struct {
 	Fingerprint string
 	Group       model.NodeGroup
 	Split       nodegroup.KernelSplit
+	OS          *osRelease // nil when the host SBOM has no distro
 }
 
 // prepareHost decodes the report's host SBOM, rewrites forked Go modules to their upstream names, removes the
@@ -60,9 +91,13 @@ func prepareHost(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error
 	}
 
 	info := n.Status.NodeInfo
-	var distro *model.Distro
+	var (
+		distro *model.Distro
+		osr    *osRelease
+	)
 	if ld := doc.Artifacts.LinuxDistribution; ld != nil {
 		distro = &model.Distro{ID: ld.ID, VersionID: ld.VersionID, Codename: ld.VersionCodename}
+		osr = &osRelease{ID: ld.ID, IDLike: ld.IDLike}
 	}
 	fp := nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Distro: distro, Kernel: split.Kernel,
 		KernelRelease: r.KernelRelease, RuntimeVersion: info.ContainerRuntimeVersion})
@@ -71,6 +106,7 @@ func prepareHost(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error
 		SyftJSON:    b,
 		Fingerprint: fp,
 		Split:       split,
+		OS:          osr,
 		Group: model.NodeGroup{
 			ID: fp, Kind: model.NodeGroupAgent, Name: name, Label: nodegroup.GroupLabel(name, fp), Digest: nodegroup.GroupDigest(fp),
 			Distro: distro, OSImage: info.OSImage, KernelRelease: r.KernelRelease, ContainerRuntimeVersion: info.ContainerRuntimeVersion,
@@ -160,8 +196,13 @@ func mainModuleOf(meta any) (string, bool) {
 }
 
 // coverageOf derives a report's coverage gaps, de-duplicated and sorted by code and detail. A report without
-// Images keeps the stored content-store gap.
-func coverageOf(r *wire.Report, stored []model.NodeCoverageGap) []model.NodeCoverageGap {
+// Images keeps the stored content-store gap. A missing package database is an image-based OS only when
+// imageBased says so (imageBasedOS); on any other OS the database was not mounted.
+func coverageOf(r *wire.Report, stored []model.NodeCoverageGap, imageBased bool) []model.NodeCoverageGap {
+	noDB := model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: detailPackageDBNotMounted}
+	if imageBased {
+		noDB.Detail = detailNoPackageDatabase
+	}
 	var gaps []model.NodeCoverageGap
 	denied := false
 	for _, p := range r.Problems {
@@ -170,14 +211,14 @@ func coverageOf(r *wire.Report, stored []model.NodeCoverageGap) []model.NodeCove
 			denied = true
 			gaps = append(gaps, model.NodeCoverageGap{Code: model.GapNodeAgentBlocked, Detail: fmt.Sprintf(detailBlockedFmt, p.Path)})
 		case wire.ProblemNoPackageDB:
-			gaps = append(gaps, model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: detailNoPackageDatabase})
+			gaps = append(gaps, noDB)
 		case wire.ProblemContentStore:
 			gaps = append(gaps, model.NodeCoverageGap{Code: model.GapContentStoreUnreadable, Detail: detailContentStore})
 		}
 	}
 	if r.Host != nil && r.Host.PackageDB == "" && !denied {
-		// SELinux-denied databases are not an image-based OS.
-		gaps = append(gaps, model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: detailNoPackageDatabase})
+		// SELinux-denied databases are not missing ones.
+		gaps = append(gaps, noDB)
 	}
 	switch {
 	case r.Images != nil && !r.Images.ContentStore:

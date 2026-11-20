@@ -12,8 +12,23 @@ import (
 
 // UpsertOwner stores o under o.Ref.Key() and replaces its owner_images rows. Containers without a
 // resolved digest are not indexed.
+//
+// A cluster-level ContainerRuntime owner is not stored while the node agent has retired the runtime
+// owner (NodesState.RuntimeRetired): the check and the write are one transaction, so an inventory flush
+// that read the state before a runtime cutover cannot bring the retired owner back.
 func (s *Store) UpsertOwner(ctx context.Context, o model.Owner) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error { return upsertOwnerTx(ctx, tx, o) })
+	return s.inTx(ctx, func(tx *sql.Tx) error {
+		if o.Ref.ClusterLevel() && o.Ref.Kind == model.OwnerKindContainerRuntime {
+			state, err := nodesState(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if state.RuntimeRetired {
+				return nil
+			}
+		}
+		return upsertOwnerTx(ctx, tx, o)
+	})
 }
 
 // upsertOwnerTx is UpsertOwner inside tx.

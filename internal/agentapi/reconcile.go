@@ -28,6 +28,10 @@ const (
 	defaultReconcileInterval = time.Minute
 	// triggerGap keeps triggered passes apart, so a burst of reports costs one pass.
 	triggerGap = 5 * time.Second
+	// baselineSettleMax bounds the node baseline's settle window: the baseline is ready once every
+	// scheduled Ready node is in a matched agent group, or min(staleAfter, baselineSettleMax) after the
+	// first fresh agent report, whichever comes first.
+	baselineSettleMax = 10 * time.Minute
 )
 
 // Rehomer is the engine as the reconciler uses it; *engine.Engine implements it.
@@ -227,6 +231,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		return fmt.Errorf("nodes state: %w", err)
 	}
 	written := state
+	if !enabled && (state.AgentEnabled || !state.BaselineReadyAt.IsZero() || !state.FirstReportAt.IsZero()) {
+		// Cleared before this pass moves or deletes any host finding, so a notify pass in between holds
+		// their transitions rather than sending them (spec §9.9).
+		state.AgentEnabled, state.BaselineReadyAt, state.FirstReportAt = false, time.Time{}, time.Time{}
+		if err := st.PutNodesState(ctx, state); err != nil {
+			return err
+		}
+		written = state
+	}
 	sel, err := cfg.NodeAgent.ExposedSelector()
 	if err != nil {
 		return fmt.Errorf("nodeAgent.exposedNodes: %w", err)
@@ -251,6 +264,16 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	agents := make(map[string]store.AgentNode, len(agentRows))
 	for _, a := range agentRows {
 		agents[a.Node] = a
+	}
+	state.Unsupported, state.FullReportOverdue = nil, 0
+	if enabled {
+		state.Unsupported = unsupportedNodes(cfg.NodeAgent, nodes)
+		state.FullReportOverdue = fullReportOverdue(cfg.NodeAgent)
+		if state.FirstReportAt.IsZero() && slices.ContainsFunc(agentRows, func(a store.AgentNode) bool {
+			return !a.LastReport.Before(now.Add(-cfg.NodeAgent.StaleAfter))
+		}) {
+			state.FirstReportAt = now
+		}
 	}
 	unmatched, err := st.UnmatchedImages(ctx)
 	if err != nil {
@@ -296,7 +319,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 
-	fresh, err := r.fresh(p, nodes, agents, members, now)
+	fresh, err := r.fresh(p, nodes, agents, members, state.Unsupported, now)
 	if err != nil {
 		return err
 	}
@@ -319,15 +342,15 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	}
 
 	cutover := func(r2 engine.Rehome, retired bool) error {
+		next := state
+		next.RuntimeRetired, next.NotFreshSince, next.ChangedAt = retired, time.Time{}, now
+		// Written with the moves, in one transaction, and before MarkCluster: inventory reads RuntimeRetired
+		// from the store when it flushes the cluster, and a crash cannot leave one without the other.
+		r2.State = &next
 		if err := r.o.Engine.Rehome(ctx, r2); err != nil {
 			return err
 		}
-		state.RuntimeRetired, state.NotFreshSince, state.ChangedAt = retired, time.Time{}, now
-		// Written before MarkCluster: inventory reads RuntimeRetired from the store when it flushes the cluster.
-		if err := st.PutNodesState(ctx, state); err != nil {
-			return err
-		}
-		written = state
+		state, written = next, next
 		if r.o.Inventory != nil {
 			r.o.Inventory.MarkCluster()
 		}
@@ -361,6 +384,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 	case fresh:
 		state.NotFreshSince = time.Time{}
 	}
+	if state.RuntimeRetired {
+		if err := r.healRetiredRuntime(ctx, nodesRef); err != nil {
+			return err
+		}
+	}
 
 	want := owner(state.RuntimeRetired)
 	stored, ok, err := st.GetOwner(ctx, nodesKey)
@@ -386,7 +414,12 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 
-	if state.BaselineReadyAt.IsZero() && enabled && len(agentIDs) > 0 {
+	// The node baseline waits until every scheduled Ready node is in a matched agent group (fresh), or for
+	// the settle window after the first fresh report, so groups that match later are in it too rather than
+	// alerting finding by finding (spec §9.9).
+	settle := min(cfg.NodeAgent.StaleAfter, baselineSettleMax)
+	settled := fresh || (!state.FirstReportAt.IsZero() && now.Sub(state.FirstReportAt) >= settle)
+	if state.BaselineReadyAt.IsZero() && enabled && len(agentIDs) > 0 && settled {
 		all := true
 		for _, id := range agentIDs {
 			m, err := p.matched(id)
@@ -404,7 +437,7 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) error {
 		}
 	}
 	if !enabled {
-		state.BaselineReadyAt = time.Time{} // re-enabling baselines again
+		state.BaselineReadyAt, state.FirstReportAt = time.Time{}, time.Time{} // re-enabling baselines again
 	}
 	state.AgentEnabled = enabled
 	if !sameState(state, written) {
@@ -450,15 +483,16 @@ func (r *Reconciler) membership(p *pass, nodes []corev1.Node, agents map[string]
 	return members, fallback, nil
 }
 
-// fresh reports whether at least one node is Ready and every Ready node is in an agent group with a report
-// no older than StaleAfter.
+// fresh reports whether at least one scheduled node is Ready and every scheduled Ready node is in an agent
+// group with a report no older than StaleAfter. Nodes the agent DaemonSet does not schedule on (unsupported)
+// are left out, so they never hold back the runtime cutover or the node baseline.
 func (r *Reconciler) fresh(p *pass, nodes []corev1.Node, agents map[string]store.AgentNode, members map[string]string,
-	now time.Time) (bool, error) {
+	unsupported map[string]string, now time.Time) (bool, error) {
 	ready := 0
 	since := now.Add(-r.o.Config.NodeAgent.StaleAfter)
 	for i := range nodes {
 		n := &nodes[i]
-		if readyStatus(n) != corev1.ConditionTrue {
+		if _, skip := unsupported[n.Name]; skip || readyStatus(n) != corev1.ConditionTrue {
 			continue
 		}
 		ready++
@@ -471,6 +505,44 @@ func (r *Reconciler) fresh(p *pass, nodes []corev1.Node, agents map[string]store
 		}
 	}
 	return ready > 0, nil
+}
+
+// unsupportedNodes returns the nodes the agent DaemonSet does not schedule on, as far as the configuration
+// tells (NodeAgentConfig.ScheduledOn), each with why; nil when there are none.
+func unsupportedNodes(na config.NodeAgentConfig, nodes []corev1.Node) map[string]string {
+	var out map[string]string
+	for i := range nodes {
+		if ok, why := na.ScheduledOn(nodes[i].Labels, nodes[i].Status.NodeInfo.Architecture); !ok {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[nodes[i].Name] = why
+		}
+	}
+	return out
+}
+
+// fullReportOverdue is how old a reporting node's last full report may be before its host inventory counts
+// as not current: the report interval with its jitter, plus staleAfter.
+func fullReportOverdue(na config.NodeAgentConfig) time.Duration {
+	return na.ReportInterval + na.ReportInterval*jitterPercent/100 + na.StaleAfter
+}
+
+// healRetiredRuntime re-homes the findings of any ContainerRuntime owner stored while the runtime is retired
+// onto the Nodes owner and drops it. Such an owner is left by an inventory flush that raced a cutover, or by
+// an older version; without this it would duplicate the Nodes owner's findings until the next cutover.
+func (r *Reconciler) healRetiredRuntime(ctx context.Context, nodesRef model.OwnerRef) error {
+	keys, err := r.o.Store.RuntimeOwnerKeys(ctx)
+	if err != nil || len(keys) == 0 {
+		return err
+	}
+	moves, drop, err := r.runtimeFindings(ctx, nodesRef)
+	if err != nil || len(drop) == 0 {
+		return err
+	}
+	r.o.Log.Info("container runtime owner found while the node agent has retired it; moving its findings to the Nodes owner",
+		"owners", drop, "findings", len(moves))
+	return r.o.Engine.Rehome(ctx, engine.Rehome{Moves: moves, Drop: drop})
 }
 
 // runtimeFindings returns the moves of every non-resolved finding of the stored ContainerRuntime owners onto
@@ -541,5 +613,6 @@ func sameOwner(a, b model.Owner) bool {
 
 func sameState(a, b store.NodesState) bool {
 	return a.AgentEnabled == b.AgentEnabled && a.RuntimeRetired == b.RuntimeRetired && a.NotFreshSince.Equal(b.NotFreshSince) &&
-		a.ChangedAt.Equal(b.ChangedAt) && a.BaselineReadyAt.Equal(b.BaselineReadyAt)
+		a.ChangedAt.Equal(b.ChangedAt) && a.BaselineReadyAt.Equal(b.BaselineReadyAt) && a.FirstReportAt.Equal(b.FirstReportAt) &&
+		a.FullReportOverdue == b.FullReportOverdue && maps.Equal(a.Unsupported, b.Unsupported)
 }

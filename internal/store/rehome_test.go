@@ -84,3 +84,51 @@ func TestRehome_MovesFindingsLedgerAndOwnersAtomically(t *testing.T) {
 	_, ok, _ = s.GetSuggestion(ctx, rt.Key(), "containerd")
 	require.False(t, ok)
 }
+
+// TestRehomeWithState_WritesStateWithTheMoves: the runtime cutover's state is written in the moves'
+// transaction, rolled back with them, and from then on the retired ContainerRuntime owner is never stored
+// again by UpsertOwner.
+func TestRehomeWithState_WritesStateWithTheMoves(t *testing.T) {
+	s := newStore(t)
+	rt := model.Owner{Ref: model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Name: "containerd"},
+		Containers: []model.ContainerUse{{Name: "containerd", Kind: model.ContainerRegular, Repo: "containerd", Digest: "runtime:containerd@2.1.4"}}}
+	nodes := model.Owner{Ref: model.NodesOwner("prod"), Containers: []model.ContainerUse{{Name: "g", Kind: model.ContainerRegular,
+		Repo: model.HostRepo, Digest: grpA}}}
+	require.NoError(t, s.UpsertOwner(ctx, rt))
+	f := model.Finding{Fingerprint: "fp-rt", Owner: rt.Ref, ImageRepo: "containerd", AdvisoryID: "CVE-2026-0001", State: model.StateOpen}
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{f}, nil))
+	retired := NodesState{AgentEnabled: true, RuntimeRetired: true, ChangedAt: t0, BaselineReadyAt: t0}
+
+	bad := []FindingMove{{OldFingerprint: "fp-rt", NewFingerprint: "", Owner: nodes.Ref, ImageRepo: model.HostRepo}}
+	require.Error(t, s.RehomeWithState(ctx, &nodes, bad, []string{rt.Ref.Key()}, retired))
+	st, err := s.NodesState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, NodesState{}, st, "a failed cutover leaves the state as it was")
+
+	move := FindingMove{OldFingerprint: "fp-rt", NewFingerprint: "fp-nodes", Owner: nodes.Ref, ImageRepo: model.HostRepo}
+	require.NoError(t, s.RehomeWithState(ctx, &nodes, []FindingMove{move}, []string{rt.Ref.Key()}, retired))
+	st, err = s.NodesState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, retired, st)
+	_, ok, err := s.GetOwner(ctx, rt.Ref.Key())
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	// A flush that read the state before the cutover stores nothing; other owners are stored as before.
+	require.NoError(t, s.UpsertOwner(ctx, rt))
+	_, ok, err = s.GetOwner(ctx, rt.Ref.Key())
+	require.NoError(t, err)
+	require.False(t, ok, "the retired runtime owner is not stored")
+	cnpg := model.Owner{Ref: model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Namespace: "db", Name: "containerd"}}
+	require.NoError(t, s.UpsertOwner(ctx, cnpg))
+	_, ok, err = s.GetOwner(ctx, cnpg.Ref.Key())
+	require.NoError(t, err)
+	require.True(t, ok, "a namespaced owner of the same kind is not the runtime owner")
+
+	retired.RuntimeRetired = false // cut back: the owner is stored again
+	require.NoError(t, s.RehomeWithState(ctx, nil, nil, nil, retired))
+	require.NoError(t, s.UpsertOwner(ctx, rt))
+	_, ok, err = s.GetOwner(ctx, rt.Ref.Key())
+	require.NoError(t, err)
+	require.True(t, ok)
+}

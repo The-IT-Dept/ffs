@@ -278,6 +278,17 @@ func TestIngest_NoPackageDatabaseIsCoverageGap(t *testing.T) {
 	r.KernelRelease = "6.12.6-talos"
 	h.report(t, r)
 	require.Equal(t, gap, h.agentNode(t).Coverage)
+
+	// An Ubuntu node whose package database the chart did not mount is not an image-based OS: its
+	// os-release says Ubuntu.
+	u := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	ubuntuBins := syftDoc(t, ubuntu, goPkg("github.com/containerd/containerd/v2", "v2.2.1", "/usr/bin/containerd",
+		"github.com/containerd/containerd/v2"))
+	r = fullReport(1, &wire.Host{SyftJSON: ubuntuBins}, &wire.Images{ContentStore: true},
+		wire.Problem{Code: wire.ProblemNoPackageDB, Detail: "no dpkg, rpm or apk database found"})
+	require.True(t, u.report(t, r).Applied)
+	require.Equal(t, []model.NodeCoverageGap{{Code: "no_package_database",
+		Detail: "package database not mounted; set nodeAgent.packageDatabases"}}, u.agentNode(t).Coverage)
 }
 
 func TestIngest_OnlyRunningKernelIngested(t *testing.T) {

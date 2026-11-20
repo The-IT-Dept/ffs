@@ -90,6 +90,17 @@ const (
 	AgentDisabled AgentState = "disabled"
 )
 
+// Count buckets beyond the states. NodeAgentStatus.State never takes these values: CountState puts a
+// node in one of them, so counts list such nodes apart from the state they would otherwise be counted in.
+const (
+	// AgentReportingWithoutInventory counts a reporting node whose host inventory is not stored or not
+	// current (GapHostNotInventoried): reporting, but not fully.
+	AgentReportingWithoutInventory AgentState = "reporting_without_inventory"
+	// AgentUnsupported counts a node the node agent DaemonSet does not schedule on (GapNodeAgentUnsupported),
+	// which would otherwise count as never reported or stale.
+	AgentUnsupported AgentState = "unsupported"
+)
+
 // NodeCoverageGap is a reason a node's host coverage is incomplete.
 type NodeCoverageGap struct{ Code, Detail string }
 
@@ -97,8 +108,14 @@ type NodeCoverageGap struct{ Code, Detail string }
 const (
 	GapNodeAgentMissing       = "node_agent_missing"       // never reported, stale, or disabled
 	GapNodeAgentBlocked       = "node_agent_blocked"       // permission denied reading a host path (SELinux, policy)
-	GapNoPackageDatabase      = "no_package_database"      // Detail exactly "no package database (image-based OS)"
+	GapNoPackageDatabase      = "no_package_database"      // image-based OS, or the database is not mounted (Detail says which)
 	GapContentStoreUnreadable = "content_store_unreadable" // no containerd content store (CRI-O, other layout)
+	// GapHostNotInventoried: the agent reports, but the node's host inventory is not stored or not current
+	// (not stored yet, a host problem or quarantine, or no full report for too long).
+	GapHostNotInventoried = "host_not_inventoried"
+	// GapNodeAgentUnsupported: the node agent DaemonSet does not schedule on the node (its architecture or
+	// labels), so the node is never inventoried.
+	GapNodeAgentUnsupported = "node_agent_unsupported"
 )
 
 // NodeAgentStatus is what ffs knows about one node's agent.
@@ -113,8 +130,24 @@ type NodeAgentStatus struct {
 	KernelRelease        string
 	RebootPending        bool
 	RebootReason         string
-	Coverage             []NodeCoverageGap // stored gaps + GapNodeAgentMissing when State != reporting
-	Problems             []string          // collection problems from the last report
+	// Coverage is the stored gaps, plus GapHostNotInventoried for a reporting node without a current host
+	// inventory, and GapNodeAgentUnsupported or else GapNodeAgentMissing when State != reporting.
+	Coverage []NodeCoverageGap
+	Problems []string // collection problems from the last report
+}
+
+// CountState is the bucket s is counted in: State, except AgentReportingWithoutInventory for a reporting
+// node with GapHostNotInventoried and AgentUnsupported for a node with GapNodeAgentUnsupported.
+func (s NodeAgentStatus) CountState() AgentState {
+	for _, g := range s.Coverage {
+		switch {
+		case g.Code == GapNodeAgentUnsupported:
+			return AgentUnsupported
+		case g.Code == GapHostNotInventoried && s.State == AgentReporting:
+			return AgentReportingWithoutInventory
+		}
+	}
+	return s.State
 }
 
 // NodeImage is an image cached on a node.

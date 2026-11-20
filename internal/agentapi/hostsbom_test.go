@@ -15,6 +15,7 @@ func TestIngest_CoverageOf(t *testing.T) {
 		return model.NodeCoverageGap{Code: model.GapNodeAgentBlocked, Detail: "node agent cannot read " + p + ": permission denied"}
 	}
 	noDB := model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: "no package database (image-based OS)"}
+	notMounted := model.NodeCoverageGap{Code: model.GapNoPackageDatabase, Detail: "package database not mounted; set nodeAgent.packageDatabases"}
 	store := model.NodeCoverageGap{Code: model.GapContentStoreUnreadable,
 		Detail: "no containerd content store on this node; side-loaded images cannot be catalogued from it"}
 	missing := model.NodeCoverageGap{Code: model.GapNodeAgentMissing, Detail: "node agent has not reported"}
@@ -24,9 +25,10 @@ func TestIngest_CoverageOf(t *testing.T) {
 	withStore := &wire.Images{ContentStore: true}
 
 	for name, tc := range map[string]struct {
-		r      wire.Report
-		stored []model.NodeCoverageGap
-		want   []model.NodeCoverageGap
+		r         wire.Report
+		stored    []model.NodeCoverageGap
+		want      []model.NodeCoverageGap
+		mutableOS bool // not an image-based OS
 	}{
 		"clean": {r: wire.Report{Host: &wire.Host{PackageDB: "dpkg"}, Images: withStore}},
 		"permission denied": {r: wire.Report{Images: withStore, Problems: []wire.Problem{denied("/var/lib/rpm")}},
@@ -48,8 +50,39 @@ func TestIngest_CoverageOf(t *testing.T) {
 			denied("/var/lib/rpm"), {Code: wire.ProblemContentStore}, denied("/var/lib/dpkg"), denied("/var/lib/rpm"),
 			{Code: wire.ProblemNoPackageDB}, {Code: wire.ProblemNoPackageDB}}},
 			want: []model.NodeCoverageGap{store, noDB, blocked("/var/lib/dpkg"), blocked("/var/lib/rpm")}},
+		"no package db problem, not image-based": {r: wire.Report{Images: withStore, Problems: []wire.Problem{{Code: wire.ProblemNoPackageDB}}},
+			mutableOS: true, want: []model.NodeCoverageGap{notMounted}},
+		"empty package db, not image-based": {r: wire.Report{Host: &wire.Host{}, Images: withStore}, mutableOS: true,
+			want: []model.NodeCoverageGap{notMounted}},
 	} {
-		require.Equal(t, tc.want, coverageOf(&tc.r, tc.stored), name)
+		require.Equal(t, tc.want, coverageOf(&tc.r, tc.stored, !tc.mutableOS), name)
+	}
+}
+
+func TestIngest_ImageBasedOSFromOSRelease(t *testing.T) {
+	for _, tc := range []struct {
+		os      *osRelease
+		osImage string
+		want    bool
+	}{
+		{&osRelease{ID: "talos"}, "", true},
+		{&osRelease{ID: "flatcar", IDLike: []string{"coreos"}}, "", true},
+		{&osRelease{ID: "bottlerocket"}, "", true},
+		{&osRelease{ID: "cos"}, "", true},
+		{&osRelease{ID: "acme-edge", IDLike: []string{"flatcar"}}, "", true},
+		{&osRelease{ID: "ubuntu", IDLike: []string{"debian"}}, "Talos (v1.11.0)", false}, // os-release wins over the OS image
+		{&osRelease{ID: "alpine"}, "", false},
+		{&osRelease{ID: "rhcos", IDLike: []string{"rhel", "fedora"}}, "", false},
+		{nil, "Talos (v1.11.0)", true},
+		{nil, "Flatcar Container Linux by Kinvolk 4230.2.0 (Oklo)", true},
+		{nil, "Bottlerocket OS 1.42.0 (aws-k8s-1.34)", true},
+		{nil, "Container-Optimized OS from Google", true},
+		{&osRelease{}, "Container-Optimized OS from Google", true}, // no ID: the OS image
+		{nil, "Ubuntu 24.04.3 LTS", false},
+		{nil, "Alpine Linux v3.22", false},
+		{nil, "", false},
+	} {
+		require.Equal(t, tc.want, imageBasedOS(tc.os, tc.osImage), "%+v %q", tc.os, tc.osImage)
 	}
 }
 

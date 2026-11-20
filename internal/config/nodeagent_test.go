@@ -40,6 +40,7 @@ func TestNodeAgent_Validate(t *testing.T) {
 		"empty namespace":         {func(n *NodeAgentConfig) { n.Namespace = "" }, "nodeAgent.namespace"},
 		"empty service account":   {func(n *NodeAgentConfig) { n.ServiceAccount = "" }, "nodeAgent.serviceAccount"},
 		"empty cert dir":          {func(n *NodeAgentConfig) { n.CertDir = "" }, "nodeAgent.certDir"},
+		"empty architecture":      {func(n *NodeAgentConfig) { n.Architectures = []string{"amd64", " "} }, "nodeAgent.architectures"},
 	} {
 		c := Default()
 		tc.mut(&c.NodeAgent)
@@ -65,4 +66,23 @@ func TestNodeAgent_ExposedSelector(t *testing.T) {
 	require.False(t, sel.Matches(labels.Set{"kubernetes.io/os": "linux"}))
 	_, err = NodeAgentConfig{ExposedNodes: "zone in (dmz"}.ExposedSelector()
 	require.Error(t, err)
+}
+
+func TestNodeAgent_ScheduledOn(t *testing.T) {
+	linuxAMD := map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "amd64"}
+	ok, why := NodeAgentConfig{}.ScheduledOn(map[string]string{"kubernetes.io/os": "windows"}, "arm64")
+	require.True(t, ok, "nothing configured: every node")
+	require.Empty(t, why)
+
+	n := NodeAgentConfig{Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}
+	ok, _ = n.ScheduledOn(linuxAMD, "")
+	require.True(t, ok)
+	ok, why = n.ScheduledOn(map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "arm64"}, "amd64")
+	require.False(t, ok, "the label wins over the reported architecture")
+	require.Equal(t, "architecture arm64 is not in nodeAgent.architectures", why)
+	ok, _ = n.ScheduledOn(map[string]string{"kubernetes.io/os": "linux"}, "amd64")
+	require.True(t, ok, "without the label, the node's reported architecture")
+	ok, why = n.ScheduledOn(map[string]string{"kubernetes.io/os": "windows", "kubernetes.io/arch": "amd64"}, "amd64")
+	require.False(t, ok)
+	require.Equal(t, "node labels do not match nodeAgent.nodeSelector", why)
 }

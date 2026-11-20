@@ -21,23 +21,25 @@ type FindingMove struct {
 	ToRepo      string
 }
 
-// Rehome is one cutover between owners: the owner to store, the findings to move and the owner keys
-// to delete.
+// Rehome is one cutover between owners: the owner to store, the findings to move, the owner keys
+// to delete and, when State is not nil, the node-agent state written in the same transaction.
 type Rehome struct {
 	Upsert *model.Owner
 	Moves  []FindingMove
 	Drop   []string
+	State  *store.NodesState
 }
 
 // Rehome moves findings between owners without transitions (the ContainerRuntime cutover). Under the
 // recompute lock, so no recompute reads a half-moved owner, it loads the moved findings (one that is
 // gone, pruned meanwhile, is skipped), gives each the fingerprint of its advisory on To and ToRepo,
-// and writes r through Store.Rehome in one transaction. It then queues the upserted owner, every
-// dropped owner and each To owner that is stored. A To owner that is not stored yet is not queued,
-// since recomputing it would resolve the moved findings: its recompute is skipped for rehomeWait
-// unless OnOwnersChanged names it first. Nothing is queued when the write fails.
+// and writes r through Store.Rehome (Store.RehomeWithState with r.State) in one transaction. It then
+// queues the upserted owner, every dropped owner and each To owner that is stored. A To owner that is
+// not stored yet is not queued, since recomputing it would resolve the moved findings: its recompute
+// is skipped for rehomeWait unless OnOwnersChanged names it first. Nothing is queued when the write
+// fails.
 func (e *Engine) Rehome(ctx context.Context, r Rehome) error {
-	if r.Upsert == nil && len(r.Moves) == 0 && len(r.Drop) == 0 {
+	if r.Upsert == nil && len(r.Moves) == 0 && len(r.Drop) == 0 && r.State == nil {
 		return nil
 	}
 	queue, wrote, err := e.rehomeLocked(ctx, r)
@@ -87,10 +89,14 @@ func (e *Engine) rehomeLocked(ctx context.Context, r Rehome) ([]string, bool, er
 			tos = append(tos, k)
 		}
 	}
-	if r.Upsert == nil && len(moves) == 0 && len(r.Drop) == 0 {
+	if r.Upsert == nil && len(moves) == 0 && len(r.Drop) == 0 && r.State == nil {
 		return nil, false, nil
 	}
-	if err := e.o.Store.Rehome(ctx, r.Upsert, moves, r.Drop); err != nil {
+	write := func() error { return e.o.Store.Rehome(ctx, r.Upsert, moves, r.Drop) }
+	if r.State != nil {
+		write = func() error { return e.o.Store.RehomeWithState(ctx, r.Upsert, moves, r.Drop, *r.State) }
+	}
+	if err := write(); err != nil {
 		return nil, false, fmt.Errorf("engine: rehome: %w", err)
 	}
 	var queue []string

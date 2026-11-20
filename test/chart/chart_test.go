@@ -625,7 +625,14 @@ func TestChart_NodeAgentConfig(t *testing.T) {
 	require.Equal(t, config.NodeAgentConfig{Enabled: false, Listen: ":9444", CertDir: "/etc/ffs/agent-tls",
 		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
 		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
-		WorkTimeout: 30 * time.Minute, ExposedNodes: "node-role.example.com/edge"}, c.NodeAgent)
+		WorkTimeout: 30 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64"},
+		NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}, c.NodeAgent)
+
+	o = render(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.nodeSelector.pool=general")
+	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
+	require.NoError(t, err)
+	require.Equal(t, []string{"amd64", "arm64"}, c.NodeAgent.Architectures)
+	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", "pool": "general"}, c.NodeAgent.NodeSelector)
 
 	o = render(t, "config.nodeAgent.listen=:1") // the top-level nodeAgent values win
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))

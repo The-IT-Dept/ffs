@@ -43,6 +43,7 @@ type Store interface {
 	Canonical(ctx context.Context, id string) (string, error)
 	RekeyFindings(ctx context.Context, rks []store.FindingRekey) error
 	Rehome(ctx context.Context, upsert *model.Owner, moves []store.FindingMove, drop []string) error
+	RehomeWithState(ctx context.Context, upsert *model.Owner, moves []store.FindingMove, drop []string, state store.NodesState) error
 	FindingsByFingerprint(ctx context.Context, fps []string) (map[string]model.Finding, error)
 	DigestsInUse(ctx context.Context) ([]string, error)
 	LiveDigests(ctx context.Context) ([]string, error)

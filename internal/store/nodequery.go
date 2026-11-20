@@ -143,8 +143,12 @@ func (s *Store) groupPackages(ctx context.Context, digest string) ([]model.Packa
 //
 // The state is disabled when the node agent is not enabled (no nodes_state row included), never
 // without a report, stale when the last report is older than staleAfter at now (exactly staleAfter
-// old is still reporting), else reporting. Every state but reporting adds the GapNodeAgentMissing
-// gap after the stored gaps.
+// old is still reporting), else reporting. After the stored gaps:
+//   - a reporting node whose host inventory is not stored or not current gets GapHostNotInventoried:
+//     its host inventory is quarantined, its last full report's host part failed (last_error), it is
+//     in no agent group yet, or its last full report is older than NodesState.FullReportOverdue;
+//   - any other state adds GapNodeAgentUnsupported for a node in NodesState.Unsupported while the
+//     agent is enabled, else GapNodeAgentMissing.
 func (s *Store) AgentStatus(ctx context.Context, now time.Time, staleAfter time.Duration) ([]model.NodeAgentStatus, error) {
 	return s.agentStatus(ctx, "", now, staleAfter)
 }
@@ -194,20 +198,57 @@ func (s *Store) agentStatus(ctx context.Context, node string, now time.Time, sta
 	for _, a := range stored {
 		agents[a.Node] = a
 	}
+	quarantined, err := s.hostQuarantines(ctx, node, now)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]model.NodeAgentStatus, 0, len(rows))
 	for _, x := range rows {
-		out = append(out, nodeAgentStatus(x.name, x.group, agents[x.name], state.AgentEnabled, now, staleAfter))
+		out = append(out, nodeAgentStatus(x.name, x.group, agents[x.name], state, quarantined[x.name], now, staleAfter))
 	}
 	return out, nil
 }
 
-// nodeAgentStatus derives one node's status from its nodes_agent row (zero when it never reported).
-func nodeAgentStatus(node, groupID string, a AgentNode, enabled bool, now time.Time, staleAfter time.Duration) model.NodeAgentStatus {
+// hostQuarantines returns the host-inventory jobs quarantined past now, by node: every node's, or the one
+// node's when it is not "".
+func (s *Store) hostQuarantines(ctx context.Context, node string, now time.Time) (map[string]AgentJob, error) {
+	var w where
+	w.add(`substr(digest, 1, ?) = ?`, len(agentHostJobPrefix), agentHostJobPrefix)
+	w.add(`quarantined_until > ?`, nanos(now))
+	if node != "" {
+		w.add(`digest = ?`, agentHostJobPrefix+node)
+	}
+	jobs, err := queryAll(ctx, s.rdb, scanAgentJob, `SELECT `+agentJobCols+` FROM agent_jobs`+w.String(), w.args...)
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]AgentJob, len(jobs))
+	for _, j := range jobs {
+		out[strings.TrimPrefix(j.Digest, agentHostJobPrefix)] = j
+	}
+	return out, nil
+}
+
+// Coverage gap details (copy).
+const (
+	detailAgentNeverReported = "node agent has not reported"
+	detailAgentStaleFmt      = "node agent not reporting since %s"
+	detailNotScheduledFmt    = "not scheduled by the node agent: %s"
+	detailHostPending        = "host packages not inventoried yet"
+	detailHostQuarantinedFmt = "host inventory quarantined until %s: %s"
+	detailNoFullReportSince  = "no full host report since %s"
+	detailNoFullReport       = "no full host report received"
+)
+
+// nodeAgentStatus derives one node's status from its nodes_agent row (zero when it never reported), the
+// node-agent state and its host-inventory quarantine (zero when none is active).
+func nodeAgentStatus(node, groupID string, a AgentNode, state NodesState, quarantine AgentJob, now time.Time,
+	staleAfter time.Duration) model.NodeAgentStatus {
 	st := model.NodeAgentStatus{Node: node, AgentVersion: a.AgentVersion, BootID: a.BootID, LastReport: a.LastReport,
 		LastFullReport: a.LastFullReport, LastError: a.LastError, GroupID: groupID, KernelRelease: a.KernelRelease,
 		RebootPending: a.RebootPending, RebootReason: a.RebootReason, Coverage: slices.Clone(a.Coverage), Problems: a.Problems}
 	switch {
-	case !enabled:
+	case !state.AgentEnabled:
 		st.State = model.AgentDisabled
 	case a.LastReport.IsZero():
 		st.State = model.AgentNever
@@ -216,14 +257,40 @@ func nodeAgentStatus(node, groupID string, a AgentNode, enabled bool, now time.T
 	default:
 		st.State = model.AgentReporting
 	}
-	if st.State != model.AgentReporting {
-		detail := "node agent has not reported"
-		if !a.LastReport.IsZero() {
-			detail = "node agent not reporting since " + a.LastReport.UTC().Format(time.RFC3339)
+	if st.State == model.AgentReporting {
+		if detail, ok := hostNotInventoried(a, state, quarantine, now); ok {
+			st.Coverage = append(st.Coverage, model.NodeCoverageGap{Code: model.GapHostNotInventoried, Detail: detail})
 		}
-		st.Coverage = append(st.Coverage, model.NodeCoverageGap{Code: model.GapNodeAgentMissing, Detail: detail})
+		return st
 	}
+	if why, ok := state.Unsupported[node]; ok && state.AgentEnabled {
+		st.Coverage = append(st.Coverage, model.NodeCoverageGap{Code: model.GapNodeAgentUnsupported,
+			Detail: fmt.Sprintf(detailNotScheduledFmt, why)})
+		return st
+	}
+	detail := detailAgentNeverReported
+	if !a.LastReport.IsZero() {
+		detail = fmt.Sprintf(detailAgentStaleFmt, a.LastReport.UTC().Format(time.RFC3339))
+	}
+	st.Coverage = append(st.Coverage, model.NodeCoverageGap{Code: model.GapNodeAgentMissing, Detail: detail})
 	return st
+}
+
+// hostNotInventoried says why a reporting node's host inventory is not stored or not current, if it is not.
+func hostNotInventoried(a AgentNode, state NodesState, quarantine AgentJob, now time.Time) (string, bool) {
+	switch {
+	case quarantine.QuarantinedUntil.After(now):
+		return fmt.Sprintf(detailHostQuarantinedFmt, quarantine.QuarantinedUntil.UTC().Format(time.RFC3339), quarantine.LastError), true
+	case a.LastError != "":
+		return a.LastError, true
+	case a.GroupID == "":
+		return detailHostPending, true
+	case state.FullReportOverdue > 0 && a.LastFullReport.IsZero():
+		return detailNoFullReport, true
+	case state.FullReportOverdue > 0 && a.LastFullReport.Before(now.Add(-state.FullReportOverdue)):
+		return fmt.Sprintf(detailNoFullReportSince, a.LastFullReport.UTC().Format(time.RFC3339)), true
+	}
+	return "", false
 }
 
 // NodeImages returns the images cached on node, ordered by digest. Status and StatusReason come

@@ -445,21 +445,24 @@ type AgentJob struct {
 
 const agentJobCols = `digest, attempts, last_error, last_node, last_attempt, quarantined_until`
 
-func agentJobOf(ctx context.Context, q querier, digest string) (AgentJob, bool, error) {
+func scanAgentJob(r scanner) (AgentJob, error) {
 	var (
 		j                 AgentJob
 		last, quarantined sql.NullInt64
 	)
-	err := q.QueryRowContext(ctx, `SELECT `+agentJobCols+` FROM agent_jobs WHERE digest = ?`, digest).
-		Scan(&j.Digest, &j.Attempts, &j.LastError, &j.LastNode, &last, &quarantined)
+	if err := r.Scan(&j.Digest, &j.Attempts, &j.LastError, &j.LastNode, &last, &quarantined); err != nil {
+		return AgentJob{}, err
+	}
+	j.LastAttempt, j.QuarantinedUntil = fromNanos(last), fromNanos(quarantined)
+	return j, nil
+}
+
+func agentJobOf(ctx context.Context, q querier, digest string) (AgentJob, bool, error) {
+	j, err := scanAgentJob(q.QueryRowContext(ctx, `SELECT `+agentJobCols+` FROM agent_jobs WHERE digest = ?`, digest))
 	if errors.Is(err, sql.ErrNoRows) {
 		return AgentJob{}, false, nil
 	}
-	if err != nil {
-		return AgentJob{}, false, err
-	}
-	j.LastAttempt, j.QuarantinedUntil = fromNanos(last), fromNanos(quarantined)
-	return j, true, nil
+	return j, err == nil, err
 }
 
 // AgentJobOf returns the agent job record of digest; false when there is none.
@@ -499,23 +502,46 @@ func (s *Store) ClearAgentJob(ctx context.Context, digest string) error {
 	return err
 }
 
+// RuntimeOwnerKeys returns the keys of the stored cluster-level ContainerRuntime owners, sorted: a cheap
+// check for owners the runtime cutover should have dropped.
+func (s *Store) RuntimeOwnerKeys(ctx context.Context) ([]string, error) {
+	prefix := model.OwnerKindContainerRuntime + "//"
+	return queryAll(ctx, s.rdb, scanString, `SELECT key FROM owners WHERE substr(key, 1, ?) = ? ORDER BY key`, len(prefix), prefix)
+}
+
 // NodesState is the single node-agent state row.
 type NodesState struct {
 	AgentEnabled    bool      // the node agent is enabled
 	RuntimeRetired  bool      // the ContainerRuntime owner is retired in favour of the Nodes owner
 	NotFreshSince   time.Time // when the nodes stopped being all fresh while retired; zero when fresh
 	ChangedAt       time.Time // the last cutover in either direction
-	BaselineReadyAt time.Time // when the first agent groups were matched: the node baseline notify reads
+	BaselineReadyAt time.Time // when the node baseline was ready: the node baseline notify reads
+	// FirstReportAt is when a fresh agent report was first seen since the agent was enabled; the node
+	// baseline's settle window starts there. Zero while none has been.
+	FirstReportAt time.Time
+	// FullReportOverdue is how old a reporting node's last full report may be before its host inventory
+	// counts as not current (GapHostNotInventoried); 0 does not check it.
+	FullReportOverdue time.Duration
+	// Unsupported holds the nodes the agent DaemonSet does not schedule on, each with why
+	// (GapNodeAgentUnsupported); nil when there are none.
+	Unsupported map[string]string
 }
 
 // NodesState returns the stored node-agent state, the zero value when there is none.
 func (s *Store) NodesState(ctx context.Context) (NodesState, error) {
+	return nodesState(ctx, s.rdb)
+}
+
+func nodesState(ctx context.Context, q querier) (NodesState, error) {
 	var (
-		st                               NodesState
-		notFresh, changed, baselineReady sql.NullInt64
+		st                                          NodesState
+		notFresh, changed, baselineReady, firstSeen sql.NullInt64
+		overdue                                     int64
+		unsupported                                 string
 	)
-	err := s.rdb.QueryRowContext(ctx, `SELECT agent_enabled, runtime_retired, not_fresh_since, changed_at, baseline_ready_at
-		FROM nodes_state WHERE id = 1`).Scan(&st.AgentEnabled, &st.RuntimeRetired, &notFresh, &changed, &baselineReady)
+	err := q.QueryRowContext(ctx, `SELECT agent_enabled, runtime_retired, not_fresh_since, changed_at, baseline_ready_at,
+		first_report_at, full_report_overdue, unsupported FROM nodes_state WHERE id = 1`).Scan(&st.AgentEnabled, &st.RuntimeRetired,
+		&notFresh, &changed, &baselineReady, &firstSeen, &overdue, &unsupported)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodesState{}, nil
 	}
@@ -523,13 +549,37 @@ func (s *Store) NodesState(ctx context.Context) (NodesState, error) {
 		return NodesState{}, err
 	}
 	st.NotFreshSince, st.ChangedAt, st.BaselineReadyAt = fromNanos(notFresh), fromNanos(changed), fromNanos(baselineReady)
+	st.FirstReportAt, st.FullReportOverdue = fromNanos(firstSeen), time.Duration(overdue)
+	if err := json.Unmarshal([]byte(unsupported), &st.Unsupported); err != nil {
+		return NodesState{}, fmt.Errorf("nodes state unsupported: %w", err)
+	}
+	if len(st.Unsupported) == 0 {
+		st.Unsupported = nil
+	}
 	return st, nil
 }
 
 // PutNodesState stores st as the single node-agent state row.
 func (s *Store) PutNodesState(ctx context.Context, st NodesState) error {
-	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO nodes_state(id, agent_enabled, runtime_retired, not_fresh_since,
-		changed_at, baseline_ready_at) VALUES(1, ?, ?, ?, ?, ?)`,
-		st.AgentEnabled, st.RuntimeRetired, nanos(st.NotFreshSince), nanos(st.ChangedAt), nanos(st.BaselineReadyAt))
+	return putNodesState(ctx, s.wdb, st)
+}
+
+// execer is satisfied by *sql.DB and *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func putNodesState(ctx context.Context, e execer, st NodesState) error {
+	unsupported := "{}"
+	if len(st.Unsupported) > 0 {
+		var err error
+		if unsupported, err = jsonText(st.Unsupported); err != nil {
+			return err
+		}
+	}
+	_, err := e.ExecContext(ctx, `INSERT OR REPLACE INTO nodes_state(id, agent_enabled, runtime_retired, not_fresh_since,
+		changed_at, baseline_ready_at, first_report_at, full_report_overdue, unsupported) VALUES(1, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		st.AgentEnabled, st.RuntimeRetired, nanos(st.NotFreshSince), nanos(st.ChangedAt), nanos(st.BaselineReadyAt),
+		nanos(st.FirstReportAt), int64(st.FullReportOverdue), unsupported)
 	return err
 }
