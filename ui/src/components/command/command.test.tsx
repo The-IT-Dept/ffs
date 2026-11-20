@@ -75,9 +75,16 @@ test('does not ask to refine a search that listed everything', async () => {
   expect(screen.queryByText(copy.command.truncated)).toBeNull()
 })
 
-test('the search hint is ⌘K on Apple platforms and Ctrl K elsewhere', async () => {
+test('the search hint is ⌘K on Apple platforms', async () => {
   mockApi()
   vi.spyOn(navigator, 'platform', 'get').mockReturnValue('MacIntel')
   renderApp('/')
   expect(await screen.findByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
+})
+
+test('the search hint is Ctrl K off Apple platforms', async () => {
+  mockApi()
+  vi.spyOn(navigator, 'platform', 'get').mockReturnValue('Linux x86_64')
+  renderApp('/')
+  expect(await screen.findByRole('button', { name: /^Search/ })).toHaveTextContent('Ctrl K')
 })

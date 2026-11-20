@@ -48,7 +48,13 @@ function gappedGroups(groups: Group[], rail?: S<'ScopeCard'>): Set<string> {
 // whether its agents report and have not inventoried the hosts yet, or are not reporting.
 function Figure({ g, gap, children }: { g: Group; gap: boolean; children: ReactNode }) {
   if (g.kind !== 'agent') {
-    const title = g.agents.reportingWithoutInventory > 0 ? copy.nodes.hostPending : copy.gaps.node_agent_missing.gap
+    const gaps = g.gaps ?? []
+    const title =
+      gaps.includes('host_not_inventoried') || g.agents.reportingWithoutInventory > 0
+        ? copy.nodes.hostPending
+        : gaps.includes('node_agent_unsupported')
+          ? copy.gaps.node_agent_unsupported.gap
+          : copy.gaps.node_agent_missing.gap
     return <CoverageMark title={title}>{copy.noValue}</CoverageMark>
   }
   return gap ? <CoverageMark title={copy.nodes.groupGap}>{children}</CoverageMark> : <>{children}</>
@@ -87,7 +93,7 @@ function GroupsTable({ list, rail }: { list: S<'NodeGroupsList'>; rail?: S<'Scop
       </TableHeader>
       <TableBody>
         {list.groups.map((g) => (
-          <TableRow key={g.id} className="h-[30px]">
+          <TableRow key={g.id} className="h-[30px] max-lg:h-10">
             <TableCell className="py-0">
               <AppLink href={nodeGroupPath(g.id)} className="hover:underline">
                 {g.label}

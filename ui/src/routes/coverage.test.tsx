@@ -62,7 +62,7 @@ test('node gaps for agents that report without a host inventory, or do not run, 
     }),
   )
   renderApp('/coverage')
-  expect((await screen.findByText('agent reporting, host not inventoried')).closest('.hatched')).not.toBeNull()
+  expect((await screen.findByText('host packages not inventoried yet')).closest('.hatched')).not.toBeNull()
   expect(screen.getByText("Check the node agent's logs on these nodes; the last error is shown.")).toBeInTheDocument()
   expect(screen.getByText('host inventory quarantined')).toBeInTheDocument()
   expect(screen.getByText('not scheduled by the node agent').closest('.hatched')).not.toBeNull()

@@ -4,7 +4,7 @@ import { CoverageMark } from '@/components/signals/CoverageMark'
 import { Mono } from '@/components/signals/Mono'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy } from '@/lib/copy'
-import { hostPendingReason } from './NodeGaps'
+import { hostPendingReason, nodeGapLabel } from './NodeGaps'
 
 // AgentStatusView is one node's agent: its state and reports, what it cannot read (hatched), and
 // any problems it reported. Host packages not inventoried yet read with their reason, the last
@@ -12,7 +12,7 @@ import { hostPendingReason } from './NodeGaps'
 export function AgentStatusView({ agent }: { agent: S<'AgentStatus'> }) {
   const f = copy.nodes.agentFields
   const pending = agent.gaps.some((g) => g.code === 'host_not_inventoried')
-  const gapLabel = (g: S<'NodeGap'>) => (g.code === 'host_not_inventoried' ? copy.nodes.hostPending : copy.gaps[g.code].gap)
+  const gapLabel = (g: S<'NodeGap'>) => nodeGapLabel(g.code)
   const gapDetail = (g: S<'NodeGap'>) => (g.code === 'host_not_inventoried' ? hostPendingReason(agent) : g.detail)
   return (
     <div className="text-[12px]">

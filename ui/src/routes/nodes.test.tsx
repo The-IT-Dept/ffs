@@ -191,15 +191,16 @@ test('a nodeinfo group whose agents report without a host inventory says the hos
   await waitFor(() => expect(within(main).getAllByText(copy.nodes.hostPending)).toHaveLength(2))
   for (const m of within(main).getAllByText(copy.nodes.hostPending)) expect(m.closest('.hatched')).not.toBeNull()
   expect(within(main).getAllByText('3 of 3 nodes')).toHaveLength(2)
-  // The last error first; a detail that only repeats the headline is not a reason.
-  expect(within(main).getByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
-  expect(within(main).queryByText(/quarantined until/)).toBeNull()
+  // The server's ordered detail (a quarantine and when it lifts) first; a detail that only repeats
+  // the headline is not a reason.
+  const reasons = 'host inventory quarantined until 2026-11-21T07:10:00Z: scan failed · no full host report received'
+  expect(within(main).getByText(reasons)).toBeInTheDocument()
   expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
   expect(within(main).queryByText(copy.gaps.host_not_inventoried.gap)).toBeNull()
   expect(within(main).queryByText(copy.empty)).toBeNull()
   for (const tab of ['Host packages', 'Cached images']) {
     await user.click(screen.getByRole('tab', { name: tab }))
-    expect(await within(main).findByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
+    expect(await within(main).findByText(reasons)).toBeInTheDocument()
     expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
   }
 })

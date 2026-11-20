@@ -213,7 +213,7 @@ export const copy = {
       todo: 'Side-loaded images on this node cannot be catalogued from it.',
     },
     host_not_inventoried: {
-      gap: 'agent reporting, host not inventoried',
+      gap: 'host packages not inventoried yet',
       todo: "Check the node agent's logs on these nodes; the last error is shown.",
     },
     node_agent_unsupported: {
@@ -456,6 +456,7 @@ export const copy = {
     // An agent that reports but whose host inventory is not stored (host_not_inventoried); its last
     // error, when it has one, says why.
     hostPending: 'Host packages not inventoried yet',
+    moreReasons: (n: number) => `+ ${formatCount(n)} more`,
     groupGap: 'ffs cannot see all of this group',
     // A group's agents by state, zero parts left out: "7 reporting · 1 without host inventory · 1 not
     // scheduled"; "—" when there are none.
@@ -555,6 +556,11 @@ const singular: Record<CountNoun, string> = {
 // facetValueLabel is how a facet value reads in a facet list or a chip.
 export function facetValueLabel(facet: string, value: string, epssBump: number): string {
   if (facet === 'signal' && value === 'epss') return copy.epss(epssBump)
+  // A cluster-level owner kind (store ClusterLevelKindPrefix) reads by what it holds, before the
+  // server's facet label arrives.
+  if (facet === 'kind' && value.startsWith('cluster-level:')) {
+    return value === 'cluster-level:Nodes' ? copy.owner.nodes : copy.owner.controlPlane
+  }
   return copy.facetValue[facet]?.[value] ?? value
 }
 
