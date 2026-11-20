@@ -23,7 +23,7 @@ const columns: Column<Row>[] = [
     sort: 'advisory',
     cell: (r) => (
       // Held to its cell as well as to 22rem, so on a phone the title ends in an ellipsis.
-      <span className="inline-flex max-w-[min(22rem,100%)] min-w-0 items-center gap-2">
+      <span className="inline-flex max-w-[min(22rem,var(--pin-cap,100%))] min-w-0 items-center gap-2">
         <AppLink href={advisoryPath(r.advisory.id)} className="shrink-0 hover:underline">
           <Mono>{r.advisory.id}</Mono>
         </AppLink>

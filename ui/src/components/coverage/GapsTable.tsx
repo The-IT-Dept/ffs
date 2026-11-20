@@ -41,7 +41,7 @@ export function GapsTable({ gaps, totalGaps }: { gaps: S<'Gap'>[]; totalGaps: nu
         <TableBody>
           {gaps.map((g, i) => (
             <TableRow key={`${g.code}:${g.what}:${i}`}>
-              <TableCell className="max-w-[18rem] truncate py-1.5 max-sm:max-w-[60vw]">
+              <TableCell className="max-w-[18rem] truncate py-1.5 max-lg:max-w-(--pin-max)">
                 <What gap={g} />
               </TableCell>
               <TableCell className="py-1.5">

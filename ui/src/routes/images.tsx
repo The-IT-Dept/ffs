@@ -24,7 +24,7 @@ const columns: Column<Row>[] = [
     header: copy.col.image,
     sort: 'repo',
     cell: (r) => (
-      <AppLink href={imagePath(r.digest)} className="inline-flex max-w-[min(26rem,100%)] min-w-0 items-center gap-2 hover:underline">
+      <AppLink href={imagePath(r.digest)} className="inline-flex max-w-[min(26rem,var(--pin-cap,100%))] min-w-0 items-center gap-2 hover:underline">
         <Mono>{r.repo || shortDigest(r.digest)}</Mono>
         {r.repo ? <Mono className="text-muted-foreground">{shortDigest(r.digest)}</Mono> : null}
       </AppLink>

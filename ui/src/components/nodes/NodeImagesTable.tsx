@@ -39,7 +39,7 @@ export function NodeImagesTable({ images }: { images: S<'NodeImage'>[] }) {
           const name = <Mono>{im.names[0] ?? shortDigest(im.digest)}</Mono>
           return (
             <TableRow key={im.digest} className="h-[30px]">
-              <TableCell className="max-w-[28rem] truncate py-0 max-sm:max-w-[60vw]">
+              <TableCell className="max-w-[28rem] truncate py-0 max-lg:max-w-(--pin-max)">
                 {im.status ? (
                   <AppLink href={imagePath(im.digest)} className="hover:underline">
                     {name}

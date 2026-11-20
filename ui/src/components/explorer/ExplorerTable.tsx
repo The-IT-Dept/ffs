@@ -70,7 +70,7 @@ export function ExplorerTable<R>({
         {rows.map((r) => (
           <TableRow key={rowKey(r)} className="h-[30px] max-lg:h-10">
             {columns.map((c, i) => (
-              <TableCell key={c.id} className={cn('max-w-[28rem] truncate py-0 tabular-nums', i === 0 && 'max-sm:max-w-[60vw]', c.align === 'right' && 'text-right')}>
+              <TableCell key={c.id} className={cn('max-w-[28rem] truncate py-0 tabular-nums', i === 0 && 'max-lg:max-w-(--pin-max)', c.align === 'right' && 'text-right')}>
                 {c.cell(r)}
               </TableCell>
             ))}

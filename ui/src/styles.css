@@ -145,14 +145,29 @@
    the path or name, stays in view. That column is opaque so the scrolled columns pass under it,
    and it keeps the row's tint: hover (as hover:bg-muted/50 does), an expanded group row, or a row
    marked data-tinted (the exposure table's group rows, bg-muted/50). Below lg, where tables
-   usually scroll, a rule marks its edge; on a phone it takes at most 60% of the width, so the
-   rest of the row stays reachable, and its content is held to the cell's width, so content laid
-   out inline-flex (the advisory column) ends in its own ellipsis rather than being clipped. The
-   rules sit in the components layer, so a utility on a first cell still wins: a first cell with
-   its own max-w-* restates the phone cap as max-sm:max-w-[60vw], and content with its own max-w-*
-   holds itself to the cell as well, max-w-[min(<width>,100%)]. */
+   usually scroll, a rule marks its edge and the column is held to --pin-max (a third of the width
+   on a tablet, 40% on a phone), so most of the row stays in view as it scrolls; its content is held
+   to the cell's width, so content laid out inline-flex (the advisory column) ends in its own
+   ellipsis rather than being clipped. The rules sit in the components layer, so a utility on a
+   first cell still wins: a first cell with its own max-w-* restates the cap as
+   max-lg:max-w-(--pin-max), and content with its own max-w-* holds itself to the cell as well,
+   max-w-[min(<width>,var(--pin-cap,100%))]. */
 :root {
   --row-tint: color-mix(in oklab, var(--muted) 50%, transparent);
+  --pin-max: 33vw;
+}
+/* --pin-cap is the pinned cell's content width (its max less p-2 padding), set only below lg.
+   Content sizes itself against it rather than a percentage, which resolves against the cell's
+   unconstrained width inside an auto-layout table. */
+@media (width < 64rem) {
+  :root {
+    --pin-cap: calc(var(--pin-max) - 1rem);
+  }
+}
+@media (width < 40rem) {
+  :root {
+    --pin-max: 40vw;
+  }
 }
 @layer components {
   [data-slot="table"] > * > tr > :first-child {
@@ -173,16 +188,32 @@
   @media (width < 64rem) {
     [data-slot="table"] > * > tr > :first-child {
       box-shadow: inset -1px 0 0 var(--border);
-    }
-  }
-  @media (width < 40rem) {
-    [data-slot="table"] > * > tr > :first-child {
-      max-width: 60vw;
+      max-width: var(--pin-max);
       overflow: hidden;
       text-overflow: ellipsis;
     }
     [data-slot="table"] > * > tr > :first-child > * {
+      max-width: var(--pin-cap);
+    }
+    /* Inline-flex content (a name beside its kind, a hostname beside its workloads) shrinks to
+       the cell and each part ends in an ellipsis instead of being cut mid-letter; glyphs stay
+       whole. A utility on a part (shrink-0, truncate) still wins. */
+    [data-slot="table"] > * > tr > :first-child :is(.inline-flex, .inline-flex > *) {
+      min-width: 0;
       max-width: 100%;
+    }
+    [data-slot="table"] > * > tr > :first-child .inline-flex > :not([aria-hidden="true"], .border) {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    /* The first part (the name) keeps its room longest; later parts (a kind, a workload list)
+       give way four times faster. Glyphs and badges (KEV, privileged) never shrink. */
+    [data-slot="table"] > * > tr > :first-child .inline-flex > :not([aria-hidden="true"], .border) ~ :not([aria-hidden="true"], .border) {
+      flex-shrink: 4;
+    }
+    [data-slot="table"] > * > tr > :first-child .inline-flex > :is([aria-hidden="true"], .border) {
+      flex-shrink: 0;
     }
   }
 }
