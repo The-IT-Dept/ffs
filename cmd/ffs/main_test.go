@@ -31,6 +31,11 @@ func TestControllerCmd_Flags(t *testing.T) {
 		require.NotNil(t, f, flag)
 		require.Equal(t, def, f.DefValue, flag)
 	}
+	// the diagnostic pprof listener is hidden and off unless asked for
+	pprof := cmd.Flags().Lookup("pprof-bind-address")
+	require.NotNil(t, pprof)
+	require.True(t, pprof.Hidden)
+	require.Empty(t, pprof.DefValue)
 }
 
 func TestCatalogCmd_Flags(t *testing.T) {
