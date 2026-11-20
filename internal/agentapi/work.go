@@ -25,8 +25,8 @@ const (
 	defaultWorkQuarantineAfter = 2
 	defaultWorkQuarantineFor   = 24 * time.Hour
 	// resultGrace is how long after its deadline a request still takes a result: the agent's job ends at the
-	// deadline, and its result is posted after that.
-	resultGrace = 2 * time.Minute
+	// deadline, and its result is posted after that, and again while the controller does not take it.
+	resultGrace = wire.ResultGrace
 	// reasonOfferExpired is the counted failure of an offer the agent reached but sent no result for: the agent
 	// answers every request it reaches, skipped ones included, so its process most likely died cataloguing the
 	// image (killed out of memory, say), and an image that keeps doing it is quarantined like one whose
@@ -93,7 +93,10 @@ type offer struct {
 	seq      uint64    // offer order: an agent works through its offers in this order
 	at       time.Time // when the offer was made
 	deadline time.Time
-	answered bool // a result arrived but could not be stored yet; the offer stays for the agent's retry
+	// answered: a result for the offer arrived but was not stored (a transient failure) or not read (it waited
+	// for the ingest budget too long). The offer stays, because the agent sends the result again while the
+	// offer takes one, and its expiry is not counted against the image.
+	answered bool
 }
 
 var (
@@ -314,8 +317,9 @@ func heldComplete(rows []model.NodeImage, d, indexDigest string) bool {
 // node that still takes a result: one Offer made to the node, no more than resultGrace past its deadline.
 // Anything else is ErrForbidden with nothing written, so a node cannot supply, fail, decline or skip an image
 // it was not asked for. A handled result releases the offer; a skipped one is released without counting and
-// leaves the image offerable. A transient failure keeps the offer, marked answered, so the agent can send the
-// result again and its expiry is not counted against the image.
+// leaves the image offerable. A transient failure keeps the offer, marked answered, and is answered 500: the
+// agent sends the result again while the offer takes one, and the offer's expiry is not counted against the
+// image.
 func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult) error {
 	if res.Node != id.Node {
 		return fmt.Errorf("%w: result is for node %s, not %s", ErrForbidden, res.Node, id.Node)
@@ -377,17 +381,44 @@ func (q *WorkQueue) release(digest, id string) {
 	}
 }
 
-// ResultWait is how long a result from node may wait for the ingest budget before it is read, and what to call
-// when it waited that long unread. An agent process answers its requests one at a time, in the order they were
-// offered, and the node's newest process (the one its latest offer went to) is the one working, so the result
-// in flight answers that process's earliest unanswered request that still takes a result: the wait ends when
-// that request stops taking one, and unread marks it answered, because the controller held it up, not the
-// image. The requests behind it get answers of their own. Failing such a request, the earliest of the node's
-// other requests that still take a result bounds the wait. wait is zero or less when none does.
-func (q *WorkQueue) ResultWait(node string) (wait time.Duration, unread func()) {
+// ResultWait is how long a result from node answering the request id may wait for the ingest budget before
+// it is read, and what to call when it waited that long unread: the time until that request stops taking a
+// result, and unread marks that request answered, because the controller held its result up, not the image.
+// Only that request is marked: the requests the agent has not reached yet need answers of their own, and one
+// it dies on still counts. A request marked answered keeps taking a result, as the agent sends a result again
+// after a 5xx (the 503 for a result not read included), a 429 or no answer while its request takes one. wait
+// is zero or less when the request takes no result: not an offer to node, past its grace, or released.
+//
+// id is the request ID the agent sends in wire.HeaderWorkID. Older agents send none, and never send a result
+// twice: their result answers the request they are on, which inFlight finds.
+func (q *WorkQueue) ResultWait(node, id string) (wait time.Duration, unread func()) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	now := q.o.Now()
+	var digest string
+	var target offer
+	if id == "" {
+		digest, target = q.inFlight(node, now)
+	} else {
+		for d, o := range q.offers {
+			if o.id == id && o.node == node {
+				digest, target = d, o
+				break
+			}
+		}
+	}
+	if digest == "" || !target.deadline.Add(resultGrace).After(now) {
+		return 0, func() {}
+	}
+	return target.deadline.Add(resultGrace).Sub(now), func() { q.markAnswered(digest, target.id) }
+}
+
+// inFlight is the request a result from node's agent answers when the agent does not name it: an agent process
+// answers its requests one at a time, in the order they were offered, and the node's newest process (the one
+// its latest offer went to) is the one working, so it is that process's earliest unanswered request that still
+// takes a result. Failing such a request, it is the earliest of the node's other requests that still take a
+// result. digest is "" when none does. The caller holds q.mu.
+func (q *WorkQueue) inFlight(node string, now time.Time) (digest string, target offer) {
 	var newest offer
 	for _, o := range q.offers {
 		if o.node == node && o.seq > newest.seq {
@@ -400,8 +431,6 @@ func (q *WorkQueue) ResultWait(node string) (wait time.Duration, unread func()) 
 		return cmp.Or(falseFirst(a.instance != newest.instance, b.instance != newest.instance),
 			falseFirst(a.answered, b.answered), cmp.Compare(a.seq, b.seq))
 	}
-	var digest string
-	var target offer
 	for d, o := range q.offers {
 		if o.node != node || !o.deadline.Add(resultGrace).After(now) {
 			continue
@@ -410,10 +439,7 @@ func (q *WorkQueue) ResultWait(node string) (wait time.Duration, unread func()) 
 			digest, target = d, o
 		}
 	}
-	if digest == "" {
-		return 0, func() {}
-	}
-	return target.deadline.Add(resultGrace).Sub(now), func() { q.markAnswered(digest, target.id) }
+	return digest, target
 }
 
 // falseFirst orders false before true.

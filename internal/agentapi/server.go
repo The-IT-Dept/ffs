@@ -29,8 +29,8 @@ import (
 const (
 	readHeaderTimeout = 10 * time.Second
 	readTimeout       = 5 * time.Minute
-	// writeTimeout is longer than the agent's 10 minute client timeout, so the agent sees the answer.
-	writeTimeout    = 11 * time.Minute
+	// writeTimeout is longer than the agent's client timeout, so the agent sees the answer.
+	writeTimeout    = wire.ClientTimeout + time.Minute
 	idleTimeout     = 2 * time.Minute
 	maxHeaderBytes  = 16 << 10
 	shutdownTimeout = 5 * time.Second
@@ -52,6 +52,9 @@ const (
 	defaultIngestWait = 2 * time.Second
 	retryAfterMin     = 10
 	retryAfterMax     = 60
+	// maxResultWait is the longest an SBOM result waits for its share of the SBOM budget: a minute short of
+	// the agent's client timeout, so the agent sees the answer and can send the result again.
+	maxResultWait = wire.ClientTimeout - time.Minute
 )
 
 var (
@@ -86,15 +89,17 @@ type ServerOptions struct {
 	IngestBudget    int64            // bytes of report bodies read and handled at once; 0: 192 MiB
 	SBOMBudget      int64            // bytes of SBOM result bodies read and handled at once; 0: 64 MiB
 	IngestWait      time.Duration    // a report's wait for budget before 429; 0: 2s
+	MaxResultWait   time.Duration    // an SBOM result's longest wait for budget before 503; 0, or more than 9m: 9m
 }
 
 // ResultWindow is implemented by an SBOMHandler that knows how long a node's result may still be accepted
 // (*WorkQueue does). The server then bounds a result's wait for the SBOM budget by it.
 type ResultWindow interface {
-	// ResultWait is how long a result from node may wait before it is read, zero or less when none is
-	// expected from node, and unread, which the server calls when the result waited that long without being
-	// read.
-	ResultWait(node string) (wait time.Duration, unread func())
+	// ResultWait is how long a result from node answering the request id (wire.HeaderWorkID; "" when the
+	// agent sent none) may wait before it is read, zero or less when that request takes no result, and
+	// unread, which the server calls when the result was not read: it waited too long, or its HTTP request
+	// ended while it waited.
+	ResultWait(node, id string) (wait time.Duration, unread func())
 }
 
 // Server serves /agent/v1 over TLS on the leader.
@@ -124,6 +129,9 @@ func NewServer(o ServerOptions) *Server {
 	}
 	if o.IngestWait <= 0 {
 		o.IngestWait = defaultIngestWait
+	}
+	if o.MaxResultWait <= 0 || o.MaxResultWait > maxResultWait {
+		o.MaxResultWait = maxResultWait
 	}
 	return &Server{o: o, fails: newFailLimiter(), reports: semaphore.NewWeighted(o.IngestBudget),
 		sboms: semaphore.NewWeighted(o.SBOMBudget)}
@@ -459,9 +467,11 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 
 // serveSBOM takes the result's share of the SBOM budget before reading its body. The agent has no
 // back-pressure for results, so it waits for as long as the result could still be accepted: until the request
-// it answers stops taking a result (ResultWindow), or while the HTTP request lasts. A node with no request
-// taking a result is answered 403 at once. A result that waited that long is answered 503, and the request it
-// answers is not counted against its image: the controller held it up.
+// it answers stops taking a result (ResultWindow), and at most MaxResultWait, which keeps the answer within
+// the agent's client timeout. A node whose request takes no result is answered 403 at once. A result that
+// waited that long is answered 503, which the agent answers by sending it again while its request takes one.
+// A result that was not read, because it waited that long or because its HTTP request ended while it waited,
+// leaves its request uncounted against the image: the controller held it up.
 func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
 	defer countAnswer(w)
@@ -469,25 +479,28 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	if !ok || declaredTooLarge(w, r, s.o.MaxSBOMBytes, "SBOM result") {
 		return
 	}
-	var wait time.Duration // as long as the request lasts
-	var unread func()
-	window, bounded := s.o.SBOMs.(ResultWindow)
-	if bounded {
-		if wait, unread = window.ResultWait(id.Node); wait <= 0 {
-			writeError(w, http.StatusForbidden, "no request to "+id.Node+" takes a result")
+	wait, unread := s.o.MaxResultWait, func() {}
+	if window, bounded := s.o.SBOMs.(ResultWindow); bounded {
+		var until time.Duration
+		if until, unread = window.ResultWait(id.Node, r.Header.Get(wire.HeaderWorkID)); until <= 0 {
+			writeError(w, http.StatusForbidden, "no request to "+id.Node+" takes this result")
 			return
 		}
+		wait = min(wait, until)
 	}
 	release, ok := acquire(r.Context(), s.sboms, bodyWeight(r, s.o.MaxSBOMBytes, s.o.SBOMBudget), wait)
 	if !ok {
-		if bounded && r.Context().Err() == nil {
-			unread()
-			s.o.Log.Info("an SBOM result waited for the ingest budget until its request expired", "node", id.Node)
-			writeError(w, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
+		unread()
+		if r.Context().Err() == nil {
+			s.o.Log.Info("an SBOM result waited too long for the ingest budget; the agent sends it again while its "+
+				"request takes one", "node", id.Node, "waited", wait)
+			writeError(w, http.StatusServiceUnavailable, "the controller could not read the result in time")
 		}
 		return // or the agent went away
 	}
 	defer release()
+	// The server's read timeout runs from the start of the request: the wait must not use up the body's time.
+	_ = http.NewResponseController(rw).SetReadDeadline(time.Now().Add(readTimeout))
 	var res wire.SBOMResult
 	if !decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res) || nodeMismatch(w, id, res.Node) {
 		return

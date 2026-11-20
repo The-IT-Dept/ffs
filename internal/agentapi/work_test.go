@@ -719,49 +719,128 @@ func TestWork_OfferCountsEveryExpiry(t *testing.T) {
 	require.Equal(t, "worker-2", j.LastNode)
 }
 
-// TestWork_ResultWaitEndsWithTheRequestInFlight: a node's result may wait for the ingest budget until the
-// request it answers stops taking a result: its newest agent process's earliest unanswered request, which the
-// agent, working in order, is on. A result that waited that long answers that request only, so its expiry is
-// not counted against the image, while the requests behind it still need answers of their own.
-func TestWork_ResultWaitEndsWithTheRequestInFlight(t *testing.T) {
+// offerID is the ID of digest's recorded offer.
+func (f *workFixture) offerID(t *testing.T, digest string) string {
+	t.Helper()
+	f.q.mu.Lock()
+	defer f.q.mu.Unlock()
+	o, ok := f.q.offers[digest]
+	require.True(t, ok, "%s is offered", digest)
+	return o.id
+}
+
+// TestWork_ResultWaitEndsWithTheRequestItAnswers: a result may wait for the ingest budget until the request it
+// names (wire.HeaderWorkID) stops taking a result. One that waited that long unread answers that request only,
+// so its expiry is not counted, while the requests the agent has not reached still need answers of their own
+// and the one it dies on counts. A request marked answered still takes the agent's resend.
+func TestWork_ResultWaitEndsWithTheRequestItAnswers(t *testing.T) {
 	ctx := context.Background()
 	attempts := func(t *testing.T, f *workFixture, digest string) int {
 		t.Helper()
 		j, _ := f.job(t, digest)
 		return j.Attempts
 	}
+	transient := &sbom.AcquireError{Kind: sbom.FailTransient, Reason: "acquisition in progress"}
 
-	t.Run("the earliest request, not the latest", func(t *testing.T) {
+	t.Run("until the named request's grace ends", func(t *testing.T) {
 		f := newWorkFixture(t)
 		f.q.o.PerReport = 1
-		wait, _ := f.q.ResultWait("worker-1")
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		f.clk.Add(10 * time.Minute)
+		f.offered("worker-1", dig3) // a later request
+		id1, id3 := f.offerID(t, dig1), f.offerID(t, dig3)
+		wait, _ := f.q.ResultWait("worker-1", id1)
+		require.Equal(t, pastGrace-10*time.Minute, wait)
+		wait, _ = f.q.ResultWait("worker-1", id3)
+		require.Equal(t, pastGrace, wait, "dig3's own window, not dig1's")
+		wait, _ = f.q.ResultWait("worker-2", id1)
+		require.LessOrEqual(t, wait, time.Duration(0), "another node's request")
+		wait, _ = f.q.ResultWait("worker-1", "0123456789abcdef0123456789abcdef")
+		require.LessOrEqual(t, wait, time.Duration(0), "no such request")
+
+		f.clk.Add(pastGrace - 10*time.Minute)
+		wait, _ = f.q.ResultWait("worker-1", id1)
+		require.LessOrEqual(t, wait, time.Duration(0), "past dig1's grace")
+		wait, _ = f.q.ResultWait("worker-1", id3)
+		require.Equal(t, 10*time.Minute, wait)
+		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{ID: id3, Node: "worker-1", Digest: dig3,
+			Unavailable: wire.UnavailableSkipped}))
+		wait, _ = f.q.ResultWait("worker-1", id3)
+		require.LessOrEqual(t, wait, time.Duration(0), "a released request takes no result")
+	})
+
+	t.Run("only the named request is answered", func(t *testing.T) {
+		f := newWorkFixture(t)
+		require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
+		id1 := f.offerID(t, dig1)
+		f.ingest.setErr(transient)
+		require.Error(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{ID: id1, Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		f.clk.Add(time.Minute) // the agent sends dig1's result again, and it waits for the budget unread
+		wait, unread := f.q.ResultWait("worker-1", id1)
+		require.Equal(t, pastGrace-time.Minute, wait, "dig1 takes the resend, though answered")
+		unread()
+
+		f.clk.Add(pastGrace) // the agent went on to dig2 and died on it
+		f.offer(t, "worker-1")
+		require.Zero(t, attempts(t, f, dig1), "dig1 was answered")
+		require.Equal(t, 1, attempts(t, f, dig2), "dig2 had not been reached when dig1's result waited, so it counts")
+		require.Zero(t, attempts(t, f, dig3), "dig3 was queued behind dig2")
+	})
+
+	t.Run("an answered request takes the agent's resend", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		id1 := f.offerID(t, dig1)
+		f.ingest.setErr(transient)
+		require.Error(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{ID: id1, Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		f.clk.Add(5 * time.Second) // the agent's first resend, after the 500
+		wait, unread := f.q.ResultWait("worker-1", id1)
+		require.Equal(t, pastGrace-5*time.Second, wait)
+		unread() // the resend waited unread and was answered 503
+		f.clk.Add(15 * time.Second)
+		wait, _ = f.q.ResultWait("worker-1", id1)
+		require.Equal(t, pastGrace-20*time.Second, wait, "and the next resend after the 503")
+		f.ingest.setErr(nil)
+		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{ID: id1, Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		_, stored := f.provenance(t, dig1)
+		require.True(t, stored, "the resend is stored")
+		wait, _ = f.q.ResultWait("worker-1", id1)
+		require.LessOrEqual(t, wait, time.Duration(0), "stored: a lost answer's resend is refused before it is read")
+	})
+
+	// Agents that send no request ID never send a result twice: their result answers the request they are on.
+	t.Run("without an ID, the earliest request, not the latest", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		wait, _ := f.q.ResultWait("worker-1", "")
 		require.LessOrEqual(t, wait, time.Duration(0), "no request open to worker-1")
 		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
-		wait, _ = f.q.ResultWait("worker-1")
+		wait, _ = f.q.ResultWait("worker-1", "")
 		require.Equal(t, pastGrace, wait)
-		wait, _ = f.q.ResultWait("worker-2")
+		wait, _ = f.q.ResultWait("worker-2", "")
 		require.LessOrEqual(t, wait, time.Duration(0))
 
 		f.clk.Add(10 * time.Minute)
 		f.offered("worker-1", dig3) // a later request, queued behind dig1
-		wait, unread := f.q.ResultWait("worker-1")
+		wait, unread := f.q.ResultWait("worker-1", "")
 		require.Equal(t, pastGrace-10*time.Minute, wait, "until dig1's grace ends, not dig3's")
 		unread()
-		wait, _ = f.q.ResultWait("worker-1")
+		wait, _ = f.q.ResultWait("worker-1", "")
 		require.Equal(t, pastGrace, wait, "dig1 is answered: the next result answers dig3")
 		f.clk.Add(pastGrace - 10*time.Minute) // past dig1's grace
-		wait, _ = f.q.ResultWait("worker-1")
+		wait, _ = f.q.ResultWait("worker-1", "")
 		require.Equal(t, 10*time.Minute, wait, "dig3 still takes a result")
 
 		f.clk.Add(10 * time.Minute) // past dig3's grace, with no answer for it
-		wait, _ = f.q.ResultWait("worker-1")
+		wait, _ = f.q.ResultWait("worker-1", "")
 		require.LessOrEqual(t, wait, time.Duration(0))
 		f.offer(t, "worker-1")
 		require.Zero(t, attempts(t, f, dig1), "the controller held up dig1's result, not the image")
 		require.Equal(t, 1, attempts(t, f, dig3), "dig3 was never answered")
 	})
 
-	t.Run("the newest agent process's request", func(t *testing.T) {
+	t.Run("without an ID, the newest agent process's request", func(t *testing.T) {
 		f := newWorkFixture(t)
 		f.q.o.PerReport = 2
 		require.Equal(t, []string{dig1, dig2}, f.offer(t, "worker-1"))
@@ -772,7 +851,7 @@ func TestWork_ResultWaitEndsWithTheRequestInFlight(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, applied)
 		require.Equal(t, []string{dig3}, f.offer(t, "worker-1"))
-		wait, unread := f.q.ResultWait("worker-1")
+		wait, unread := f.q.ResultWait("worker-1", "")
 		require.Equal(t, pastGrace, wait, "the new process is on dig3, not on the dead one's dig2")
 		unread()
 
@@ -780,16 +859,5 @@ func TestWork_ResultWaitEndsWithTheRequestInFlight(t *testing.T) {
 		f.offer(t, "worker-1")
 		require.Equal(t, 1, attempts(t, f, dig2), "the old process died on dig2")
 		require.Zero(t, attempts(t, f, dig3), "the controller held up dig3's result")
-	})
-
-	t.Run("an answered request when no other takes a result", func(t *testing.T) {
-		f := newWorkFixture(t)
-		f.q.o.PerReport = 1
-		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
-		f.ingest.setErr(&sbom.AcquireError{Kind: sbom.FailTransient, Reason: "acquisition in progress"})
-		require.Error(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
-		f.clk.Add(time.Minute)
-		wait, _ := f.q.ResultWait("worker-1")
-		require.Equal(t, pastGrace-time.Minute, wait, "dig1 still takes the agent's retry")
 	})
 }

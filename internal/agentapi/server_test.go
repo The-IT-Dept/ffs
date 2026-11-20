@@ -394,13 +394,15 @@ func TestServer_IngestBudgetDefersFullReports(t *testing.T) {
 }
 
 // blockingSBOMs is an SBOMHandler that holds every result until release is closed. With wait set it is also
-// a ResultWindow whose results may wait that long, recording the nodes whose results waited too long.
+// a ResultWindow whose results may wait that long, recording the requests asked about and those left unread,
+// as "<node>/<request ID>".
 type blockingSBOMs struct {
 	entered chan struct{}
 	release chan struct{}
 
 	mu     sync.Mutex
 	wait   time.Duration
+	asked  []string
 	unread []string
 }
 
@@ -419,7 +421,13 @@ func (b *blockingSBOMs) setWait(d time.Duration) {
 	b.wait = d
 }
 
-func (b *blockingSBOMs) unreadNodes() []string {
+func (b *blockingSBOMs) askedFor() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return slices.Clone(b.asked)
+}
+
+func (b *blockingSBOMs) unreadRequests() []string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return slices.Clone(b.unread)
@@ -428,13 +436,14 @@ func (b *blockingSBOMs) unreadNodes() []string {
 // windowedSBOMs is blockingSBOMs as a ResultWindow.
 type windowedSBOMs struct{ *blockingSBOMs }
 
-func (w windowedSBOMs) ResultWait(node string) (time.Duration, func()) {
+func (w windowedSBOMs) ResultWait(node, id string) (time.Duration, func()) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.asked = append(w.asked, node+"/"+id)
 	return w.wait, func() {
 		w.mu.Lock()
 		defer w.mu.Unlock()
-		w.unread = append(w.unread, node)
+		w.unread = append(w.unread, node+"/"+id)
 	}
 }
 
@@ -446,13 +455,31 @@ func sizedBody(t *testing.T, prefix, suffix string, size int) string {
 	return body
 }
 
-// postAsync sends body to path on another goroutine and returns its status on the channel; it asserts nothing.
-func postAsync(ctx context.Context, h http.Handler, path, body string) <-chan int {
+// resultRequest is a POST of an SBOM result body naming the request workID ("": none).
+func resultRequest(ctx context.Context, body, workID string) *http.Request {
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, wire.PathSBOM, strings.NewReader(body))
+	req.ContentLength = int64(len(body))
+	req.Header.Set("Authorization", "Bearer tok")
+	if workID != "" {
+		req.Header.Set(wire.HeaderWorkID, workID)
+	}
+	return req
+}
+
+// postResult sends an SBOM result naming workID and returns the answer.
+func postResult(t *testing.T, h http.Handler, body, workID string) answer {
+	t.Helper()
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, resultRequest(context.Background(), body, workID))
+	return answer{code: w.Code, header: w.Header(), body: w.Body.Bytes()}
+}
+
+// postAsync sends an SBOM result naming workID on another goroutine and returns its status on the channel; it
+// asserts nothing.
+func postAsync(ctx context.Context, h http.Handler, body, workID string) <-chan int {
 	answer := make(chan int, 1)
 	go func() {
-		req := httptest.NewRequestWithContext(ctx, http.MethodPost, path, strings.NewReader(body))
-		req.ContentLength = int64(len(body))
-		req.Header.Set("Authorization", "Bearer tok")
+		req := resultRequest(ctx, body, workID)
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, req)
 		answer <- w.Code
@@ -471,9 +498,9 @@ func TestServer_ReportsDoNotWaitBehindSBOMResults(t *testing.T) {
 	h := srv.Handler()
 	held := inFlight()
 	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
-	first := postAsync(context.Background(), h, wire.PathSBOM, result)
+	first := postAsync(context.Background(), h, result, "w1")
 	<-sboms.entered // the first result holds the whole SBOM budget
-	waiting := postAsync(context.Background(), h, wire.PathSBOM, result)
+	waiting := postAsync(context.Background(), h, result, "w1")
 
 	report := sizedBody(t, `{"node":"worker-1","kind":"images","agentVersion":"`, `"}`, size)
 	for range 3 {
@@ -490,8 +517,8 @@ func TestServer_ReportsDoNotWaitBehindSBOMResults(t *testing.T) {
 }
 
 // TestServer_SBOMWaitEndsWithItsRequest: a result waits for the SBOM budget no longer than the request it
-// answers takes a result (ResultWindow). It is then answered 503 and that request is marked answered; a node
-// with no request taking a result is answered 403 before its body is read.
+// names (wire.HeaderWorkID) takes a result (ResultWindow). It is then answered 503 and that request is marked
+// answered; a result whose request takes none is answered 403 before its body is read.
 func TestServer_SBOMWaitEndsWithItsRequest(t *testing.T) {
 	const size = 1 << 20
 	forbidden := func() float64 {
@@ -504,24 +531,123 @@ func TestServer_SBOMWaitEndsWithItsRequest(t *testing.T) {
 	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
 
 	before := forbidden()
-	a := serve(t, h, http.MethodPost, wire.PathSBOM, "tok", strings.NewReader(result), int64(len(result)))
-	requireError(t, a, http.StatusForbidden, "no request to worker-1 takes a result")
+	requireError(t, postResult(t, h, result, "w1"), http.StatusForbidden, "no request to worker-1 takes this result")
 	require.Equal(t, before+1, forbidden())
 	require.Empty(t, sboms.entered, "the handler never sees it")
+	require.Equal(t, []string{"worker-1/w1"}, sboms.askedFor(), "the window of the request the result names")
 
 	sboms.setWait(time.Hour)
-	first := postAsync(context.Background(), h, wire.PathSBOM, result)
+	first := postAsync(context.Background(), h, result, "w1")
 	<-sboms.entered // the first result holds the whole SBOM budget
 
 	sboms.setWait(50 * time.Millisecond)
 	start := time.Now()
-	a = serve(t, h, http.MethodPost, wire.PathSBOM, "tok", strings.NewReader(result), int64(len(result)))
-	requireError(t, a, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
+	a := postResult(t, h, result, "w2")
+	requireError(t, a, http.StatusServiceUnavailable, "the controller could not read the result in time")
 	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
-	require.Equal(t, []string{"worker-1"}, sboms.unreadNodes(), "its request is answered")
+	require.Equal(t, []string{"worker-1/w2"}, sboms.unreadRequests(), "the request it names is answered, and no other")
 	require.Equal(t, held+size, inFlight())
 
 	close(sboms.release)
 	require.Equal(t, http.StatusNoContent, <-first)
 	require.Equal(t, held, inFlight())
+}
+
+// TestServer_SBOMWaitStaysBelowTheAgentTimeout: however long its request takes a result, a result waits for
+// the SBOM budget at most a minute less than the agent's client timeout, so the agent sees the 503 and can
+// send it again; a result that waited that long leaves its request unread.
+func TestServer_SBOMWaitStaysBelowTheAgentTimeout(t *testing.T) {
+	const size = 1 << 20
+	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{})}
+	opts := ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms}, MaxSBOMBytes: 2 * size,
+		SBOMBudget: size}
+	require.Equal(t, wire.ClientTimeout-time.Minute, NewServer(opts).o.MaxResultWait, "by default")
+	opts.MaxResultWait = time.Hour
+	require.Equal(t, wire.ClientTimeout-time.Minute, NewServer(opts).o.MaxResultWait, "never longer")
+	require.Less(t, wire.ClientTimeout, writeTimeout, "the agent's timeout ends before the server's")
+
+	opts.MaxResultWait = 50 * time.Millisecond
+	h := NewServer(opts).Handler()
+	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+	sboms.setWait(time.Hour) // the requests take a result for an hour
+	first := postAsync(context.Background(), h, result, "w1")
+	<-sboms.entered
+
+	start := time.Now()
+	requireError(t, postResult(t, h, result, "w2"), http.StatusServiceUnavailable, "the controller could not read the result in time")
+	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
+	require.Less(t, time.Since(start), 10*time.Second, "not the request's hour")
+	require.Equal(t, []string{"worker-1/w2"}, sboms.unreadRequests())
+
+	close(sboms.release)
+	require.Equal(t, http.StatusNoContent, <-first)
+}
+
+// TestServer_AbandonedSBOMResultIsUnread: a result whose HTTP request ends while it waits for the SBOM budget
+// (the agent gave up, or stopped) was never read, so its request is not counted against the image.
+func TestServer_AbandonedSBOMResultIsUnread(t *testing.T) {
+	const size = 1 << 20
+	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+	h := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
+		MaxSBOMBytes: 2 * size, SBOMBudget: size}).Handler()
+	held := inFlight()
+	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+	first := postAsync(context.Background(), h, result, "w1")
+	<-sboms.entered
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	abandoned := postAsync(ctx, h, result, "w2")
+	require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second, time.Millisecond)
+	cancel()
+	<-abandoned
+	require.Equal(t, []string{"worker-1/w2"}, sboms.unreadRequests(), "the abandoned result's request is answered")
+	require.Equal(t, held+size, inFlight(), "it took none of the budget")
+
+	close(sboms.release)
+	require.Equal(t, http.StatusNoContent, <-first)
+	require.Equal(t, held, inFlight())
+}
+
+// TestServer_SBOMBodyReadAfterALongWait: the server's read timeout runs from the start of a request, so a
+// result that waited for the SBOM budget longer than it is still read in full once it has its share.
+func TestServer_SBOMBodyReadAfterALongWait(t *testing.T) {
+	const size = 1 << 20
+	sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+	srv := httptest.NewUnstartedServer(NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{},
+		SBOMs: windowedSBOMs{sboms}, MaxSBOMBytes: 2 * size, SBOMBudget: size}).Handler())
+	srv.Config.ReadTimeout = 200 * time.Millisecond
+	srv.Start()
+	t.Cleanup(srv.Close)
+	result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+	post := func(workID string) <-chan int {
+		answer := make(chan int, 1)
+		go func() {
+			req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL+wire.PathSBOM, strings.NewReader(result))
+			if err != nil {
+				answer <- 0
+				return
+			}
+			req.Header.Set("Authorization", "Bearer tok")
+			req.Header.Set(wire.HeaderWorkID, workID)
+			resp, err := srv.Client().Do(req)
+			if err != nil {
+				answer <- 0
+				return
+			}
+			_ = resp.Body.Close()
+			answer <- resp.StatusCode
+		}()
+		return answer
+	}
+
+	first := post("w1")
+	<-sboms.entered // the first result holds the whole SBOM budget
+	second := post("w2")
+	require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second, time.Millisecond)
+	time.Sleep(2 * srv.Config.ReadTimeout) // the second waits past the read timeout
+	close(sboms.release)
+	require.Equal(t, http.StatusNoContent, <-first)
+	require.Equal(t, http.StatusNoContent, <-second, "its body is read after the wait")
+	require.Empty(t, sboms.unreadRequests())
 }

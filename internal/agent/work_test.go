@@ -245,6 +245,67 @@ func TestWork_ScratchFailuresAreNotTheImages(t *testing.T) {
 	require.Empty(t, workDirs(t, e.scratch))
 }
 
+// fastResends shortens the waits before resending a result to 20, 40 and 80ms (16, 32 and 64ms with the env's
+// zero jitter) for the test.
+func fastResends(t *testing.T) {
+	t.Helper()
+	old := resultResends
+	t.Cleanup(func() { resultResends = old })
+	resultResends = []time.Duration{20 * time.Millisecond, 40 * time.Millisecond, 80 * time.Millisecond}
+}
+
+// TestWork_ResultResentUntilTheControllerTakesIt: a result the controller did not take (a 503, then a dropped
+// connection) is sent again, after growing waits, until it is taken. Every send names its request, and the
+// image is catalogued once.
+func TestWork_ResultResentUntilTheControllerTakesIt(t *testing.T) {
+	e := newEnv(t)
+	fastResends(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	e.ctl.failSBOMs(http.StatusServiceUnavailable, dropConnection)
+	a.runJob(context.Background(), wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: "linux/" + runtime.GOARCH,
+		Deadline: time.Now().Add(5 * time.Minute)}, time.Now())
+
+	res := e.ctl.nextSBOM(t)
+	require.Equal(t, "w1", res.ID)
+	require.JSONEq(t, imageJSON, string(res.SyftJSON), "the resend streams the spooled SBOM again")
+	e.ctl.noSBOM(t)
+	events, times := e.ctl.log()
+	require.Equal(t, []string{"sbom:w1", "sbom:w1", "sbom:w1"}, events, "failed twice, then taken")
+	require.GreaterOrEqual(t, times[1].Sub(times[0]), 16*time.Millisecond, "the first resend waits")
+	require.GreaterOrEqual(t, times[2].Sub(times[1]), 32*time.Millisecond, "the second waits longer")
+	require.Equal(t, []string{"w1", "w1", "w1"}, e.ctl.sentWorkIDs(), "every send names its request")
+	require.Len(t, e.runner.requests(), 1, "the image is catalogued once")
+	require.Empty(t, spooled(t, e.scratch), "the spooled SBOM is removed after the last send")
+}
+
+// TestWork_ResultNotResentWhenItCannotBeTaken: an answer other than 429 or 5xx is final, and a result is not
+// sent again once its request no longer takes one (wire.ResultGrace after its deadline).
+func TestWork_ResultNotResentWhenItCannotBeTaken(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	fastResends(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	platform := "linux/" + runtime.GOARCH
+
+	for _, code := range []int{http.StatusBadRequest, http.StatusForbidden, http.StatusRequestEntityTooLarge} {
+		e.ctl.failSBOMs(code)
+		a.runJob(ctx, wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: platform, Deadline: time.Now().Add(5 * time.Minute)},
+			time.Now())
+	}
+	events, _ := e.ctl.log()
+	require.Equal(t, []string{"sbom:w1", "sbom:w1", "sbom:w1"}, events, "each sent once")
+
+	// The request takes a result for 10ms more, less than the first resend's wait: its skipped answer is sent once.
+	e.ctl.failSBOMs(http.StatusServiceUnavailable)
+	a.runJob(ctx, wire.WorkRequest{ID: "w2", Digest: e.manifest, Platform: platform,
+		Deadline: time.Now().Add(10*time.Millisecond - wire.ResultGrace)}, time.Now())
+	events, _ = e.ctl.log()
+	require.Equal(t, []string{"sbom:w1", "sbom:w1", "sbom:w1", "sbom:w2"}, events, "not sent again past its request's grace")
+	e.ctl.noSBOM(t)
+}
+
 // requireSkipped checks a skipped result: the agent did not attempt the request, and says so with nothing else.
 func requireSkipped(t *testing.T, res wire.SBOMResult, id, digest string) {
 	t.Helper()

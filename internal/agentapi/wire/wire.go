@@ -22,6 +22,21 @@ const (
 	KindFull = "full"
 	// KindImages is a lightweight report: a heartbeat that carries the cached images only when they changed.
 	KindImages = "images"
+
+	// HeaderWorkID carries an SBOMResult's ID on POST /agent/v1/sbom, so the controller knows which request
+	// the result answers before it reads the body. Older agents send none.
+	HeaderWorkID = "Ffs-Work-Id"
+)
+
+// Timing both sides rely on.
+const (
+	// ClientTimeout bounds one request of the agent. The controller answers an SBOM result within
+	// ClientTimeout less a minute, however long the result waits to be read, so the agent sees the answer.
+	ClientTimeout = 10 * time.Minute
+	// ResultGrace is how long after its WorkRequest's Deadline the controller still takes a result: the
+	// agent's job ends at the deadline and its result is sent after that, and sent again while the controller
+	// does not take it (no answer, 429 or 5xx).
+	ResultGrace = 2 * time.Minute
 )
 
 // Report is sent by the agent to POST /agent/v1/report.
