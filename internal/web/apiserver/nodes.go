@@ -84,6 +84,19 @@ func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, boo
 	return model.NodeGroup{}, false, nil
 }
 
+// findGroup is the group nodeGroups shows under id.
+func (s *Server) findGroup(ctx context.Context, id string) (model.NodeGroup, bool, error) {
+	groups, err := s.nodeGroups(ctx)
+	if err != nil {
+		return model.NodeGroup{}, false, err
+	}
+	i := slices.IndexFunc(groups, func(g model.NodeGroup) bool { return g.ID == id })
+	if i < 0 {
+		return model.NodeGroup{}, false, nil
+	}
+	return groups[i], true, nil
+}
+
 // groupStats are a group's open host findings (node-level findings only, by its digest); a nodeinfo
 // group has none.
 func (s *Server) groupStats(ctx context.Context, g model.NodeGroup) (store.OwnerStats, error) {
