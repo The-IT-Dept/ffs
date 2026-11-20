@@ -399,6 +399,8 @@ func findingFacetValues(f FindingFacet, counts map[string]int, q FindingQuery) [
 	case FacetState:
 		enum = []string{string(model.StateOpen), string(model.StateExcepted), string(model.StateResolved)}
 	case FacetPriority:
+		// A finding's priority is one of the four levels (priority.Compute starts at low), so "none"
+		// is listed only for a stored finding that has none, which would otherwise go uncounted.
 		enum = []string{"urgent", "high", "medium", "low"}
 		if counts[priorityNoneValue] > 0 {
 			enum = append(enum, priorityNoneValue)
@@ -739,21 +741,4 @@ func (s *Store) TransitionCount(ctx context.Context, sc model.Scope, since time.
 		return 0, fmt.Errorf("store: count transitions: %w", err)
 	}
 	return n, nil
-}
-
-// scanTransition reads an (id, data) transitions row, with ID set.
-func scanTransition(r scanner) (model.Transition, error) {
-	var (
-		t    model.Transition
-		id   int64
-		data string
-	)
-	if err := r.Scan(&id, &data); err != nil {
-		return model.Transition{}, err
-	}
-	if err := json.Unmarshal([]byte(data), &t); err != nil {
-		return model.Transition{}, fmt.Errorf("transition %d: %w", id, err)
-	}
-	t.ID = id
-	return t, nil
 }

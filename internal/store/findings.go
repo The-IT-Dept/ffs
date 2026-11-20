@@ -182,21 +182,24 @@ func (s *Store) TransitionsAfter(ctx context.Context, afterID int64, limit int) 
 	if limit <= 0 {
 		limit = defaultTransitionsLimit
 	}
-	return queryAll(ctx, s.rdb, func(r scanner) (model.Transition, error) {
-		var (
-			t    model.Transition
-			id   int64
-			data string
-		)
-		if err := r.Scan(&id, &data); err != nil {
-			return model.Transition{}, err
-		}
-		if err := json.Unmarshal([]byte(data), &t); err != nil {
-			return model.Transition{}, fmt.Errorf("transition %d: %w", id, err)
-		}
-		t.ID = id
-		return t, nil
-	}, `SELECT id, data FROM transitions WHERE id > ? ORDER BY id LIMIT ?`, afterID, limit)
+	return queryAll(ctx, s.rdb, scanTransition, `SELECT id, data FROM transitions WHERE id > ? ORDER BY id LIMIT ?`, afterID, limit)
+}
+
+// scanTransition reads an (id, data) transitions row, with ID set.
+func scanTransition(r scanner) (model.Transition, error) {
+	var (
+		t    model.Transition
+		id   int64
+		data string
+	)
+	if err := r.Scan(&id, &data); err != nil {
+		return model.Transition{}, err
+	}
+	if err := json.Unmarshal([]byte(data), &t); err != nil {
+		return model.Transition{}, fmt.Errorf("transition %d: %w", id, err)
+	}
+	t.ID = id
+	return t, nil
 }
 
 // Cursor returns the last transition ID the consumer processed, 0 when it has none.
