@@ -125,7 +125,9 @@ test('a node group with gaps leads its findings and host packages with them', as
   const group = await screen.findByRole('button', { name: /No fix yet/ })
   expect(note.compareDocumentPosition(group) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
   await user.click(screen.getByRole('tab', { name: 'Host packages' }))
-  expect(within(await screen.findByRole('note')).getByText(copy.gaps.no_package_database.todo)).toBeInTheDocument()
+  expect(
+    within(await screen.findByRole('note')).getByText('Image-based operating systems have no package database; on any other OS, check nodeAgent.packageDatabases.'),
+  ).toBeInTheDocument()
   expect(await screen.findByText(copy.emptyList.hostPackages)).toBeInTheDocument()
 })
 
@@ -155,7 +157,7 @@ test.each([
   ['disabled', agentStatus({ state: 'disabled' }), copy.agentMissing],
   ['never reported', agentStatus({ state: 'never' }), copy.gaps.node_agent_missing.gap],
   ['blocked', blocked, copy.gaps.node_agent_blocked.gap],
-  ['reporting without a host inventory', agentStatus(), copy.gaps.host_not_inventoried.gap],
+  ['reporting without a host inventory', agentStatus(), copy.nodes.hostPending],
   ['unsupported', agentStatus({ state: 'never', gaps: [{ code: 'node_agent_unsupported', detail: 'arm' }] }), copy.gaps.node_agent_unsupported.gap],
 ] as const)('without agent data a group says why by its agents: %s', async (_, agent, text) => {
   mockApi().on('/nodegroups/{id}', nodeGroupDetail({ agentData: false, members: [member('worker-1', agent)] }))
@@ -164,6 +166,86 @@ test.each([
   expect((await within(main).findAllByText(text)).length).toBeGreaterThan(0)
   if (text !== copy.agentMissing) expect(within(main).queryByText(copy.agentMissing)).toBeNull()
   if (text === copy.gaps.node_agent_unsupported.gap) expect(within(main).queryByText(copy.gaps.node_agent_missing.gap)).toBeNull()
+})
+
+test('a nodeinfo group whose agents report without a host inventory says the host packages are not inventoried yet, and why', async () => {
+  const pending = (detail: string, lastError?: string) =>
+    agentStatus({ gaps: [{ code: 'host_not_inventoried', detail }], ...(lastError ? { lastError } : {}) })
+  mockApi()
+    .on(
+      '/nodegroups/{id}',
+      nodeGroupDetail({
+        agentData: false,
+        group: { ...nodeGroupDetail().group, id: 'worker-pool-a-nodeinfo', kind: 'nodeinfo' },
+        members: [
+          member('worker-1', pending('host inventory quarantined until 2026-11-21T07:10:00Z: scan failed', 'scan failed: disk full')),
+          member('worker-2', pending('no full host report received')),
+          member('worker-3', pending('host packages not inventoried yet')),
+        ],
+      }),
+    )
+    .on('/findings', findingsPage())
+  const { user } = renderApp('/nodegroups/worker-pool-a-nodeinfo')
+  const main = await screen.findByRole('main')
+  // Under the header, and in place of the findings.
+  await waitFor(() => expect(within(main).getAllByText(copy.nodes.hostPending)).toHaveLength(2))
+  for (const m of within(main).getAllByText(copy.nodes.hostPending)) expect(m.closest('.hatched')).not.toBeNull()
+  expect(within(main).getAllByText('3 of 3 nodes')).toHaveLength(2)
+  // The last error first; a detail that only repeats the headline is not a reason.
+  expect(within(main).getByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
+  expect(within(main).queryByText(/quarantined until/)).toBeNull()
+  expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
+  expect(within(main).queryByText(copy.gaps.host_not_inventoried.gap)).toBeNull()
+  expect(within(main).queryByText(copy.empty)).toBeNull()
+  for (const tab of ['Host packages', 'Cached images']) {
+    await user.click(screen.getByRole('tab', { name: tab }))
+    expect(await within(main).findByText('scan failed: disk full · no full host report received')).toBeInTheDocument()
+    expect(within(main).queryByText(/Enable the node agent/)).toBeNull()
+  }
+})
+
+test('a node whose agent reports without a host inventory says so with its last error, once', async () => {
+  mockApi().on(
+    '/nodes/{name}',
+    nodeDetail({
+      agent: agentStatus({ gaps: [{ code: 'host_not_inventoried', detail: 'scan failed: disk full' }], lastError: 'scan failed: disk full' }),
+      group: { id: 'worker-pool-a-nodeinfo', label: 'worker pool', kind: 'nodeinfo' },
+    }),
+  )
+  renderApp('/nodes/worker-1')
+  expect((await screen.findByText(copy.nodes.hostPending)).closest('.hatched')).not.toBeNull()
+  expect(screen.getAllByText('scan failed: disk full')).toHaveLength(1)
+  expect(screen.queryByText(/Enable the node agent/)).toBeNull()
+  expect(screen.getByRole('link', { name: 'worker pool' })).toHaveAttribute('href', '/nodegroups/worker-pool-a-nodeinfo')
+})
+
+test('the nodes page says a nodeinfo group whose agents report has not inventoried its hosts yet', async () => {
+  mockApi().on(
+    '/nodegroups',
+    nodeGroupsList({
+      groups: [
+        nodeGroupRow({
+          id: 'ubuntu-24.04-k6.8-nodeinfo',
+          kind: 'nodeinfo',
+          label: 'ubuntu a',
+          agents: { reporting: 0, reportingWithoutInventory: 2, stale: 0, never: 0, disabled: 0, unsupported: 0 },
+          gaps: ['host_not_inventoried'],
+        }),
+        nodeGroupRow({
+          id: 'talos-1.11-nodeinfo',
+          kind: 'nodeinfo',
+          label: 'talos b',
+          agents: { reporting: 0, reportingWithoutInventory: 0, stale: 0, never: 2, disabled: 0, unsupported: 0 },
+          gaps: ['node_agent_missing'],
+        }),
+      ],
+    }),
+  )
+  renderApp('/nodes')
+  const dashes = async (name: string) => within(await screen.findByRole('row', { name: new RegExp(name) })).getAllByText('—')
+  for (const d of await dashes('ubuntu a')) expect(d).toHaveAttribute('title', copy.nodes.hostPending)
+  for (const d of await dashes('talos b')) expect(d).toHaveAttribute('title', copy.gaps.node_agent_missing.gap)
+  expect(within(await screen.findByRole('row', { name: /ubuntu a/ })).getByText('2 without host inventory')).toBeInTheDocument()
 })
 
 test('empty lists that are not findings say what is empty', async () => {

@@ -43,9 +43,13 @@ function gappedGroups(groups: Group[], rail?: S<'ScopeCard'>): Set<string> {
 }
 
 // Figure is a group's count: hatched where ffs cannot see all of the group, and "—" for a group
-// whose host packages were never inventoried, where a zero would read as clean.
+// whose host packages were never inventoried, where a zero would read as clean; its title says
+// whether its agents report and have not inventoried the hosts yet, or are not reporting.
 function Figure({ g, gap, children }: { g: Group; gap: boolean; children: ReactNode }) {
-  if (g.kind !== 'agent') return <CoverageMark title={copy.gaps.node_agent_missing.gap}>{copy.noValue}</CoverageMark>
+  if (g.kind !== 'agent') {
+    const title = g.agents.reportingWithoutInventory > 0 ? copy.nodes.hostPending : copy.gaps.node_agent_missing.gap
+    return <CoverageMark title={title}>{copy.noValue}</CoverageMark>
+  }
   return gap ? <CoverageMark title={copy.nodes.groupGap}>{children}</CoverageMark> : <>{children}</>
 }
 

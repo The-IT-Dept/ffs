@@ -204,7 +204,7 @@ export const copy = {
     },
     no_package_database: {
       gap: 'no package database (image-based OS)',
-      todo: 'Host packages are not inventoried on image-based operating systems.',
+      todo: 'Image-based operating systems have no package database; on any other OS, check nodeAgent.packageDatabases.',
     },
     content_store_unreadable: {
       gap: 'no containerd content store',
@@ -451,6 +451,9 @@ export const copy = {
     gapNodes: (n: number, m: number) => `${formatCount(n)} of ${plural(m, 'node', 'nodes')}`,
     // A stale agent has no gap code of its own: its last report may be out of date.
     agentStale: 'node agent stopped reporting',
+    // An agent that reports but whose host inventory is not stored (host_not_inventoried); its last
+    // error, when it has one, says why.
+    hostPending: 'Host packages not inventoried yet',
     groupGap: 'ffs cannot see all of this group',
     // A group's agents by state, zero parts left out: "7 reporting · 1 without host inventory · 1 not
     // scheduled"; "—" when there are none.
