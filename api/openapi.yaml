@@ -118,7 +118,10 @@ paths:
           schema: {type: array, items: {type: string}}
         - in: query
           name: kind
-          description: Owner kinds, such as Deployment.
+          description: >-
+            Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and
+            cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the
+            cluster itself.
           style: form
           explode: false
           schema: {type: array, items: {type: string}}
@@ -443,10 +446,11 @@ paths:
         - in: path
           name: id
           required: true
+          description: The group's stable name, which survives package updates, or its label or ID.
           schema: {type: string}
         - in: query
           name: compare
-          description: ID of another node group to compare this group with.
+          description: Stable name, label or ID of another node group to compare this group with.
           schema: {type: string, maxLength: 200}
       responses:
         '200':
@@ -827,6 +831,7 @@ components:
         value: {type: string}
         count: {type: integer}
         selected: {type: boolean}
+        label: {type: string, description: How the value reads when that differs from the value.}
 
     Facets:
       type: object
@@ -1511,6 +1516,10 @@ components:
         counts: {$ref: '#/components/schemas/PriorityCounts'}
         fixable: {type: integer}
         agents: {$ref: '#/components/schemas/AgentCounts'}
+        gaps:
+          type: array
+          description: The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full.
+          items: {$ref: '#/components/schemas/GapCode'}
         rebootPending: {type: integer}
         drift: {type: string, description: Field differences against the largest group of the same architecture.}
 
@@ -1518,7 +1527,7 @@ components:
       type: object
       required: [reporting, stale, never, disabled]
       properties:
-        reporting: {type: integer}
+        reporting: {type: integer, description: Agents reporting whose host inventory is stored.}
         stale: {type: integer}
         never: {type: integer}
         disabled: {type: integer}

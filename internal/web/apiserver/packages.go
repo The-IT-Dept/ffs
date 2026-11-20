@@ -20,6 +20,9 @@ func (s *Server) ListPackages(ctx context.Context, req apigen.ListPackagesReques
 	if err != nil {
 		return nil, err
 	}
+	if _, err := s.resolveScope(ctx, sc); err != nil {
+		return nil, err
+	}
 	prios, err := enumParam("priority", p.Priority)
 	if err != nil {
 		return nil, err

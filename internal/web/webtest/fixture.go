@@ -78,7 +78,15 @@ var (
 	AgentGroupID = "3f9c1a" + strings.Repeat("0", 58)
 	// CP1GroupID is the nodeinfo group of cp-1: nodegroup.FallbackID of its Node.
 	CP1GroupID = nodegroup.FallbackID(smallNode("cp-1", kernelCP1))
+
+	// AgentGroupKey and CP1GroupKey are the keys the API names the two groups by: their stable names,
+	// which no other group shares.
+	AgentGroupKey = agentGroupName
+	CP1GroupKey   = nodegroup.GroupName(nil, osImage, kernelCP1)
 )
+
+// agentGroupName is the stable name of the agent group.
+const agentGroupName = "ubuntu-24.04-k6.8.0-88"
 
 const (
 	kernelCP1    = "6.8.0-85-generic"
@@ -590,7 +598,7 @@ func (f *Fixture) seedNodeAgent(ctx context.Context) error {
 			return err
 		}
 	}
-	name := "ubuntu-24.04-k6.8.0-88"
+	name := agentGroupName
 	group := model.NodeGroup{ID: AgentGroupID, Kind: model.NodeGroupAgent, Name: name, Label: nodegroup.GroupLabel(name, AgentGroupID),
 		Digest: digest, Distro: ubuntu, OSImage: osImage, KernelRelease: kernelWorker,
 		ContainerRuntimeVersion: "containerd://2.2.1", KubeletVersion: "v1.34.2", Arch: "amd64",

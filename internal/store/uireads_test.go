@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -290,38 +291,59 @@ func TestJump_PrefixFirstPerKind(t *testing.T) {
 	put(t, s, "sha256:web", model.Package{Ecosystem: "deb", Name: "webkit", Version: "1.0"}, model.Package{Ecosystem: "deb", Name: "webkit", Version: "2.0"})
 	require.NoError(t, s.ReplaceNodes(ctx, []model.Node{{Name: "worker-1", Ready: true}, {Name: "cp-1", Ready: true}}))
 
-	hits, err := s.Jump(ctx, "web", 0)
+	hits, more, err := s.Jump(ctx, "web", 0)
 	require.NoError(t, err)
+	require.False(t, more)
 	require.Equal(t, []JumpHit{
-		{Kind: "workload", ID: exWeb.Key(), Label: "web", Detail: "Deployment · shop", Worst: model.PriorityUrgent},
+		{Kind: "workload", ID: exWeb.Key(), Label: "web", Detail: "Deployment · shop", Worst: model.PriorityUrgent, Prefix: true},
 		{Kind: "workload", ID: "Deployment/webshop/legacy-web", Label: "legacy-web", Detail: "Deployment · webshop"},
-		{Kind: "namespace", ID: "webshop", Label: "webshop", Detail: "1 workloads"},
+		{Kind: "namespace", ID: "webshop", Label: "webshop", Detail: "1 workload", Prefix: true},
 		{Kind: "image", ID: "sha256:web", Label: "ghcr.io/example/web", Detail: "sha256:web", Worst: model.PriorityUrgent},
-		{Kind: "package", ID: "deb/webkit", Label: "webkit", Detail: "deb"},
+		{Kind: "package", ID: "deb/webkit", Label: "webkit", Detail: "deb", Prefix: true},
 	}, hits)
 
-	one, err := s.Jump(ctx, "web", 1)
+	one, more, err := s.Jump(ctx, "web", 1)
 	require.NoError(t, err)
+	require.True(t, more, "a second web workload is left out")
 	var kinds []string
 	for _, h := range one {
 		kinds = append(kinds, h.Kind+":"+h.ID)
 	}
 	require.Equal(t, []string{"workload:" + exWeb.Key(), "namespace:webshop", "image:sha256:web", "package:deb/webkit"}, kinds)
 
-	hits, err = s.Jump(ctx, "WORK", 0)
+	hits, _, err = s.Jump(ctx, "WORK", 0)
 	require.NoError(t, err)
-	require.Contains(t, hits, JumpHit{Kind: "node", ID: "worker-1", Label: "worker-1"})
-	require.Equal(t, JumpHit{Kind: "workload", ID: exWorker.Key(), Label: "worker", Detail: "Deployment · shop"}, hits[0])
+	require.Contains(t, hits, JumpHit{Kind: "node", ID: "worker-1", Label: "worker-1", Prefix: true})
+	require.Equal(t, JumpHit{Kind: "workload", ID: exWorker.Key(), Label: "worker", Detail: "Deployment · shop", Prefix: true}, hits[0])
 	require.Equal(t, model.PriorityNone, hits[len(hits)-1].Worst)
 
 	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0001", Title: "web server overflow"}))
 	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0003", Title: "api bug"}))
-	hits, err = s.Jump(ctx, "CVE-2026-000", 0)
+	hits, _, err = s.Jump(ctx, "CVE-2026-000", 0)
 	require.NoError(t, err)
 	require.Equal(t, []JumpHit{
-		{Kind: "advisory", ID: "CVE-2026-0001", Label: "CVE-2026-0001", Detail: "web server overflow", Worst: model.PriorityUrgent},
-		{Kind: "advisory", ID: "CVE-2026-0003", Label: "CVE-2026-0003", Detail: "api bug", Worst: model.PriorityMedium},
+		{Kind: "advisory", ID: "CVE-2026-0001", Label: "CVE-2026-0001", Detail: "web server overflow", Worst: model.PriorityUrgent, Prefix: true},
+		{Kind: "advisory", ID: "CVE-2026-0003", Label: "CVE-2026-0003", Detail: "api bug", Worst: model.PriorityMedium, Prefix: true},
 	}, hits)
+}
+
+// A prefix hit is never lost to an alphabetical cut: with many labels containing the query, those
+// starting with it still come back, before the rest.
+func TestJump_PrefixHitsSurviveTheCut(t *testing.T) {
+	s := newStore(t)
+	for _, name := range []string{"a-kube-1", "a-kube-2", "b-kube-3", "c-kube-4", "d-kube-5", "e-kube-6", "kube-proxy", "kubelet-csr"} {
+		require.NoError(t, s.UpsertOwner(ctx, uiOwner(ref("Deployment", "ops", name))))
+	}
+	hits, more, err := s.Jump(ctx, "kube", 3)
+	require.NoError(t, err)
+	require.True(t, more)
+	var labels []string
+	for _, h := range hits {
+		if h.Kind == "workload" {
+			labels = append(labels, h.Label)
+		}
+	}
+	require.Equal(t, []string{"kube-proxy", "kubelet-csr", "a-kube-1"}, labels)
 }
 
 func TestChangeMarks_StableSensitiveAndReadOnly(t *testing.T) {
@@ -415,4 +437,96 @@ func TestSBOMDescriptor_StreamsToDescriptor(t *testing.T) {
 	require.NoError(t, s.PutSBOM(ctx, "sha256:broken", []byte(`{"artifacts":[`), nil))
 	_, _, _, err = s.SBOMDescriptor(ctx, "sha256:broken")
 	require.Error(t, err)
+}
+
+// An image whose SBOM is stored but whose first match has not run is not seen into yet: it counts
+// as in use only, reads as pending in the images explorer and is a coverage gap, until the match.
+func TestCoverage_UnmatchedImagesAreNotSeenInto(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	cluster := model.Scope{Kind: model.ScopeCluster}
+	before, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:web", t0))
+
+	after, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: before.InUse, SeenInto: before.SeenInto - 1, Full: before.Full - 1}, after)
+	img, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:web"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: 1}, img)
+	owners, err := s.OwnerCoverage(ctx, []string{exWeb.Key()})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{InUse: 1}, owners[exWeb.Key()])
+	nss, err := s.NamespaceStats(ctx)
+	require.NoError(t, err)
+	for _, n := range nss {
+		if n.Namespace == "shop" {
+			require.Equal(t, CoverageFigure{InUse: 2, SeenInto: 1, Full: 1}, n.Coverage)
+		}
+	}
+	byOwner, err := s.OwnerImageCoverage(ctx, []string{exWeb.Key()})
+	require.NoError(t, err)
+	require.Equal(t, []DigestCoverage{{Digest: "sha256:web"}}, byOwner[exWeb.Key()])
+
+	page, err := s.ImagesPage(ctx, ImageQuery{Q: "example/web", Limit: 10})
+	require.NoError(t, err)
+	require.Len(t, page.Rows, 1)
+	require.Equal(t, model.ImagePending, page.Rows[0].Image.Status)
+	require.Equal(t, model.CoverageNone, page.Rows[0].Class)
+	gaps, err := s.CoverageImages(ctx, cluster)
+	require.NoError(t, err)
+	require.True(t, slices.ContainsFunc(gaps, func(c CoverageImage) bool {
+		return c.Image.Digest == "sha256:web" && c.Image.Status == model.ImagePending
+	}), "the unmatched image is a pending gap")
+
+	require.NoError(t, s.MarkMatched(ctx, "sha256:web"))
+	matched, err := s.CoverageOf(ctx, cluster)
+	require.NoError(t, err)
+	require.Equal(t, before, matched)
+}
+
+// An image's own coverage figure counts it in use only when an owner runs it.
+func TestCoverageOf_ImageInUseOnlyWhenRun(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	unused, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:unused"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{SeenInto: 1, Full: 1}, unused, "catalogued, but no owner runs it")
+	none, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:nowhere"})
+	require.NoError(t, err)
+	require.Equal(t, CoverageFigure{}, none)
+}
+
+// A fully covered image holding classifier-found packages is listed, so the API can name the
+// packages matched against CPE data only; one without them is not.
+func TestCoverageImages_ListsFullImagesWithClassifierPackages(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	put(t, s, "sha256:worker", model.Package{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary",
+		Path: "/usr/local/bin/redis-server"})
+	put(t, s, "sha256:web", deb("openssl", ""))
+	imgs, err := s.CoverageImages(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"})
+	require.NoError(t, err)
+	require.Len(t, imgs, 1)
+	require.Equal(t, "sha256:worker", imgs[0].Image.Digest)
+	require.Equal(t, model.CoverageFull, CoverageClassOf(imgs[0].Image))
+}
+
+// Each owner's distinct container images, with how far ffs sees into each; synthetic digests are
+// left out.
+func TestOwnerImageCoverage_DistinctContainerImages(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	require.NoError(t, s.UpsertOwner(ctx, uiOwner(ref("Deployment", "shop", "web-canary"), func(o *model.Owner) {
+		o.Containers = append(o.Containers, model.ContainerUse{Name: "proxy", Digest: "sha256:web"})
+	})))
+	got, err := s.OwnerImageCoverage(ctx, []string{exWeb.Key(), "Deployment/shop/web-canary", exAPI.Key(), exReport.Key(), exNodes.Key()})
+	require.NoError(t, err)
+	require.Equal(t, map[string][]DigestCoverage{
+		exWeb.Key():                  {{Digest: "sha256:web", SeenInto: true, Full: true}},
+		"Deployment/shop/web-canary": {{Digest: "sha256:web", SeenInto: true, Full: true}, {Digest: "sha256:web-canary"}},
+		exAPI.Key():                  {{Digest: "sha256:api", SeenInto: true}},
+		exReport.Key():               {{Digest: placeholderDigest}},
+	}, got)
 }

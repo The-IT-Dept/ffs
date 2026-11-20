@@ -567,6 +567,8 @@ export interface components {
             value: string;
             count: number;
             selected: boolean;
+            /** @description How the value reads when that differs from the value. */
+            label?: string;
         };
         /** @description Facet name to its values, for the requested facets only. */
         Facets: {
@@ -1069,11 +1071,14 @@ export interface components {
             counts: components["schemas"]["PriorityCounts"];
             fixable: number;
             agents: components["schemas"]["AgentCounts"];
+            /** @description The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full. */
+            gaps?: components["schemas"]["GapCode"][];
             rebootPending: number;
             /** @description Field differences against the largest group of the same architecture. */
             drift: string;
         };
         AgentCounts: {
+            /** @description Agents reporting whose host inventory is stored. */
             reporting: number;
             stale: number;
             never: number;
@@ -1504,7 +1509,7 @@ export interface operations {
                 /** @description Ecosystem of the finding's first package. */
                 ecosystem?: string[];
                 namespace?: string[];
-                /** @description Owner kinds, such as Deployment. */
+                /** @description Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the cluster itself. */
                 kind?: string[];
                 /** @description Advisory ID or any of its aliases. */
                 advisory?: string;
@@ -1816,11 +1821,12 @@ export interface operations {
     getNodeGroup: {
         parameters: {
             query?: {
-                /** @description ID of another node group to compare this group with. */
+                /** @description Stable name, label or ID of another node group to compare this group with. */
                 compare?: string;
             };
             header?: never;
             path: {
+                /** @description The group's stable name, which survives package updates, or its label or ID. */
                 id: string;
             };
             cookie?: never;

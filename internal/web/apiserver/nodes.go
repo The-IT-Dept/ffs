@@ -15,11 +15,11 @@ import (
 	"github.com/the-it-dept/ffs/internal/web/apigen"
 )
 
-// nodeGroups are the node groups the API shows: the stored groups that have members, plus a
+// readNodeGroups reads the node groups the API shows: the stored groups that have members, plus a
 // nodeinfo fallback group (nodegroup.FallbackGroups) for the nodes no stored group lists. A fallback
 // group whose ID is a stored group's (FallbackID is deterministic) adds its members to that group
 // instead of a second row. Agent groups come first, then nodeinfo groups, each by Label and then ID.
-func (s *Server) nodeGroups(ctx context.Context) ([]model.NodeGroup, error) {
+func (s *Server) readNodeGroups(ctx context.Context) ([]model.NodeGroup, error) {
 	stored, err := s.o.Store.NodeGroups(ctx)
 	if err != nil {
 		return nil, err
@@ -69,34 +69,219 @@ func groupKindRank(k model.NodeGroupKind) int {
 	return 1
 }
 
-// groupOf is the group a node belongs to, as nodeGroups shows them: the stored group that lists it
-// (the answer Store.NodeGroupOfNode gives), else the fallback group holding it. It searches
-// nodeGroups rather than calling Store.NodeGroupOfNode, so a node merged into a stored group from a
-// fallback group with the same ID resolves too.
-func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, bool, error) {
-	groups, err := s.nodeGroups(ctx)
-	if err != nil {
-		return model.NodeGroup{}, false, err
-	}
-	for _, g := range groups {
-		if slices.Contains(g.Members, node) {
-			return g, true, nil
-		}
-	}
-	return model.NodeGroup{}, false, nil
+// groupSet is the node groups the API shows, with the key each is linked by. The key is the
+// group's stable name (nodegroup.GroupName), which survives the fingerprint changes package updates
+// bring. When several current groups share the name, each key adds what tells them apart and also
+// survives package updates: "-<arch>" when they span architectures, and "-nodeinfo" on a nodeinfo
+// group when an agent group shares the name. Groups that still share a key (a rollout of package
+// updates, or two pools with the same OS, kernel and architecture) are each anchored to their first
+// member node, "<key>@<node>", which find follows into whichever group with that key holds the node
+// next. A key that is another group's ID, label or key falls back to the group's ID.
+type groupSet struct {
+	groups []model.NodeGroup
+	keys   map[string]string // group ID → key
+	forms  map[string][]int  // stable form (stableForms) → indexes into groups, in group order
 }
 
-// findGroup is the group nodeGroups shows under id.
-func (s *Server) findGroup(ctx context.Context, id string) (model.NodeGroup, bool, error) {
-	groups, err := s.nodeGroups(ctx)
+const (
+	// nodeInfoSuffix marks a nodeinfo group's key when an agent group shares its stable name.
+	nodeInfoSuffix = "-nodeinfo"
+	// anchorSep joins a key that several groups share to a member node's name. Neither stable
+	// names nor node names (DNS subdomains) contain it.
+	anchorSep = "@"
+)
+
+// stableKey is g's stable name, with its architecture and, for a nodeinfo group, nodeInfoSuffix
+// when asked for.
+func stableKey(g model.NodeGroup, withArch, withKind bool) string {
+	k := g.Name
+	if withArch && g.Arch != "" {
+		k += "-" + g.Arch
+	}
+	if withKind && g.Kind == model.NodeGroupNodeInfo {
+		k += nodeInfoSuffix
+	}
+	return k
+}
+
+// stableForms are the stable keys g may have been linked by, whichever groups shared its name.
+func stableForms(g model.NodeGroup) []string {
+	if g.Name == "" {
+		return nil
+	}
+	forms := []string{stableKey(g, false, false), stableKey(g, true, false)}
+	if g.Kind == model.NodeGroupNodeInfo {
+		forms = append(forms, stableKey(g, false, true), stableKey(g, true, true))
+	}
+	slices.Sort(forms)
+	return slices.Compact(forms)
+}
+
+// spans reports whether the groups at idx differ in attr.
+func spans(groups []model.NodeGroup, idx []int, attr func(model.NodeGroup) string) bool {
+	return slices.ContainsFunc(idx, func(i int) bool { return attr(groups[i]) != attr(groups[idx[0]]) })
+}
+
+func newGroupSet(groups []model.NodeGroup) *groupSet {
+	keys := make([]string, len(groups))
+	byName := map[string][]int{}
+	for i, g := range groups {
+		keys[i] = g.ID
+		if g.Name != "" {
+			byName[g.Name] = append(byName[g.Name], i)
+		}
+	}
+	for _, idx := range byName {
+		withArch := spans(groups, idx, func(g model.NodeGroup) string { return g.Arch })
+		withKind := spans(groups, idx, func(g model.NodeGroup) string { return string(g.Kind) })
+		shared := map[string]int{}
+		for _, i := range idx {
+			keys[i] = stableKey(groups[i], withArch, withKind)
+			shared[keys[i]]++
+		}
+		for _, i := range idx {
+			switch g := groups[i]; {
+			case shared[keys[i]] == 1:
+			case len(g.Members) > 0:
+				keys[i] += anchorSep + g.Members[0]
+			default:
+				keys[i] = g.ID
+			}
+		}
+	}
+	// How many groups each exact reference names: their key, ID and label, each once per group. (A
+	// key that is another group's stable name wins over it in find, as a current key should.)
+	refs := map[string]int{}
+	for i, g := range groups {
+		own := []string{keys[i], g.ID, g.Label}
+		for j, r := range own {
+			if r != "" && !slices.Contains(own[:j], r) {
+				refs[r]++
+			}
+		}
+	}
+	gs := &groupSet{groups: groups, keys: make(map[string]string, len(groups)), forms: map[string][]int{}}
+	for i, g := range groups {
+		if refs[keys[i]] > 1 {
+			keys[i] = g.ID
+		}
+		gs.keys[g.ID] = keys[i]
+		for _, f := range stableForms(g) {
+			gs.forms[f] = append(gs.forms[f], i)
+		}
+	}
+	return gs
+}
+
+// key is the reference API links use for g.
+func (gs *groupSet) key(g model.NodeGroup) string {
+	if k, ok := gs.keys[g.ID]; ok {
+		return k
+	}
+	return g.ID
+}
+
+// find resolves a group reference: a group ID, a current key or label, or a key built while other
+// groups shared the name (or none did). A stable form names the current groups it is a stable form
+// of (stableForms); "<form>-nodeinfo" with none of those names the groups of <form>, which the
+// nodeinfo group's nodes moved to once their agent reported. An anchored reference, "<form>@<node>",
+// is the one of those groups that holds the node; else, and for a bare form, it is the preferred one
+// (preferGroup).
+func (gs *groupSet) find(ref string) (model.NodeGroup, bool) {
+	if ref == "" {
+		return model.NodeGroup{}, false
+	}
+	for _, match := range []func(model.NodeGroup) bool{
+		func(g model.NodeGroup) bool { return g.ID == ref },
+		func(g model.NodeGroup) bool { return gs.keys[g.ID] == ref || g.Label == ref },
+	} {
+		if i := slices.IndexFunc(gs.groups, match); i >= 0 {
+			return gs.groups[i], true
+		}
+	}
+	form, node, anchored := ref, "", false
+	if i := strings.LastIndex(ref, anchorSep); i >= 0 {
+		form, node, anchored = ref[:i], ref[i+len(anchorSep):], true
+	}
+	tiers := [][]int{gs.forms[form]}
+	if base, ok := strings.CutSuffix(form, nodeInfoSuffix); ok {
+		tiers = append(tiers, gs.forms[base])
+	}
+	if anchored {
+		for _, idx := range tiers {
+			if i := slices.IndexFunc(idx, func(j int) bool { return slices.Contains(gs.groups[j].Members, node) }); i >= 0 {
+				return gs.groups[idx[i]], true
+			}
+		}
+	}
+	for _, idx := range tiers {
+		if len(idx) > 0 {
+			return gs.groups[slices.MaxFunc(idx, func(a, b int) int { return preferGroup(gs.groups[a], gs.groups[b]) })], true
+		}
+	}
+	return model.NodeGroup{}, false
+}
+
+// preferGroup is positive when a reference that names both a and b should resolve to a: an agent
+// group first, then the one with the most members, then the most recently seen, then the lowest ID.
+func preferGroup(a, b model.NodeGroup) int {
+	return cmp.Or(cmp.Compare(groupKindRank(b.Kind), groupKindRank(a.Kind)), cmp.Compare(len(a.Members), len(b.Members)),
+		a.LastSeen.Compare(b.LastSeen), strings.Compare(b.ID, a.ID))
+}
+
+// byID is the group with exactly this ID.
+func (gs *groupSet) byID(id string) (model.NodeGroup, bool) {
+	i := slices.IndexFunc(gs.groups, func(g model.NodeGroup) bool { return g.ID == id })
+	if i < 0 {
+		return model.NodeGroup{}, false
+	}
+	return gs.groups[i], true
+}
+
+// of is the group a node belongs to: the stored group that lists it (the answer
+// Store.NodeGroupOfNode gives), else the fallback group holding it. It searches the shown groups
+// rather than calling Store.NodeGroupOfNode, so a node merged into a stored group from a fallback
+// group with the same ID resolves too.
+func (gs *groupSet) of(node string) (model.NodeGroup, bool) {
+	i := slices.IndexFunc(gs.groups, func(g model.NodeGroup) bool { return slices.Contains(g.Members, node) })
+	if i < 0 {
+		return model.NodeGroup{}, false
+	}
+	return gs.groups[i], true
+}
+
+// nodeGroups are the node groups the API shows (readNodeGroups), read once per request.
+func (s *Server) nodeGroups(ctx context.Context) ([]model.NodeGroup, error) {
+	gs, err := s.groupSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return gs.groups, nil
+}
+
+// groupOf is the group a node belongs to (groupSet.of).
+func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, bool, error) {
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return model.NodeGroup{}, false, err
 	}
-	i := slices.IndexFunc(groups, func(g model.NodeGroup) bool { return g.ID == id })
-	if i < 0 {
-		return model.NodeGroup{}, false, nil
+	g, ok := gs.of(node)
+	return g, ok, nil
+}
+
+// findGroup is the group a reference resolves to (groupSet.find): its ID, key, label or a stable form.
+func (s *Server) findGroup(ctx context.Context, ref string) (model.NodeGroup, bool, error) {
+	gs, err := s.groupSet(ctx)
+	if err != nil {
+		return model.NodeGroup{}, false, err
 	}
-	return groups[i], true, nil
+	g, ok := gs.find(ref)
+	return g, ok, nil
+}
+
+// groupScope is the scope API links name a group by: its key.
+func (gs *groupSet) scope(g model.NodeGroup) model.Scope {
+	return model.Scope{Kind: model.ScopeNodeGroup, Value: gs.key(g)}
 }
 
 // groupStats are a group's open host findings (node-level findings only, by its digest); a nodeinfo
@@ -108,17 +293,37 @@ func (s *Server) groupStats(ctx context.Context, g model.NodeGroup) (store.Owner
 	return s.o.Store.ScopeStats(ctx, model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID})
 }
 
-// agentStatuses is the agent status of every stored node, by node name.
-func (s *Server) agentStatuses(ctx context.Context) (map[string]model.NodeAgentStatus, error) {
-	list, err := s.o.Store.AgentStatus(ctx, s.o.Now(), s.o.Config.NodeAgent.StaleAfter)
-	if err != nil {
-		return nil, err
+// hostGapCodes are the node gaps after which ffs does not see a node's host packages in full: its
+// agent is blocked, not reporting or not scheduled on it, it has no package database, or its host
+// inventory is not stored. A content store the agent cannot read concerns side-loaded images only.
+var hostGapCodes = []string{model.GapNodeAgentBlocked, model.GapNoPackageDatabase, model.GapNodeAgentMissing,
+	string(apigen.GapCodeHostNotInventoried), string(apigen.GapCodeNodeAgentUnsupported)}
+
+// hasGap reports whether a node's agent status carries one of codes.
+func hasGap(a model.NodeAgentStatus, codes ...string) bool {
+	return slices.ContainsFunc(a.Coverage, func(g model.NodeCoverageGap) bool { return slices.Contains(codes, g.Code) })
+}
+
+// hostGap reports whether ffs does not see a node's host packages in full (hostGapCodes).
+func hostGap(a model.NodeAgentStatus) bool { return hasGap(a, hostGapCodes...) }
+
+// fullyReporting reports whether a node's agent reports and its host inventory is stored.
+func fullyReporting(a model.NodeAgentStatus) bool {
+	return a.State == model.AgentReporting && !hasGap(a, string(apigen.GapCodeHostNotInventoried))
+}
+
+// memberGaps are the gap codes of a group's members, each once, sorted.
+func memberGaps(g model.NodeGroup, agents *agentView) []apigen.GapCode {
+	out := []apigen.GapCode{}
+	for _, m := range g.Members {
+		for _, gap := range agents.of(m).Coverage {
+			if c := apigen.GapCode(gap.Code); !slices.Contains(out, c) {
+				out = append(out, c)
+			}
+		}
 	}
-	out := make(map[string]model.NodeAgentStatus, len(list))
-	for _, st := range list {
-		out[st.Node] = st
-	}
-	return out, nil
+	slices.Sort(out)
+	return out
 }
 
 // missingAgent is the status of a node the store has no status for: disabled when the node agent
@@ -138,9 +343,10 @@ func liveAgent(st model.AgentState) bool {
 }
 
 // ListNodeGroups lists the control plane and every node group with its members' agent states and
-// field drift against the largest group of the same architecture.
+// coverage gaps and field drift against the largest group of the same architecture. A member whose
+// agent reports but whose host inventory is not stored is not counted as reporting.
 func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequestObject) (apigen.ListNodeGroupsResponseObject, error) {
-	state, err := s.o.Store.NodesState(ctx)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -148,42 +354,38 @@ func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequ
 	if err != nil {
 		return nil, err
 	}
-	groups, err := s.nodeGroups(ctx)
-	if err != nil {
-		return nil, err
-	}
-	agents, err := s.agentStatuses(ctx)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return nil, err
 	}
 	// The base of each architecture: the group with the most members, ties by Label.
 	base := map[string]model.NodeGroup{}
-	for _, g := range groups {
+	for _, g := range gs.groups {
 		b, ok := base[g.Arch]
 		if !ok || len(g.Members) > len(b.Members) || (len(g.Members) == len(b.Members) && g.Label < b.Label) {
 			base[g.Arch] = g
 		}
 	}
-	rows := make([]apigen.NodeGroupRow, 0, len(groups))
-	for _, g := range groups {
+	rows := make([]apigen.NodeGroupRow, 0, len(gs.groups))
+	for _, g := range gs.groups {
 		st, err := s.groupStats(ctx, g)
 		if err != nil {
 			return nil, err
 		}
+		gaps := memberGaps(g, agents)
 		row := apigen.NodeGroupRow{
-			Id: g.ID, Kind: apigen.NodeGroupKind(g.Kind), Name: g.Name, Label: g.Label, OsImage: g.OSImage,
+			Id: gs.key(g), Kind: apigen.NodeGroupKind(g.Kind), Name: g.Name, Label: g.Label, OsImage: g.OSImage,
 			KernelRelease: g.KernelRelease, ContainerRuntimeVersion: g.ContainerRuntimeVersion, KubeletVersion: g.KubeletVersion,
 			Arch: g.Arch, Members: len(g.Members), ExposedNodes: len(g.ExposedNodes), Counts: priorityCounts(st.Counts),
-			Fixable: st.Fixable,
+			Fixable: st.Fixable, Gaps: &gaps,
 		}
 		for _, m := range g.Members {
-			a, ok := agents[m]
-			if !ok {
-				a = missingAgent(m, state.AgentEnabled)
-			}
+			a := agents.of(m)
 			switch a.State {
 			case model.AgentReporting:
-				row.Agents.Reporting++
+				if fullyReporting(a) {
+					row.Agents.Reporting++
+				}
 			case model.AgentStale:
 				row.Agents.Stale++
 			case model.AgentNever:
@@ -201,51 +403,41 @@ func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequ
 		rows = append(rows, row)
 	}
 	cluster, at := s.stamp()
-	return apigen.ListNodeGroups200JSONResponse{Cluster: cluster, GeneratedAt: at, AgentEnabled: state.AgentEnabled,
+	return apigen.ListNodeGroups200JSONResponse{Cluster: cluster, GeneratedAt: at, AgentEnabled: agents.enabled,
 		ControlPlane: cp, Groups: rows}, nil
 }
 
-// GetNodeGroup is one node group: its description, members, drift against every other group (with
-// the package comparison when both are agent groups), an optional detailed comparison, its host
-// findings and the images cached on its members.
+// GetNodeGroup is one node group, found by its key, a stable form of it, its label or its ID
+// (groupSet.find): its description, members, drift against every other group (with the package
+// comparison when both are agent groups), an optional detailed comparison, its host findings and
+// the images cached on its members.
 func (s *Server) GetNodeGroup(ctx context.Context, req apigen.GetNodeGroupRequestObject) (apigen.GetNodeGroupResponseObject, error) {
-	groups, err := s.nodeGroups(ctx)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return nil, err
 	}
-	find := func(id string) (model.NodeGroup, bool) {
-		i := slices.IndexFunc(groups, func(g model.NodeGroup) bool { return g.ID == id })
-		if i < 0 {
-			return model.NodeGroup{}, false
-		}
-		return groups[i], true
-	}
-	g, ok := find(req.Id)
+	g, ok := gs.find(req.Id)
 	if !ok {
 		return nil, notFound("node group " + req.Id + " not found")
 	}
 	var compare *model.NodeGroup
 	if req.Params.Compare != nil && *req.Params.Compare != "" {
-		other, ok := find(*req.Params.Compare)
+		other, ok := gs.find(*req.Params.Compare)
 		if !ok {
 			return nil, notFound("node group " + *req.Params.Compare + " not found")
 		}
 		compare = &other
 	}
-	state, err := s.o.Store.NodesState(ctx)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return nil, err
 	}
-	agents, err := s.agentStatuses(ctx)
+	members, err := s.nodeRows(ctx, g, agents)
 	if err != nil {
 		return nil, err
 	}
-	members, err := s.nodeRows(ctx, g, agents, state.AgentEnabled)
-	if err != nil {
-		return nil, err
-	}
-	drift := make([]apigen.DriftRow, 0, len(groups))
-	for _, other := range groups {
+	drift := make([]apigen.DriftRow, 0, len(gs.groups))
+	for _, other := range gs.groups {
 		if other.ID == g.ID {
 			continue
 		}
@@ -254,7 +446,7 @@ func (s *Server) GetNodeGroup(ctx context.Context, req apigen.GetNodeGroupReques
 			return nil, err
 		}
 		drift = append(drift, apigen.DriftRow{
-			Other: groupRef(other), Summary: nodegroup.Summary(d), Fields: fieldDrift(d.Fields), PackagesCompared: d.PackagesCompared,
+			Other: gs.ref(other), Summary: nodegroup.Summary(d), Fields: fieldDrift(d.Fields), PackagesCompared: d.PackagesCompared,
 			NewerHere: d.NewerInTo, NewerThere: d.NewerInFrom, OnlyHere: len(d.OnlyTo), OnlyThere: len(d.OnlyFrom),
 		})
 	}
@@ -268,11 +460,11 @@ func (s *Server) GetNodeGroup(ctx context.Context, req apigen.GetNodeGroupReques
 		if err != nil {
 			return nil, err
 		}
-		cached = liveImages(imgs, agents)
+		cached = liveImages(imgs, agents.byNode)
 	}
 	cluster, at := s.stamp()
 	out := apigen.GetNodeGroup200JSONResponse{
-		Cluster: cluster, GeneratedAt: at, Group: nodeGroupOf(g), AgentData: g.Kind == model.NodeGroupAgent, Members: members,
+		Cluster: cluster, GeneratedAt: at, Group: nodeGroupOf(g, gs.key(g)), AgentData: g.Kind == model.NodeGroupAgent, Members: members,
 		Drift: drift, Counts: priorityCounts(st.Counts), Fixable: st.Fixable, CachedImages: cached,
 	}
 	if compare != nil {
@@ -280,7 +472,7 @@ func (s *Server) GetNodeGroup(ctx context.Context, req apigen.GetNodeGroupReques
 		if err != nil {
 			return nil, err
 		}
-		out.Compare = driftDetail(d)
+		out.Compare = driftDetail(d, gs.key(*compare), gs.key(g))
 	}
 	return out, nil
 }
@@ -296,7 +488,7 @@ func (s *Server) drift(ctx context.Context, from, to model.NodeGroup) (model.Nod
 
 // nodeRows are a group's members: readiness from the inventory, exposure from the group, and the
 // agent status.
-func (s *Server) nodeRows(ctx context.Context, g model.NodeGroup, agents map[string]model.NodeAgentStatus, enabled bool) ([]apigen.NodeRow, error) {
+func (s *Server) nodeRows(ctx context.Context, g model.NodeGroup, agents *agentView) ([]apigen.NodeRow, error) {
 	nodes, err := s.o.Store.ListNodes(ctx)
 	if err != nil {
 		return nil, err
@@ -307,11 +499,8 @@ func (s *Server) nodeRows(ctx context.Context, g model.NodeGroup, agents map[str
 	}
 	out := make([]apigen.NodeRow, 0, len(g.Members))
 	for _, m := range g.Members {
-		a, ok := agents[m]
-		if !ok {
-			a = missingAgent(m, enabled)
-		}
-		out = append(out, apigen.NodeRow{Name: m, Ready: ready[m], Exposed: slices.Contains(g.ExposedNodes, m), Agent: agentStatusOf(a)})
+		out = append(out, apigen.NodeRow{Name: m, Ready: ready[m], Exposed: slices.Contains(g.ExposedNodes, m),
+			Agent: agentStatusOf(agents.of(m))})
 	}
 	return out, nil
 }
@@ -346,10 +535,11 @@ func (s *Server) GetNode(ctx context.Context, req apigen.GetNodeRequestObject) (
 	if pv, ok := eol.NodeOSProduct(n.OSImage); ok {
 		info.OsEol = s.eolFor(pv)
 	}
-	g, inGroup, err := s.groupOf(ctx, n.Name)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return nil, err
 	}
+	g, inGroup := gs.of(n.Name)
 	agent, ok, err := s.o.Store.NodeAgentStatus(ctx, n.Name, s.o.Now(), s.o.Config.NodeAgent.StaleAfter)
 	if err != nil {
 		return nil, err
@@ -366,7 +556,7 @@ func (s *Server) GetNode(ctx context.Context, req apigen.GetNodeRequestObject) (
 		st  store.OwnerStats
 	)
 	if inGroup {
-		r := groupRef(g)
+		r := gs.ref(g)
 		ref = &r
 		if st, err = s.groupStats(ctx, g); err != nil {
 			return nil, err
@@ -409,7 +599,11 @@ func (s *Server) controlPlane(ctx context.Context) (apigen.ControlPlane, error) 
 	if err != nil {
 		return apigen.ControlPlane{}, err
 	}
-	suggestions, err := s.suggestions(ctx, func(owner string, _ model.Suggestion) bool { return isControlPlaneKey(owner) })
+	keys, err := s.controlPlaneKeys(ctx)
+	if err != nil {
+		return apigen.ControlPlane{}, err
+	}
+	suggestions, err := s.suggestions(ctx, func(owner string, _ model.Suggestion) bool { return slices.Contains(keys, owner) })
 	if err != nil {
 		return apigen.ControlPlane{}, err
 	}
@@ -449,11 +643,6 @@ func (s *Server) controlPlane(ctx context.Context) (apigen.ControlPlane, error) 
 	return out, nil
 }
 
-// isControlPlaneKey reports whether an owner key is the Cluster's or a ContainerRuntime's.
-func isControlPlaneKey(key string) bool {
-	return strings.HasPrefix(key, model.OwnerKindCluster+"/") || strings.HasPrefix(key, model.OwnerKindContainerRuntime+"/")
-}
-
 // eolFor is the lifecycle status of a product version; nil without lifecycle data or a known cycle.
 func (s *Server) eolFor(pv eol.ProductVersion) *apigen.EOL {
 	if s.o.EOL == nil {
@@ -467,13 +656,15 @@ func (s *Server) eolFor(pv eol.ProductVersion) *apigen.EOL {
 	return &e
 }
 
-func groupRef(g model.NodeGroup) apigen.GroupRef {
-	return apigen.GroupRef{Id: g.ID, Label: g.Label, Kind: apigen.NodeGroupKind(g.Kind)}
+// ref is a reference to g by its key.
+func (gs *groupSet) ref(g model.NodeGroup) apigen.GroupRef {
+	return apigen.GroupRef{Id: gs.key(g), Label: g.Label, Kind: apigen.NodeGroupKind(g.Kind)}
 }
 
-func nodeGroupOf(g model.NodeGroup) apigen.NodeGroup {
+// nodeGroupOf shapes g, identified by key.
+func nodeGroupOf(g model.NodeGroup, key string) apigen.NodeGroup {
 	out := apigen.NodeGroup{
-		Id: g.ID, Kind: apigen.NodeGroupKind(g.Kind), Name: g.Name, Label: g.Label, Digest: g.Digest, OsImage: g.OSImage,
+		Id: key, Kind: apigen.NodeGroupKind(g.Kind), Name: g.Name, Label: g.Label, Digest: g.Digest, OsImage: g.OSImage,
 		KernelRelease: g.KernelRelease, ContainerRuntimeVersion: g.ContainerRuntimeVersion, KubeletVersion: g.KubeletVersion,
 		Arch: g.Arch, Binaries: []apigen.NodeBinary{}, PackageDb: g.PackageDB, PackageCount: g.PackageCount,
 		FirstSeen: optTime(g.FirstSeen), LastSeen: optTime(g.LastSeen),
@@ -532,9 +723,9 @@ func driftPackages(ps []model.DriftPackage) []apigen.DriftPackage {
 	return out
 }
 
-// driftDetail shapes a comparison: from is the other group and to is this one.
-func driftDetail(d model.NodeDrift) *apigen.NodeDriftDetail {
-	out := &apigen.NodeDriftDetail{From: d.From, To: d.To, Fields: fieldDrift(d.Fields), PackagesCompared: d.PackagesCompared,
+// driftDetail shapes a comparison: from is the other group and to is this one, by their keys.
+func driftDetail(d model.NodeDrift, from, to string) *apigen.NodeDriftDetail {
+	out := &apigen.NodeDriftDetail{From: from, To: to, Fields: fieldDrift(d.Fields), PackagesCompared: d.PackagesCompared,
 		OnlyFrom: driftPackages(d.OnlyFrom), OnlyTo: driftPackages(d.OnlyTo), Changed: []apigen.VersionDrift{}}
 	for _, c := range d.Changed {
 		out.Changed = append(out.Changed, apigen.VersionDrift{Ecosystem: c.Ecosystem, Name: c.Name, Arch: c.Arch, From: c.From,

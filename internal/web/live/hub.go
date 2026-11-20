@@ -56,16 +56,17 @@ type NodeMarks func(ctx context.Context) (string, error)
 // Clock the real clock, a nil Marks or Nodes polls nothing of that kind, and a nil Store leaves
 // owner digests unexpanded.
 type Options struct {
-	Store      *store.Store
-	Marks      MarkSource
-	Nodes      NodeMarks
-	Coalesce   time.Duration // 2s: how long changes gather into one event
-	Poll       time.Duration // 2s: how often the change marks are compared
-	Heartbeat  time.Duration // 25s: how often an idle stream gets a comment
-	Ring       int           // 256: how many events are kept for replay
-	MaxStreams int           // 64: open streams at once
-	Now        func() time.Time
-	Log        logr.Logger
+	Store        *store.Store
+	Marks        MarkSource
+	Nodes        NodeMarks
+	Coalesce     time.Duration // 2s: how long changes gather into one event
+	Poll         time.Duration // 2s: how often the change marks are compared
+	Heartbeat    time.Duration // 25s: how often an idle stream gets a comment
+	WriteTimeout time.Duration // 10s: how long one write to a stream may block
+	Ring         int           // 256: how many events are kept for replay
+	MaxStreams   int           // 64: open streams at once
+	Now          func() time.Time
+	Log          logr.Logger
 	// Clock drives the coalescer, the poller and the heartbeats. It needs AfterFunc as well as
 	// NewTicker, so it is a WithTickerAndDelayedExecution (clock.RealClock and the fake clock
 	// implement it).
@@ -75,11 +76,12 @@ type Options struct {
 }
 
 const (
-	defaultCoalesce   = 2 * time.Second
-	defaultPoll       = 2 * time.Second
-	defaultHeartbeat  = 25 * time.Second
-	defaultRing       = 256
-	defaultMaxStreams = 64
+	defaultCoalesce     = 2 * time.Second
+	defaultPoll         = 2 * time.Second
+	defaultHeartbeat    = 25 * time.Second
+	defaultWriteTimeout = 10 * time.Second
+	defaultRing         = 256
+	defaultMaxStreams   = 64
 
 	// subscriberBuffer is how many events a stream may fall behind before it is closed; its browser
 	// reconnects and replays from the ring.
@@ -128,6 +130,9 @@ func NewHub(o Options) *Hub {
 	}
 	if o.Heartbeat <= 0 {
 		o.Heartbeat = defaultHeartbeat
+	}
+	if o.WriteTimeout <= 0 {
+		o.WriteTimeout = defaultWriteTimeout
 	}
 	if o.Ring <= 0 {
 		o.Ring = defaultRing

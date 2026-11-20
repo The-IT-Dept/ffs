@@ -539,3 +539,113 @@ func TestImagePackages_SearchFindingsAndHostDigests(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []FacetValue{{"deb", 2}, {"npm", 1}}, eco)
 }
+
+// A host package and a container package at the same version: over the cluster the packages
+// explorer counts only the container image's finding, while a namespace scope counts its own.
+func TestPackagesPage_ClusterCountsContainerFindingsOnly(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	stdlib := model.Package{Ecosystem: "go-module", Name: "stdlib", Version: "go1.24.1", GoStdlib: true, Path: "/bin/app"}
+	put(t, s, "sha256:worker", stdlib)
+	put(t, s, "nodegroup:g1", stdlib)
+	onStdlib := func(digest string) func(*model.Finding) {
+		return func(f *model.Finding) {
+			f.Digests = []string{digest}
+			f.Packages = []model.FindingPackage{{Name: "stdlib", Ecosystem: "go-module", Installed: "go1.24.1"}}
+		}
+	}
+	apply(t, s,
+		uiFinding(exWorker, "ghcr.io/example/worker", "GO-2026-0001", model.PriorityMedium, onStdlib("sha256:worker")),
+		uiFinding(exNodes, model.HostRepo, "GO-2026-0001", model.PriorityUrgent, onStdlib("nodegroup:g1")),
+		uiFinding(exCluster, "kubernetes", "GO-2026-0002", model.PriorityHigh, onStdlib("k8s:1.35.1")),
+	)
+	row := func(sc model.Scope) PackageRow {
+		t.Helper()
+		page, err := s.PackagesPage(ctx, PackageEntityQuery{Scope: sc, Q: "stdlib", Limit: 200})
+		require.NoError(t, err)
+		require.Len(t, page.Rows, 1)
+		return page.Rows[0]
+	}
+	cluster := row(model.Scope{Kind: model.ScopeCluster})
+	require.Equal(t, PriorityCounts{Medium: 1}, cluster.Counts, "the host and Kubernetes findings are not on a container image")
+	require.Equal(t, model.PriorityMedium, cluster.Worst)
+	require.Equal(t, 1, cluster.Images, "the host SBOM is not an in-use container image")
+	require.Equal(t, PriorityCounts{Medium: 1}, row(model.Scope{Kind: model.ScopeNamespace, Value: "shop"}).Counts)
+
+	facets, err := s.PackageFacets(ctx, PackageEntityQuery{Q: "stdlib"}, []string{"priority"})
+	require.NoError(t, err)
+	require.Contains(t, facets["priority"], FacetValue{Value: "medium", Count: 1})
+	require.Contains(t, facets["priority"], FacetValue{Value: "urgent", Count: 0})
+}
+
+func TestInstalledVersions_ByDigestAndName(t *testing.T) {
+	s := newStore(t)
+	put(t, s, "nodegroup:g1",
+		model.Package{Ecosystem: "deb", Name: "openssl", Version: "3.0.13-0ubuntu3", Arch: "amd64"},
+		model.Package{Ecosystem: "deb", Name: "libc6", Epoch: "1", Version: "2.39-0ubuntu8", Arch: "amd64"},
+		model.Package{Ecosystem: "deb", Name: "zlib1g", Version: "1.3", Arch: "amd64"})
+	put(t, s, "nodegroup:g2", model.Package{Ecosystem: "deb", Name: "openssl", Version: "3.0.13-0ubuntu3.1", Arch: "amd64"},
+		model.Package{Ecosystem: "rpm", Name: "openssl", Version: "3.2.2", Arch: "x86_64"})
+
+	got, err := s.InstalledVersions(ctx, []string{"nodegroup:g1", "nodegroup:g2", "nodegroup:none"},
+		[]PackageName{{Ecosystem: "deb", Name: "openssl"}, {Ecosystem: "deb", Name: "libc6"}})
+	require.NoError(t, err)
+	require.Equal(t, map[string][]InstalledVersion{
+		"nodegroup:g1": {{PackageName{"deb", "libc6"}, "1:2.39-0ubuntu8"}, {PackageName{"deb", "openssl"}, "3.0.13-0ubuntu3"}},
+		"nodegroup:g2": {{PackageName{"deb", "openssl"}, "3.0.13-0ubuntu3.1"}},
+	}, got, "versions are epoch-prefixed as findings record them; another ecosystem's openssl is left out")
+
+	empty, err := s.InstalledVersions(ctx, nil, []PackageName{{Ecosystem: "deb", Name: "openssl"}})
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}
+
+// The rail's count-only reads give the explorers' totals, two stored forms of one installed
+// version counting once.
+func TestEntityCounts_MatchExplorerTotals(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	put(t, s, "sha256:web", model.Package{Ecosystem: "deb", Name: "libc6", Epoch: "1", Version: "2.36-9"}, deb("openssl", ""))
+	put(t, s, "sha256:worker", model.Package{Ecosystem: "deb", Name: "libc6", Version: "1:2.36-9"}, deb("zlib1g", ""))
+	put(t, s, "sha256:api", deb("openssl", ""))
+	put(t, s, "nodegroup:g1", deb("kmod", ""))
+	for _, sc := range []model.Scope{{Kind: model.ScopeCluster}, {Kind: model.ScopeNamespace, Value: "shop"},
+		{Kind: model.ScopeNamespace, Value: "payments"}, {Kind: model.ScopeNamespace, Value: "ops"}, {Kind: model.ScopeNamespace, Value: "none"}} {
+		got, err := s.EntityCounts(ctx, sc)
+		require.NoError(t, err)
+		wl, err := s.WorkloadsPage(ctx, WorkloadQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		im, err := s.ImagesPage(ctx, ImageQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		pk, err := s.PackagesPage(ctx, PackageEntityQuery{Scope: sc, Limit: 1})
+		require.NoError(t, err)
+		require.Equal(t, EntityCounts{Workloads: wl.Total, Images: im.Total, Packages: pk.Total}, got, sc.String())
+	}
+	cluster, err := s.EntityCounts(ctx, model.Scope{Kind: model.ScopeCluster})
+	require.NoError(t, err)
+	require.Equal(t, EntityCounts{Workloads: 7, Images: 7, Packages: 3}, cluster, "libc6 once, openssl, zlib1g; the host's kmod is not counted")
+	_, err = s.EntityCounts(ctx, model.Scope{Kind: model.ScopeWorkload, Value: exWeb.Key()})
+	require.ErrorIs(t, err, ErrScope)
+}
+
+// The image gap tally counts what CoverageImages lists: one gap for an image not seen into, one per
+// partial-coverage reason, and hands back the classifier-found packages of the catalogued images.
+func TestImageGapTally_CountsCodes(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	redis := model.Package{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary", Path: "/usr/local/bin/redis-server"}
+	put(t, s, "sha256:worker", redis)
+	put(t, s, "sha256:node-exporter", redis) // pending: its packages are not counted
+	tally, err := s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeCluster})
+	require.NoError(t, err)
+	// api (attestation), node-exporter (pending), the placeholder (unresolvable), norow (no row)
+	require.Equal(t, 4, tally.Codes)
+	require.Len(t, tally.Classified, 1)
+	require.Equal(t, []string{"redis-server"}, names(tally.Classified["sha256:worker"]))
+
+	require.NoError(t, s.MarkUnmatched(ctx, "sha256:worker", t0))
+	tally, err = s.ImageGapTally(ctx, model.Scope{Kind: model.ScopeNamespace, Value: "shop"})
+	require.NoError(t, err)
+	require.Equal(t, 1, tally.Codes, "worker is pending until its first match")
+	require.Empty(t, tally.Classified)
+}

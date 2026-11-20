@@ -122,7 +122,7 @@ func (s *Server) GetSummary(ctx context.Context, req apigen.GetSummaryRequestObj
 	if err != nil {
 		return nil, err
 	}
-	gaps, err := s.scopeGaps(ctx, sc)
+	gaps, err := s.scopeGapCount(ctx, sc)
 	if err != nil {
 		return nil, err
 	}
@@ -130,6 +130,6 @@ func (s *Server) GetSummary(ctx context.Context, req apigen.GetSummaryRequestObj
 	return apigen.GetSummary200JSONResponse{
 		Cluster: cluster, GeneratedAt: at, Scope: scopeRef(sc, label), Reachable: n, ReachableUrgent: urgent,
 		Findings: priorityCounts(stats.Counts), Open: stats.Open, Fixable: stats.Fixable, Exploited: stats.Exploited,
-		Coverage: coverageFigure(cov), Feeds: feeds, Gaps: len(gaps),
+		Coverage: coverageFigure(cov), Feeds: feeds, Gaps: gaps,
 	}, nil
 }

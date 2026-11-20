@@ -157,6 +157,53 @@ func (s *Server) scopeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, e
 	return gaps, nil
 }
 
+// scopeGapCount is len(scopeGaps(sc)), counted without listing the gaps: the stale feeds, the image
+// gaps from the store's tally (the scope's images are never read one by one), and the node gaps.
+func (s *Server) scopeGapCount(ctx context.Context, sc model.Scope) (int, error) {
+	states, err := s.feedStates(ctx)
+	if err != nil {
+		return 0, err
+	}
+	n := 0
+	now := s.o.Now()
+	for i, st := range states {
+		if stale(st, s.o.Feeds[i], now) {
+			n++
+		}
+	}
+	switch sc.Kind {
+	case model.ScopeCluster, model.ScopeNamespace, model.ScopeWorkload:
+		t, err := s.o.Store.ImageGapTally(ctx, sc)
+		if err != nil {
+			return 0, err
+		}
+		n += t.Codes
+		for _, pkgs := range t.Classified {
+			if len(upstream.UncoveredClassified(pkgs)) > 0 {
+				n++
+			}
+		}
+	case model.ScopeImage:
+		images, err := s.gapImages(ctx, sc)
+		if err != nil {
+			return 0, err
+		}
+		for _, c := range images {
+			classified, err := s.o.Store.ClassifiedPackages(ctx, []string{c.Image.Digest})
+			if err != nil {
+				return 0, err
+			}
+			n += len(imageGaps(c.Image, c.HasRow, upstream.UncoveredClassified(classified[c.Image.Digest])))
+		}
+	case model.ScopeNodeGroup, model.ScopeNode, model.ScopeControlPlane:
+	}
+	nodeGaps, err := s.nodeGaps(ctx, sc)
+	if err != nil {
+		return 0, err
+	}
+	return n + len(nodeGaps), nil
+}
+
 func targetLabel(g apigen.Gap) string {
 	if g.Target == nil {
 		return g.What
@@ -206,16 +253,12 @@ func (s *Server) nodeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, er
 	case model.ScopeNamespace, model.ScopeWorkload, model.ScopeImage, model.ScopeControlPlane:
 		return nil, nil
 	}
-	state, err := s.o.Store.NodesState(ctx)
-	if err != nil {
-		return nil, err
-	}
-	agents, err := s.agentStatuses(ctx)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return nil, err
 	}
 	if nodes == nil {
-		nodes = slices.Sorted(maps.Keys(agents))
+		nodes = slices.Sorted(maps.Keys(agents.byNode))
 	}
 	type affected struct {
 		nodes  []string
@@ -223,11 +266,7 @@ func (s *Server) nodeGaps(ctx context.Context, sc model.Scope) ([]apigen.Gap, er
 	}
 	byCode := map[string]*affected{}
 	for _, n := range slices.Sorted(slices.Values(nodes)) {
-		a, ok := agents[n]
-		if !ok {
-			a = missingAgent(n, state.AgentEnabled)
-		}
-		for _, g := range a.Coverage {
+		for _, g := range agents.of(n).Coverage {
 			x := byCode[g.Code]
 			if x == nil {
 				x = &affected{detail: g.Detail}

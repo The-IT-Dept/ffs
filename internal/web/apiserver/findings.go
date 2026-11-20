@@ -1,6 +1,7 @@
 package apiserver
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
 )
@@ -182,7 +184,19 @@ func findingFacets(q store.FindingQuery, counts map[store.FindingFacet][]store.F
 	for f, vals := range counts {
 		out[string(f)] = facetValues(vals, selected[f])
 	}
+	for i, v := range out[string(store.FacetKind)] {
+		if label, ok := clusterLevelKinds[v.Value]; ok {
+			out[string(store.FacetKind)][i].Label = &label
+		}
+	}
 	return out
+}
+
+// clusterLevelKinds labels the kind facet values of the cluster-level owners.
+var clusterLevelKinds = map[string]string{
+	store.ClusterLevelKindPrefix + model.OwnerKindCluster:          "Kubernetes (control plane)",
+	store.ClusterLevelKindPrefix + model.OwnerKindContainerRuntime: "Container runtime (control plane)",
+	store.ClusterLevelKindPrefix + model.OwnerKindNodes:            "Nodes (host packages)",
 }
 
 // facetValues shapes store facet values, in their order, marking the selected ones.
@@ -202,13 +216,18 @@ func stringsOf[T ~string](vs []T) []string {
 	return out
 }
 
-// findingRows shapes a page of findings, reading their advisories in one call.
+// findingRows shapes a page of findings, reading their advisories in one call. A host finding names
+// the node groups it affects.
 func (s *Server) findingRows(ctx context.Context, fs []model.Finding) ([]apigen.FindingRow, error) {
 	ids := make([]string, 0, len(fs))
 	for _, f := range fs {
 		ids = append(ids, f.AdvisoryID)
 	}
 	advs, err := s.o.Store.Advisories(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	hostGroups, err := s.hostGroups(ctx, fs)
 	if err != nil {
 		return nil, err
 	}
@@ -231,9 +250,115 @@ func (s *Server) findingRows(ctx context.Context, fs []model.Finding) ([]apigen.
 		if f.ResolvedAt != nil {
 			row.ResolvedAt = optTime(*f.ResolvedAt)
 		}
+		if isHostFinding(f) {
+			groups := nz(hostGroups[f.Fingerprint])
+			row.NodeGroups = &groups
+		}
 		out = append(out, row)
 	}
 	return out, nil
+}
+
+// isHostFinding reports whether f is on a node's host packages: its owner is the Nodes owner.
+func isHostFinding(f model.Finding) bool {
+	return f.Owner.Kind == model.OwnerKindNodes && f.Owner.Namespace == ""
+}
+
+// groupVersion is one installed version of a FindingNodeGroup.
+type groupVersion = struct {
+	Package string `json:"package"`
+	Version string `json:"version"`
+}
+
+// hostGroups lists, per host finding of fs by fingerprint, the current node groups whose host
+// packages it is on (its nodegroup: digests), by label: each by its key, with its member count and
+// the installed versions of the finding's packages there. A group that no longer has members is
+// left out.
+func (s *Server) hostGroups(ctx context.Context, fs []model.Finding) (map[string][]apigen.FindingNodeGroup, error) {
+	out := map[string][]apigen.FindingNodeGroup{}
+	var (
+		digests []string
+		names   []store.PackageName
+	)
+	for _, f := range fs {
+		if !isHostFinding(f) {
+			continue
+		}
+		for _, d := range f.Digests {
+			if _, ok := nodegroup.IDFromDigest(d); ok && !slices.Contains(digests, d) {
+				digests = append(digests, d)
+			}
+		}
+		for _, p := range f.Packages {
+			if n := (store.PackageName{Ecosystem: p.Ecosystem, Name: p.Name}); !slices.Contains(names, n) {
+				names = append(names, n)
+			}
+		}
+	}
+	if len(digests) == 0 {
+		return out, nil
+	}
+	gs, err := s.groupSet(ctx)
+	if err != nil {
+		return nil, err
+	}
+	versions, err := s.o.Store.InstalledVersions(ctx, digests, names)
+	if err != nil {
+		return nil, err
+	}
+	for _, f := range fs {
+		if !isHostFinding(f) {
+			continue
+		}
+		var groups []apigen.FindingNodeGroup
+		for _, d := range f.Digests {
+			id, ok := nodegroup.IDFromDigest(d)
+			if !ok {
+				continue
+			}
+			g, ok := gs.byID(id)
+			if !ok || slices.ContainsFunc(groups, func(x apigen.FindingNodeGroup) bool { return x.Id == gs.key(g) }) {
+				continue
+			}
+			fg := apigen.FindingNodeGroup{Id: gs.key(g), Label: g.Label, Nodes: len(g.Members), Versions: []groupVersion{}}
+			for _, v := range versions[d] {
+				if slices.ContainsFunc(f.Packages, func(p model.FindingPackage) bool { return p.Ecosystem == v.Ecosystem && p.Name == v.Name }) {
+					fg.Versions = append(fg.Versions, groupVersion{Package: v.Name, Version: v.Version})
+				}
+			}
+			groups = append(groups, fg)
+		}
+		slices.SortFunc(groups, func(a, b apigen.FindingNodeGroup) int { return strings.Compare(a.Label, b.Label) })
+		out[f.Fingerprint] = groups
+	}
+	return out, nil
+}
+
+// mergeHostGroups merges the node groups of several host findings: each group once, with the union
+// of their installed versions, by package and version; groups by label.
+func mergeHostGroups(byFinding map[string][]apigen.FindingNodeGroup) []apigen.FindingNodeGroup {
+	out := []apigen.FindingNodeGroup{}
+	for _, groups := range byFinding {
+		for _, g := range groups {
+			i := slices.IndexFunc(out, func(x apigen.FindingNodeGroup) bool { return x.Id == g.Id })
+			if i < 0 {
+				out = append(out, apigen.FindingNodeGroup{Id: g.Id, Label: g.Label, Nodes: g.Nodes, Versions: []groupVersion{}})
+				i = len(out) - 1
+			}
+			for _, v := range g.Versions {
+				if !slices.Contains(out[i].Versions, v) {
+					out[i].Versions = append(out[i].Versions, v)
+				}
+			}
+		}
+	}
+	for i := range out {
+		slices.SortFunc(out[i].Versions, func(a, b groupVersion) int {
+			return cmp.Or(strings.Compare(a.Package, b.Package), strings.Compare(a.Version, b.Version))
+		})
+	}
+	slices.SortFunc(out, func(a, b apigen.FindingNodeGroup) int { return strings.Compare(a.Label, b.Label) })
+	return out
 }
 
 // groupRowOf shapes a group of findings. The store labels every group with its key; the label here

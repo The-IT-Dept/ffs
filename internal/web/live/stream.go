@@ -2,11 +2,13 @@ package live
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/the-it-dept/ffs/internal/web/apigen"
 )
@@ -50,15 +52,26 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	hd.Set("Content-Type", "text/event-stream")
 	hd.Set("X-Accel-Buffering", "no")
 	rc := http.NewResponseController(w)
-	if _, err := fmt.Fprintf(w, "retry: %d\n\n", retryMillis); err != nil {
-		return
-	}
-	for _, ev := range first {
-		if writeEvent(w, ev) != nil {
-			return
+	// send writes and flushes one block under a write deadline, so a client that stops reading
+	// releases the stream (and lets Close end it) instead of pinning it. The deadline is the
+	// connection's, on the wall clock.
+	send := func(write func() error) bool {
+		if err := rc.SetWriteDeadline(time.Now().Add(h.o.WriteTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return false
 		}
+		return write() == nil && rc.Flush() == nil
 	}
-	if rc.Flush() != nil {
+	if !send(func() error {
+		if _, err := fmt.Fprintf(w, "retry: %d\n\n", retryMillis); err != nil {
+			return err
+		}
+		for _, ev := range first {
+			if err := writeEvent(w, ev); err != nil {
+				return err
+			}
+		}
+		return nil
+	}) {
 		return
 	}
 	for {
@@ -70,11 +83,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case <-sub.gone:
 			return
 		case ev := <-sub.ch:
-			if writeEvent(w, ev) != nil || rc.Flush() != nil {
+			if !send(func() error { return writeEvent(w, ev) }) {
 				return
 			}
 		case <-ticker.C():
-			if _, err := io.WriteString(w, ": ping\n\n"); err != nil || rc.Flush() != nil {
+			if !send(func() error { _, err := io.WriteString(w, ": ping\n\n"); return err }) {
 				return
 			}
 		}

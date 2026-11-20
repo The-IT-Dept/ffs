@@ -140,13 +140,13 @@ func intp(n int) *int { return &n }
 func (r *rail) cluster(ctx context.Context) error {
 	s, sc := r.s, r.sc
 	var (
-		ci                       model.ClusterInfo
-		nodes                    []model.Node
-		nss                      []store.NamespaceStat
-		stats                    store.OwnerStats
-		reach, wl, im, pk, ngaps int
-		agents                   map[string]model.NodeAgentStatus
-		state                    store.NodesState
+		ci           model.ClusterInfo
+		nodes        []model.Node
+		nss          []store.NamespaceStat
+		stats        store.OwnerStats
+		counts       store.EntityCounts
+		reach, ngaps int
+		agents       *agentView
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { ci, _, err = s.o.Store.GetClusterInfo(gctx); return err })
@@ -154,28 +154,9 @@ func (r *rail) cluster(ctx context.Context) error {
 	g.Go(func() (err error) { nss, err = s.o.Store.NamespaceStats(gctx); return err })
 	g.Go(func() (err error) { stats, err = s.o.Store.ScopeStats(gctx, sc); return err })
 	g.Go(func() (err error) { reach, _, err = s.reachable(gctx, sc); return err })
-	g.Go(func() error {
-		p, err := s.o.Store.WorkloadsPage(gctx, store.WorkloadQuery{Scope: sc, Limit: 1})
-		wl = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.ImagesPage(gctx, store.ImageQuery{Scope: sc, Limit: 1})
-		im = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.PackagesPage(gctx, store.PackageEntityQuery{Scope: sc, Limit: 1})
-		pk = p.Total
-		return err
-	})
-	g.Go(func() error {
-		gaps, err := s.scopeGaps(gctx, sc)
-		ngaps = len(gaps)
-		return err
-	})
-	g.Go(func() (err error) { agents, err = s.agentStatuses(gctx); return err })
-	g.Go(func() (err error) { state, err = s.o.Store.NodesState(gctx); return err })
+	g.Go(func() (err error) { counts, err = s.o.Store.EntityCounts(gctx, sc); return err })
+	g.Go(func() (err error) { ngaps, err = s.scopeGapCount(gctx, sc); return err })
+	g.Go(func() (err error) { agents, err = s.agentView(gctx); return err })
 	if err := g.Wait(); err != nil {
 		return err
 	}
@@ -187,17 +168,13 @@ func (r *rail) cluster(ctx context.Context) error {
 
 	nodesGap := false
 	for _, n := range nodes {
-		a, ok := agents[n.Name]
-		if !ok {
-			a = missingAgent(n.Name, state.AgentEnabled)
-		}
-		nodesGap = nodesGap || len(a.Coverage) > 0
+		nodesGap = nodesGap || len(agents.of(n.Name).Coverage) > 0
 	}
 	r.view(apigen.ViewIdExposure, intp(reach), false)
 	r.view(apigen.ViewIdVulnerabilities, intp(stats.Open), r.covGap())
-	r.view(apigen.ViewIdWorkloads, intp(wl), false)
-	r.view(apigen.ViewIdImages, intp(im), r.covGap())
-	r.view(apigen.ViewIdPackages, intp(pk), r.covGap())
+	r.view(apigen.ViewIdWorkloads, intp(counts.Workloads), false)
+	r.view(apigen.ViewIdImages, intp(counts.Images), r.covGap())
+	r.view(apigen.ViewIdPackages, intp(counts.Packages), r.covGap())
 	r.view(apigen.ViewIdNodes, intp(len(nodes)), nodesGap)
 	r.view(apigen.ViewIdCoverage, intp(ngaps), ngaps > 0)
 
@@ -208,22 +185,21 @@ func (r *rail) cluster(ctx context.Context) error {
 	}
 	r.related(apigen.RelatedSectionIdNamespaces, items)
 
-	groups, err := s.nodeGroups(ctx)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return err
 	}
-	items = make([]relItem, 0, len(groups))
-	for _, g := range groups {
+	items = make([]relItem, 0, len(gs.groups))
+	for _, g := range gs.groups {
 		st, err := s.groupStats(ctx, g)
 		if err != nil {
 			return err
 		}
 		gap := g.Kind != model.NodeGroupAgent
 		for _, m := range g.Members {
-			gap = gap || agents[m].State != model.AgentReporting
+			gap = gap || hostGap(agents.of(m))
 		}
-		items = append(items, countsItem(model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, "nodegroup", g.Label,
-			plural(len(g.Members), "node"), st, gap))
+		items = append(items, countsItem(gs.scope(g), "nodegroup", g.Label, plural(len(g.Members), "node"), st, gap))
 	}
 	r.related(apigen.RelatedSectionIdNodegroups, items)
 
@@ -244,25 +220,17 @@ func (r *rail) cluster(ctx context.Context) error {
 func (r *rail) namespace(ctx context.Context) error {
 	s, sc := r.s, r.sc
 	var (
-		nss           []store.NamespaceStat
-		stats         store.OwnerStats
-		reach, im, pk int
-		owners        []store.OwnerEntity
+		nss    []store.NamespaceStat
+		stats  store.OwnerStats
+		reach  int
+		counts store.EntityCounts
+		owners []store.OwnerEntity
 	)
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { nss, err = s.o.Store.NamespaceStats(gctx); return err })
 	g.Go(func() (err error) { stats, err = s.o.Store.ScopeStats(gctx, sc); return err })
 	g.Go(func() (err error) { reach, _, err = s.reachable(gctx, sc); return err })
-	g.Go(func() error {
-		p, err := s.o.Store.ImagesPage(gctx, store.ImageQuery{Scope: sc, Limit: 1})
-		im = p.Total
-		return err
-	})
-	g.Go(func() error {
-		p, err := s.o.Store.PackagesPage(gctx, store.PackageEntityQuery{Scope: sc, Limit: 1})
-		pk = p.Total
-		return err
-	})
+	g.Go(func() (err error) { counts, err = s.o.Store.EntityCounts(gctx, sc); return err })
 	g.Go(func() (err error) { owners, err = s.o.Store.OwnerEntities(gctx, sc); return err })
 	if err := g.Wait(); err != nil {
 		return err
@@ -275,8 +243,8 @@ func (r *rail) namespace(ctx context.Context) error {
 		fmt.Sprintf("%d exposed", ns.Exposed)}, " · ")
 	r.view(apigen.ViewIdExposure, intp(reach), false)
 	r.view(apigen.ViewIdVulnerabilities, intp(stats.Open), r.covGap())
-	r.view(apigen.ViewIdImages, intp(im), r.covGap())
-	r.view(apigen.ViewIdPackages, intp(pk), r.covGap())
+	r.view(apigen.ViewIdImages, intp(counts.Images), r.covGap())
+	r.view(apigen.ViewIdPackages, intp(counts.Packages), r.covGap())
 	items, err := s.workloadItems(ctx, owners, "")
 	if err != nil {
 		return err
@@ -362,21 +330,22 @@ func (r *rail) workload(ctx context.Context) error {
 	r.view(apigen.ViewIdRbac, nil, false)
 	r.view(apigen.ViewIdHistory, intp(history), false)
 
+	// Each container counts this workload's own findings on its image, not every workload's.
+	byDigest, err := s.o.Store.OwnerDigestStats(ctx, sc.Value)
+	if err != nil {
+		return err
+	}
 	items := make([]relItem, 0, len(o.Containers))
 	for _, c := range o.Containers {
 		it := relItem{RelatedItem: apigen.RelatedItem{Kind: "container", Label: c.Name, Detail: optString(c.Repo),
 			Worst: apigen.PriorityNone, Gap: true}}
 		if c.Digest != "" {
-			isc := model.Scope{Kind: model.ScopeImage, Value: c.Digest}
-			st, err := s.o.Store.ScopeStats(ctx, isc)
+			img, hasRow, err := s.imageRow(ctx, c.Digest)
 			if err != nil {
 				return err
 			}
-			img, hasRow, err := s.o.Store.GetImage(ctx, c.Digest)
-			if err != nil {
-				return err
-			}
-			it = countsItem(isc, "container", c.Name, c.Repo, st, !hasRow || store.CoverageClassOf(img) != model.CoverageFull)
+			it = countsItem(model.Scope{Kind: model.ScopeImage, Value: c.Digest}, "container", c.Name, c.Repo, byDigest[c.Digest],
+				!hasRow || store.CoverageClassOf(img) != model.CoverageFull)
 		}
 		items = append(items, it)
 	}
@@ -483,13 +452,17 @@ func (r *rail) nodeGroup(ctx context.Context) error {
 		return notFound("node group " + r.sc.Value + " not found")
 	}
 	r.card.Summary = groupSummary(g)
-	agents, err := s.agentStatuses(ctx)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return err
 	}
 	st, err := s.groupStats(ctx, g)
 	if err != nil {
 		return err
+	}
+	membersGap := false
+	for _, m := range g.Members {
+		membersGap = membersGap || hostGap(agents.of(m))
 	}
 	agent := g.Kind == model.NodeGroupAgent
 	r.view(apigen.ViewIdFindings, intp(st.Open), r.covGap())
@@ -502,17 +475,13 @@ func (r *rail) nodeGroup(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		r.view(apigen.ViewIdHostPackages, intp(pkgs.Total), false)
-		r.view(apigen.ViewIdKernel, nil, false)
-		r.view(apigen.ViewIdCachedImages, intp(len(liveImages(imgs, agents))), false)
+		r.view(apigen.ViewIdHostPackages, intp(pkgs.Total), membersGap)
+		r.view(apigen.ViewIdKernel, nil, membersGap)
+		r.view(apigen.ViewIdCachedImages, intp(len(liveImages(imgs, agents.byNode))), false)
 	} else {
 		r.view(apigen.ViewIdHostPackages, nil, true)
 		r.view(apigen.ViewIdKernel, nil, true)
 		r.view(apigen.ViewIdCachedImages, nil, true)
-	}
-	membersGap := false
-	for _, m := range g.Members {
-		membersGap = membersGap || agents[m].State != model.AgentReporting
 	}
 	r.view(apigen.ViewIdMembers, intp(len(g.Members)), membersGap)
 	r.related(apigen.RelatedSectionIdMembers, memberItems(g, "", agents, st))
@@ -529,28 +498,22 @@ func (r *rail) node(ctx context.Context) error {
 	if i < 0 {
 		return notFound("node " + name + " not found")
 	}
-	g, _, err := s.groupOf(ctx, name)
+	gs, err := s.groupSet(ctx)
 	if err != nil {
 		return err
 	}
-	agents, err := s.agentStatuses(ctx)
+	g, _ := gs.of(name)
+	agents, err := s.agentView(ctx)
 	if err != nil {
 		return err
 	}
-	state, err := s.o.Store.NodesState(ctx)
-	if err != nil {
-		return err
-	}
-	agent, ok := agents[name]
-	if !ok {
-		agent = missingAgent(name, state.AgentEnabled)
-	}
+	agent := agents.of(name)
 	ready := "Not ready"
 	if nodes[i].Ready {
 		ready = "Ready"
 	}
 	r.card.Summary = strings.Join([]string{g.Label, ready, "agent " + string(agent.State)}, " · ")
-	r.card.Breadcrumbs = append(r.card.Breadcrumbs, scopeRef(model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, g.Label))
+	r.card.Breadcrumbs = append(r.card.Breadcrumbs, scopeRef(gs.scope(g), g.Label))
 	st, err := s.groupStats(ctx, g)
 	if err != nil {
 		return err
@@ -614,20 +577,19 @@ func groupSummary(g model.NodeGroup) string {
 }
 
 // memberItems are rail items for a group's members other than skip: each node's agent state, its
-// group's worst priority, no count, and a gap unless its agent is reporting.
-func memberItems(g model.NodeGroup, skip string, agents map[string]model.NodeAgentStatus, st store.OwnerStats) []relItem {
+// group's worst priority, no count, and a gap while ffs does not see its host packages in full
+// (hostGap: its agent is not reporting, blocked or without a package database, or its host
+// inventory is not stored).
+func memberItems(g model.NodeGroup, skip string, agents *agentView, st store.OwnerStats) []relItem {
 	items := make([]relItem, 0, len(g.Members))
 	for _, m := range g.Members {
 		if m == skip {
 			continue
 		}
-		state := agents[m].State
-		if state == "" {
-			state = model.AgentNever
-		}
+		a := agents.of(m)
 		items = append(items, relItem{RelatedItem: apigen.RelatedItem{
 			Scope: optString(model.Scope{Kind: model.ScopeNode, Value: m}.String()), Kind: "node", Label: m,
-			Detail: optString("agent " + string(state)), Worst: priorityOf(st.Counts.Worst()), Gap: state != model.AgentReporting,
+			Detail: optString("agent " + string(a.State)), Worst: priorityOf(st.Counts.Worst()), Gap: hostGap(a),
 		}, urgent: st.Counts.Urgent, high: st.Counts.High})
 	}
 	return items

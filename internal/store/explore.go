@@ -57,7 +57,7 @@ type FindingQuery struct {
 	Signals       []model.Signal // all must hold: signals & mask = mask
 	Ecosystems    []string
 	Namespaces    []string
-	Kinds         []string
+	Kinds         []string    // owner kinds of namespaced owners, or ClusterLevelKindPrefix + the kind of a cluster-level one
 	Advisory      string      // canonical id or any alias (sameAdvisory)
 	Package       string      // any package of the finding, by exact name (finding_packages)
 	Repo          string      // exact image_repo
@@ -532,7 +532,7 @@ func findingFacetStmts(q FindingQuery, f FindingFacet) ([]stmt, error) {
 	case FacetNamespace:
 		return groupBy("namespace", "namespace"), nil
 	case FacetKind:
-		return groupBy("owner_kind", "owner_kind"), nil
+		return groupBy(kindValueSQL, "1"), nil
 	case FacetSignal:
 		sums := make([]string, len(model.Signals))
 		unpivot := make([]string, len(model.Signals))
@@ -640,7 +640,7 @@ func findingQueryWhere(q FindingQuery, omit FindingFacet) (where, error) {
 		w.add(inCond("namespace", len(q.Namespaces)), anys(q.Namespaces)...)
 	}
 	if omit != FacetKind && len(q.Kinds) > 0 {
-		w.add(inCond("owner_kind", len(q.Kinds)), anys(q.Kinds)...)
+		addKinds(&w, q.Kinds)
 	}
 	if q.Advisory != "" {
 		list := idList([]string{q.Advisory})
@@ -660,6 +660,35 @@ func findingQueryWhere(q FindingQuery, omit FindingFacet) (where, error) {
 		w.add(`(advisory_id LIKE ? ESCAPE '\' OR owner_key LIKE ? ESCAPE '\' OR image_repo LIKE ? ESCAPE '\')`, pat, pat, pat)
 	}
 	return w, nil
+}
+
+// ClusterLevelKindPrefix starts the kind facet value of a cluster-level owner (one with no
+// namespace: Cluster, ContainerRuntime, Nodes), so a namespaced owner of the same kind, such as a
+// CloudNativePG Cluster, is a value of its own: "cluster-level:Cluster" and "Cluster".
+const ClusterLevelKindPrefix = "cluster-level:"
+
+// kindValueSQL is the kind facet value of a finding's owner.
+const kindValueSQL = `CASE WHEN namespace = '' THEN '` + ClusterLevelKindPrefix + `' || owner_kind ELSE owner_kind END`
+
+// addKinds adds the kind filter: a plain kind selects namespaced owners of that kind, a
+// ClusterLevelKindPrefix one the cluster-level owners.
+func addKinds(w *where, kinds []string) {
+	var namespaced, clusterLevel []any
+	for _, k := range kinds {
+		if c, ok := strings.CutPrefix(k, ClusterLevelKindPrefix); ok {
+			clusterLevel = append(clusterLevel, c)
+		} else {
+			namespaced = append(namespaced, k)
+		}
+	}
+	var parts []string
+	if len(namespaced) > 0 {
+		parts = append(parts, `(`+inCond("owner_kind", len(namespaced))+` AND namespace != '')`)
+	}
+	if len(clusterLevel) > 0 {
+		parts = append(parts, `(`+inCond("owner_kind", len(clusterLevel))+` AND namespace = '')`)
+	}
+	w.add(`(`+strings.Join(parts, ` OR `)+`)`, append(namespaced, clusterLevel...)...)
 }
 
 // addStates adds q's state predicate: open and excepted by value, resolved since q.ResolvedSince.

@@ -44,10 +44,15 @@ func (s *Server) GetAdvisory(ctx context.Context, req apigen.GetAdvisoryRequestO
 	if err != nil {
 		return nil, err
 	}
-	packages, err := s.advisoryPackages(ctx, id)
+	packages, hostFindings, err := s.advisoryPackages(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	hostGroups, err := s.hostGroups(ctx, hostFindings)
+	if err != nil {
+		return nil, err
+	}
+	nodeGroups := mergeHostGroups(hostGroups)
 	cov, err := s.o.Store.CoverageOf(ctx, model.Scope{Kind: model.ScopeCluster})
 	if err != nil {
 		return nil, err
@@ -59,6 +64,7 @@ func (s *Server) GetAdvisory(ctx context.Context, req apigen.GetAdvisoryRequestO
 		Malicious: adv.Malicious, Withdrawn: adv.Withdrawn, Severities: severities,
 		Timeline: apigen.AdvisoryTimeline{Published: optTime(adv.Published), Observed: optTime(adv.Observed), FirstMatched: optTime(firstMatched)},
 		ByFix:    make([]apigen.FindingGroupRow, 0, len(byFix.Rows)), Packages: packages, Uncatalogued: cov.InUse - cov.SeenInto,
+		NodeGroups: &nodeGroups,
 	}
 	if adv.KEVAdded != nil {
 		out.Kev = &apigen.KevInfo{Added: openapi_types.Date{Time: adv.KEVAdded.UTC()}}
@@ -108,22 +114,27 @@ func (s *Server) advisorySeverities(ctx context.Context, adv model.Advisory) ([]
 }
 
 // advisoryPackages lists the package versions the advisory's open findings are on, with the fixed
-// versions its open and excepted findings name. It reads every one of those findings: they come in
-// priority order, so a single page would drop the fixed versions of lower-priority packages.
-func (s *Server) advisoryPackages(ctx context.Context, id string) ([]apigen.AdvisoryPackage, error) {
+// versions its open and excepted findings name, and returns its open host findings. It reads every
+// one of those findings: they come in priority order, so a single page would drop the fixed
+// versions of lower-priority packages.
+func (s *Server) advisoryPackages(ctx context.Context, id string) ([]apigen.AdvisoryPackage, []model.Finding, error) {
 	groups, err := s.o.Store.FindingGroups(ctx, store.FindingQuery{Advisory: id, Limit: maxLimit}, store.GroupPackage)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	var host []model.Finding
 	type pkgKey struct{ ecosystem, name, installed string }
 	fixed := map[pkgKey]map[string]bool{}
 	q := store.FindingQuery{Advisory: id, States: []model.FindingState{model.StateOpen, model.StateExcepted}, Limit: maxLimit}
 	for {
 		page, err := s.o.Store.FindingsPage(ctx, q)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for _, f := range page.Rows {
+			if f.State == model.StateOpen && isHostFinding(f) {
+				host = append(host, f)
+			}
 			for _, p := range f.Packages {
 				k := pkgKey{p.Ecosystem, p.Name, p.Installed}
 				for _, v := range p.Fixed {
@@ -148,5 +159,5 @@ func (s *Server) advisoryPackages(ctx context.Context, id string) ([]apigen.Advi
 		fx := slices.Sorted(maps.Keys(fixed[pkgKey{eco, name, version}]))
 		out = append(out, apigen.AdvisoryPackage{Name: name, Ecosystem: eco, Installed: version, Fixed: nz(fx), Findings: r.Findings})
 	}
-	return out, nil
+	return out, host, nil
 }

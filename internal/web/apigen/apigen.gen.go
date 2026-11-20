@@ -1024,8 +1024,10 @@ type AdvisoryTimeline struct {
 
 // AgentCounts defines model for AgentCounts.
 type AgentCounts struct {
-	Disabled  int `json:"disabled"`
-	Never     int `json:"never"`
+	Disabled int `json:"disabled"`
+	Never    int `json:"never"`
+
+	// Reporting Agents reporting whose host inventory is stored.
 	Reporting int `json:"reporting"`
 	Stale     int `json:"stale"`
 }
@@ -1265,9 +1267,12 @@ type ExposureTable struct {
 
 // FacetValue defines model for FacetValue.
 type FacetValue struct {
-	Count    int    `json:"count"`
-	Selected bool   `json:"selected"`
-	Value    string `json:"value"`
+	Count int `json:"count"`
+
+	// Label How the value reads when that differs from the value.
+	Label    *string `json:"label,omitempty"`
+	Selected bool    `json:"selected"`
+	Value    string  `json:"value"`
 }
 
 // Facets Facet name to its values, for the requested facets only.
@@ -1725,11 +1730,14 @@ type NodeGroupRow struct {
 	Counts PriorityCounts `json:"counts"`
 
 	// Drift Field differences against the largest group of the same architecture.
-	Drift         string `json:"drift"`
-	ExposedNodes  int    `json:"exposedNodes"`
-	Fixable       int    `json:"fixable"`
-	Id            string `json:"id"`
-	KernelRelease string `json:"kernelRelease"`
+	Drift        string `json:"drift"`
+	ExposedNodes int    `json:"exposedNodes"`
+	Fixable      int    `json:"fixable"`
+
+	// Gaps The coverage gaps of the group's members, each code once. A group whose members have a gap is not seen into in full.
+	Gaps          *[]GapCode `json:"gaps,omitempty"`
+	Id            string     `json:"id"`
+	KernelRelease string     `json:"kernelRelease"`
 
 	// Kind agent groups come from node agent inventories; nodeinfo groups from the node status.
 	Kind           NodeGroupKind `json:"kind"`
@@ -2314,7 +2322,7 @@ type ListFindingsParams struct {
 	Ecosystem *[]string `form:"ecosystem,omitempty" json:"ecosystem,omitempty"`
 	Namespace *[]string `form:"namespace,omitempty" json:"namespace,omitempty"`
 
-	// Kind Owner kinds, such as Deployment.
+	// Kind Owner kinds of workloads, such as Deployment; cluster-level:Cluster, cluster-level:ContainerRuntime and cluster-level:Nodes for the cluster-level owners, so a workload of kind Cluster is told apart from the cluster itself.
 	Kind *[]string `form:"kind,omitempty" json:"kind,omitempty"`
 
 	// Advisory Advisory ID or any of its aliases.
@@ -2389,7 +2397,7 @@ type ListImagePackagesParams struct {
 
 // GetNodeGroupParams defines parameters for GetNodeGroup.
 type GetNodeGroupParams struct {
-	// Compare ID of another node group to compare this group with.
+	// Compare Stable name, label or ID of another node group to compare this group with.
 	Compare *string `form:"compare,omitempty" json:"compare,omitempty"`
 }
 

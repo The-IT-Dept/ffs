@@ -3,6 +3,8 @@
 package apiserver
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"time"
 
@@ -59,6 +61,7 @@ func New(o Options) *Server {
 // Handler returns the HTTP handler of every operation below BaseURL. Parameters the generated
 // router cannot bind are a 400 invalid_parameter problem, a handler error is the problem it maps to
 // (500 internal when it maps to none), and a path no operation matches is a 404 not_found problem.
+// Each request reads the node groups and agent statuses at most once.
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -68,9 +71,9 @@ func (s *Server) Handler() http.Handler {
 		RequestErrorHandlerFunc:  s.paramError,
 		ResponseErrorHandlerFunc: s.responseError,
 	})
-	return apigen.HandlerWithOptions(strict, apigen.StdHTTPServerOptions{
+	return withMemo(apigen.HandlerWithOptions(strict, apigen.StdHTTPServerOptions{
 		BaseURL: BaseURL, BaseRouter: mux, ErrorHandlerFunc: s.paramError,
-	})
+	}))
 }
 
 // paramError answers a request whose parameters could not be bound.
@@ -79,8 +82,12 @@ func (s *Server) paramError(w http.ResponseWriter, r *http.Request, err error) {
 }
 
 // responseError answers a request whose handler failed: with the problem the error maps to, or 500
-// internal, logged, with a generic detail.
+// internal, logged, with a generic detail. A request the client cancelled (the browser aborts
+// superseded queries) gets no answer and no log: there is no one to answer.
 func (s *Server) responseError(w http.ResponseWriter, r *http.Request, err error) {
+	if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+		return
+	}
 	p := problemOf(err)
 	if p == nil {
 		s.o.Log.Error(err, "API request failed", "path", r.URL.Path)

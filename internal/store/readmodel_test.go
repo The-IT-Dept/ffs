@@ -618,3 +618,22 @@ func TestFindingScopeWhere_Predicates(t *testing.T) {
 		require.Equal(t, want, got, scope)
 	}
 }
+
+// One owner's findings per digest, not every owner's on that image.
+func TestOwnerDigestStats_OneOwnersFindings(t *testing.T) {
+	s := newStore(t)
+	seedExplorer(t, s)
+	canary := ref("Deployment", "shop", "web-canary")
+	apply(t, s, uiFinding(canary, "ghcr.io/example/web", "CVE-2026-0009", model.PriorityUrgent, func(f *model.Finding) {
+		f.Digests = []string{"sha256:web"}
+	}))
+	web, err := s.OwnerDigestStats(ctx, exWeb.Key())
+	require.NoError(t, err)
+	require.Equal(t, map[string]OwnerStats{"sha256:web": {Counts: PriorityCounts{Urgent: 1, High: 1}, Open: 2, Fixable: 1}}, web)
+	image, err := s.ScopeStats(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:web"})
+	require.NoError(t, err)
+	require.Equal(t, 3, image.Open, "the image scope counts every owner's findings")
+	none, err := s.OwnerDigestStats(ctx, exWorker.Key())
+	require.NoError(t, err)
+	require.Empty(t, none)
+}

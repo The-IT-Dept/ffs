@@ -8,33 +8,50 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
-func TestStore_SearchOnlyInUseDigests(t *testing.T) {
+// Jump lists only what in-use container images hold: a candidate image and its packages are not
+// hits, nor are the synthetic Kubernetes, runtime and node group digests; a package held only by a
+// node group's host packages is a hostpackage hit naming the group's digest.
+func TestJump_InUseContainerImagesAndHostPackages(t *testing.T) {
 	s := newStore(t)
-	const inUse, candidate = "sha256:aaa", "sha256:bbb"
+	const inUse, candidate, host = "sha256:aaa", "sha256:bbb", "nodegroup:g1"
 	for _, d := range []string{inUse, candidate} {
 		require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: d, Repo: "docker.io/library/nginx", Status: model.ImageCatalogued}))
 		require.NoError(t, s.PutSBOM(ctx, d, nil, []model.Package{deb("openssl", "")}))
 	}
+	require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: host, Repo: "docker.io/library/nginx-host", Status: model.ImageCatalogued}))
+	require.NoError(t, s.PutSBOM(ctx, host, nil, []model.Package{deb("openssl", ""), deb("nginx-kmod", "")}))
+	require.NoError(t, s.UpsertImage(ctx, model.Image{Digest: "k8s:1.35.1", Repo: "nginx-k8s", Status: model.ImageCatalogued}))
 	require.NoError(t, s.UpsertOwner(ctx, model.Owner{
 		Ref:        model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "web"},
 		Containers: []model.ContainerUse{{Name: "nginx", Digest: inUse}},
 	}))
+	require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: model.NodesOwner(testCluster), Containers: []model.ContainerUse{{Name: "g1", Digest: host}}}))
+	require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "Cluster", Name: testCluster},
+		Containers: []model.ContainerUse{{Name: "kubernetes", Digest: "k8s:1.35.1"}}}))
 	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0002", Aliases: []string{"GHSA-aaaa-bbbb-cccc"}, Title: "A title"}))
 
-	hits, err := s.Search(ctx, "OPENSSL", 0)
+	hits, more, err := s.Jump(ctx, "OPENSSL", 0)
 	require.NoError(t, err)
-	require.Len(t, hits, 1)
-	require.Equal(t, SearchHit{Kind: "package", ID: "openssl", Label: "openssl", Ecosystem: "deb", Version: hits[0].Version, Digests: []string{inUse}}, hits[0])
+	require.False(t, more)
+	require.Equal(t, []JumpHit{{Kind: "package", ID: "deb/openssl", Label: "openssl", Detail: "deb", Prefix: true}}, hits,
+		"a package a container holds is a package hit, wherever else it is")
 
-	hits, err = s.Search(ctx, "nginx", 0)
+	hits, _, err = s.Jump(ctx, "nginx", 0)
 	require.NoError(t, err)
-	require.Equal(t, []SearchHit{{Kind: "image", ID: inUse, Label: "docker.io/library/nginx", Digests: []string{inUse}}}, hits)
+	require.Equal(t, []JumpHit{
+		{Kind: "image", ID: inUse, Label: "docker.io/library/nginx", Detail: inUse},
+		{Kind: "hostpackage", ID: host, Label: "nginx-kmod", Detail: "1.0", Prefix: true},
+	}, hits, "neither the candidate image nor a synthetic digest is an image hit")
 
-	hits, err = s.Search(ctx, "aaaa-bbbb", 0)
+	hits, _, err = s.Jump(ctx, "aaaa-bbbb", 0)
 	require.NoError(t, err)
-	require.Equal(t, []SearchHit{{Kind: "advisory", ID: "CVE-2026-0002", Label: "A title"}}, hits)
+	require.Equal(t, []JumpHit{{Kind: "advisory", ID: "CVE-2026-0002", Label: "CVE-2026-0002", Detail: "A title"}}, hits)
+	hits, _, err = s.Jump(ctx, "ghsa", 0)
+	require.NoError(t, err)
+	require.Equal(t, []JumpHit{{Kind: "advisory", ID: "CVE-2026-0002", Label: "CVE-2026-0002", Detail: "A title", Prefix: true}}, hits,
+		"an alias starting with the query is a prefix hit")
 
-	hits, err = s.Search(ctx, "%", 0)
+	hits, _, err = s.Jump(ctx, "%", 0)
 	require.NoError(t, err)
 	require.Empty(t, hits)
 }

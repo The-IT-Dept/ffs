@@ -24,20 +24,23 @@ const (
 	rowInternal     = "internal"
 	rowNotExposed   = "not-exposed"
 	rowControlPlane = "controlplane"
-	tailSuffix      = "/tail"
+	// tailSuffix ends a tail row's id. "~" is in no hostname, node name or owner key, so no child
+	// id, and no child of another group, can end with it.
+	tailSuffix = "/~tail"
 )
 
 // exposureData holds what the exposure table sums per owner.
 type exposureData struct {
 	owners map[string]store.OwnerEntity
 	stats  map[string]store.OwnerStats
-	cov    map[string]store.CoverageFigure
+	images map[string][]store.DigestCoverage
 	best   map[string]store.FixSummary
 }
 
 // signals sums the signal columns over owners: their open urgent, high, fixable and exploited
-// findings, how many are privileged or hold a powerful service account, their coverage figures,
-// and the best fix of any of them.
+// findings, how many are privileged or hold a powerful service account, the coverage of the
+// distinct images they run (an image several of them run counts once), and the best fix of any
+// of them.
 func (d *exposureData) signals(keys []string) apigen.RowSignals {
 	var (
 		sig       apigen.RowSignals
@@ -49,6 +52,7 @@ func (d *exposureData) signals(keys []string) apigen.RowSignals {
 				cmp.Compare(b.Findings, a.Findings), strings.Compare(a.Key, b.Key)) < 0
 		}
 	)
+	images := map[string]store.DigestCoverage{}
 	for _, k := range keys {
 		st := d.stats[k]
 		sig.Urgent += st.Counts.Urgent
@@ -61,12 +65,20 @@ func (d *exposureData) signals(keys []string) apigen.RowSignals {
 		if d.owners[k].PowerfulSA {
 			sa++
 		}
-		c := d.cov[k]
-		sig.Coverage.InUse += c.InUse
-		sig.Coverage.SeenInto += c.SeenInto
-		sig.Coverage.Full += c.Full
+		for _, c := range d.images[k] {
+			images[c.Digest] = c
+		}
 		if fs, ok := d.best[k]; ok && (!hasBest || betterFix(fs, best)) {
 			best, hasBest = fs, true
+		}
+	}
+	for _, c := range images {
+		sig.Coverage.InUse++
+		if c.SeenInto {
+			sig.Coverage.SeenInto++
+		}
+		if c.Full {
+			sig.Coverage.Full++
 		}
 	}
 	sig.Privileged, sig.SaPower = intp(priv), intp(sa)
@@ -190,7 +202,7 @@ func (t *exposureTable) load(ctx context.Context, sc model.Scope) ([]store.Owner
 	}
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() (err error) { t.d.stats, err = t.s.o.Store.OwnerStatsOf(gctx, keys); return err })
-	g.Go(func() (err error) { t.d.cov, err = t.s.o.Store.OwnerCoverage(gctx, keys); return err })
+	g.Go(func() (err error) { t.d.images, err = t.s.o.Store.OwnerImageCoverage(gctx, keys); return err })
 	g.Go(func() (err error) { t.d.best, err = t.s.o.Store.BestFixes(gctx, keys); return err })
 	return owners, g.Wait()
 }
@@ -508,18 +520,19 @@ func (t *exposureTable) byNode(ctx context.Context) error {
 	t.rows = append(t.rows, apigen.ExposureRow{Id: rowControlPlane, Kind: apigen.ExposureRowKindControlplane, Label: controlPlaneLabel,
 		Workloads: []apigen.WorkloadRef{}, Signals: sig, Target: &target})
 
-	groups, err := s.nodeGroups(ctx)
+	set, err := s.groupSet(ctx)
 	if err != nil {
 		return err
 	}
+	groups := set.groups
 	var rows []*xrow
 	for _, g := range groups {
 		gs, err := t.groupSignals(ctx, g)
 		if err != nil {
 			return err
 		}
-		id := "ng:" + g.ID
-		target := scopeRef(model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, g.Label)
+		id := "ng:" + set.key(g)
+		target := scopeRef(set.scope(g), g.Label)
 		x := &xrow{row: apigen.ExposureRow{Id: id, Kind: apigen.ExposureRowKindNodegroup, Label: g.Label, Signals: gs.sig,
 			Target: &target}, groups: []string{g.ID}, noun: "node"}
 		for _, n := range g.Members {

@@ -21,8 +21,8 @@ func Register(m manager.Manager, d deps.Deps) error {
 		Store: d.Store, Config: d.Config, Feeds: feedInfos(d.Feeds.StaleAfter()), EOL: d.EOL,
 		Kube: m.GetClient(), Pods: d.Inventory, Now: time.Now, Log: d.Log.WithName("api"),
 	})
-	hub := live.NewHub(live.Options{Store: d.Store, Marks: d.Store, Nodes: live.StoreNodeMarks(d.Store), Log: d.Log.WithName("live"),
-		Cluster: d.Config.ClusterName})
+	hub := live.NewHub(live.Options{Store: d.Store, Marks: d.Store, Nodes: live.StoreNodeMarks(d.Store, d.Config.NodeAgent.StaleAfter, time.Now),
+		Log: d.Log.WithName("live"), Cluster: d.Config.ClusterName})
 	if err := m.Add(hub); err != nil {
 		return fmt.Errorf("add live hub: %w", err)
 	}

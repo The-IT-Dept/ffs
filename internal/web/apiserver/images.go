@@ -30,6 +30,9 @@ func (s *Server) ListImages(ctx context.Context, req apigen.ListImagesRequestObj
 	if err != nil {
 		return nil, err
 	}
+	if _, err := s.resolveScope(ctx, sc); err != nil {
+		return nil, err
+	}
 	statuses, err := enumParam("status", p.Status)
 	if err != nil {
 		return nil, err
@@ -113,10 +116,11 @@ func (s *Server) ListImages(ctx context.Context, req apigen.ListImagesRequestObj
 	}, nil
 }
 
-// imageOf reads an image by digest. A digest with no images row that an owner runs is a pending
-// image with the repository of the container that runs it; any other unknown digest is 404.
+// imageOf reads an image by digest (imageRow: pending until its first match). A digest with no
+// images row that an owner runs is a pending image with the repository of the container that runs
+// it; any other unknown digest is 404.
 func (s *Server) imageOf(ctx context.Context, digest string) (img model.Image, hasRow bool, owners []string, err error) {
-	img, hasRow, err = s.o.Store.GetImage(ctx, digest)
+	img, hasRow, err = s.imageRow(ctx, digest)
 	if err != nil {
 		return model.Image{}, false, nil, err
 	}

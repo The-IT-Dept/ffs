@@ -10,7 +10,9 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -272,4 +274,76 @@ func TestStream_ShutdownEndsStreams(t *testing.T) {
 	require.NoError(t, ws.Server.Shutdown(ctx))
 	require.Less(t, time.Since(start), 2*time.Second)
 	require.True(t, errors.Is(<-served, http.ErrServerClosed))
+}
+
+// stuckWriter is a stream's response writer whose client stops reading once stuck is closed: from
+// then on every write blocks until the write deadline the stream set, and fails then. Without a
+// deadline it blocks for good.
+type stuckWriter struct {
+	header   http.Header
+	stuck    chan struct{}
+	mu       sync.Mutex
+	deadline time.Time
+	written  strings.Builder
+}
+
+func newStuckWriter() *stuckWriter {
+	return &stuckWriter{header: http.Header{}, stuck: make(chan struct{})}
+}
+
+func (w *stuckWriter) Header() http.Header { return w.header }
+func (w *stuckWriter) WriteHeader(int)     {}
+func (w *stuckWriter) FlushError() error   { return nil }
+
+func (w *stuckWriter) SetWriteDeadline(t time.Time) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.deadline = t
+	return nil
+}
+
+func (w *stuckWriter) Write(p []byte) (int, error) {
+	select {
+	case <-w.stuck:
+	default:
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return w.written.Write(p)
+	}
+	w.mu.Lock()
+	deadline := w.deadline
+	w.mu.Unlock()
+	if deadline.IsZero() {
+		select {} // a client that never reads, and no deadline to give up on it
+	}
+	time.Sleep(time.Until(deadline))
+	return 0, os.ErrDeadlineExceeded
+}
+
+// V55: every write to a stream has a deadline, so a client that stops reading releases its handler,
+// and Close ends a stream blocked in a write.
+func TestStream_StuckClientIsReleased(t *testing.T) {
+	for _, closeHub := range []bool{false, true} {
+		hub, fc, _ := newHub(t, live.Options{WriteTimeout: 50 * time.Millisecond})
+		w := newStuckWriter()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/stream", nil)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			hub.ServeHTTP(w, req)
+		}()
+		require.Eventually(t, func() bool { return hub.Streams() == 1 }, 2*time.Second, 5*time.Millisecond)
+		close(w.stuck)
+		hub.Publish([]live.Kind{live.KindFindings}, []string{"cluster"})
+		fc.Step(coalesce)
+		if closeHub {
+			hub.Close()
+		}
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			require.FailNow(t, "the stream stayed blocked on a client that stopped reading", "close=%t", closeHub)
+		}
+		require.Zero(t, hub.Streams())
+	}
 }
