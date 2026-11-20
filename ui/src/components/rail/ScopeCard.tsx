@@ -18,7 +18,8 @@ function hrefOf(scope: string): string | undefined {
 // ScopeCard heads the rail: breadcrumbs back up, the kind, the name and a one-line summary. The
 // cluster card switches cluster (only one exists for now). A trail too long for the card ends in an
 // ellipsis, with the whole trail as its title; its links stay inline so the ellipsis can apply, and
-// below lg the line is 40 px tall with the links padded to fill it, for touch.
+// below lg the line is 40 px tall with the links padded to fill it (py-3.5 around 10.5 px text is a
+// 40 px hit box), for touch.
 export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope }) {
   return (
     <div className="rounded-md border bg-background p-2.5 shadow-xs">
@@ -35,7 +36,7 @@ export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope 
               <Fragment key={b.scope}>
                 {i > 0 ? <span aria-hidden="true"> › </span> : null}
                 {href ? (
-                  <AppLink href={href} className="hover:text-foreground hover:underline max-lg:py-3">
+                  <AppLink href={href} className="hover:text-foreground hover:underline max-lg:py-3.5">
                     {b.label}
                   </AppLink>
                 ) : (

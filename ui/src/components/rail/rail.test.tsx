@@ -116,5 +116,10 @@ test('a long parent trail ends in an ellipsis with the whole trail as its title'
   expect(trail).toHaveAttribute('title', 'test › shop')
   expect(trail).toHaveClass('truncate')
   // Inline links, so the ellipsis applies; atomic inline-flex boxes would clip without one.
-  for (const a of within(trail).getAllByRole('link')) expect(a.className).not.toMatch(/inline-flex/)
+  // Padded to a 40 px touch target below lg: py-3.5 (28 px) around the ~12 px inline text box.
+  for (const a of within(trail).getAllByRole('link')) {
+    expect(a.className).not.toMatch(/inline-flex/)
+    expect(a).toHaveClass('max-lg:py-3.5')
+  }
+  expect(trail).toHaveClass('max-lg:leading-10')
 })
