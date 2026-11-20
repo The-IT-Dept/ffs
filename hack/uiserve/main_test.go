@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -137,4 +141,48 @@ func TestHandlers_ServeAPIAndUI(t *testing.T) {
 func TestOpenFixture_RejectsUnknownKind(t *testing.T) {
 	_, err := openFixture(t.Context(), "large", t.TempDir())
 	require.ErrorContains(t, err, "small or scale")
+}
+
+// TestRun_ControlListenerFailureStopsTheWebServerFirst: when the control address is taken, run returns the
+// control listener's error only once the web server has shut down, and then removes the store. The web
+// server logs through the logger run was given.
+func TestRun_ControlListenerFailureStopsTheWebServerFirst(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp) // run's store directory
+	var lc net.ListenConfig
+	taken, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = taken.Close() })
+	free, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := free.Addr().String()
+	require.NoError(t, free.Close())
+
+	var (
+		mu    sync.Mutex
+		lines []string
+	)
+	log := funcr.New(func(prefix, args string) {
+		mu.Lock()
+		defer mu.Unlock()
+		lines = append(lines, prefix+" "+args)
+	}, funcr.Options{})
+
+	err = run(t.Context(), options{Addr: addr, Control: taken.Addr().String(), Fixture: "small"}, log)
+	require.ErrorContains(t, err, "control listener: listen tcp "+taken.Addr().String())
+
+	conn, dialErr := (&net.Dialer{Timeout: time.Second}).DialContext(t.Context(), "tcp", addr)
+	if dialErr == nil {
+		require.NoError(t, conn.Close())
+	}
+	require.Error(t, dialErr, "the web server stopped before run returned")
+	entries, err := os.ReadDir(tmp)
+	require.NoError(t, err)
+	require.Empty(t, entries, "the store directory is removed")
+
+	mu.Lock()
+	defer mu.Unlock()
+	logged := strings.Join(lines, "\n")
+	require.Contains(t, logged, `"msg"="starting server" "name"="web"`)
+	require.Contains(t, logged, `"msg"="shutting down server" "name"="web"`)
 }

@@ -128,10 +128,10 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `metrics.serviceMonitor.labels` | `{}` | Extra ServiceMonitor labels. |
 | `prometheusRule.enabled` | `false` | Create a PrometheusRule with the ffs alert rules. |
 | `prometheusRule.labels` | `{}` | Extra PrometheusRule labels. |
-| `grafanaDashboard.enabled` | `false` | Create a ConfigMap holding the Grafana dashboard. |
-| `grafanaDashboard.namespace` | `""` | Namespace of the dashboard ConfigMap; empty uses the release namespace. |
-| `grafanaDashboard.labels` | `grafana_dashboard: "1"` | Dashboard ConfigMap labels, including the one the Grafana sidecar selects on. |
-| `grafanaDashboard.annotations` | `{}` | Extra dashboard ConfigMap annotations. |
+| `grafanaDashboard.enabled` | `false` | Create a ConfigMap carrying the Grafana dashboard. |
+| `grafanaDashboard.namespace` | `""` | Namespace of the Grafana dashboard ConfigMap; empty uses the release namespace. |
+| `grafanaDashboard.labels` | `grafana_dashboard: "1"` | Grafana dashboard ConfigMap labels, including the one the Grafana sidecar selects on. |
+| `grafanaDashboard.annotations` | `{}` | Extra Grafana dashboard ConfigMap annotations. |
 
 Metrics are served on port 8443 behind Kubernetes authentication and authorisation. A scraper needs `get` on the `/metrics` non-resource URL, which the chart's ClusterRole `ffs-metrics-reader` grants; bind it to the scraper's ServiceAccount.
 

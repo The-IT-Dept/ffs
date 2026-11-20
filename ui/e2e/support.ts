@@ -24,14 +24,19 @@ export async function api<T>(request: APIRequestContext, path: string, params?: 
   return (await res.json()) as T
 }
 
+// LIVE_ADVISORY matches the advisories the live spec adds through the control listener. A reused
+// dev server keeps them between runs.
+export const LIVE_ADVISORY = /^CVE-2099-/
+
 // mainPages are the six pages the screenshots and the CSP check cover. The image and advisory
-// paths are built as lib/links.ts builds them: one percent-encoded segment.
+// paths are built as lib/links.ts builds them: one percent-encoded segment. The advisory is the
+// fixture's first, never one the live spec added.
 export async function mainPages(request: APIRequestContext): Promise<MainPage[]> {
   const web = await api<S['WorkloadDetail']>(request, '/workloads/Deployment/shop/web')
   const digest = web.containers.find((c) => c.digest)?.digest
   if (!digest) throw new Error('Deployment/shop/web runs no image with a digest')
-  const groups = await api<S['FindingsPage']>(request, '/findings', { group: 'advisory', limit: '1' })
-  const advisory = groups.groupRows[0]?.key
+  const groups = await api<S['FindingsPage']>(request, '/findings', { group: 'advisory', limit: '200' })
+  const advisory = groups.groupRows.map((g) => g.key).find((key) => !LIVE_ADVISORY.test(key))
   if (!advisory) throw new Error('the fixture has no open findings')
   return [
     { name: 'home', path: '/' },

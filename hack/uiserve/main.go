@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/the-it-dept/ffs/internal/web"
 	"github.com/the-it-dept/ffs/internal/web/apiserver"
@@ -42,7 +43,11 @@ func main() {
 	flag.StringVar(&o.Fixture, "fixture", "small", "seeded store: small or scale")
 	flag.Parse()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, o, logr.FromSlogHandler(slog.NewTextHandler(os.Stderr, nil)))
+	log := logr.FromSlogHandler(slog.NewTextHandler(os.Stderr, nil))
+	// controller-runtime code that logs without a context logger uses this one, rather than printing
+	// that SetLogger was never called.
+	ctrllog.SetLogger(log)
+	err := run(ctx, o, log)
 	stop()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "uiserve:", err)
@@ -50,9 +55,12 @@ func main() {
 	}
 }
 
-// run serves the fixture until ctx ends, then shuts both listeners down. It returns the first
-// server error, or nil after ctx ends.
+// run serves the fixture until ctx ends or a listener fails, then shuts both listeners down and
+// waits for them before it closes and removes the store. It returns the first listener error, or
+// nil after ctx ends.
 func run(ctx context.Context, o options, log logr.Logger) (err error) {
+	// The web server (a controller-runtime manager.Server) logs through the context's logger.
+	ctx = logr.NewContext(ctx, log)
 	dir, err := os.MkdirTemp("", "ffs-uiserve-")
 	if err != nil {
 		return err
@@ -70,7 +78,9 @@ func run(ctx context.Context, o options, log logr.Logger) (err error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	hub := newHub(f, log)
+	hubDone := make(chan struct{})
 	go func() {
+		defer close(hubDone)
 		if err := hub.Start(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Error(err, "live hub stopped")
 		}
@@ -78,32 +88,46 @@ func run(ctx context.Context, o options, log logr.Logger) (err error) {
 
 	cfg := f.Config
 	cfg.Listen = o.Addr
-	errs := make(chan error, 2)
 	srv := web.NewServer(cfg, handlers(f, hub), hub.Close)
-	go func() { errs <- srv.Start(ctx) }()
+	webDone := make(chan error, 1)
+	go func() { webDone <- srv.Start(ctx) }()
 
 	ctl := &http.Server{Addr: o.Control, Handler: newControl(f.Store, cfg.ClusterName, hub), ReadHeaderTimeout: 10 * time.Second}
+	ctlDone := make(chan error, 1)
 	go func() {
-		if err := ctl.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			errs <- fmt.Errorf("control listener: %w", err)
+		err := ctl.ListenAndServe()
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		} else {
+			err = fmt.Errorf("control listener: %w", err)
 		}
-	}()
-	go func() {
-		<-ctx.Done()
-		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer scancel()
-		_ = ctl.Shutdown(sctx)
+		ctlDone <- err
 	}()
 
 	log.Info("serving", "addr", o.Addr, "control", o.Control, "fixture", o.Fixture)
+	var first error
 	select {
-	case err := <-errs:
-		cancel()
-		return err
+	case first = <-webDone:
+		webDone = nil
+	case first = <-ctlDone:
+		ctlDone = nil
 	case <-ctx.Done():
-		// The web server returns once it has shut down.
-		return <-errs
 	}
+	// Both listeners and the hub stop, and requests in flight finish, before the deferred store
+	// Close and RemoveAll run: cancel shuts the web server down, and Start returns once it has.
+	cancel()
+	sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer scancel()
+	if err := ctl.Shutdown(sctx); err != nil {
+		first = errors.Join(first, fmt.Errorf("control listener: %w", err))
+	}
+	for _, done := range []chan error{webDone, ctlDone} {
+		if done != nil {
+			first = errors.Join(first, <-done)
+		}
+	}
+	<-hubDone
+	return first
 }
 
 // openFixture builds the named fixture with its store at dir/ffs.db.
