@@ -160,7 +160,7 @@ func (f *workFixture) offered(node string, digests ...string) {
 	f.q.mu.Lock()
 	defer f.q.mu.Unlock()
 	for _, d := range digests {
-		f.q.offers[d] = offer{id: "offer-" + node + "-" + d[len(d)-4:], node: node, deadline: f.clk.Now().Add(30 * time.Minute)}
+		f.q.hold(d, "offer-"+node+"-"+d[len(d)-4:], node, "", f.clk.Now())
 	}
 }
 
@@ -455,33 +455,129 @@ func TestWork_SBOMResultHandling(t *testing.T) {
 	})
 }
 
-// TestWork_ExpiredOffersCountTowardQuarantine: an offer that expires without a result (the agent killed
-// cataloguing it) counts as a failure, so an image that keeps killing collectors is quarantined after the
-// usual two and no longer offered (spec §9.3).
+// TestWork_ExpiredOffersCountTowardQuarantine: an offer the agent reached but sent no result for before it
+// expired (the agent killed cataloguing it) counts as a failure, so an image that keeps killing collectors is
+// quarantined after the usual two and no longer offered (spec §9.3). The agent works through its requests in
+// order, so the images offered with it, which it never got to, are not counted.
 func TestWork_ExpiredOffersCountTowardQuarantine(t *testing.T) {
 	f := newWorkFixture(t)
-	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
-
-	f.clk.Add(30 * time.Minute) // every deadline passes with no result
-	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"), "offered again after one failure")
-	for _, d := range []string{dig1, dig2, dig3} {
-		j, ok := f.job(t, d)
-		require.True(t, ok, d)
-		require.Equal(t, 1, j.Attempts)
+	requireAttempts := func(t *testing.T, digest string, want int) {
+		t.Helper()
+		j, ok := f.job(t, digest)
+		if want == 0 {
+			require.False(t, ok, "%s is not counted", digest)
+			return
+		}
+		require.True(t, ok, digest)
+		require.Equal(t, want, j.Attempts, digest)
 		require.Equal(t, "worker-1", j.LastNode)
 		require.Equal(t, "the node agent sent no result before the request expired", j.LastError)
-		require.True(t, j.QuarantinedUntil.IsZero())
 	}
+	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
 
-	// dig2's result arrives in time; dig1 and dig3 expire again.
+	// dig1 kills the collector: no result for dig1, and dig2 and dig3 are never started.
+	f.clk.Add(30 * time.Minute)
+	require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"), "offered again after one failure")
+	requireAttempts(t, dig1, 1)
+	requireAttempts(t, dig2, 0)
+	requireAttempts(t, dig3, 0)
+	j, _ := f.job(t, dig1)
+	require.True(t, j.QuarantinedUntil.IsZero())
+
+	f.clk.Add(30 * time.Minute) // and again
+	require.Equal(t, []string{dig2, dig3, dig4}, f.offer(t, "worker-1"), "dig1 is quarantined; dig2 and dig3 are not")
+	requireAttempts(t, dig1, 2)
+	j, _ = f.job(t, dig1)
+	require.Equal(t, f.clk.Now().Add(24*time.Hour), j.QuarantinedUntil)
+	requireAttempts(t, dig2, 0)
+	requireAttempts(t, dig3, 0)
+
+	// dig2's result arrives in time, so the agent got to dig3, which expires; dig4 was behind dig3.
 	require.NoError(t, f.q.SBOM(context.Background(), worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig2, SyftJSON: sideloadDoc(t)}))
 	f.clk.Add(30 * time.Minute)
-	require.Equal(t, []string{dig4}, f.offer(t, "worker-1"), "dig1 and dig3 are quarantined; dig2 is catalogued")
-	for _, d := range []string{dig1, dig3} {
-		j, _ := f.job(t, d)
-		require.Equal(t, 2, j.Attempts, d)
-		require.Equal(t, f.clk.Now().Add(24*time.Hour), j.QuarantinedUntil, d)
+	require.Equal(t, []string{dig3, dig4}, f.offer(t, "worker-1"), "dig2 is catalogued")
+	requireAttempts(t, dig2, 0)
+	requireAttempts(t, dig3, 1)
+	requireAttempts(t, dig4, 0)
+}
+
+// TestWork_ExpiredOffersQueuedBehindAStallAreNotCounted: offers made while an earlier unanswered offer to
+// the same agent process was live sat in its queue, whichever report they came with; an agent that restarted
+// starts a new queue; a result the controller could not store yet answers its offer.
+func TestWork_ExpiredOffersQueuedBehindAStallAreNotCounted(t *testing.T) {
+	ctx := context.Background()
+	attempts := func(t *testing.T, f *workFixture, digest string) int {
+		t.Helper()
+		j, _ := f.job(t, digest)
+		return j.Attempts
 	}
-	_, ok := f.job(t, dig2)
-	require.False(t, ok, "a handled offer is never counted")
+
+	t.Run("a later report's offer waits behind the stalled job", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		f.clk.Add(10 * time.Minute) // a report between jobs brings more work
+		require.Equal(t, []string{dig2}, f.offer(t, "worker-1"))
+		f.clk.Add(30 * time.Minute) // dig1 ran out its deadline; dig2 had what was left of its own
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		require.Equal(t, 1, attempts(t, f, dig1))
+		require.Zero(t, attempts(t, f, dig2), "dig2 was queued behind dig1")
+
+		// A stall that ended before an offer was made does not excuse it.
+		f.clk.Add(30 * time.Minute)
+		require.Equal(t, []string{dig2}, f.offer(t, "worker-1"), "dig1 is quarantined")
+		require.Equal(t, 2, attempts(t, f, dig1))
+		f.clk.Add(30 * time.Minute)
+		require.Equal(t, []string{dig2}, f.offer(t, "worker-1"))
+		require.Equal(t, 1, attempts(t, f, dig2))
+	})
+
+	t.Run("an agent that restarted starts a new queue", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		f.clk.Add(5 * time.Minute) // dig1 kills the collector, which comes back as a new process
+		applied, err := f.st.AcceptAgentReport(ctx, store.AgentReport{Node: "worker-1", AgentVersion: "v0.0.1",
+			BootID: "boot-worker-1", Instance: "after-restart", StartedAt: f.clk.Now(), Seq: 1, At: f.clk.Now()})
+		require.NoError(t, err)
+		require.True(t, applied)
+		f.clk.Add(5 * time.Minute)
+		require.Equal(t, []string{dig2}, f.offer(t, "worker-1"))
+		f.clk.Add(30 * time.Minute) // dig2 kills the new process too
+		f.offer(t, "worker-1")
+		require.Equal(t, 1, attempts(t, f, dig1))
+		require.Equal(t, 1, attempts(t, f, dig2), "dig2 was the first request of the new process")
+	})
+
+	t.Run("a result that could not be stored answers the offer", func(t *testing.T) {
+		f := newWorkFixture(t)
+		require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
+		f.ingest.setErr(&sbom.AcquireError{Kind: sbom.FailTransient, Reason: "acquisition in progress"})
+		require.Error(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		require.True(t, f.live(dig1), "the offer stays for the agent's retry")
+		f.clk.Add(30 * time.Minute) // the retries fail too; the agent went on to dig2, which expires
+		f.offer(t, "worker-1")
+		require.Zero(t, attempts(t, f, dig1), "dig1 was answered")
+		require.Equal(t, 1, attempts(t, f, dig2))
+		require.Zero(t, attempts(t, f, dig3))
+	})
+
+	t.Run("stalls are forgotten once no offer can be behind them", func(t *testing.T) {
+		f := newWorkFixture(t)
+		require.Equal(t, []string{dig1, dig2, dig3}, f.offer(t, "worker-1"))
+		f.clk.Add(30 * time.Minute)
+		f.offer(t, "worker-1")
+		f.q.mu.Lock()
+		require.Len(t, f.q.stalled, 1)
+		f.q.mu.Unlock()
+		f.clk.Add(30 * time.Minute)
+		require.NoError(t, f.st.ReplaceNodeImages(ctx, "worker-1", nil)) // nothing more to offer
+		f.offer(t, "worker-1")
+		f.clk.Add(30 * time.Minute)
+		f.offer(t, "worker-1")
+		f.q.mu.Lock()
+		defer f.q.mu.Unlock()
+		require.Empty(t, f.q.stalled)
+		require.Empty(t, f.q.offers)
+	})
 }
