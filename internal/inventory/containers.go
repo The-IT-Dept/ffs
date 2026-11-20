@@ -282,11 +282,11 @@ func (p prevUses) of(name string, kind model.ContainerKind, ref string) *model.C
 // attach that image's packages and CVEs to this workload. A confirmation holds for TagTTL per
 // credentials, repository and digest.
 //
-// A tag goes through the recorded tag digest while the record is younger than TagTTL and confirmed
-// for cs (unless a TagTTL refresh is forcing tags, see refreshTemplates), else a registry HEAD under
-// cs; a reference pinned by digest is confirmed with a HEAD. A refusal yields an unresolvable
-// placeholder, never a digest recorded for someone else. When a lookup fails for any other reason,
-// the image prev (this container's stored use) had is kept.
+// A tag goes through the recorded tag digest while the record is younger than TagTTL, confirmed for
+// cs and, during a TagTTL refresh, written since the refresh started (see refreshTemplates), else a
+// registry HEAD under cs; a reference pinned by digest is confirmed with a HEAD. A refusal yields an
+// unresolvable placeholder, never a digest recorded for someone else. When a lookup fails for any
+// other reason, the image prev (this container's stored use) had is kept.
 //
 // A lookup that ended in an unresolvable placeholder is not repeated for the same credentials and
 // platform while its miss holds (missTTL, doubling up to maxMissTTL), so a tag that never resolves
@@ -305,7 +305,7 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 		if err != nil {
 			return model.Image{}, err
 		}
-		if ok && !inv.forceTags && now.Sub(at) < inv.o.TagTTL && inv.access.confirmed(cs, repo, recorded, now) {
+		if ok && !at.Before(inv.tagsSince) && now.Sub(at) < inv.o.TagTTL && inv.access.confirmed(cs, repo, recorded, now) {
 			digest = recorded
 		} else {
 			mk := missKeyOf(cs, lookup, platform)

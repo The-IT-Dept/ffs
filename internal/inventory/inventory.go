@@ -104,9 +104,10 @@ type Inventory struct {
 	catalogRetry map[string]bool                // synthetic digests whose OnImageCatalogued failed
 	unreported   map[string]bool                // owner keys whose OnOwnersChanged failed
 	superseded   map[string]time.Time           // agent-catalogued digests → last Supersede request
-	// forceTags makes resolveRef look recorded tags up again however young the record: set for the
-	// flush of a TagTTL refresh, so no tag is used for longer than TagTTL.
-	forceTags bool
+	// tagsSince is when the TagTTL refresh being flushed started (zero otherwise): resolveRef then
+	// uses only tag records written since, so no tag is used for longer than TagTTL, while the owners
+	// of one tag under the same credentials still share a single lookup per refresh.
+	tagsSince time.Time
 
 	mu             sync.Mutex
 	known          map[string]bool // stored workload owner keys
@@ -308,9 +309,11 @@ func (inv *Inventory) pruneHandedOff(ctx context.Context) error {
 	return nil
 }
 
-// refreshTemplates flushes the template-backed owners now, looking every recorded tag up again however
-// young its record. A record written just after one refresh is therefore replaced at the next, so a tag
-// is used for at most TagTTL (one refresh period), not up to twice that.
+// refreshTemplates flushes the template-backed owners now, looking up again every tag whose record
+// was written before the refresh started, however young. A record written just after one refresh is
+// therefore replaced at the next, so a tag is used for at most TagTTL (one refresh period), not up to
+// twice that. A record this refresh writes is used by the rest of it, so the owners that share a tag
+// and credentials cost one registry lookup per refresh, not one each.
 func (inv *Inventory) refreshTemplates(ctx context.Context) error {
 	inv.mu.Lock()
 	keys := sortedKeys(inv.templateBacked)
@@ -318,7 +321,7 @@ func (inv *Inventory) refreshTemplates(ctx context.Context) error {
 	if len(keys) == 0 {
 		return nil
 	}
-	return inv.flush(ctx, keys, true)
+	return inv.flush(ctx, keys, inv.now())
 }
 
 // MarkCluster queues "cluster", which rebuilds the synthetic Cluster and ContainerRuntime owners (the
@@ -404,15 +407,15 @@ type flushState struct {
 // Flush returns an error only when the batch as a whole could not be applied or reported; what it
 // could not report is reported by a later Flush.
 func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
-	return inv.flush(ctx, keys, false)
+	return inv.flush(ctx, keys, time.Time{})
 }
 
-// flush is Flush; forceTags looks recorded tags up again (refreshTemplates).
-func (inv *Inventory) flush(ctx context.Context, keys []string, forceTags bool) error {
+// flush is Flush; with tagsSince set, tags recorded before it are looked up again (refreshTemplates).
+func (inv *Inventory) flush(ctx context.Context, keys []string, tagsSince time.Time) error {
 	inv.flushMu.Lock()
 	defer inv.flushMu.Unlock()
-	inv.forceTags = forceTags
-	defer func() { inv.forceTags = false }()
+	inv.tagsSince = tagsSince
+	defer func() { inv.tagsSince = time.Time{} }()
 	f, err := inv.newFlush(ctx)
 	if err != nil {
 		inv.batch.Add(keys...)

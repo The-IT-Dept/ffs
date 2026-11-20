@@ -95,5 +95,32 @@ func TestRefreshTemplates_TagsAtMostTagTTLOld(t *testing.T) {
 	h.now = t0.Add(7 * time.Hour)
 	require.NoError(t, h.inv.Flush(ctx, []string{key}))
 	require.Equal(t, 2, h.res.resolveTagCalls)
-	require.False(t, h.inv.forceTags)
+	require.True(t, h.inv.tagsSince.IsZero())
+}
+
+// TestRefreshTemplates_OneLookupPerTagAndCredentials (F53): the owners that share a tag under the same
+// credentials cost one registry lookup per TagTTL refresh, not one each: a record the refresh writes is
+// used by the rest of it. Other credentials still get their own lookup.
+func TestRefreshTemplates_OneLookupPerTagAndCredentials(t *testing.T) {
+	h := newHarness(t, newNode("n1", "amd64"), cronJob("apps", "nightly", "nginx:1.27"),
+		cronJob("apps", "weekly", "nginx:1.27"), cronJob("team-b", "nightly", "nginx:1.27"))
+	keys := []string{"CronJob/apps/nightly", "CronJob/apps/weekly", "CronJob/team-b/nightly"}
+	h.res.tags[nginx+":1.27"] = idx
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.Equal(t, 2, h.res.resolveTagCalls, "one lookup per credentials")
+
+	// The tag moves. Each refresh looks it up once per credentials, and every owner follows.
+	idx2 := "sha256:" + "2222222222222222222222222222222222222222222222222222222222222222"
+	h.res.tags[nginx+":1.27"] = idx2
+	h.res.platforms[idx2+"|linux/amd64"] = registryManifest(mB, idx2, "linux/amd64")
+	for i, at := range []time.Duration{6 * time.Hour, 12 * time.Hour} {
+		h.now = t0.Add(at)
+		require.NoError(t, h.inv.refreshTemplates(ctx))
+		require.Equal(t, 2*(i+2), h.res.resolveTagCalls, "refresh at %s", at)
+		for _, k := range keys {
+			require.Equal(t, []string{mB}, digestsOf(h.owner(t, k).Containers), k)
+		}
+	}
+	require.True(t, h.inv.tagsSince.IsZero())
 }
