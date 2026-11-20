@@ -14,19 +14,19 @@ require (
 	github.com/google/go-containerregistry v0.22.1
 	github.com/google/go-containerregistry/pkg/authn/kubernetes v0.0.0-20260904000721-8a72a424fdec
 	github.com/google/osv-scalibr v0.5.3
-	github.com/klauspost/compress v1.20.3
+	github.com/klauspost/compress v1.20.4
 	github.com/oapi-codegen/runtime v1.9.0
 	github.com/openreports/reports-api v0.2.1
 	github.com/ossf/osv-schema/bindings/go v0.0.0-20260424063704-83285ce2a866
 	github.com/pandatix/go-cvss v0.6.4
-	github.com/prometheus/client_golang v1.24.1
-	github.com/prometheus/client_model v0.6.2
+	github.com/prometheus/client_golang v1.25.0
+	github.com/prometheus/client_model v0.6.3
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.12.1
 	go.yaml.in/yaml/v3 v3.0.6
 	golang.org/x/mod v0.43.0
-	golang.org/x/sync v0.24.0
+	golang.org/x/sync v0.25.0
 	golang.org/x/time v0.16.0
 	google.golang.org/protobuf v1.36.12
 	k8s.io/api v0.37.1
@@ -294,8 +294,8 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/pquerna/cachecontrol v0.1.0 // indirect
 	github.com/proglottis/gpgme v0.1.6 // indirect
-	github.com/prometheus/common v0.70.1 // indirect
-	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
+	github.com/prometheus/procfs v0.22.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
 	github.com/rust-secure-code/go-rustaudit v0.0.0-20250226111315-e20ec32e963c // indirect
