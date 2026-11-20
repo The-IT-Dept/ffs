@@ -21,8 +21,9 @@ rules:
   - apiGroups: [networking.k8s.io]
     resources: [ingresses, ingressclasses]
     verbs: [get, list, watch]
+  # Exposure: gateways and routes, and the ReferenceGrants that let routes in other namespaces reach a Service.
   - apiGroups: [gateway.networking.k8s.io]
-    resources: [gateways, gatewayclasses, httproutes, grpcroutes, tlsroutes, tcproutes, udproutes]
+    resources: [gateways, gatewayclasses, httproutes, grpcroutes, tlsroutes, tcproutes, udproutes, referencegrants]
     verbs: [get, list, watch]
   - apiGroups: [rbac.authorization.k8s.io]
     resources: [roles, clusterroles, rolebindings, clusterrolebindings]

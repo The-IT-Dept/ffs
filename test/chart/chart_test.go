@@ -286,8 +286,9 @@ func controllerRules(wgPolicy bool) map[rule]bool {
 	add("apps", []string{"deployments", "statefulsets", "daemonsets", "replicasets"}, read...)
 	add("batch", []string{"jobs", "cronjobs"}, read...)
 	add("networking.k8s.io", []string{"ingresses", "ingressclasses"}, read...)
+	// ReferenceGrants decide which routes in other namespaces count towards a Service's exposure (spec call 11).
 	add("gateway.networking.k8s.io", []string{"gateways", "gatewayclasses", "httproutes", "grpcroutes", "tlsroutes", "tcproutes",
-		"udproutes"}, read...)
+		"udproutes", "referencegrants"}, read...)
 	add("rbac.authorization.k8s.io", []string{"roles", "clusterroles", "rolebindings", "clusterrolebindings"}, read...)
 	add("ffs.theitdept.au", []string{"findings", "vulnerabilities", "alerttargets", "exceptions"}, read...)
 	add("ffs.theitdept.au", []string{"findings", "vulnerabilities"}, "create", "update", "patch", "delete")
@@ -333,7 +334,8 @@ func TestChart_ControllerRBACIsReadMostly(t *testing.T) {
 		}
 	}
 	// The whole ClusterRole is pinned: F115 dropped the Flux HelmRelease, Flux Kustomization and Argo CD Application
-	// reads (owners come from workload labels and annotations, and those objects can carry inline credentials).
+	// reads (owners come from workload labels and annotations, and those objects can carry inline credentials), and
+	// v0.0.2 adds only the ReferenceGrant read, in the Gateway API group already read.
 	require.Equal(t, controllerRules(true), ruleSet(cr.Rules))
 	for _, group := range []string{"helm.toolkit.fluxcd.io", "kustomize.toolkit.fluxcd.io", "argoproj.io"} {
 		for r := range ruleSet(cr.Rules) {
