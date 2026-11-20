@@ -210,8 +210,14 @@ func wantSplit(t *testing.T, doc []byte, release string) nodegroup.KernelSplit {
 func wantFingerprint(t *testing.T, doc []byte, release string) string {
 	t.Helper()
 	split := wantSplit(t, doc, release)
-	return nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Kernel: split.Kernel, KernelRelease: release,
-		RuntimeVersion: "containerd://2.2.1"})
+	d, err := sbom.DecodeSyftJSON(doc)
+	require.NoError(t, err)
+	var distro *model.Distro
+	if ld := d.Artifacts.LinuxDistribution; ld != nil {
+		distro = &model.Distro{ID: ld.ID, VersionID: ld.VersionID, Codename: ld.VersionCodename}
+	}
+	return nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Distro: distro, Kernel: split.Kernel,
+		KernelRelease: release, RuntimeVersion: "containerd://2.2.1"})
 }
 
 func TestIngest_NoPackageDatabaseIsCoverageGap(t *testing.T) {

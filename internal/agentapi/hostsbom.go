@@ -60,12 +60,12 @@ func prepareHost(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error
 	}
 
 	info := n.Status.NodeInfo
-	fp := nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Kernel: split.Kernel,
-		KernelRelease: r.KernelRelease, RuntimeVersion: info.ContainerRuntimeVersion})
 	var distro *model.Distro
 	if ld := doc.Artifacts.LinuxDistribution; ld != nil {
 		distro = &model.Distro{ID: ld.ID, VersionID: ld.VersionID, Codename: ld.VersionCodename}
 	}
+	fp := nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Distro: distro, Kernel: split.Kernel,
+		KernelRelease: r.KernelRelease, RuntimeVersion: info.ContainerRuntimeVersion})
 	name := nodegroup.GroupName(distro, info.OSImage, r.KernelRelease)
 	return hostPrep{
 		SyftJSON:    b,
