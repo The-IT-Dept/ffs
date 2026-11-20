@@ -229,7 +229,8 @@ func TestBuild_GrypeOpinionBeatsOSV(t *testing.T) {
 
 func TestBuild_MergesStandingMatches(t *testing.T) {
 	// No grype opinion on CVE-E: the osv and k8s matches merge. On CVE-F grype's DB was built after
-	// the earliest observation on the triple (the k8s match's), so grype wins.
+	// the earliest observation on the triple (the k8s match's), but grype takes precedence over OSV
+	// matches only: the k8s and osv matches stand, merged.
 	k8sEarly := observed(obs.Add(-time.Hour))
 	ms := []model.Match{
 		match(model.SourceOSV, libssl3Amd, "CVE-E", vendor(model.SeverityLow, "debian")),
@@ -247,7 +248,41 @@ func TestBuild_MergesStandingMatches(t *testing.T) {
 	assert.Equal(t, "debian", e.SeveritySource)
 	assert.False(t, e.Provisional, "a non-OSV source on the triple is authoritative")
 
-	assert.Equal(t, []string{"3.0.17-1"}, byAdvisory(t, fs, "CVE-F").Packages[0].Fixed)
+	assert.Equal(t, []string{"3.0.14-1"}, byAdvisory(t, fs, "CVE-F").Packages[0].Fixed)
+}
+
+func TestBuild_GrypeTakesPrecedenceOverOSVOnly(t *testing.T) {
+	// A later grype NVD CPE match on php, a binary the upstream-runtime map covers, never replaces the
+	// upstream (CNA) verdict or its fix versions, nor does grype's not-affected verdict drop it.
+	later := built(obs.Add(time.Hour))
+	cpe := func(m *model.Match) { m.Namespace, m.VendorSeveritySource = "nvd:cpe", "nvd" }
+	ms := []model.Match{
+		match(model.SourceUpstream, phpAmd, "CVE-U", fixedIn("8.3.15")),
+		match(model.SourceGrype, phpAmd, "CVE-U", fixedIn("8.4.1"), vendor(model.SeverityCritical, "nvd"), cpe, later),
+		match(model.SourceUpstream, phpAmd, "CVE-V", fixedIn("8.3.16")),
+		match(model.SourceGrype, phpAmd, "CVE-V", notAffected, cpe, later),
+		match(model.SourceUpstream, phpAmd, "CVE-W", fixedIn("8.3.17")),
+		match(model.SourceOSV, phpAmd, "CVE-W", fixedIn("8.3.18")),
+		match(model.SourceGrype, phpAmd, "CVE-W", fixedIn("8.4.2"), cpe, later),
+		match(model.SourceOSV, phpAmd, "CVE-X", fixedIn("8.3.19")),
+		match(model.SourceGrype, phpAmd, "CVE-X", fixedIn("8.4.3"), cpe, later),
+	}
+	in := input(ms, advisory("CVE-U", cna(model.SeverityMedium)))
+	in.GrypeDBBuilds = []time.Time{obs.Add(time.Hour)}
+	fs := Build(in)
+	require.Len(t, fs, 4)
+
+	u := byAdvisory(t, fs, "CVE-U")
+	assert.Equal(t, []string{"8.3.15"}, u.Packages[0].Fixed)
+	assert.Equal(t, model.SeverityMedium, u.Severity, "the CNA rating, not NVD's")
+	assert.Equal(t, "cna", u.SeveritySource)
+	assert.Equal(t, []string{"8.3.16"}, byAdvisory(t, fs, "CVE-V").Packages[0].Fixed)
+	assert.Equal(t, []string{"8.3.17", "8.3.18"}, byAdvisory(t, fs, "CVE-W").Packages[0].Fixed,
+		"an upstream match beside OSV ones keeps grype out")
+	assert.Equal(t, []string{"8.4.3"}, byAdvisory(t, fs, "CVE-X").Packages[0].Fixed, "over OSV alone, grype wins")
+	for _, f := range fs {
+		assert.False(t, f.Provisional, f.AdvisoryID)
+	}
 }
 
 func TestBuild_RunsAsRootFromImageUser(t *testing.T) {
@@ -551,4 +586,29 @@ func TestBuild_OSVSeverityFallback(t *testing.T) {
 	f = one(t, Build(in))
 	assert.Equal(t, model.SeverityCritical, f.Severity)
 	assert.Equal(t, "cna", f.SeveritySource)
+}
+
+func TestBuild_EPSSEdgesFollowThePreviousPriority(t *testing.T) {
+	ms := []model.Match{match(model.SourceGrype, libssl3Amd, "CVE-2026-0007", vendor(model.SeverityLow, "debian"))}
+	adv := advisory("CVE-2026-0007", func(a *model.Advisory) { a.EPSS = 0.47 })
+	fp := model.FindingFingerprint("prod", api().Ref, phpRepo, "CVE-2026-0007")
+
+	fresh := one(t, Build(input(ms, adv)))
+	assert.Equal(t, model.PriorityMedium, fresh.Priority, "a new finding enters high at 0.5")
+	assert.True(t, fresh.Signals.EPSSElevated)
+
+	in := input(ms, adv)
+	in.Previous = map[string]model.Priority{fp: model.PriorityHigh}
+	held := one(t, Build(in))
+	assert.Equal(t, model.PriorityHigh, held.Priority, "a high finding leaves only below 0.45")
+	assert.Contains(t, held.Reasons, "EPSS 0.47")
+	assert.True(t, held.Signals.EPSSElevated)
+
+	adv.EPSS = 0.095
+	in = input(ms, adv)
+	in.Previous = map[string]model.Priority{fp: model.PriorityMedium}
+	assert.Equal(t, model.PriorityMedium, one(t, Build(in)).Priority, "bumped: held until below 0.09")
+	assert.True(t, one(t, Build(in)).Signals.EPSSElevated, "the bump that holds it is shown")
+	assert.Equal(t, model.PriorityLow, one(t, Build(input(ms, adv))).Priority)
+	assert.False(t, one(t, Build(input(ms, adv))).Signals.EPSSElevated)
 }

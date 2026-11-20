@@ -8,6 +8,103 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
+// Causes is the set of reasons an owner was queued for the recompute Diff labels. An owner queued
+// more than once before its recompute keeps every reason, so each transition takes the trigger of
+// the reason that explains it, not one trigger for the whole recompute.
+type Causes uint8
+
+const (
+	// CauseNewAdvisory: a feed changed the owner's matches (NewAdvisory).
+	CauseNewAdvisory Causes = 1 << iota
+	// CauseInventory: the owner's containers, context or existence changed (InventoryChange).
+	CauseInventory
+	// CausePriority: enrichment changed an advisory's KEV, EPSS or CNA data (PriorityChange).
+	CausePriority
+	// CauseException: an exception rule changed or expired.
+	CauseException
+)
+
+// CausesOf is the cause a single trigger stands for: ExceptionExpired for an exception change, and
+// PriorityChange for any trigger that names no other cause.
+func CausesOf(t model.Trigger) Causes {
+	switch t {
+	case model.TriggerNewAdvisory:
+		return CauseNewAdvisory
+	case model.TriggerInventoryChange:
+		return CauseInventory
+	case model.TriggerExceptionExpired:
+		return CauseException
+	}
+	return CausePriority
+}
+
+func (c Causes) has(x Causes) bool { return c&x != 0 }
+
+// Top is the trigger of the highest-ranked cause: NewAdvisory, then InventoryChange, then
+// PriorityChange, which also stands for an exception change.
+func (c Causes) Top() model.Trigger {
+	switch {
+	case c.has(CauseNewAdvisory):
+		return model.TriggerNewAdvisory
+	case c.has(CauseInventory):
+		return model.TriggerInventoryChange
+	}
+	return model.TriggerPriorityChange
+}
+
+// appeared labels a finding n that is created or reopens from resolved: the cause that produced its
+// match, a feed before an inventory change, or else the exception change that queued the owner (the
+// exception trigger, ExceptionExpired, for an open finding) or the enrichment.
+//
+// A finding that appears already excepted in an exception change's recompute is PriorityChange,
+// the label of an exception being applied (see excepted): the trigger enum's only exception value,
+// ExceptionExpired, says an exception lapsed, which is the opposite of what happened. A dedicated
+// value would be an additive enum and API change, which this release does not make.
+func (c Causes) appeared(n model.Finding) model.Trigger {
+	switch {
+	case c.has(CauseNewAdvisory):
+		return model.TriggerNewAdvisory
+	case c.has(CauseInventory):
+		return model.TriggerInventoryChange
+	case c.has(CauseException) && n.State == model.StateOpen:
+		return model.TriggerExceptionExpired
+	}
+	return model.TriggerPriorityChange
+}
+
+// excepted labels an open finding becoming excepted: the exception change or the priority change
+// that let a rule apply, PriorityChange, when either queued the owner.
+func (c Causes) excepted() model.Trigger {
+	if c.has(CauseException | CausePriority) {
+		return model.TriggerPriorityChange
+	}
+	return c.Top()
+}
+
+// confirmed labels a provisional finding's confirmation (see change). The trigger enum has no
+// confirmation value; the closest is NewAdvisory, Grype's DB ruling on it, or InventoryChange when
+// only a rollout, whose new digest grype matched, queued the owner.
+func (c Causes) confirmed() model.Trigger {
+	if c.has(CauseInventory) && !c.has(CauseNewAdvisory) {
+		return model.TriggerInventoryChange
+	}
+	return model.TriggerNewAdvisory
+}
+
+// resolved labels a stored finding that was not built. A provisional one w says was withdrawn
+// resolves as Withdrawn. One the owner no longer runs every digest of, after an inventory change,
+// was fixed by the rollout (spec §6.7.5) or went with its owner: InventoryChange, even when a feed
+// also queued the owner. Anything else takes the top cause.
+func (c Causes) resolved(o model.Finding, w Withdrawals) model.Trigger {
+	switch {
+	case o.Provisional && w.withdrawn(o, c):
+		return model.TriggerWithdrawn
+	case c.has(CauseInventory) && !w.runsAll(o):
+		return model.TriggerInventoryChange
+	}
+	return c.Top()
+}
+
 // Withdrawals tells Diff why stored findings that were not built disappeared.
 type Withdrawals struct {
 	// NotAffected holds the fingerprints grype's not-affected verdict removed (Result.NotAffected).
@@ -17,13 +114,18 @@ type Withdrawals struct {
 }
 
 // withdrawn reports whether the stored finding o, which was not built, was withdrawn rather than
-// fixed or removed: grype says the package is not affected (spec §6.5), or a feed change, not an
-// inventory change, dropped it while the owner still runs every digest it was found in.
-func (w Withdrawals) withdrawn(o model.Finding, trig model.Trigger) bool {
+// fixed or removed: grype says the package is not affected (spec §6.5), or something other than an
+// inventory change (a feed) dropped it while the owner still runs every digest it was found in.
+func (w Withdrawals) withdrawn(o model.Finding, c Causes) bool {
 	if w.NotAffected[o.Fingerprint] {
 		return true
 	}
-	if trig == model.TriggerInventoryChange || len(o.Digests) == 0 {
+	return c&^CauseInventory != 0 && w.runsAll(o)
+}
+
+// runsAll reports whether the owner still runs every digest o was found in.
+func (w Withdrawals) runsAll(o model.Finding) bool {
+	if len(o.Digests) == 0 {
 		return false
 	}
 	for _, d := range o.Digests {
@@ -37,13 +139,17 @@ func (w Withdrawals) withdrawn(o model.Finding, trig model.Trigger) bool {
 // Diff compares an owner's stored findings with the ones Build just produced. It returns the
 // findings to upsert, sorted by fingerprint, and at most one transition per fingerprint (spec §6.6).
 //
-// A built finding keeps Matched, Observed and Suggestion from its stored one and is seen now. A
-// stored finding that was not built resolves: it keeps everything else, and a provisional one that
-// w says was withdrawn resolves as withdrawn; one the owner fixed by moving to another image, or
-// that went with its owner, keeps trig. A finding that was resolved and is still absent is left
-// alone. trig is the transition trigger, except that an excepted finding reopening is an expired
-// exception, and an open finding staying open is a fix appearing or a priority change.
-func Diff(stored, built []model.Finding, w Withdrawals, now time.Time, trig model.Trigger) ([]model.Finding, []model.Transition) {
+// A built finding keeps Matched and Suggestion from its stored one, takes the earlier non-zero of
+// its stored and built Observed (the built one is the advisory's, which a first build before the
+// advisory was stored left zero, and an alias merge can move earlier), and is seen now. A stored
+// finding that was not built resolves: it keeps everything else. A finding that was resolved and is
+// still absent is left alone.
+//
+// c holds every reason the owner was queued for; each transition takes the trigger of the one that
+// explains it: a creation or reopening the cause of its match, a resolution as resolved says, an
+// excepted finding reopening ExceptionExpired, and an open finding staying open a fix appearing, a
+// priority change or, at the same priority, its confirmation (see change).
+func Diff(stored, built []model.Finding, w Withdrawals, now time.Time, c Causes) ([]model.Finding, []model.Transition) {
 	olds, news := byFingerprint(stored), byFingerprint(built)
 	fps := slices.Collect(maps.Keys(olds))
 	for fp := range news {
@@ -61,11 +167,12 @@ func Diff(stored, built []model.Finding, w Withdrawals, now time.Time, trig mode
 		switch {
 		case hasNew:
 			if hasOld {
-				n.Matched, n.Observed, n.Suggestion = o.Matched, o.Observed, o.Suggestion
+				n.Matched, n.Suggestion = o.Matched, o.Suggestion
+				n.Observed = earliest(o.Observed, n.Observed)
 			}
 			n.LastSeen, n.ResolvedAt = now, nil
 			ups = append(ups, n)
-			if t, ok := change(o, hasOld, n, trig); ok {
+			if t, ok := change(o, hasOld, n, c); ok {
 				ts = append(ts, transition(o, n, t, now))
 			}
 		case o.State != model.StateResolved:
@@ -73,33 +180,45 @@ func Diff(stored, built []model.Finding, w Withdrawals, now time.Time, trig mode
 			r := o
 			r.State, r.ResolvedAt = model.StateResolved, &at
 			ups = append(ups, r)
-			t := trig
-			if o.Provisional && w.withdrawn(o, trig) {
-				t = model.TriggerWithdrawn
-			}
-			ts = append(ts, transition(o, r, t, now))
+			ts = append(ts, transition(o, r, c.resolved(o, w), now))
 		}
 	}
 	return ups, ts
 }
 
-// change returns the trigger of the transition from o (when hasOld) to n, if there is one.
-func change(o model.Finding, hasOld bool, n model.Finding, trig model.Trigger) (model.Trigger, bool) {
+// change returns the trigger of the transition from o (when hasOld) to n, a built finding (open or
+// excepted), if there is one.
+//
+// An open provisional finding that stops being provisional at the same priority is confirmed: grype
+// ruled on it, or two Grype DBs passed without a record. The confirmation is a transition of its
+// own, so a finding held back from immediate alerts while provisional (spec §6.5) is alerted once
+// confirmed if nothing was sent for it yet.
+func change(o model.Finding, hasOld bool, n model.Finding, c Causes) (model.Trigger, bool) {
 	switch {
-	case !hasOld:
-		return trig, true
+	case !hasOld || o.State == model.StateResolved:
+		return c.appeared(n), true
 	case o.State == model.StateExcepted && n.State == model.StateOpen:
 		return model.TriggerExceptionExpired, true
 	case o.State != n.State:
-		return trig, true
+		return c.excepted(), true
 	case n.State != model.StateOpen:
 		return "", false // an excepted finding stays quiet whatever its priority does
 	case !o.FixAvailable && n.FixAvailable:
 		return model.TriggerFixAvailable, true
 	case o.Priority != n.Priority:
 		return model.TriggerPriorityChange, true
+	case o.Provisional && !n.Provisional:
+		return c.confirmed(), true
 	}
 	return "", false
+}
+
+// earliest returns the earlier of a and b, ignoring a zero time.
+func earliest(a, b time.Time) time.Time {
+	if a.IsZero() || (!b.IsZero() && b.Before(a)) {
+		return b
+	}
+	return a
 }
 
 // transition records from → to; from is the zero Finding for a creation.

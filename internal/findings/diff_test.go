@@ -21,6 +21,7 @@ func TestDiff_Transitions(t *testing.T) {
 		newAdv   = model.TriggerNewAdvisory
 		inv      = model.TriggerInventoryChange
 		prioCh   = model.TriggerPriorityChange
+		expired  = model.TriggerExceptionExpired
 	)
 	ref := api().Ref
 	f := func(s model.FindingState, p model.Priority) *model.Finding {
@@ -33,6 +34,8 @@ func TestDiff_Transitions(t *testing.T) {
 	prov := func(x *model.Finding) *model.Finding { x.Provisional = true; return x }
 	fixed := func(x *model.Finding) *model.Finding { x.FixAvailable, x.FixState = true, model.FixFixed; return x }
 
+	// feedAndRollout: a Grype DB update and an inventory change queued the owner before its recompute.
+	feedAndRollout := CauseNewAdvisory | CauseInventory
 	cases := []struct {
 		name     string
 		old, new *model.Finding
@@ -41,30 +44,54 @@ func TestDiff_Transitions(t *testing.T) {
 		wantTrig model.Trigger
 		none     bool
 		w        *Withdrawals // nil = running
+		causes   Causes       // 0 = CausesOf(trig)
 	}{
-		{"create open", nil, f(open, high), newAdv, open, newAdv, false, nil},
-		{"create excepted", nil, f(excepted, high), inv, excepted, inv, false, nil},
-		{"create provisional", nil, prov(f(open, urgent)), newAdv, open, newAdv, false, nil},
-		{"gone", f(open, high), nil, inv, resolved, inv, false, nil},
-		{"gone provisional", prov(f(open, urgent)), nil, newAdv, resolved, model.TriggerWithdrawn, false, nil},
-		{"gone provisional after a rollout", prov(f(open, urgent)), nil, inv, resolved, inv, false, nil},
-		{"gone provisional, owner moved on", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &movedOn},
-		{"gone provisional with its owner", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &Withdrawals{}},
-		{"gone provisional, grype not affected", prov(f(open, urgent)), nil, inv, resolved, model.TriggerWithdrawn, false, &notAffected},
-		{"gone settled, grype not affected", f(open, urgent), nil, inv, resolved, inv, false, &notAffected},
-		{"excepted gone", f(excepted, high), nil, inv, resolved, inv, false, nil},
-		{"regression", f(resolved, high), f(open, high), inv, open, inv, false, nil},
-		{"regression excepted", f(resolved, high), f(excepted, high), inv, excepted, inv, false, nil},
-		{"exception expired", f(excepted, high), f(open, high), prioCh, open, model.TriggerExceptionExpired, false, nil},
-		{"excepted", f(open, high), f(excepted, high), prioCh, excepted, prioCh, false, nil},
-		{"escalation", f(open, high), f(open, urgent), newAdv, open, prioCh, false, nil},
-		{"de-escalation", f(open, urgent), f(open, medium), inv, open, prioCh, false, nil},
-		{"fix appeared", f(open, medium), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
-		{"fix appeared, same priority", f(open, high), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil},
-		{"unchanged", f(open, high), f(open, high), newAdv, "", "", true, nil},
-		{"fix still there", fixed(f(open, high)), fixed(f(open, high)), newAdv, "", "", true, nil},
-		{"excepted, priority moved", f(excepted, high), f(excepted, medium), prioCh, "", "", true, nil},
-		{"resolved stays gone", f(resolved, high), nil, inv, "", "", true, nil},
+		{"create open", nil, f(open, high), newAdv, open, newAdv, false, nil, 0},
+		{"create excepted", nil, f(excepted, high), inv, excepted, inv, false, nil, 0},
+		{"create provisional", nil, prov(f(open, urgent)), newAdv, open, newAdv, false, nil, 0},
+		{"gone", f(open, high), nil, inv, resolved, inv, false, nil, 0},
+		{"gone provisional", prov(f(open, urgent)), nil, newAdv, resolved, model.TriggerWithdrawn, false, nil, 0},
+		{"gone provisional after a rollout", prov(f(open, urgent)), nil, inv, resolved, inv, false, nil, 0},
+		{"gone provisional, owner moved on", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &movedOn, 0},
+		{"gone provisional with its owner", prov(f(open, urgent)), nil, newAdv, resolved, newAdv, false, &Withdrawals{}, 0},
+		{"gone provisional, grype not affected", prov(f(open, urgent)), nil, inv, resolved, model.TriggerWithdrawn, false, &notAffected, 0},
+		{"gone settled, grype not affected", f(open, urgent), nil, inv, resolved, inv, false, &notAffected, 0},
+		{"excepted gone", f(excepted, high), nil, inv, resolved, inv, false, nil, 0},
+		{"regression", f(resolved, high), f(open, high), inv, open, inv, false, nil, 0},
+		{"regression excepted", f(resolved, high), f(excepted, high), inv, excepted, inv, false, nil, 0},
+		{"exception expired", f(excepted, high), f(open, high), prioCh, open, model.TriggerExceptionExpired, false, nil, 0},
+		{"excepted", f(open, high), f(excepted, high), prioCh, excepted, prioCh, false, nil, 0},
+		{"escalation", f(open, high), f(open, urgent), newAdv, open, prioCh, false, nil, 0},
+		{"de-escalation", f(open, urgent), f(open, medium), inv, open, prioCh, false, nil, 0},
+		{"fix appeared", f(open, medium), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil, 0},
+		{"fix appeared, same priority", f(open, high), fixed(f(open, high)), newAdv, open, model.TriggerFixAvailable, false, nil, 0},
+		{"confirmed", prov(f(open, high)), f(open, high), newAdv, open, newAdv, false, nil, 0},
+		{"confirmed by a rollout's match", prov(f(open, high)), f(open, high), inv, open, inv, false, nil, 0},
+		{"confirmed and escalated", prov(f(open, high)), f(open, urgent), newAdv, open, prioCh, false, nil, 0},
+		{"still provisional", prov(f(open, high)), prov(f(open, high)), newAdv, "", "", true, nil, 0},
+		{"confirmed while excepted", prov(f(excepted, high)), f(excepted, high), newAdv, "", "", true, nil, 0},
+		{"unchanged", f(open, high), f(open, high), newAdv, "", "", true, nil, 0},
+		{"rollout resolves it during a DB update", f(open, high), nil, "", resolved, inv, false, &movedOn, feedAndRollout},
+		{"owner gone during a DB update", f(open, high), nil, "", resolved, inv, false, &Withdrawals{}, feedAndRollout},
+		{"feed drops it while the owner still runs it", f(open, high), nil, "", resolved, newAdv, false, nil, feedAndRollout},
+		{"provisional, rollout during a DB update", prov(f(open, urgent)), nil, "", resolved, inv, false, &movedOn, feedAndRollout},
+		{"provisional, feed drops it during a rollout elsewhere", prov(f(open, urgent)), nil, "", resolved, model.TriggerWithdrawn,
+			false, nil, feedAndRollout},
+		{"created by an exception change", nil, f(open, high), "", open, expired, false, nil, CauseException},
+		{"created excepted by an exception change: applied, not expired", nil, f(excepted, high), "", excepted, prioCh, false, nil,
+			CauseException},
+		{"reopened by an exception change", f(resolved, high), f(open, high), "", open, expired, false, nil, CauseException},
+		{"created during an exception change and a DB update", nil, f(open, high), "", open, newAdv, false, nil,
+			CauseException | CauseNewAdvisory},
+		{"created by enrichment", nil, f(open, high), prioCh, open, prioCh, false, nil, 0},
+		{"excepted during a DB update", f(open, high), f(excepted, high), "", excepted, prioCh, false, nil,
+			CauseException | CauseNewAdvisory},
+		{"excepted by a feed alias", f(open, high), f(excepted, high), newAdv, excepted, newAdv, false, nil, 0},
+		{"confirmed during a rollout and a DB update", prov(f(open, high)), f(open, high), "", open, newAdv, false, nil, feedAndRollout},
+		{"resolved during an exception change", f(open, high), nil, "", resolved, prioCh, false, &movedOn, CauseException},
+		{"fix still there", fixed(f(open, high)), fixed(f(open, high)), newAdv, "", "", true, nil, 0},
+		{"excepted, priority moved", f(excepted, high), f(excepted, medium), prioCh, "", "", true, nil, 0},
+		{"resolved stays gone", f(resolved, high), nil, inv, "", "", true, nil, 0},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -80,7 +107,11 @@ func TestDiff_Transitions(t *testing.T) {
 			if c.w != nil {
 				w = *c.w
 			}
-			_, ts := Diff(old, built, w, now, c.trig)
+			causes := c.causes
+			if causes == 0 {
+				causes = CausesOf(c.trig)
+			}
+			_, ts := Diff(old, built, w, now, causes)
 			if c.none {
 				assert.Empty(t, ts)
 				return
@@ -123,7 +154,7 @@ func TestDiff_Upserts(t *testing.T) {
 	ups, _ := Diff(
 		[]model.Finding{stored("d-unchanged", model.StateOpen), stored("c-gone", model.StateOpen), regressed, stillGone},
 		[]model.Finding{fresh("e-new"), fresh("d-unchanged"), fresh("b-regression")},
-		Withdrawals{}, now, model.TriggerInventoryChange)
+		Withdrawals{}, now, CauseInventory)
 
 	fps := make([]string, 0, len(ups))
 	got := map[string]model.Finding{}
@@ -157,4 +188,29 @@ func TestDiff_Upserts(t *testing.T) {
 	created := got["e-new"]
 	assert.Equal(t, now, created.Matched)
 	assert.Nil(t, created.Suggestion)
+}
+
+func TestDiff_ObservedTakesTheEarliestNonZero(t *testing.T) {
+	t0, t1 := now.Add(-48*time.Hour), now.Add(-time.Hour)
+	ref := api().Ref
+	fnd := func(fp string, observed time.Time) model.Finding {
+		return model.Finding{Fingerprint: fp, Owner: ref, AdvisoryID: "CVE-" + fp, State: model.StateOpen,
+			Priority: model.PriorityHigh, Observed: observed}
+	}
+	ups, _ := Diff(
+		[]model.Finding{fnd("a-zero-stored", time.Time{}), fnd("b-later-stored", t1), fnd("c-earlier-stored", t0),
+			fnd("d-zero-built", t0)},
+		[]model.Finding{fnd("a-zero-stored", t1), fnd("b-later-stored", t0), fnd("c-earlier-stored", t1),
+			fnd("d-zero-built", time.Time{})},
+		Withdrawals{}, now, CauseNewAdvisory)
+	got := map[string]time.Time{}
+	for _, u := range ups {
+		got[u.Fingerprint] = u.Observed
+	}
+	assert.Equal(t, map[string]time.Time{
+		"a-zero-stored":    t1, // the advisory was not stored when the finding was first built
+		"b-later-stored":   t0, // an alias merge moved the advisory's first sighting earlier
+		"c-earlier-stored": t0,
+		"d-zero-built":     t0,
+	}, got)
 }

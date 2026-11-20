@@ -49,7 +49,11 @@ type BuildInput struct {
 	// matched (store.UnmatchedDigests): what that digest holds is unknown, so a finding the matches
 	// do not build stands instead of resolving (spec §6.2: never clean when not catalogued). Its
 	// advisory must be in Advisories.
-	Carry          []model.Finding
+	Carry []model.Finding
+	// Previous holds the priority of each of the owner's stored findings that is not resolved, by
+	// fingerprint: it decides which EPSS edges rank the finding (priority.Thresholds). A finding
+	// absent from it, new or reopening, enters at the configured edges.
+	Previous       map[string]model.Priority
 	Now            time.Time
 	PriorityConfig config.PriorityConfig
 }
@@ -188,21 +192,26 @@ func digestRepos(cs []model.ContainerUse) map[string][]string {
 	return out
 }
 
-// precedence decides what stands for one triple (spec §6.5, §13.3). Grype has an opinion only
-// through a DB built after ffs observed the other matches on the triple; then its match wins, and
-// its not-affected verdict removes the triple. Otherwise the non-grype matches stand, merged.
+// precedence decides what stands for one triple (spec §6.5, §13.3). Grype takes precedence only
+// over OSV matches: the upstream-runtime map (CNA ranges and OSV GIT records) and Kubernetes matches
+// are the authority on what they match, so a grype match beside one of them, such as an NVD CPE
+// match on a binary built from source, never replaces their verdict or fix versions. Over OSV
+// matches grype has an opinion only through a DB built after ffs observed them; then its match wins,
+// and its not-affected verdict removes the triple. Otherwise the non-grype matches stand, merged.
 func precedence(ms []model.Match) (model.Match, bool) {
 	var grype *model.Match
 	var others []model.Match
+	osvOnly := true
 	for i, m := range ms {
 		switch {
 		case m.Source != model.SourceGrype:
 			others = append(others, m)
+			osvOnly = osvOnly && m.Source == model.SourceOSV
 		case grype == nil || m.DBBuilt.After(grype.DBBuilt):
 			grype = &ms[i]
 		}
 	}
-	if grype != nil && (len(others) == 0 || grype.DBBuilt.After(earliestObserved(others))) {
+	if grype != nil && (len(others) == 0 || (osvOnly && grype.DBBuilt.After(earliestObserved(others)))) {
 		return *grype, grype.FixState != model.FixNotAffected
 	}
 	return merge(others), true
@@ -396,11 +405,12 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string, ctx 
 		SAReasons:        ctx.SAReasons,
 		NotRunning:       b.in.Owner.NotRunning,
 		GoStdlib:         f.GoStdlib,
+		Previous:         b.in.Previous[f.Fingerprint],
 	}
 	f.Signals = model.FindingSignals{
 		Exposed: pin.Exposed, Privileged: pin.Privileged, PowerfulSA: pin.PowerfulSA, NotRunning: pin.NotRunning,
 		KEV: pin.KEVAdded != nil, Malicious: pin.Malicious,
-		EPSSElevated: pin.EPSS >= b.in.PriorityConfig.EPSSBump, EPSS: pin.EPSS,
+		EPSSElevated: pin.EPSS >= priority.Thresholds(pin, b.in.PriorityConfig).EPSSBump, EPSS: pin.EPSS,
 	}
 	f.Priority, f.Reasons = priority.Evaluate(pin, b.in.PriorityConfig)
 	b.except(f, adv.Aliases, pin)

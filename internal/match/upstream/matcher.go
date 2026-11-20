@@ -142,7 +142,9 @@ func (m *Matcher) ApplyOSV(ctx context.Context, recs []osv.Changed) ([]match.Del
 
 // ApplyCNA re-evaluates the advisories of CVE records the cvelist feed stored, after resolving each
 // id to its canonical advisory. Each advisory gets one Delta, scoped to the upstream source and that
-// advisory, combining its CNA and GIT matches.
+// advisory, combining its CNA and GIT matches, unless it has none and no upstream match is stored on
+// it: such a Delta would replace nothing with nothing, and most CVE records name no mapped product,
+// so a first-run backfill would otherwise run tens of thousands of empty match transactions.
 func (m *Matcher) ApplyCNA(ctx context.Context, advisoryIDs []string) ([]match.Delta, error) {
 	advs := make([]string, 0, len(advisoryIDs))
 	for _, id := range advisoryIDs {
@@ -153,12 +155,20 @@ func (m *Matcher) ApplyCNA(ctx context.Context, advisoryIDs []string) ([]match.D
 		advs = append(advs, adv)
 	}
 	slices.Sort(advs)
+	advs = slices.Compact(advs)
+	stored, err := m.st.AdvisoriesWithMatches(ctx, model.SourceUpstream, advs)
+	if err != nil {
+		return nil, err
+	}
 	c := newLookups(m.st)
-	deltas := make([]match.Delta, 0, len(advs))
-	for _, adv := range slices.Compact(advs) {
+	var deltas []match.Delta
+	for _, adv := range advs {
 		d, err := m.evalAdvisory(ctx, c, adv, nil)
 		if err != nil {
 			return nil, err
+		}
+		if _, ok := slices.BinarySearch(stored, adv); len(d.Matches) == 0 && !ok {
+			continue
 		}
 		deltas = append(deltas, d)
 	}

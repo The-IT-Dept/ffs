@@ -48,3 +48,50 @@ func TestGroupStdlib(t *testing.T) {
 	ordered, _ := GroupStdlib([]model.Finding{sf("GO-1", "go1.10.0", model.PriorityLow), sf("GO-2", "go1.9.7", model.PriorityLow)})
 	assert.Equal(t, []string{"go1.9.7", "go1.10.0"}, []string{ordered[0].Installed, ordered[1].Installed})
 }
+
+func TestGroupStdlib_FixedInChoosesTheBranchFirst(t *testing.T) {
+	sf := func(id string, fixed ...string) model.Finding {
+		return model.Finding{Fingerprint: "fp-" + id, AdvisoryID: id, GoStdlib: true, Priority: model.PriorityMedium,
+			Packages: []model.FindingPackage{{Name: "stdlib", Ecosystem: "go-module", Installed: "go1.22.3",
+				Path: "/usr/local/bin/tool", Fixed: fixed}}}
+	}
+	cases := []struct {
+		name string
+		fs   []model.Finding
+		want string
+	}{
+		{"every advisory fixed on the installed branch: the highest fix there",
+			[]model.Finding{sf("GO-1", "1.22.5", "1.23.1"), sf("GO-2", "1.22.12", "1.23.6")}, "1.22.12"},
+		// The highest of each advisory's lowest fix is 1.23.2, which leaves GO-1 unfixed (1.23.6 fixes it).
+		{"one advisory unfixed on the installed branch: the next branch, its highest fix",
+			[]model.Finding{sf("GO-1", "1.22.12", "1.23.6"), sf("GO-2", "1.23.2")}, "1.23.6"},
+		{"a branch the other advisory was not fixed on is skipped",
+			[]model.Finding{sf("GO-1", "1.22.5", "1.24.1"), sf("GO-2", "1.23.2")}, "1.24.1"},
+		{"an advisory fixed only on earlier branches needs nothing on a later one",
+			[]model.Finding{sf("GO-1", "1.22.5"), sf("GO-2", "1.23.2")}, "1.23.2"},
+		{"advisories with no fix do not count",
+			[]model.Finding{sf("GO-1", "1.22.7"), sf("GO-2")}, "1.22.7"},
+		{"release candidates parse",
+			[]model.Finding{sf("GO-1", "1.23.0-rc.2"), sf("GO-2", "1.23.1")}, "1.23.1"},
+		{"no fixes", []model.Finding{sf("GO-1"), sf("GO-2")}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			groups, rest := GroupStdlib(c.fs)
+			require.Empty(t, rest)
+			require.Len(t, groups, 1)
+			assert.Equal(t, c.want, groups[0].FixedIn)
+		})
+	}
+
+	// A version that is not a Go version keeps the highest of each advisory's lowest fix.
+	odd := sf("GO-1", "1.22.5")
+	odd.Packages[0].Installed = "devel"
+	groups, _ := GroupStdlib([]model.Finding{odd, func() model.Finding {
+		f := sf("GO-2", "1.23.2", "1.22.9")
+		f.Packages[0].Installed = "devel"
+		return f
+	}()})
+	require.Len(t, groups, 1)
+	assert.Equal(t, "1.22.9", groups[0].FixedIn)
+}

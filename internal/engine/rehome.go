@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/the-it-dept/ffs/internal/findings"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -46,7 +47,7 @@ func (e *Engine) Rehome(ctx context.Context, r Rehome) error {
 	if err != nil || !wrote {
 		return err
 	}
-	e.enqueue(queue, model.TriggerInventoryChange)
+	e.enqueue(queue, findings.CauseInventory)
 	e.signal()
 	return nil
 }

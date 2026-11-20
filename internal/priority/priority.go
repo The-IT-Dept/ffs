@@ -3,6 +3,7 @@ package priority
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -29,11 +30,48 @@ type Input struct {
 	NotRunning       bool
 	GoStdlib         bool
 	VEXNotAffected   bool
+	// Previous is the finding's priority before this evaluation, PriorityNone for a new one. It
+	// decides which EPSS edges apply (Thresholds).
+	Previous model.Priority
 }
 
-// Evaluate returns the priority of a finding and the facts that explain it.
+// leaveFactor puts the EPSS edges a finding leaves at below the edges it enters at: 0.09 and 0.45
+// for the default 0.1 and 0.5.
+const leaveFactor = 0.9
+
+// Evaluate returns the priority of a finding and the facts that explain it, with the EPSS edges
+// Thresholds chooses for it.
 func Evaluate(in Input, cfg config.PriorityConfig) (model.Priority, []string) {
-	return rank(in, cfg), reasons(in, cfg)
+	t := Thresholds(in, cfg)
+	p := rank(in, t)
+	if t != cfg {
+		p = min(p, in.Previous) // the leave edges only keep what the finding had
+	}
+	return p, reasons(in, t)
+}
+
+// Thresholds returns the EPSS edges that apply to in, a hysteresis band so a score hovering at an
+// edge does not move the priority back and forth daily: a finding enters a priority at cfg's edges
+// (EPSS ≥ EPSSBump, ≥ EPSSHigh) and leaves it only below the leave edges, leaveFactor of cfg's. So
+// cfg applies, unless in.Previous is above what cfg gives and the leave edges keep more of it.
+func Thresholds(in Input, cfg config.PriorityConfig) config.PriorityConfig {
+	enter := rank(in, cfg)
+	if in.Previous <= enter {
+		return cfg
+	}
+	leave := leaving(cfg)
+	if rank(in, leave) > enter {
+		return leave
+	}
+	return cfg
+}
+
+// leaving returns cfg with its EPSS edges at leaveFactor, rounded to the 6 decimals of a score so
+// that a score of exactly 0.09 holds.
+func leaving(cfg config.PriorityConfig) config.PriorityConfig {
+	edge := func(x float64) float64 { return math.Round(x*leaveFactor*1e6) / 1e6 }
+	cfg.EPSSHigh, cfg.EPSSBump = edge(cfg.EPSSHigh), edge(cfg.EPSSBump)
+	return cfg
 }
 
 func rank(in Input, cfg config.PriorityConfig) model.Priority {

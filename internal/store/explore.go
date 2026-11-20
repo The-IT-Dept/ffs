@@ -13,9 +13,9 @@ import (
 )
 
 // The findings explorer: keyset pages, groups and facets over the read model's generated columns
-// (migration 050). Counting statements that can be answered from the findings_explore index alone
-// name it, because the planner prefers the older findings_state_priority index and SQLite never
-// reports an index holding VIRTUAL columns as covering.
+// (migration 050). Counting statements that can be answered from the findings_groups index (055)
+// alone name it, because the planner prefers the older findings_state_priority index and SQLite
+// never reports an index holding VIRTUAL columns as covering.
 
 // FindingSort orders a findings page. Each sort is a tuple whose last element is the fingerprint.
 type FindingSort string
@@ -127,7 +127,7 @@ type TransitionPage struct {
 	Next string
 }
 
-// stmt is one statement of a count or facet. indexOnly means it names findings_explore and reads
+// stmt is one statement of a count or facet. indexOnly means it names findings_groups and reads
 // nothing else of the findings table.
 type stmt struct {
 	query     string
@@ -546,13 +546,13 @@ func findingFacetStmts(q FindingQuery, f FindingFacet) ([]stmt, error) {
 	return nil, fmt.Errorf("store: unknown finding facet %q", f)
 }
 
-// findingsFrom is the FROM of a findings statement of q: findings_explore named when the statement
+// findingsFrom is the FROM of a findings statement of q: findings_groups named when the statement
 // can be answered from it, and findings_fix for one workload's fix group, which the planner would
 // otherwise read in page order through findings_page. Other statements leave the choice to it.
 func findingsFrom(q FindingQuery, coverable bool) string {
 	switch {
 	case coverable:
-		return `findings INDEXED BY findings_explore`
+		return `findings INDEXED BY findings_groups`
 	case q.FixKey != "" && q.Scope.Kind == model.ScopeWorkload:
 		return `findings INDEXED BY findings_fix`
 	}
@@ -582,7 +582,7 @@ func groupsFrom(q FindingQuery) string {
 }
 
 // coverable reports whether the statements of q, minus facet omit's selection, read only columns of
-// the findings_explore index: a cluster, namespace, workload or control plane scope, no Package,
+// the findings_groups index: a cluster, namespace, workload or control plane scope, no Package,
 // Repo, Q or FixKey, and only the open and excepted states.
 func coverable(q FindingQuery, omit FindingFacet) bool {
 	switch q.Scope.Kind {

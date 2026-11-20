@@ -13,19 +13,20 @@ import (
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
-// Recompute rebuilds the findings of the owners keys and writes the changes, with trig as the
-// trigger of their transitions. The findings of every key that recomputed are written in one
-// ApplyFindings call even when another key failed; the failures are returned together.
+// Recompute rebuilds the findings of the owners keys and writes the changes, with the cause trig
+// stands for (findings.CausesOf) labelling their transitions. The findings of every key that
+// recomputed are written in one ApplyFindings call even when another key failed; the failures are
+// returned together.
 func (e *Engine) Recompute(ctx context.Context, keys []string, trig model.Trigger) error {
 	e.running.Add(1)
 	defer e.running.Add(-1)
-	_, err := e.recompute(ctx, keys, trig)
+	_, err := e.recompute(ctx, keys, findings.CausesOf(trig))
 	return err
 }
 
 // pass is the state one Recompute call shares across its owners.
 type pass struct {
-	trig   model.Trigger
+	causes findings.Causes
 	now    time.Time
 	builds []time.Time
 	rules  []findings.ExceptionRule
@@ -34,8 +35,8 @@ type pass struct {
 
 // recompute is Recompute, also returning the keys whose findings were not written. Observers hear
 // about the keys whose findings were, once the recompute lock is released.
-func (e *Engine) recompute(ctx context.Context, keys []string, trig model.Trigger) ([]string, error) {
-	failed, err := e.recomputeLocked(ctx, keys, trig)
+func (e *Engine) recompute(ctx context.Context, keys []string, c findings.Causes) ([]string, error) {
+	failed, err := e.recomputeLocked(ctx, keys, c)
 	var written []string
 	for _, k := range keys {
 		if !slices.Contains(failed, k) {
@@ -48,7 +49,7 @@ func (e *Engine) recompute(ctx context.Context, keys []string, trig model.Trigge
 
 // recomputeLocked rebuilds and writes the findings of keys under the recompute lock and returns the
 // keys whose findings were not written.
-func (e *Engine) recomputeLocked(ctx context.Context, keys []string, trig model.Trigger) ([]string, error) {
+func (e *Engine) recomputeLocked(ctx context.Context, keys []string, c findings.Causes) ([]string, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	builds, err := e.o.Store.GrypeDBBuilds(ctx)
@@ -61,7 +62,7 @@ func (e *Engine) recomputeLocked(ctx context.Context, keys []string, trig model.
 			return keys, fmt.Errorf("engine: exception rules: %w", err)
 		}
 	}
-	p := &pass{trig: trig, now: e.now(), builds: builds, rules: rules, canon: map[string]string{}}
+	p := &pass{causes: c, now: e.now(), builds: builds, rules: rules, canon: map[string]string{}}
 
 	var (
 		ups    []model.Finding
@@ -121,7 +122,7 @@ func (e *Engine) recomputeOwner(ctx context.Context, p *pass, key string) (ups [
 	if err != nil {
 		return nil, nil, rekeyed, err
 	}
-	ups, ts = findings.Diff(old, built, w, p.now, p.trig)
+	ups, ts = findings.Diff(old, built, w, p.now, p.causes)
 	return ups, ts, rekeyed, nil
 }
 
@@ -259,8 +260,13 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		}
 	}
 	var carry []model.Finding
+	previous := make(map[string]model.Priority, len(old))
 	for _, f := range old {
-		if f.State != model.StateResolved && unknown[f.ImageRepo] {
+		if f.State == model.StateResolved {
+			continue
+		}
+		previous[f.Fingerprint] = f.Priority
+		if unknown[f.ImageRepo] {
 			carry = append(carry, f)
 			addID(f.AdvisoryID)
 		}
@@ -279,6 +285,7 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		GrypeDBBuilds:  p.builds,
 		ImageUsers:     users,
 		Carry:          carry,
+		Previous:       previous,
 		Now:            p.now,
 		PriorityConfig: e.o.Config.Priority,
 	})

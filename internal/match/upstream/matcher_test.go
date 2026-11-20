@@ -264,3 +264,42 @@ func TestUpstream_ApplyOSVClearsDroppedRecord(t *testing.T) {
 	require.Equal(t, store.MatchScope{Source: model.SourceUpstream, AdvisoryIDs: []string{cvePHP}}, deltas[0].Scope)
 	require.Empty(t, deltas[0].Matches)
 }
+
+func TestUpstream_ApplyCNASkipsAdvisoriesWithNothingToReplace(t *testing.T) {
+	st := newStore(t)
+	m := upstream.New(st)
+	php := image(t, st, digest("a"), phpCLI("8.3.13"))
+	const (
+		matched  = "CVE-2026-1000" // CNA ranges that affect the stored php
+		nodeOnly = "CVE-2026-1001" // CNA ranges for node, which no image has
+	)
+	nothing := []string{"CVE-2026-0001", "CVE-2026-0002", "CVE-2026-0003"}
+	deltas, err := m.ApplyCNA(ctx, nothing)
+	require.NoError(t, err)
+	require.Empty(t, deltas, "no ranges, no GIT records and no stored matches: nothing to replace")
+
+	require.NoError(t, st.PutUpstreamRanges(ctx, matched, "php",
+		[]byte(`{"defaultStatus":"unaffected","versions":[{"version":"8.3.*","lessThan":"8.3.15","status":"affected"}]}`)))
+	require.NoError(t, st.PutUpstreamRanges(ctx, nodeOnly, "node",
+		[]byte(`{"defaultStatus":"unaffected","versions":[{"version":"22.0.0","lessThan":"22.11.0","status":"affected"}]}`)))
+	deltas, err = m.ApplyCNA(ctx, append([]string{nodeOnly, matched}, nothing...))
+	require.NoError(t, err)
+	require.Len(t, deltas, 1)
+	require.Equal(t, []string{matched}, deltas[0].Scope.AdvisoryIDs)
+	require.Len(t, deltas[0].Matches, 1)
+	require.Equal(t, php[0].ID, deltas[0].Matches[0].PackageID)
+	_, err = st.ReplaceMatches(ctx, deltas[0].Scope, deltas[0].Matches)
+	require.NoError(t, err)
+
+	// The CNA withdraws the ranges: the stored match must go, so the advisory still gets its Delta.
+	require.NoError(t, st.ReplaceUpstreamRanges(ctx, matched, nil))
+	deltas, err = m.ApplyCNA(ctx, []string{matched})
+	require.NoError(t, err)
+	require.Len(t, deltas, 1)
+	require.Empty(t, deltas[0].Matches)
+	_, err = st.ReplaceMatches(ctx, deltas[0].Scope, deltas[0].Matches)
+	require.NoError(t, err)
+	deltas, err = m.ApplyCNA(ctx, []string{matched})
+	require.NoError(t, err)
+	require.Empty(t, deltas, "once cleared, there is nothing left to replace")
+}

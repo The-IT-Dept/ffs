@@ -51,6 +51,7 @@ type Store interface {
 	UnmatchedDigests(ctx context.Context, digests []string) ([]string, error)
 	MarkMatched(ctx context.Context, digest string) error
 	PruneResolved(ctx context.Context, olderThan time.Time) (int, error)
+	PruneTransitions(ctx context.Context, olderThan time.Time, keep int) (int, error)
 	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
 	GrypeDBBuilds(ctx context.Context) ([]time.Time, error)
@@ -100,8 +101,8 @@ type Engine struct {
 	matchMu sync.Mutex
 
 	qmu     sync.Mutex
-	pending map[string]model.Trigger // owner key → trigger of its queued recompute
-	running atomic.Int32             // Recompute calls in progress, or batches Drain has taken
+	pending map[string]findings.Causes // owner key → every cause of its queued recompute
+	running atomic.Int32               // Recompute calls in progress, or batches Drain has taken
 	wake    chan struct{}
 	// awaiting, under qmu, holds the To owners Rehome found absent, by owner key, with when it did:
 	// their recompute is skipped for rehomeWait so the moved findings are not resolved before the
@@ -123,7 +124,7 @@ func New(o Options) *Engine {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	e := &Engine{o: o, pending: map[string]model.Trigger{}, awaiting: map[string]time.Time{}, wake: make(chan struct{}, 1)}
+	e := &Engine{o: o, pending: map[string]findings.Causes{}, awaiting: map[string]time.Time{}, wake: make(chan struct{}, 1)}
 	e.lastCheck = e.now()
 	return e
 }
@@ -148,7 +149,7 @@ func (e *Engine) OnImageCatalogued(ctx context.Context, digest string) error {
 	if oerr != nil {
 		return errors.Join(err, fmt.Errorf("engine: owners of %s: %w", digest, oerr))
 	}
-	e.enqueue(owners, model.TriggerInventoryChange)
+	e.enqueue(owners, findings.CauseInventory)
 	return err
 }
 
@@ -161,7 +162,7 @@ func (e *Engine) OnOwnersChanged(_ context.Context, keys []string) error {
 		delete(e.awaiting, k)
 	}
 	e.qmu.Unlock()
-	e.enqueue(keys, model.TriggerInventoryChange)
+	e.enqueue(keys, findings.CauseInventory)
 	return nil
 }
 
@@ -193,14 +194,14 @@ func (e *Engine) applyDelta(ctx context.Context, d match.Delta, trig model.Trigg
 		if err != nil {
 			return fmt.Errorf("engine: owners of changed digests: %w", err)
 		}
-		e.enqueue(owners, trig)
+		e.enqueue(owners, findings.CausesOf(trig))
 	}
 	if len(s.AdvisoryIDs) > 0 {
 		owners, err := e.o.Store.OwnersWithAdvisories(ctx, s.AdvisoryIDs)
 		if err != nil {
 			return fmt.Errorf("engine: owners with changed advisories: %w", err)
 		}
-		e.enqueue(owners, trig)
+		e.enqueue(owners, findings.CausesOf(trig))
 	}
 	return nil
 }
@@ -215,13 +216,13 @@ func (e *Engine) OnAdvisoriesEnriched(ctx context.Context, ids []string) error {
 	if err != nil {
 		return fmt.Errorf("engine: owners with enriched advisories: %w", err)
 	}
-	e.enqueue(owners, model.TriggerPriorityChange)
+	e.enqueue(owners, findings.CausePriority)
 	return nil
 }
 
 // OnExceptionsChanged queues every owner, since any finding may gain or lose an exception.
 func (e *Engine) OnExceptionsChanged(ctx context.Context) error {
-	return e.enqueueAll(ctx, model.TriggerPriorityChange)
+	return e.enqueueAll(ctx, findings.CauseException)
 }
 
 // observe records the time since start in h.
@@ -327,7 +328,7 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	if err := e.o.Store.RecordGrypeDBBuild(ctx, u.Built); err != nil {
 		return fmt.Errorf("engine: record grype database build: %w", err)
 	}
-	return e.enqueueAll(ctx, model.TriggerNewAdvisory)
+	return e.enqueueAll(ctx, findings.CauseNewAdvisory)
 }
 
 // grypeTargets returns the digests OnGrypeDB re-matches for u, and those of them that test the DB:
@@ -410,8 +411,8 @@ func (e *Engine) Idle() bool {
 	return len(e.pending) == 0 && e.running.Load() == 0
 }
 
-// enqueueAll queues every stored owner.
-func (e *Engine) enqueueAll(ctx context.Context, trig model.Trigger) error {
+// enqueueAll queues every stored owner with cause c.
+func (e *Engine) enqueueAll(ctx context.Context, c findings.Causes) error {
 	owners, err := e.o.Store.ListOwners(ctx)
 	if err != nil {
 		return fmt.Errorf("engine: list owners: %w", err)
@@ -420,7 +421,7 @@ func (e *Engine) enqueueAll(ctx context.Context, trig model.Trigger) error {
 	for i, o := range owners {
 		keys[i] = o.Ref.Key()
 	}
-	e.enqueue(keys, trig)
+	e.enqueue(keys, c)
 	return nil
 }
 

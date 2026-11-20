@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	v6 "github.com/anchore/grype/grype/db/v6"
 	"github.com/anchore/grype/grype/db/v6/name"
@@ -87,15 +88,66 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 	if err != nil {
 		return nil, err
 	}
-	for _, a := range r.advisoryList() {
-		if err := m.st.UpsertAdvisory(ctx, a); err != nil {
-			return nil, fmt.Errorf("grype: store advisory %s: %w", a.ID, err)
-		}
+	if err := m.storeAdvisories(ctx, r.advisoryList()); err != nil {
+		return nil, err
 	}
 	if err := m.st.PutGrypeKeys(ctx, in.Digest, keys.pkgNames, keys.cpeProducts); err != nil {
 		return nil, fmt.Errorf("grype: store search keys of %s: %w", in.Digest, err)
 	}
 	return r.list(), nil
+}
+
+// storeAdvisories stores the advisories an image matched, grype's titles and dates filling gaps only
+// (see fillOnly).
+func (m *Matcher) storeAdvisories(ctx context.Context, advs []model.Advisory) error {
+	for _, a := range advs {
+		a, err := m.fillOnly(ctx, a)
+		if err != nil {
+			return err
+		}
+		if err := m.st.UpsertAdvisory(ctx, a); err != nil {
+			return fmt.Errorf("grype: store advisory %s: %w", a.ID, err)
+		}
+	}
+	return nil
+}
+
+// fillOnly keeps a's Title and Published, taken from grype's record a.ID, only where they fill a gap
+// in the advisory a is stored as: grype's description and record date title an advisory no other
+// source has described (a RHEL or Amazon Linux one), and never replace an OSV summary or a CNA
+// title, nor describe another advisory.
+//
+// UpsertAdvisory merges a into the stored advisories of a.ID and of every alias, under their
+// canonical id, and overwrites with any non-zero field. So both are dropped when a canonicalises to
+// another id (an ALAS that by-CVE normalisation left alone, aliased to its one CVE, would title the
+// CVE with the vendor update's text and date) or merges with an advisory stored under another id,
+// and each is dropped when any advisory a resolves to already has it.
+func (m *Matcher) fillOnly(ctx context.Context, a model.Advisory) (model.Advisory, error) {
+	if a.Title == "" && a.Published.IsZero() {
+		return a, nil
+	}
+	ids := append([]string{a.ID}, a.Aliases...)
+	if model.CanonicalID(ids...) != a.ID {
+		a.Title, a.Published = "", time.Time{}
+		return a, nil
+	}
+	stored, err := m.st.Advisories(ctx, ids)
+	if err != nil {
+		return a, fmt.Errorf("grype: advisory %s: %w", a.ID, err)
+	}
+	for id, s := range stored {
+		if id != a.ID {
+			a.Title, a.Published = "", time.Time{}
+			return a, nil
+		}
+		if s.Title != "" {
+			a.Title = ""
+		}
+		if !s.Published.IsZero() {
+			a.Published = time.Time{}
+		}
+	}
+	return a, nil
 }
 
 // matchImage runs grype over the image and adds the opinions, under the read lock.
@@ -404,17 +456,68 @@ func (r *results) add(p model.Package, v vulnerability.Vulnerability, fix model.
 	r.ids[p.ID][v.ID] = true
 	for _, rel := range v.RelatedVulnerabilities {
 		if rel.ID != "" && rel.ID != v.ID {
-			a.Aliases = append(a.Aliases, rel.ID)
 			r.ids[p.ID][rel.ID] = true
 		}
 	}
+	a.Aliases = append(a.Aliases, relatedAliases(v)...)
 	if v.Metadata != nil {
 		for _, l := range append([]string{v.Metadata.DataSource}, v.Metadata.URLs...) {
 			if l != "" {
 				a.Links = append(a.Links, l)
 			}
 		}
+		// by-CVE normalisation renames a vendor record to its CVE but keeps the record's metadata,
+		// which then describes the vendor advisory, not the CVE
+		if a.Title == "" && v.Metadata.ID == v.ID {
+			a.Title = descriptionTitle(v.Metadata.Description)
+		}
 	}
+	if h, ok := v.Internal.(*v6.VulnerabilityHandle); ok && h != nil && h.Name == v.ID && h.PublishedDate != nil && a.Published.IsZero() {
+		a.Published = h.PublishedDate.UTC()
+	}
+}
+
+// relatedAliases returns the related ids of v that are its aliases: every id that is not a CVE,
+// and a CVE only when it is the one CVE v relates to. A vendor advisory (ALAS, ELSA) that lists
+// several CVEs is related to each of them, but they are distinct advisories: aliasing them all would
+// merge them into one canonical advisory for good (the store never splits an alias group).
+func relatedAliases(v vulnerability.Vulnerability) []string {
+	var ids, cves []string
+	for _, rel := range v.RelatedVulnerabilities {
+		switch {
+		case rel.ID == "" || rel.ID == v.ID:
+		case isCVE(rel.ID):
+			if !slices.Contains(cves, rel.ID) {
+				cves = append(cves, rel.ID)
+			}
+		default:
+			ids = append(ids, rel.ID)
+		}
+	}
+	if len(cves) == 1 {
+		ids = append(ids, cves[0])
+	}
+	return ids
+}
+
+func isCVE(id string) bool { return strings.HasPrefix(strings.ToUpper(id), "CVE-") }
+
+// maxTitleRunes bounds a title taken from a grype record's description.
+const maxTitleRunes = 200
+
+// descriptionTitle returns the first sentence of a grype record's description, without its full
+// stop and cut to 200 runes: the title of an advisory only grype knows (a RHEL or Amazon Linux
+// advisory), which alerts and the dashboard otherwise show as a bare id.
+func descriptionTitle(desc string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(desc), "\n")
+	if i := strings.Index(line, ". "); i >= 0 {
+		line = line[:i]
+	}
+	line = strings.TrimSuffix(strings.TrimSpace(line), ".")
+	if utf8.RuneCountInString(line) > maxTitleRunes {
+		line = string([]rune(line)[:maxTitleRunes])
+	}
+	return strings.TrimSpace(line)
 }
 
 // matched reports whether p has a match on any of ids, directly or through an alias.
