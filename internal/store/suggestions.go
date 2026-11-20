@@ -85,15 +85,21 @@ func (s *Store) PutSuggestionApplied(ctx context.Context, ownerKey string, sg mo
 	if err != nil {
 		return err
 	}
-	var app any
+	// The replaced row's other columns take their defaults: not stale, no applied upgrade. Without an
+	// applied upgrade the statement names only the columns of migration 009, as a store migrated
+	// before 063 has them.
+	q := `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at) VALUES(?, ?, ?, ?, ?)`
+	args := []any{ownerKey, sg.Repo, sg.FromTag, data, nanos(orNow(sg.ComputedAt))}
 	if applied != nil {
-		if app, err = jsonText(applied); err != nil {
+		app, err := jsonText(applied)
+		if err != nil {
 			return err
 		}
+		q = `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at, applied) VALUES(?, ?, ?, ?, ?, ?)`
+		args = append(args, app)
 	}
 	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at, stale, applied)
-			VALUES(?, ?, ?, ?, ?, 0, ?)`, ownerKey, sg.Repo, sg.FromTag, data, nanos(orNow(sg.ComputedAt)), app); err != nil {
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("store: suggestion %s %s: %w", ownerKey, sg.Repo, err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM candidates WHERE owner_key = ? AND repo = ?`, ownerKey, sg.Repo); err != nil {
