@@ -60,13 +60,30 @@ type FeedConfig struct {
 	StaleAfter time.Duration `yaml:"staleAfter"`
 }
 
+// GrypeDBConfig is the grypedb feed's FeedConfig and the size rule for its updates.
+type GrypeDBConfig struct {
+	Enabled    bool          `yaml:"enabled"`
+	URL        string        `yaml:"url"`
+	Interval   time.Duration `yaml:"interval"`
+	StaleAfter time.Duration `yaml:"staleAfter"`
+	// DiffMinImages is the number of catalogued SBOMs (images and node groups) from which a new
+	// build is diffed against the current one to re-match only the changed packages; below it, a
+	// new build re-matches everything. 0 always diffs.
+	DiffMinImages int `yaml:"diffMinImages"`
+}
+
+// Feed returns the feed's schedule and source.
+func (c GrypeDBConfig) Feed() FeedConfig {
+	return FeedConfig{Enabled: c.Enabled, URL: c.URL, Interval: c.Interval, StaleAfter: c.StaleAfter}
+}
+
 type FeedsConfig struct {
-	GrypeDB FeedConfig `yaml:"grypedb"`
-	OSV     FeedConfig `yaml:"osv"`
-	CVEList FeedConfig `yaml:"cvelist"`
-	KEV     FeedConfig `yaml:"kev"`
-	EPSS    FeedConfig `yaml:"epss"`
-	EOL     FeedConfig `yaml:"eol"`
+	GrypeDB GrypeDBConfig `yaml:"grypedb"`
+	OSV     FeedConfig    `yaml:"osv"`
+	CVEList FeedConfig    `yaml:"cvelist"`
+	KEV     FeedConfig    `yaml:"kev"`
+	EPSS    FeedConfig    `yaml:"epss"`
+	EOL     FeedConfig    `yaml:"eol"`
 	// NVD is reserved: there is no NVD feed in v0.0.1 and Validate rejects enabled: true.
 	NVD FeedConfig `yaml:"nvd"`
 	// ChainguardOSV is an on/off switch only: it adds the Wolfi/Chainguard buckets to the osv feed and rides its schedule.
@@ -76,7 +93,7 @@ type FeedsConfig struct {
 // ByName returns the feeds keyed by Feed.Name().
 func (f FeedsConfig) ByName() map[string]FeedConfig {
 	return map[string]FeedConfig{
-		"grypedb": f.GrypeDB, "osv": f.OSV, "cvelist": f.CVEList, "kev": f.KEV,
+		"grypedb": f.GrypeDB.Feed(), "osv": f.OSV, "cvelist": f.CVEList, "kev": f.KEV,
 		"epss": f.EPSS, "eol": f.EOL, "nvd": f.NVD, "chainguard-osv": f.ChainguardOSV,
 	}
 }
@@ -132,6 +149,12 @@ type TagOverride struct {
 	Ignore  []string `yaml:"ignore"`
 }
 
+// DefaultDiffMinImages is the default feeds.grypedb.diffMinImages. Measured on one machine with the
+// 2026-11-18 and 2026-11-20 production builds, the diff took 223 CPU-seconds and a Grype re-match
+// 0.38 to 0.46 CPU-seconds per SBOM: the diff alone costs as much as re-matching about 500 SBOMs,
+// before the diff path re-matches the images whose packages changed, which was most of them.
+const DefaultDiffMinImages = 500
+
 // Default returns the built-in configuration.
 func Default() Config {
 	const h = time.Hour
@@ -141,7 +164,7 @@ func Default() Config {
 		Catalog:  CatalogConfig{Socket: "/run/ffs/catalog.sock", Timeout: 10 * time.Minute, MaxImageBytes: 10 << 30, Concurrency: 2},
 		Registry: RegistryConfig{ReadPullSecrets: true},
 		Feeds: FeedsConfig{
-			GrypeDB:       FeedConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h},
+			GrypeDB:       GrypeDBConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h, DefaultDiffMinImages},
 			OSV:           FeedConfig{true, "https://osv-vulnerabilities.storage.googleapis.com", 5 * time.Minute, 2 * h},
 			CVEList:       FeedConfig{true, "https://github.com/CVEProject/cvelistV5/releases/download", 1 * h, 6 * h},
 			KEV:           FeedConfig{true, "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", 1 * h, 24 * h},
@@ -242,7 +265,7 @@ func (c Config) Validate() error {
 		path string
 		f    FeedConfig
 	}{
-		{"grypedb", c.Feeds.GrypeDB}, {"osv", c.Feeds.OSV}, {"cvelist", c.Feeds.CVEList},
+		{"grypedb", c.Feeds.GrypeDB.Feed()}, {"osv", c.Feeds.OSV}, {"cvelist", c.Feeds.CVEList},
 		{"kev", c.Feeds.KEV}, {"epss", c.Feeds.EPSS}, {"eol", c.Feeds.EOL},
 	} {
 		if !n.f.Enabled {
@@ -257,6 +280,9 @@ func (c Config) Validate() error {
 		if n.f.StaleAfter <= n.f.Interval {
 			bad("feeds.%s.staleAfter: must be greater than interval", n.path)
 		}
+	}
+	if c.Feeds.GrypeDB.DiffMinImages < 0 {
+		bad("feeds.grypedb.diffMinImages: must be >= 0")
 	}
 	if c.Feeds.NVD.Enabled {
 		bad("feeds.nvd: not supported in this release")

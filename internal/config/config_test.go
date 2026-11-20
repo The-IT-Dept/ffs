@@ -24,7 +24,7 @@ func TestDefault(t *testing.T) {
 		Catalog:  CatalogConfig{Socket: "/run/ffs/catalog.sock", Timeout: 10 * time.Minute, MaxImageBytes: 10 << 30, Concurrency: 2},
 		Registry: RegistryConfig{ReadPullSecrets: true},
 		Feeds: FeedsConfig{
-			GrypeDB:       FeedConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h},
+			GrypeDB:       GrypeDBConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h, 500},
 			OSV:           FeedConfig{true, "https://osv-vulnerabilities.storage.googleapis.com", 5 * time.Minute, 2 * h},
 			CVEList:       FeedConfig{true, "https://github.com/CVEProject/cvelistV5/releases/download", 1 * h, 6 * h},
 			KEV:           FeedConfig{true, "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", 1 * h, 24 * h},
@@ -64,6 +64,15 @@ func TestLoad_Overlay(t *testing.T) {
 	require.Equal(t, map[string]string{"docker.io": "mirror.gcr.io"}, c.Registry.Mirrors)
 }
 
+func TestLoad_GrypeDBDiffMinImages(t *testing.T) {
+	c, err := Load(writeFile(t, "feeds:\n  grypedb:\n    diffMinImages: 0\n    interval: 2h\n"))
+	require.NoError(t, err)
+	require.Zero(t, c.Feeds.GrypeDB.DiffMinImages)
+	require.Equal(t, FeedConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 2 * time.Hour, 48 * time.Hour},
+		c.Feeds.GrypeDB.Feed())
+	require.Equal(t, c.Feeds.GrypeDB.Feed(), c.Feeds.ByName()["grypedb"])
+}
+
 func TestLoad_EmptyFileIsDefault(t *testing.T) {
 	c, err := Load(writeFile(t, ""))
 	require.NoError(t, err)
@@ -101,6 +110,8 @@ func TestValidate(t *testing.T) {
 		"enabled feed, no interval": {func(c *Config) { c.Feeds.KEV.Interval = 0 }, "feeds.kev.interval"},
 		"nvd not supported":         {func(c *Config) { c.Feeds.NVD.Enabled = true }, "feeds.nvd: not supported in this release"},
 		"stale before interval":     {func(c *Config) { c.Feeds.OSV.StaleAfter = time.Minute }, "feeds.osv.staleAfter"},
+		"grypedb stale too soon":    {func(c *Config) { c.Feeds.GrypeDB.StaleAfter = time.Minute }, "feeds.grypedb.staleAfter"},
+		"negative diff size":        {func(c *Config) { c.Feeds.GrypeDB.DiffMinImages = -1 }, "feeds.grypedb.diffMinImages"},
 		"epss bump above high":      {func(c *Config) { c.Priority.EPSSBump = 0.6 }, "priority.epssBump"},
 		"allowed host with scheme":  {func(c *Config) { c.AllowedHosts = []string{"https://ffs.example.com"} }, "allowedHosts[0]"},
 		"allowed host with port":    {func(c *Config) { c.AllowedHosts = []string{"ffs.example.com", "ffs.example.com:443"} }, "allowedHosts[1]"},

@@ -69,7 +69,8 @@ func TestManagerOptions(t *testing.T) {
 
 // disableAllFeeds turns every feed off, so Run makes no outbound requests.
 func disableAllFeeds(c *config.Config) {
-	for _, f := range []*config.FeedConfig{&c.Feeds.GrypeDB, &c.Feeds.OSV, &c.Feeds.CVEList, &c.Feeds.KEV,
+	c.Feeds.GrypeDB.Enabled = false
+	for _, f := range []*config.FeedConfig{&c.Feeds.OSV, &c.Feeds.CVEList, &c.Feeds.KEV,
 		&c.Feeds.EPSS, &c.Feeds.EOL, &c.Feeds.NVD, &c.Feeds.ChainguardOSV} {
 		f.Enabled = false
 	}
