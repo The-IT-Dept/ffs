@@ -15,17 +15,22 @@ type FeedState struct {
 	LastSuccess, LastAttempt time.Time
 	LastError                string
 	Meta                     map[string]string
+	// FirstAttempt is when the feed's first sync started, kept across restarts: a feed that never
+	// succeeded is stale measured from it. Fails counts the syncs that failed since the last success.
+	FirstAttempt time.Time
+	Fails        int
 }
 
 // FeedState returns the stored state of the named feed, or FeedState{Name: name} when unknown.
 func (s *Store) FeedState(ctx context.Context, name string) (FeedState, error) {
 	st := FeedState{Name: name}
 	var (
-		success, attempt sql.NullInt64
-		meta             string
+		success, attempt, first sql.NullInt64
+		meta                    string
 	)
-	err := s.rdb.QueryRowContext(ctx, `SELECT watermark, last_success, last_attempt, last_error, meta FROM feeds WHERE name = ?`, name).
-		Scan(&st.Watermark, &success, &attempt, &st.LastError, &meta)
+	err := s.rdb.QueryRowContext(ctx, `SELECT watermark, last_success, last_attempt, last_error, meta, first_attempt, fails
+		FROM feeds WHERE name = ?`, name).
+		Scan(&st.Watermark, &success, &attempt, &st.LastError, &meta, &first, &st.Fails)
 	if errors.Is(err, sql.ErrNoRows) {
 		return FeedState{Name: name}, nil
 	}
@@ -34,6 +39,7 @@ func (s *Store) FeedState(ctx context.Context, name string) (FeedState, error) {
 	}
 	st.LastSuccess = fromNanos(success)
 	st.LastAttempt = fromNanos(attempt)
+	st.FirstAttempt = fromNanos(first)
 	if err := json.Unmarshal([]byte(meta), &st.Meta); err != nil {
 		return FeedState{}, fmt.Errorf("store: feed %s meta: %w", name, err)
 	}
@@ -49,8 +55,9 @@ func (s *Store) PutFeedState(ctx context.Context, st FeedState) error {
 			return err
 		}
 	}
-	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO feeds(name, watermark, last_success, last_attempt, last_error, meta)
-		VALUES(?, ?, ?, ?, ?, ?)`, st.Name, st.Watermark, nanos(st.LastSuccess), nanos(st.LastAttempt), st.LastError, meta)
+	_, err := s.wdb.ExecContext(ctx, `INSERT OR REPLACE INTO feeds(name, watermark, last_success, last_attempt, last_error, meta,
+		first_attempt, fails) VALUES(?, ?, ?, ?, ?, ?, ?, ?)`,
+		st.Name, st.Watermark, nanos(st.LastSuccess), nanos(st.LastAttempt), st.LastError, meta, nanos(st.FirstAttempt), st.Fails)
 	return err
 }
 

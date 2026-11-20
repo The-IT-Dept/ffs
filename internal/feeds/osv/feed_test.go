@@ -1524,3 +1524,41 @@ func TestOSVSync_OverlapTakesLateListedRecords(t *testing.T) {
 	require.Equal(t, gets, e.srv.recordGETs("PyPI"))
 	require.Len(t, e.sink.all(), 3)
 }
+
+// TestOSVSync_MissingRecordRetried (F54): a record modified_id.csv lists but the bucket answers 404
+// for is held as missing in the feed's meta and asked for again at later syncs, after the
+// watermark has moved past its row, until it is found or a day has passed.
+func TestOSVSync_MissingRecordRetried(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "hashver": osv.HashVersion})
+	listing := csvOf(row{t1, "PYSEC-a"}, row{t1, "PYSEC-b"}, row{t1, "PYSEC-c"})
+	records := map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1)} // b and c are not uploaded yet
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: listing, records: records})
+	clock := now
+	f := e.feed(func(o *osv.Options) { o.Now = func() time.Time { return clock } })
+
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a"}, e.sink.keys())
+	require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"], "the watermark moves past the missing rows")
+	require.Equal(t, "PYSEC-b "+now.Format(time.RFC3339)+"\nPYSEC-c "+now.Format(time.RFC3339), e.meta(t)["missing.PyPI"])
+
+	// b appears; the listing is unchanged, so only the retry reads it.
+	records["PYSEC-b"] = pypi("PYSEC-b", "1.0", t1)
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: listing, records: records})
+	clock = now.Add(5 * time.Minute)
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a", "PyPI/PYSEC-b"}, e.sink.keys())
+	require.Equal(t, "PYSEC-c "+now.Format(time.RFC3339), e.meta(t)["missing.PyPI"], "c keeps when it was first missed")
+	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
+
+	// A day after it was first missed, c is given up on.
+	clock = now.Add(missingFor)
+	require.NoError(t, f.Sync(ctx))
+	require.NotContains(t, e.meta(t), "missing.PyPI")
+	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
+	require.Len(t, e.sink.all(), 2)
+}
+
+const missingFor = 24 * time.Hour

@@ -1,7 +1,9 @@
 // Package osv is the fast path for new and changed advisories. It polls the OSV.dev bucket for the
 // ecosystems present in the inventory (plus Go and GIT), reads each bucket's modified_id.csv down
-// to its watermark, caches the changed records locally and hands a record to the handler only when
-// its affected set, aliases or withdrawn time changed: most modifications only touch timestamps.
+// to an hour below its watermark, caches the changed records locally and hands a record to the
+// handler only when its affected set, aliases, withdrawn time or ratings changed: most
+// modifications only touch timestamps. A listed record the bucket answers 404 for is asked for
+// again at later syncs.
 // A cached GIT record that stops referencing the GitRepos repositories is handed off once more
 // and then dropped from the cache. A weekly set-diff withdraws records that left the bucket, and
 // records outside Go and GIT are pruned after 14 days unless the osv source still matches them.
@@ -57,8 +59,17 @@ const (
 	metaZipBehind   = "zipbehind." // + bucket: when its all.zip was first seen older than modified_id.csv
 	metaGitRepos    = "repos.GIT"
 	metaSetDiff     = "setdiff"
-	metaHashVersion = "hashver" // the HashVersion of the cached records' affected hashes
-	metaListed      = "listed." // + bucket: when its overlap rows were first recorded (store.OSVListed)
+	metaHashVersion = "hashver"  // the HashVersion of the cached records' affected hashes
+	metaListed      = "listed."  // + bucket: when its overlap rows were first recorded (store.OSVListed)
+	metaMissing     = "missing." // + bucket: listed records that were not found (see retryMissing)
+)
+
+// missingFor is how long a record that modified_id.csv lists but the bucket answers 404 for is
+// asked for again, at every Sync, before it is given up on. At most maxMissing are held per bucket,
+// so a mirror that lists records it does not serve costs a bounded number of requests.
+const (
+	missingFor = 24 * time.Hour
+	maxMissing = 1000
 )
 
 // pollOverlap is how far below the watermark a poll reads modified_id.csv again. The listing is
@@ -163,10 +174,10 @@ type recKey struct{ bucket, id string }
 
 func (k recKey) String() string { return k.bucket + "/" + k.id }
 
-// Sync hands off any pending records, polls (or, for Go and GIT, first loads) every bucket in use,
-// runs the weekly set-diff and prunes old records. A failing bucket does not stop the others,
-// unless it failed with records pending (a handler error, say): those must be handed off before
-// anything else is taken in.
+// Sync hands off any pending records, asks again for listed records that were not found, polls
+// (or, for Go and GIT, first loads) every bucket in use, runs the weekly set-diff and prunes old
+// records. A failing bucket does not stop the others, unless it failed with records pending (a
+// handler error, say): those must be handed off before anything else is taken in.
 func (f *Feed) Sync(ctx context.Context) error {
 	st, err := f.o.Store.FeedState(ctx, feeds.NameOSV)
 	if err != nil {
@@ -185,14 +196,16 @@ func (f *Feed) Sync(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	dropMissingOutside(&st, buckets)
 	var errs []error
 	for _, b := range buckets {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		if f.needsBootstrap(st, b) {
+		err = f.retryMissing(ctx, &st, b)
+		if err == nil && f.needsBootstrap(st, b) {
 			err = f.bootstrap(ctx, &st, b)
-		} else {
+		} else if err == nil {
 			err = f.poll(ctx, &st, b)
 		}
 		if err == nil && needsMalicious(st, b) {
@@ -266,7 +279,8 @@ func (f *Feed) loadMalicious(ctx context.Context, st *store.FeedState, b string)
 			want[id] = modified
 		}
 	}
-	changed, takeErr := f.take(ctx, st, b, want, "")
+	changed, missing, takeErr := f.take(ctx, st, b, want, "")
+	f.holdMissing(ctx, st, b, missing)
 	if takeErr == nil {
 		// Every record is cached and the changed ones are pending (see handOff), in the same write.
 		st.Meta[metaMalicious+b] = f.o.Now().UTC().Format(time.RFC3339)
@@ -296,6 +310,97 @@ func (f *Feed) rehash(ctx context.Context, st *store.FeedState) error {
 	logr.FromContextOrDiscard(ctx).Info("rehashed the cached OSV records for a new hash version", "version", HashVersion, "records", n)
 	st.Meta[metaHashVersion] = HashVersion
 	return f.save(ctx, st)
+}
+
+// retryMissing asks again for the records of b that modified_id.csv listed but the bucket answered
+// 404 for, instead of passing over them for good: the watermark has moved past their rows. Those
+// found are cached and handed off like any other; those missing for missingFor are given up on.
+func (f *Feed) retryMissing(ctx context.Context, st *store.FeedState, b string) error {
+	held := missingOf(*st, b)
+	if len(held) == 0 {
+		return nil
+	}
+	now := f.o.Now().UTC()
+	want := make(map[string]time.Time, len(held))
+	for id, since := range held {
+		if now.Sub(since) >= missingFor {
+			logr.FromContextOrDiscard(ctx).Info("an OSV record that modified_id.csv lists is still not found; giving up on it",
+				"bucket", b, "id", id, "since", since)
+			delete(held, id)
+			continue
+		}
+		want[id] = time.Time{}
+	}
+	changed, missing, takeErr := f.take(ctx, st, b, want, "")
+	if takeErr == nil {
+		still := make(map[string]time.Time, len(missing))
+		for _, id := range missing {
+			still[id] = held[id]
+		}
+		held = still
+	}
+	setMissing(st, b, held)
+	if err := f.handOff(ctx, st, changed); err != nil {
+		return errors.Join(takeErr, err)
+	}
+	return errors.Join(takeErr, f.save(ctx, st))
+}
+
+// holdMissing adds the records of b that were not found to those retryMissing asks for again,
+// keeping when each was first missed, up to maxMissing. The caller saves st.
+func (f *Feed) holdMissing(ctx context.Context, st *store.FeedState, b string, ids []string) {
+	if len(ids) == 0 {
+		return
+	}
+	held := missingOf(*st, b)
+	now := f.o.Now().UTC()
+	dropped := 0
+	for _, id := range ids {
+		if _, ok := held[id]; ok {
+			continue
+		}
+		if len(held) >= maxMissing {
+			dropped++
+			continue
+		}
+		held[id] = now
+	}
+	if dropped > 0 {
+		logr.FromContextOrDiscard(ctx).Info("too many OSV records that modified_id.csv lists are not found; not asking for the rest again",
+			"bucket", b, "held", len(held), "dropped", dropped)
+	}
+	setMissing(st, b, held)
+}
+
+// missingOf returns the records of b held as missing, with when each was first missed. Meta holds
+// them as "<id> <RFC 3339 time>" lines.
+func missingOf(st store.FeedState, b string) map[string]time.Time {
+	out := map[string]time.Time{}
+	for line := range strings.SplitSeq(st.Meta[metaMissing+b], "\n") {
+		id, at, ok := strings.Cut(line, " ")
+		if t, err := time.Parse(time.RFC3339, at); ok && id != "" && err == nil {
+			out[id] = t
+		}
+	}
+	return out
+}
+
+// setMissing stores held as the records of b held as missing.
+func setMissing(st *store.FeedState, b string, held map[string]time.Time) {
+	lines := make([]string, 0, len(held))
+	for _, id := range slices.Sorted(maps.Keys(held)) {
+		lines = append(lines, id+" "+held[id].UTC().Format(time.RFC3339))
+	}
+	setMeta(st, metaMissing+b, strings.Join(lines, "\n"))
+}
+
+// dropMissingOutside forgets the missing records of buckets that are no longer polled.
+func dropMissingOutside(st *store.FeedState, buckets []string) {
+	for k := range st.Meta {
+		if b, ok := strings.CutPrefix(k, metaMissing); ok && !slices.Contains(buckets, b) {
+			delete(st.Meta, k)
+		}
+	}
 }
 
 func (f *Feed) save(ctx context.Context, st *store.FeedState) error {
@@ -377,7 +482,8 @@ func (f *Feed) poll(ctx context.Context, st *store.FeedState, b string) error {
 		}
 	}
 
-	changed, takeErr := f.take(ctx, st, b, want, rd.gen)
+	changed, missing, takeErr := f.take(ctx, st, b, want, rd.gen)
+	f.holdMissing(ctx, st, b, missing)
 	if errors.Is(takeErr, errZipBehind) { // nothing taken; the listing is read again next time
 		logr.FromContextOrDiscard(ctx).V(1).Info("OSV all.zip is older than modified_id.csv; polling again next time", "bucket", b)
 		return f.save(ctx, st)
@@ -428,7 +534,8 @@ func (f *Feed) watermark(st store.FeedState, b string) time.Time {
 
 // take fetches and caches the records of b that want names, returning the ones to hand off: those
 // whose affected hash changed and dropped GIT records (see put); on an error, those so far, which
-// the caller still hands off. want maps each ID to the modified time modified_id.csv lists for it
+// the caller still hands off. It also returns the IDs the bucket answered 404 for (see
+// retryMissing). want maps each ID to the modified time modified_id.csv lists for it
 // (zero: not known). It reads them the cheapest way (see choose): one GET each, Range reads of
 // their entries in all.zip, or all of all.zip. all.zip can be an export older than the listing, so
 // an entry older than its listed time, or a listed record the zip lacks, is then read with one GET:
@@ -436,18 +543,18 @@ func (f *Feed) watermark(st store.FeedState, b string) time.Time {
 // is older than the listing, take returns errZipBehind instead, having read nothing, until the zip
 // has been behind for zipBehindWait (see plan). Every candidate is pending while the cache is
 // written, so a crash between a record's write and its hand-off cannot lose it.
-func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map[string]time.Time, csvGen string) ([]recKey, error) {
+func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map[string]time.Time, csvGen string) ([]recKey, []string, error) {
 	if len(want) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	ids := slices.Sorted(maps.Keys(want))
 	gitCached, err := f.gitCached(ctx, b)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	how, probe, err := f.plan(ctx, st, b, len(ids), csvGen)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	keys := make([]recKey, len(ids))
 	for i, id := range ids {
@@ -455,26 +562,27 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map
 	}
 	setPending(st, keys)
 	if err := f.save(ctx, st); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	var (
-		out    []recKey
-		stats  readStats
-		behind []string // listed records the zip held only an older version of, or lacked
+		out     []recKey
+		missing []string
+		stats   readStats
+		behind  []string // listed records the zip held only an older version of, or lacked
 	)
 	switch how {
 	case wholeZip:
 		var path string
 		if path, err = f.downloadZip(ctx, b); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		defer func() { _ = os.Remove(path) }()
 		out, stats, behind, err = f.storeZip(ctx, b, path, want, gitCached)
 	case rangedZip:
 		out, stats, behind, err = f.storeRanged(ctx, b, probe, want, gitCached)
 	default:
-		out, stats, err = f.storeRecords(ctx, b, ids, gitCached)
+		out, stats, missing, err = f.storeRecords(ctx, b, ids, gitCached)
 	}
 	if err == nil && len(behind) > 0 {
 		logr.FromContextOrDiscard(ctx).Info("OSV all.zip is older than modified_id.csv for some records; reading them one at a time",
@@ -483,12 +591,12 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map
 			more  []recKey
 			extra readStats
 		)
-		more, extra, err = f.storeRecords(ctx, b, behind, gitCached)
+		more, extra, missing, err = f.storeRecords(ctx, b, behind, gitCached)
 		out = append(out, more...)
 		stats.n, stats.bytes = stats.n+extra.n, stats.bytes+extra.bytes
 	}
 	learnRecordBytes(st, b, stats)
-	return out, err
+	return out, missing, err
 }
 
 // zipBehind reports whether all.zip, of version zipVersion, is known to be older than the
@@ -569,16 +677,19 @@ func learnRecordBytes(st *store.FeedState, b string, s readStats) {
 	st.Meta[metaRecordBytes+b] = strconv.FormatInt(max(mean, 1), 10)
 }
 
-// storeRecords GETs the records ids of b, fetchChunk at a time, and caches each (see put).
-func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCached map[string]bool) ([]recKey, readStats, error) {
+// storeRecords GETs the records ids of b, fetchChunk at a time, and caches each (see put). It also
+// returns the IDs the bucket answered 404 for.
+func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCached map[string]bool) ([]recKey, readStats, []string, error) {
 	var (
-		out   []recKey
-		sizes readStats
+		out     []recKey
+		missing []string
+		sizes   readStats
 	)
 	for chunk := range slices.Chunk(ids, fetchChunk) {
-		raws, err := f.fetchRecords(ctx, b, chunk)
+		raws, notFound, err := f.fetchRecords(ctx, b, chunk)
+		missing = append(missing, notFound...)
 		if err != nil {
-			return out, sizes, err
+			return out, sizes, missing, err
 		}
 		for i, raw := range raws {
 			if raw == nil {
@@ -587,14 +698,14 @@ func (f *Feed) storeRecords(ctx context.Context, b string, ids []string, gitCach
 			res, modified, err := f.put(ctx, b, chunk[i], raw, gitCached, time.Time{})
 			sizes.add(len(raw), modified)
 			if err != nil {
-				return out, sizes, err
+				return out, sizes, missing, err
 			}
 			if res == putChanged || res == putDropped {
 				out = append(out, recKey{b, chunk[i]})
 			}
 		}
 	}
-	return out, sizes, nil
+	return out, sizes, missing, nil
 }
 
 // storeRanged reads the entries of the probed all.zip of b that want names with Range requests,
@@ -689,10 +800,11 @@ func (f *Feed) gitCached(ctx context.Context, b string) (map[string]bool, error)
 }
 
 // fetchRecords GETs <b>/<id>.json for each id, 8 at a time. A missing or oversized record is
-// skipped (nil).
-func (f *Feed) fetchRecords(ctx context.Context, b string, ids []string) ([][]byte, error) {
+// skipped (nil); the IDs of the missing ones are returned too.
+func (f *Feed) fetchRecords(ctx context.Context, b string, ids []string) ([][]byte, []string, error) {
 	log := logr.FromContextOrDiscard(ctx)
 	out := make([][]byte, len(ids))
+	notFound := make([]bool, len(ids))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(fetchConcurrency)
 	for i, id := range ids {
@@ -700,6 +812,7 @@ func (f *Feed) fetchRecords(ctx context.Context, b string, ids []string) ([][]by
 			resp, err := feeds.Fetch(gctx, f.o.HTTP, feeds.Request{URL: f.bucketURL(b, id+".json"), MaxBytes: maxRecordBytes})
 			switch {
 			case errors.Is(err, feeds.ErrNotFound):
+				notFound[i] = true
 				return nil
 			case errors.Is(err, feeds.ErrTooLarge):
 				log.Info("skipping an oversized OSV record", "bucket", b, "id", id)
@@ -711,7 +824,14 @@ func (f *Feed) fetchRecords(ctx context.Context, b string, ids []string) ([][]by
 			return nil
 		})
 	}
-	return out, g.Wait()
+	err := g.Wait()
+	var missing []string
+	for i, nf := range notFound {
+		if nf {
+			missing = append(missing, ids[i])
+		}
+	}
+	return out, missing, err
 }
 
 // putResult is what put did with a record.

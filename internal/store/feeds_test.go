@@ -24,6 +24,16 @@ func TestFeedState(t *testing.T) {
 	require.Equal(t, in.Watermark, got.Watermark)
 	require.True(t, got.LastSuccess.Equal(t0))
 	require.True(t, got.LastAttempt.Equal(t0))
+	require.True(t, got.FirstAttempt.IsZero())
+	require.Zero(t, got.Fails)
+
+	in.FirstAttempt, in.Fails, in.LastError = t0.Add(-time.Hour), 3, "boom"
+	require.NoError(t, s.PutFeedState(ctx, in))
+	got, err = s.FeedState(ctx, "osv")
+	require.NoError(t, err)
+	require.True(t, got.FirstAttempt.Equal(t0.Add(-time.Hour)), "FirstAttempt %v", got.FirstAttempt)
+	require.Equal(t, 3, got.Fails)
+	require.Equal(t, "boom", got.LastError)
 }
 
 func TestUpstreamRanges(t *testing.T) {
