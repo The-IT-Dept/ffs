@@ -87,7 +87,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | `[]` | Pull secrets for the ffs image itself. |
 | `rbac.readPullSecrets` | `true` | Grant cluster-wide `get` on Secrets so pull secrets of pods and ServiceAccounts can be read. When false, private images that need them show as `unresolvable`. |
-| `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. |
+| `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. The memory limit is a byte count or a whole quantity such as `1536Mi`; `GOMEMLIMIT` is set to 90% of it. |
 | `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. SQLite's temporary files do not use it: they go to `<dataDir>/tmp` on the persistent volume, or to `SQLITE_TMPDIR` when that is set. |
 | `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |

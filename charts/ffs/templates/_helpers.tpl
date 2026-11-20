@@ -62,6 +62,17 @@ ffs.bytes renders a byte count from a number or a Kubernetes quantity with no fr
 {{- end -}}
 
 {{- /*
+ffs.goMemLimit is the controller's GOMEMLIMIT in bytes: 90% of its memory limit. The rest is for
+what the Go runtime does not count: SQLite's page caches and sort buffers, which live outside the Go
+heap, and the kernel's own accounting. At 100% the container can be OOM-killed before the garbage
+collector has tried to stay under the limit.
+*/ -}}
+{{- define "ffs.goMemLimit" -}}
+{{- $limit := include "ffs.bytes" (list "controller.resources.limits.memory" .) | int64 -}}
+{{- div (mul $limit 9) 10 -}}
+{{- end -}}
+
+{{- /*
 ffs.scratchLimit is catalog.scratchLimit in bytes. It must be above zero, which the cataloguer
 would read as unlimited, and below catalog.scratchSizeLimit, so a job is refused before the
 kubelet evicts the pod for filling the scratch volume.

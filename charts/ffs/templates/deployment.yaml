@@ -61,10 +61,14 @@ spec:
             - --config=/etc/ffs/config.yaml
           env:
             - name: GOMEMLIMIT
+              {{- with (.Values.controller.resources.limits | default dict).memory }}
+              value: {{ include "ffs.goMemLimit" . | quote }}
+              {{- else }}
               valueFrom:
                 resourceFieldRef:
                   containerName: controller
                   resource: limits.memory
+              {{- end }}
           ports:
             - {name: http, containerPort: 8080, protocol: TCP}
             - {name: metrics, containerPort: 8443, protocol: TCP}

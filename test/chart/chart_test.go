@@ -97,10 +97,11 @@ func TestChart_DeploymentShape(t *testing.T) {
 	for _, c := range ps.Containers {
 		require.Len(t, c.Env, 1, c.Name)
 		require.Equal(t, "GOMEMLIMIT", c.Env[0].Name)
-		ref := c.Env[0].ValueFrom.ResourceFieldRef
-		require.Equal(t, c.Name, ref.ContainerName)
-		require.Equal(t, "limits.memory", ref.Resource)
 	}
+	require.Equal(t, "966367641", ctl.Env[0].Value, "90% of the controller's 1Gi limit")
+	ref := cat.Env[0].ValueFrom.ResourceFieldRef
+	require.Equal(t, "catalog", ref.ContainerName)
+	require.Equal(t, "limits.memory", ref.Resource)
 	reqs := func(c corev1.Container) (string, string, string, bool) {
 		return c.Resources.Requests.Cpu().String(), c.Resources.Requests.Memory().String(),
 			c.Resources.Limits.Memory().String(), c.Resources.Limits.Cpu().IsZero()
@@ -534,6 +535,29 @@ func TestChart_ServiceMonitorHonorsLabels(t *testing.T) {
 
 // TestChart_ScratchLimitQuantities is the regression test for F16: a quantity such as 18Gi used to
 // render --scratch-limit=0, which the cataloguer reads as unlimited.
+// TestChart_ControllerGoMemLimit checks the controller's GOMEMLIMIT is 90% of its memory limit, so
+// memory the Go runtime does not count (SQLite's, mostly) fits under the limit too, and that without
+// a limit it falls back to the container's allocatable memory.
+func TestChart_ControllerGoMemLimit(t *testing.T) {
+	env := func(sets ...string) corev1.EnvVar {
+		t.Helper()
+		c := container(t, podSpec(t, sets...), "controller")
+		require.Len(t, c.Env, 1)
+		require.Equal(t, "GOMEMLIMIT", c.Env[0].Name)
+		return c.Env[0]
+	}
+	require.Equal(t, "966367641", env().Value)
+	require.Equal(t, "1449551462", env("controller.resources.limits.memory=1536Mi").Value)
+	require.Equal(t, "1800000000", env("controller.resources.limits.memory=2G").Value)
+	e := env("controller.resources.limits=null")
+	require.Empty(t, e.Value)
+	require.Equal(t, "limits.memory", e.ValueFrom.ResourceFieldRef.Resource)
+	require.Equal(t, "controller", e.ValueFrom.ResourceFieldRef.ContainerName)
+
+	_, err := renderErr(t, "controller.resources.limits.memory=1.5Gi")
+	require.ErrorContains(t, err, "controller.resources.limits.memory must be a byte count or a quantity such as 18Gi")
+}
+
 func TestChart_ScratchLimitQuantities(t *testing.T) {
 	limit := func(sets ...string) string {
 		t.Helper()
