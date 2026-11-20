@@ -21,7 +21,7 @@ func TestFixture_SmallDerivedFacts(t *testing.T) {
 	require.Equal(t, smallOpen, apigen.PriorityCounts{Urgent: st.Counts.Urgent, High: st.Counts.High, Medium: st.Counts.Medium,
 		Low: st.Counts.Low})
 	require.Equal(t, smallOpenTotal, st.Open)
-	require.Equal(t, 8, st.Fixable)
+	require.Equal(t, 9, st.Fixable)
 	require.Equal(t, 2, st.Exploited)
 	require.Equal(t, 1, st.Excepted)
 

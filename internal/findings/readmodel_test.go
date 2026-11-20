@@ -82,6 +82,12 @@ func TestBuild_FixAction(t *testing.T) {
 			Package: "lodash", Ecosystem: "npm", From: "4.17.20", To: to}
 	}
 	rebuild := &model.FixAction{Kind: model.FixKindRebuild, Key: "rebuild:debian:12", Label: "debian 12 rebuild", Distro: deb12}
+	// A host finding is the Nodes owner's: a node has no image to rebuild, so an OS package gets the
+	// package action (spec decision 16).
+	nodes := model.Owner{Ref: model.NodesOwner("test"), Containers: []model.ContainerUse{{Name: "g1", Kind: model.ContainerRegular,
+		ImageRef: "g1", Repo: model.HostRepo, Digest: amd}}}
+	libssl3To := &model.FixAction{Kind: model.FixKindPackage, Key: "package:deb:libssl3:3.0.13-1:3.0.15-1",
+		Label: "libssl3 3.0.13-1 → 3.0.15-1", Package: "libssl3", Ecosystem: "deb", From: "3.0.13-1", To: "3.0.15-1"}
 	cases := []struct {
 		name string
 		ms   []model.Match
@@ -121,6 +127,35 @@ func TestBuild_FixAction(t *testing.T) {
 		}
 		require.Equal(t, tc.want, one(t, Build(in)).Fix, tc.name)
 	}
+
+	hostCases := []struct {
+		name string
+		ms   []model.Match
+		want *model.FixAction
+	}{
+		{"host finding: os package → package action, never a rebuild", []model.Match{grype(libssl3Amd, fixedIn("3.0.15-1"))}, libssl3To},
+		{"host finding: the smallest Debian fixed version above installed",
+			[]model.Match{grype(libssl3Amd, fixedIn("3.0.16-1", "3.0.15-1"))}, libssl3To},
+		{"host finding: Debian order, where a tilde sorts first", []model.Match{grype(libssl3Amd, fixedIn("3.0.15-1", "3.0.15~rc1-1"))},
+			&model.FixAction{Kind: model.FixKindPackage, Key: "package:deb:libssl3:3.0.13-1:3.0.15~rc1-1",
+				Label: "libssl3 3.0.13-1 → 3.0.15~rc1-1", Package: "libssl3", Ecosystem: "deb", From: "3.0.13-1", To: "3.0.15~rc1-1"}},
+	}
+	for _, tc := range hostCases {
+		in := input(tc.ms)
+		in.Owner = nodes
+		f := one(t, Build(in))
+		require.Equal(t, model.HostRepo, f.ImageRepo, tc.name)
+		require.Equal(t, tc.want, f.Fix, tc.name)
+	}
+
+	// A host finding stored before Build set Fix is carried with the package action too.
+	stored := model.Finding{Fingerprint: "fp-host", Owner: nodes.Ref, ImageRepo: model.HostRepo, AdvisoryID: id, Digests: []string{amd},
+		Packages: []model.FindingPackage{{Name: "libssl3", Ecosystem: "deb", Installed: "3.0.13-1", Fixed: []string{"3.0.16-1", "3.0.15-1"}}},
+		FixState: model.FixFixed, FixAvailable: true, State: model.StateOpen}
+	carry := input(nil)
+	carry.Owner, carry.Carry = nodes, []model.Finding{stored}
+	carry.Advisories[id] = advisory(id)
+	require.Equal(t, libssl3To, one(t, Build(carry)).Fix)
 }
 
 func TestDiff_SignalsAndFixMakeNoTransition(t *testing.T) {

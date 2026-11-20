@@ -2,9 +2,12 @@ package apiserver
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/web/apigen"
 )
 
@@ -15,7 +18,7 @@ const (
 )
 
 // Search finds objects of every kind for the jump menu, in the store's order (kind, then prefix
-// matches first), at most 20.
+// matches first) followed by node groups, at most 20.
 func (s *Server) Search(ctx context.Context, req apigen.SearchRequestObject) (apigen.SearchResponseObject, error) {
 	q := req.Params.Q
 	if n := utf8.RuneCountInString(q); n < 1 || n > searchMaxLen {
@@ -25,6 +28,11 @@ func (s *Server) Search(ctx context.Context, req apigen.SearchRequestObject) (ap
 	if err != nil {
 		return nil, err
 	}
+	groups, err := s.groupHits(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	hits = append(hits, groups...)
 	perKind := map[string]int{}
 	for _, h := range hits {
 		perKind[h.Kind]++
@@ -52,4 +60,28 @@ func (s *Server) Search(ctx context.Context, req apigen.SearchRequestObject) (ap
 // hitScopes is the scope kind of each hit kind that has a scope; advisories and packages have none.
 var hitScopes = map[string]model.ScopeKind{
 	"workload": model.ScopeWorkload, "namespace": model.ScopeNamespace, "image": model.ScopeImage, "node": model.ScopeNode,
+	"nodegroup": model.ScopeNodeGroup,
+}
+
+// groupHits are the node groups whose label or name contains q, case-insensitively: prefix matches
+// first, at most searchPerKind.
+func (s *Server) groupHits(ctx context.Context, q string) ([]store.JumpHit, error) {
+	groups, err := s.nodeGroups(ctx)
+	if err != nil {
+		return nil, err
+	}
+	lq := strings.ToLower(q)
+	var prefix, inside []store.JumpHit
+	for _, g := range groups {
+		label, name := strings.ToLower(g.Label), strings.ToLower(g.Name)
+		hit := store.JumpHit{Kind: "nodegroup", ID: g.ID, Label: g.Label, Detail: fmt.Sprintf("%d nodes", len(g.Members))}
+		switch {
+		case strings.HasPrefix(label, lq) || strings.HasPrefix(name, lq):
+			prefix = append(prefix, hit)
+		case strings.Contains(label, lq) || strings.Contains(name, lq):
+			inside = append(inside, hit)
+		}
+	}
+	all := append(prefix, inside...)
+	return all[:min(len(all), searchPerKind)], nil
 }

@@ -331,7 +331,7 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 	}
 	f.Digests, fixed = sortedSet(digests), sortedSet(fixed)
 	f.FixAvailable = len(fixed) > 0 || f.FixState == model.FixFixed
-	f.Fix = fixAction(vs, fixed)
+	f.Fix = fixAction(vs, fixed, b.in.Owner.Ref.Kind == model.OwnerKindNodes)
 	f.Severity, f.SeveritySource = severity(vs, adv)
 	b.rank(&f, adv, fixed, b.contextOf(f.Digests))
 	return f

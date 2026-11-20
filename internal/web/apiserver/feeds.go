@@ -118,7 +118,8 @@ func (s *Server) ListExceptions(ctx context.Context, _ apigen.ListExceptionsRequ
 }
 
 // GetSettings is the configuration that shapes what ffs reports. Deployment details (registry,
-// listen address, allowed hosts, paths, catalogue) are left out.
+// listen addresses, allowed hosts, paths, catalogue, the node agent's TLS and namespace) are left
+// out.
 func (s *Server) GetSettings(_ context.Context, _ apigen.GetSettingsRequestObject) (apigen.GetSettingsResponseObject, error) {
 	c := s.o.Config
 	byName := c.Feeds.ByName()
@@ -143,5 +144,6 @@ func (s *Server) GetSettings(_ context.Context, _ apigen.GetSettingsRequestObjec
 		Exceptions:  apigen.ExceptionSettings{MaxDuration: c.Exceptions.MaxDuration.String()},
 		Retention:   apigen.RetentionSettings{Resolved: c.Retention.Resolved.String()},
 		Upgrades:    apigen.UpgradeSettings{Enabled: c.Upgrades.Enabled, DailyAt: c.Upgrades.DailyAt},
+		NodeAgent:   &apigen.NodeAgentSettings{Enabled: c.NodeAgent.Enabled, StaleAfter: c.NodeAgent.StaleAfter.String()},
 	}, nil
 }

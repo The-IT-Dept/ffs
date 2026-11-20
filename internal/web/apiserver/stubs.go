@@ -29,21 +29,6 @@ func (s *Server) GetExposure(context.Context, apigen.GetExposureRequestObject) (
 	return nil, notImplemented()
 }
 
-// ListNodeGroups is not implemented yet.
-func (s *Server) ListNodeGroups(context.Context, apigen.ListNodeGroupsRequestObject) (apigen.ListNodeGroupsResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// GetNodeGroup is not implemented yet.
-func (s *Server) GetNodeGroup(context.Context, apigen.GetNodeGroupRequestObject) (apigen.GetNodeGroupResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// GetNode is not implemented yet.
-func (s *Server) GetNode(context.Context, apigen.GetNodeRequestObject) (apigen.GetNodeResponseObject, error) {
-	return nil, notImplemented()
-}
-
 // GetCoverage is not implemented yet.
 func (s *Server) GetCoverage(context.Context, apigen.GetCoverageRequestObject) (apigen.GetCoverageResponseObject, error) {
 	return nil, notImplemented()

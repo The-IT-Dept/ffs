@@ -13,12 +13,12 @@ import (
 	"github.com/the-it-dept/ffs/internal/web/webtest"
 )
 
-// Small's open findings, and its fix groups (spec decisions 3 and 16).
-var smallOpen = apigen.PriorityCounts{Urgent: 2, High: 3, Medium: 3, Low: 2}
+// Small's open findings, and its fix groups (spec decisions 3 and 16), host finding F13 included.
+var smallOpen = apigen.PriorityCounts{Urgent: 2, High: 4, Medium: 3, Low: 2}
 
 const (
-	smallOpenTotal = 10
-	smallFixGroups = 9
+	smallOpenTotal = 11
+	smallFixGroups = 10
 )
 
 // newAPI opens Small and returns it with the API handler over it.

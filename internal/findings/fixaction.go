@@ -10,9 +10,11 @@ import (
 )
 
 // osvEcosystems maps the syft package types osv-scalibr has a version ordering for to the OSV
-// ecosystem that names it. Other types compare as semver.
+// ecosystem that names it. Other types compare as semver. The OS package types are here for host
+// findings, whose fix action names a package version (an image finding rebuilds instead).
 var osvEcosystems = map[string]string{"go-module": "Go", "npm": "npm", "python": "PyPI", "gem": "RubyGems", "rust-crate": "crates.io",
-	"java-archive": "Maven", "php-composer": "Packagist", "dotnet": "NuGet", "hex": "Hex"}
+	"java-archive": "Maven", "php-composer": "Packagist", "dotnet": "NuGet", "hex": "Hex",
+	"deb": "Debian", "apk": "Alpine", "rpm": "Red Hat"}
 
 // osPackageTypes are the package types a rebuild on the distro's current packages fixes.
 var osPackageTypes = map[string]bool{"deb": true, "rpm": true, "apk": true}
@@ -20,10 +22,11 @@ var osPackageTypes = map[string]bool{"deb": true, "rpm": true, "apk": true}
 // fixAction returns how the finding built from vs, whose fixed versions are fixed, is cleared
 // (spec §11.1), short of an image-tag upgrade, which the store derives from the Suggestion:
 //   - with no fix, won't fix or no fix yet, by the fix state;
-//   - with an OS package affected, a rebuild on its distro (the first OS package by name);
+//   - with an OS package affected, a rebuild on its distro (the first OS package by name), unless
+//     the finding is a host finding (host): a node has no image to rebuild;
 //   - else the first package by name with a fixed version, moved to its smallest fixed version
 //     above the installed one.
-func fixAction(vs []verdict, fixed []string) *model.FixAction {
+func fixAction(vs []verdict, fixed []string, host bool) *model.FixAction {
 	state := fixState(vs)
 	available := len(fixed) > 0 || state == model.FixFixed
 	if !available {
@@ -36,19 +39,20 @@ func fixAction(vs []verdict, fixed []string) *model.FixAction {
 			osPkg = p
 		}
 	}
-	if osPkg != nil {
+	if osPkg != nil && !host {
 		return rebuild(osPkg.Distro)
 	}
 	return packageAction(packages(vs))
 }
 
 // carriedFix is the action of a stored finding that has none, because it was stored before Build
-// set one. A FindingPackage carries no distro, so an OS package gets a rebuild without one.
+// set one. A FindingPackage carries no distro, so an OS package gets a rebuild without one; a host
+// finding (the Nodes owner's) gets the package action instead.
 func carriedFix(c model.Finding) *model.FixAction {
 	switch {
 	case !c.FixAvailable:
 		return noFix(c.FixState)
-	case len(c.Packages) > 0 && osPackageTypes[c.Packages[0].Ecosystem]:
+	case len(c.Packages) > 0 && osPackageTypes[c.Packages[0].Ecosystem] && c.Owner.Kind != model.OwnerKindNodes:
 		return rebuild(nil)
 	}
 	return packageAction(c.Packages)
