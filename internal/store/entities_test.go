@@ -400,6 +400,9 @@ func TestPackagesPage_InstalledVersionJoinsFindings(t *testing.T) {
 	require.Equal(t, "1:5.2-1", rows["bash"].Version)
 	require.Equal(t, "php-cli-binary", rows["php"].Classifier)
 	require.Equal(t, "libc6", page.Rows[0].Name, "-risk puts the urgent package first")
+	for _, p := range []model.Package{libc6, tzdata, bash, php} {
+		require.Equal(t, p.Installed(), rows[p.Name].Version, "installedExpr and model.Package.Installed agree on %s", p.Name)
+	}
 }
 
 func TestPackagesPage_ScopesSortsAndFacets(t *testing.T) {

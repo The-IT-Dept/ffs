@@ -256,17 +256,8 @@ func (s *Server) notablePackages(ctx context.Context, digest string) ([]apigen.I
 
 func imagePackageRow(r store.ImagePackageRow) apigen.ImagePackageRow {
 	p := r.Package
-	return apigen.ImagePackageRow{Name: p.Name, Version: installedVersion(p), Ecosystem: p.Ecosystem, Purl: optString(p.PURL),
+	return apigen.ImagePackageRow{Name: p.Name, Version: p.Installed(), Ecosystem: p.Ecosystem, Purl: optString(p.PURL),
 		Classifier: optString(p.Classifier), Path: optString(p.Path), Findings: r.Findings, Worst: priorityOf(r.Worst)}
-}
-
-// installedVersion is a package's version as findings record it: epoch-prefixed when it has an
-// epoch the version does not already carry.
-func installedVersion(p model.Package) string {
-	if p.Epoch == "" || strings.HasPrefix(p.Version, p.Epoch+":") {
-		return p.Version
-	}
-	return p.Epoch + ":" + p.Version
 }
 
 // ListImagePackages searches one image's packages by name, version or ID, with the ecosystem facet.

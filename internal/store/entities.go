@@ -65,8 +65,8 @@ func containerDigest(col string) string {
 	return `NOT (` + col + ` LIKE 'k8s:%' OR ` + col + ` LIKE 'runtime:%' OR ` + col + ` LIKE 'nodegroup:%')`
 }
 
-// installedExpr is findings.installed in SQL over the packages row aliased a: the version with its
-// epoch, unless the version already carries it. It joins finding_packages.version.
+// installedExpr is model.Package.Installed in SQL over the packages row aliased a: the version with
+// its epoch, unless the version already carries it. It joins finding_packages.version.
 func installedExpr(a string) string {
 	return `CASE WHEN ` + a + `.epoch = '' OR substr(` + a + `.version, 1, length(` + a + `.epoch) + 1) = ` + a + `.epoch || ':'
 		THEN ` + a + `.version ELSE ` + a + `.epoch || ':' || ` + a + `.version END`

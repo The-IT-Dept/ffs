@@ -1,7 +1,10 @@
 // Package model holds the shared domain types. It imports the standard library only.
 package model
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 type FixState string
 
@@ -60,6 +63,16 @@ type Package struct {
 	Classifier    string // syft binary classifier class when found that way, e.g. "php-cli-binary"
 	GoStdlib      bool   // Name=="stdlib" from a Go binary
 	SyftID        string // syft artifact ID in its SBOM; "" for synthetic packages; not part of PackageID
+}
+
+// Installed is the version findings record for p: the version with its epoch, unless the version
+// already carries it (dpkg's does). The store's installedExpr is the same rule in SQL; the API's
+// package rows and finding packages both use this form, so they join.
+func (p Package) Installed() string {
+	if p.Epoch == "" || strings.HasPrefix(p.Version, p.Epoch+":") {
+		return p.Version
+	}
+	return p.Epoch + ":" + p.Version
 }
 
 type Coverage struct {

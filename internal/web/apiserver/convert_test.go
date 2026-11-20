@@ -101,6 +101,15 @@ func TestConvert_SharedShapes(t *testing.T) {
 		eolOf(eol.Status{Product: "alpine", Cycle: "rolling", Note: "rolling release"}, at))
 }
 
+func TestImagePackageRow_InstalledForm(t *testing.T) {
+	rpm := model.Package{Ecosystem: "rpm", Name: "openssl-libs", Epoch: "1", Version: "3.0.7-27.el9"}
+	got := imagePackageRow(store.ImagePackageRow{Package: rpm, Findings: 2, Worst: model.PriorityHigh})
+	require.Equal(t, "1:3.0.7-27.el9", got.Version, "the epoch-prefixed form findings record")
+	require.Equal(t, rpm.Installed(), got.Version)
+	require.Equal(t, 2, got.Findings)
+	require.Equal(t, apigen.PriorityHigh, got.Worst)
+}
+
 func TestFreshness_StaleFeedsAndOldestSuccess(t *testing.T) {
 	ctx := t.Context()
 	st, err := store.Open(ctx, t.TempDir()+"/ffs.db")

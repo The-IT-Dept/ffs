@@ -391,7 +391,7 @@ func packages(vs []verdict) []model.FindingPackage {
 	index := map[key]int{}
 	var out []model.FindingPackage
 	for _, v := range vs {
-		k := key{v.pkg.Name, v.pkg.Ecosystem, installed(v.pkg), v.pkg.Path}
+		k := key{v.pkg.Name, v.pkg.Ecosystem, v.pkg.Installed(), v.pkg.Path}
 		i, ok := index[k]
 		if !ok {
 			i = len(out)
@@ -408,14 +408,6 @@ func packages(vs []verdict) []model.FindingPackage {
 			strings.Compare(a.Installed, b.Installed), strings.Compare(a.Path, b.Path))
 	})
 	return out
-}
-
-// installed is the package version with its epoch, unless the version already carries it (dpkg's does).
-func installed(p model.Package) string {
-	if p.Epoch == "" || strings.HasPrefix(p.Version, p.Epoch+":") {
-		return p.Version
-	}
-	return p.Epoch + ":" + p.Version
 }
 
 // fixState is fixed when any standing match is, wont-fix when all are, else not-fixed when any is.

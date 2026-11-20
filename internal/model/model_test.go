@@ -110,3 +110,17 @@ func TestCanonicalID(t *testing.T) {
 	require.Equal(t, "MAL-2026-7", CanonicalID("MAL-2026-7"))
 	require.Equal(t, "", CanonicalID())
 }
+
+func TestPackage_Installed(t *testing.T) {
+	for _, c := range []struct {
+		p    Package
+		want string
+	}{
+		{Package{Version: "2025a"}, "2025a"},
+		{Package{Epoch: "1", Version: "3.0.7-27.el9"}, "1:3.0.7-27.el9"},
+		{Package{Epoch: "1", Version: "1:2.36-9"}, "1:2.36-9"},
+		{Package{Epoch: "1", Version: "10:2.0-1"}, "1:10:2.0-1"},
+	} {
+		require.Equal(t, c.want, c.p.Installed(), "%+v", c.p)
+	}
+}
