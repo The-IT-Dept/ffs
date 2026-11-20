@@ -90,6 +90,7 @@ type wireItem struct {
 	Priority    model.Priority  `json:"priority"`
 	Reasons     []string        `json:"reasons"`
 	Owners      []wireOwner     `json:"owners"`
+	NodeGroups  []string        `json:"nodeGroups,omitempty"`
 	Packages    []wirePackage   `json:"packages"`
 	FixedIn     []string        `json:"fixedIn"`
 	Suggestion  *wireSuggestion `json:"suggestion,omitempty"`
@@ -161,8 +162,8 @@ func wireOf(m notify.Message) wireData {
 	for _, it := range m.Items {
 		wi := wireItem{Event: it.Event, AdvisoryID: it.AdvisoryID, Title: it.Title, Advisories: it.Grouped,
 			Priority: it.Priority, Reasons: nonNil(it.Reasons), FixedIn: nonNil(it.FixedIn), Links: nonNil(it.Links),
-			Owners: []wireOwner{}, Packages: []wirePackage{}, Published: it.Published, Observed: it.Observed,
-			Provisional: it.Provisional}
+			Owners: []wireOwner{}, NodeGroups: it.NodeGroups, Packages: []wirePackage{}, Published: it.Published,
+			Observed: it.Observed, Provisional: it.Provisional}
 		for _, o := range it.Owners {
 			wi.Owners = append(wi.Owners, wireOwner{Kind: o.Kind, Namespace: o.Namespace, Name: o.Name})
 		}

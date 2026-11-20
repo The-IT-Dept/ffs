@@ -97,7 +97,7 @@ Webhook targets receive a POST with `Content-Type: application/cloudevents+json;
 | `time` | When the message was created. |
 | `subject` | The advisory ID, for immediate alerts. |
 | `datacontenttype` | `application/json` |
-| `data` | `kind`, `cluster`, `target`, `title`, `items` (one per advisory: `event`, `advisoryId`, `title`, `priority`, `reasons`, `owners`, `packages`, `fixedIn`, `suggestion`, `published`, `observed`, `links`, `provisional`), and for summaries `summary` and `feeds`. |
+| `data` | `kind`, `cluster`, `target`, `title`, `items` (one per advisory: `event`, `advisoryId`, `title`, `priority`, `reasons`, `owners`, `nodeGroups` (node findings: the affected node groups, at most three, then `+N more`), `packages`, `fixedIn`, `suggestion`, `published`, `observed`, `links`, `provisional`), and for summaries `summary` and `feeds`. |
 
 | Event type | Sent for |
 |---|---|

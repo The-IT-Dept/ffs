@@ -17,8 +17,9 @@ import (
 // digest's minimum priority; a fix or resolution counts at the priority the target was told about.
 // When nothing qualifies, nothing is sent; the cursor still moves and resolutions are still
 // recorded in the ledger. Classifying against the ledger, which the immediate pass has already
-// updated, keeps anything sent immediately out of the digest.
-func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time) error {
+// updated, keeps anything sent immediately out of the digest. With holdNodes the transitions of
+// Nodes findings are passed over, as the immediate pass does.
+func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time, holdNodes bool) error {
 	fire := t.digestFire(st)
 	if !digestDue(fire, now) {
 		return nil
@@ -55,7 +56,7 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 	listedFP := map[string]bool{}
 	for _, fp := range r.order {
 		tr, l := r.final[fp], entry(ledger, fp)
-		if !t.cfg.allows(tr.Owner.Namespace) {
+		if !t.cfg.allows(tr.Owner.Namespace) || (holdNodes && isNodes(tr.Owner)) {
 			continue
 		}
 		ev := classify(tr, l)
