@@ -16,6 +16,15 @@ import (
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
+// recordChunk is how many cached GIT records MatchImage reads, parses and evaluates at a time: a
+// repository's records grow with the feed and can list thousands of tags each. A var so tests can
+// lower it.
+var recordChunk = 256
+
+// loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
+// the batches.
+var loadRecords = (*store.Store).OSVRecordsByID
+
 // Matcher is the upstream-runtime matcher. It matches the packages Lookup maps against the OSV GIT
 // records cached for the entry's repository and the CNA ranges stored for its product. It is safe
 // for concurrent use.
@@ -32,7 +41,8 @@ func New(st *store.Store) *Matcher { return &Matcher{st: st} }
 // Source implements match.Matcher.
 func (m *Matcher) Source() model.MatchSource { return model.SourceUpstream }
 
-// MatchImage implements match.Matcher. Synthetic digests get no matches.
+// MatchImage implements match.Matcher. The GIT records of each repository are read recordChunk at a
+// time, in id order. Synthetic digests get no matches.
 func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
 	if match.IsSynthetic(in.Digest) {
 		return nil, nil
@@ -57,18 +67,22 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 		if err != nil {
 			return nil, err
 		}
-		recs, err := m.records(ctx, ids, nil)
-		if err != nil {
-			return nil, err
-		}
 		for _, id := range slices.Sorted(maps.Keys(ranges)) {
 			if err := c.addCNA(ctx, &ms, e, id, ranges[id], byKey[key]); err != nil {
 				return nil, err
 			}
 		}
-		for _, v := range recs {
-			if err := c.addGit(ctx, &ms, e, v, byKey[key]); err != nil {
+		// ids are sorted, so consecutive chunks visit the records in the same order as reading them
+		// all at once, and ms merges across chunks as before.
+		for chunk := range slices.Chunk(ids, recordChunk) {
+			recs, err := m.records(ctx, chunk, nil)
+			if err != nil {
 				return nil, err
+			}
+			for _, v := range recs {
+				if err := c.addGit(ctx, &ms, e, v, byKey[key]); err != nil {
+					return nil, err
+				}
 			}
 		}
 	}
@@ -202,7 +216,7 @@ func (m *Matcher) evalAdvisory(ctx context.Context, c *lookups, adv string, chan
 // records returns the cached records with ids, with override replacing (or adding) records by id,
 // sorted by id. Cached records that do not parse are skipped.
 func (m *Matcher) records(ctx context.Context, ids []string, override map[string]*osvschema.Vulnerability) ([]*osvschema.Vulnerability, error) {
-	raws, err := m.st.OSVRecordsByID(ctx, ids)
+	raws, err := loadRecords(m.st, ctx, ids)
 	if err != nil {
 		return nil, err
 	}
