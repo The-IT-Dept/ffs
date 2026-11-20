@@ -51,8 +51,9 @@ func (f fakeNodes) GetNode(_ context.Context, name string) (*corev1.Node, bool, 
 }
 
 type ingestCall struct {
-	req sbom.Request
-	res sbom.Result
+	req  sbom.Request
+	res  sbom.Result
+	prov *store.AgentProvenance // IngestFromNode only
 }
 
 // fakeIngest records Ingest calls and, unless err is set, stores the image catalogued with its packages as
@@ -66,8 +67,19 @@ type fakeIngest struct {
 }
 
 func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Result) error {
+	return f.ingest(ctx, nil, r, res)
+}
+
+// IngestFromNode is Ingest that, like the acquirer, refuses an image catalogued from another node's agent
+// SBOM and records prov for a stored SBOM.
+func (f *fakeIngest) IngestFromNode(ctx context.Context, prov store.AgentProvenance, r sbom.Request, res *sbom.Result) error {
+	prov.Digest = r.Digest
+	return f.ingest(ctx, &prov, r, res)
+}
+
+func (f *fakeIngest) ingest(ctx context.Context, prov *store.AgentProvenance, r sbom.Request, res *sbom.Result) error {
 	f.mu.Lock()
-	f.calls = append(f.calls, ingestCall{req: r, res: *res})
+	f.calls = append(f.calls, ingestCall{req: r, res: *res, prov: prov})
 	err, during := f.err, f.during
 	f.mu.Unlock()
 	if during != nil {
@@ -75,6 +87,19 @@ func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Resul
 	}
 	if err != nil {
 		return err
+	}
+	if prov != nil {
+		img, ok, err := f.st.GetImage(ctx, r.Digest)
+		if err != nil {
+			return err
+		}
+		stored, has, err := f.st.AgentProvenanceOf(ctx, r.Digest)
+		if err != nil {
+			return err
+		}
+		if ok && img.Status == model.ImageCatalogued && has && stored.Node != prov.Node {
+			return sbom.ErrOtherNode
+		}
 	}
 	doc, err := sbom.DecodeSyftJSON(res.SyftJSON)
 	if err != nil {
@@ -84,8 +109,14 @@ func (f *fakeIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Resul
 	if err := f.st.PutSBOM(ctx, r.Digest, res.SyftJSON, pkgs); err != nil {
 		return err
 	}
-	return f.st.UpsertImage(ctx, model.Image{Digest: r.Digest, Repo: r.Repo, Platform: r.Platform, Status: model.ImageCatalogued,
-		Source: sbom.SourceAgent, Coverage: cov, CataloguedAt: t0})
+	if err := f.st.UpsertImage(ctx, model.Image{Digest: r.Digest, Repo: r.Repo, Platform: r.Platform, Status: model.ImageCatalogued,
+		Source: sbom.SourceAgent, Coverage: cov, CataloguedAt: t0}); err != nil {
+		return err
+	}
+	if prov != nil {
+		return f.st.PutAgentProvenance(ctx, *prov)
+	}
+	return nil
 }
 
 func (f *fakeIngest) setErr(err error) {
@@ -170,7 +201,7 @@ func (h *harness) job(t *testing.T) (store.AgentJob, bool) {
 
 // fullReport is a full report from worker-1's agent process started at t0.
 func fullReport(seq uint64, host *wire.Host, images *wire.Images, problems ...wire.Problem) *wire.Report {
-	return &wire.Report{Node: "worker-1", AgentVersion: "v0.0.1", BootID: "boot-1", StartedAt: t0, Seq: seq, Kind: wire.KindFull,
+	return &wire.Report{Node: "worker-1", AgentVersion: "v0.0.1", BootID: "boot-1", Instance: "proc-1", StartedAt: t0, Seq: seq, Kind: wire.KindFull,
 		CollectedAt: t0, KernelRelease: runningKernel, Arch: "amd64", Host: host, Images: images, Problems: problems}
 }
 
@@ -210,8 +241,14 @@ func wantSplit(t *testing.T, doc []byte, release string) nodegroup.KernelSplit {
 func wantFingerprint(t *testing.T, doc []byte, release string) string {
 	t.Helper()
 	split := wantSplit(t, doc, release)
-	return nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Kernel: split.Kernel, KernelRelease: release,
-		RuntimeVersion: "containerd://2.2.1"})
+	d, err := sbom.DecodeSyftJSON(doc)
+	require.NoError(t, err)
+	var distro *model.Distro
+	if ld := d.Artifacts.LinuxDistribution; ld != nil {
+		distro = &model.Distro{ID: ld.ID, VersionID: ld.VersionID, Codename: ld.VersionCodename}
+	}
+	return nodegroup.Fingerprint(nodegroup.FingerprintInput{Packages: split.Running, Distro: distro, Kernel: split.Kernel,
+		KernelRelease: release, RuntimeVersion: "containerd://2.2.1"})
 }
 
 func TestIngest_NoPackageDatabaseIsCoverageGap(t *testing.T) {
@@ -241,6 +278,17 @@ func TestIngest_NoPackageDatabaseIsCoverageGap(t *testing.T) {
 	r.KernelRelease = "6.12.6-talos"
 	h.report(t, r)
 	require.Equal(t, gap, h.agentNode(t).Coverage)
+
+	// An Ubuntu node whose package database the chart did not mount is not an image-based OS: its
+	// os-release says Ubuntu.
+	u := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	ubuntuBins := syftDoc(t, ubuntu, goPkg("github.com/containerd/containerd/v2", "v2.2.1", "/usr/bin/containerd",
+		"github.com/containerd/containerd/v2"))
+	r = fullReport(1, &wire.Host{SyftJSON: ubuntuBins}, &wire.Images{ContentStore: true},
+		wire.Problem{Code: wire.ProblemNoPackageDB, Detail: "no dpkg, rpm or apk database found"})
+	require.True(t, u.report(t, r).Applied)
+	require.Equal(t, []model.NodeCoverageGap{{Code: "no_package_database",
+		Detail: "package database not mounted; set nodeAgent.packageDatabases"}}, u.agentNode(t).Coverage)
 }
 
 func TestIngest_OnlyRunningKernelIngested(t *testing.T) {
@@ -691,7 +739,9 @@ func TestIngest_TriggersAndOffers(t *testing.T) {
 }
 
 func TestIngest_CountsAppliedAndDuplicate(t *testing.T) {
-	count := func(result string) float64 { return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(result)) }
+	count := func(result string) float64 {
+		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(result, ""))
+	}
 	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
 	applied, duplicate := count(metrics.AgentReportApplied), count(metrics.AgentReportDuplicate)
 
@@ -702,4 +752,174 @@ func TestIngest_CountsAppliedAndDuplicate(t *testing.T) {
 	require.False(t, h.report(t, imagesReport(1, nil)).Applied)
 	require.Equal(t, applied+1, count(metrics.AgentReportApplied))
 	require.Equal(t, duplicate+1, count(metrics.AgentReportDuplicate))
+}
+
+// TestIngest_HostRetryWhenHostNotStored: a full report whose host part was not stored for a reason that may
+// pass answers HostRetry; one that was stored, or failed for good, does not.
+func TestIngest_HostRetryWhenHostNotStored(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	seq := uint64(0)
+	full := func(opensslVersion string) *wire.Report {
+		seq++
+		return fullReport(seq, ubuntuHost(t, opensslVersion), &wire.Images{ContentStore: true})
+	}
+
+	h.fake.setErr(&sbom.AcquireError{Kind: sbom.FailTransient, Reason: "an acquisition of the image is in progress"})
+	resp := h.report(t, full("3.0.13-0ubuntu3.5"))
+	require.True(t, resp.Applied)
+	require.True(t, resp.HostRetry, "a transient failure")
+	_, counted := h.job(t)
+	require.False(t, counted)
+
+	h.fake.setErr(&sbom.AcquireError{Kind: sbom.FailCounted, Reason: "decoding SBOM"})
+	resp = h.report(t, full("3.0.13-0ubuntu3.5"))
+	require.True(t, resp.Applied)
+	require.False(t, resp.HostRetry, "a counted failure is not retried early")
+
+	h.fake.setErr(nil)
+	resp = h.report(t, full("3.0.13-0ubuntu3.5"))
+	require.False(t, resp.HostRetry, "stored")
+	require.NotEmpty(t, h.agentNode(t).Fingerprint)
+
+	// Another report of this node is processing its host part.
+	h.ing.mu.Lock()
+	h.ing.busy["worker-1"] = true
+	h.ing.mu.Unlock()
+	resp = h.report(t, full("3.0.13-0ubuntu3.6"))
+	require.True(t, resp.Applied)
+	require.True(t, resp.HostRetry, "skipped as in progress")
+	h.ing.mu.Lock()
+	delete(h.ing.busy, "worker-1")
+	h.ing.mu.Unlock()
+
+	// A retried copy of this report is applied while this one prepares its host part: this one loses to
+	// DuplicateOf with its host part unstored.
+	retried := full("3.0.13-0ubuntu3.6")
+	h.ing.prepare = func(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error) {
+		applied, err := h.st.AcceptAgentReport(ctx, store.AgentReport{Node: "worker-1", BootID: r.BootID, Instance: r.Instance,
+			Seq: r.Seq, At: now})
+		require.NoError(t, err)
+		require.True(t, applied)
+		return prepareHost(r, n, now)
+	}
+	resp = h.report(t, retried)
+	require.False(t, resp.Applied)
+	require.True(t, resp.HostRetry, "a duplicate that lost the race with its host part unstored")
+
+	resp = h.report(t, imagesReport(seq+1, nil))
+	require.True(t, resp.Applied)
+	require.False(t, resp.HostRetry, "an images-only report has no host part")
+}
+
+// gatedIngest is an AgentIngest whose Ingest waits for release and then fails, as the acquirer does, when its
+// ctx has ended.
+type gatedIngest struct {
+	*fakeIngest
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedIngest) Ingest(ctx context.Context, r sbom.Request, res *sbom.Result) error {
+	g.entered <- struct{}{}
+	<-g.release
+	if err := ctx.Err(); err != nil {
+		return &sbom.AcquireError{Kind: sbom.FailTransient, Reason: "storing the SBOM", Err: err}
+	}
+	return g.fakeIngest.Ingest(ctx, r, res)
+}
+
+// TestIngest_CancelledLeaderDoesNotFailFollowers: two nodes report the same host fingerprint; the first,
+// which leads the shared store, disconnects mid-store. The store is detached from its request, so the node
+// waiting on it gets its group.
+func TestIngest_CancelledLeaderDoesNotFailFollowers(t *testing.T) {
+	ctx := context.Background()
+	st := newStore(t)
+	gate := &gatedIngest{fakeIngest: &fakeIngest{st: st}, entered: make(chan struct{}, 2), release: make(chan struct{})}
+	nodes := fakeNodes{"worker-1": testNode("worker-1", "Ubuntu 26.04 LTS"), "worker-2": testNode("worker-2", "Ubuntu 26.04 LTS")}
+	ing := NewIngester(IngesterOptions{Store: st, Acquirer: gate, Nodes: nodes, Config: config.Default().NodeAgent,
+		Now: newClock(t0).Now, Log: logr.Discard()})
+	followerPrepared := make(chan struct{})
+	ing.prepare = func(r *wire.Report, n *corev1.Node, now time.Time) (hostPrep, error) {
+		p, err := prepareHost(r, n, now)
+		if r.Node == "worker-2" {
+			close(followerPrepared)
+		}
+		return p, err
+	}
+	host := ubuntuHost(t, "3.0.13-0ubuntu3.5")
+	type result struct {
+		resp wire.ReportResponse
+		err  error
+	}
+	leaderCtx, cancel := context.WithCancel(ctx)
+	leader, follower := make(chan result, 1), make(chan result, 1)
+	go func() {
+		resp, err := ing.Report(leaderCtx, worker1, fullReport(1, host, &wire.Images{ContentStore: true}))
+		leader <- result{resp, err}
+	}()
+	<-gate.entered // the leader is storing the group SBOM
+	go func() {
+		r := fullReport(1, host, &wire.Images{ContentStore: true})
+		r.Node = "worker-2"
+		resp, err := ing.Report(ctx, worker2, r)
+		follower <- result{resp, err}
+	}()
+	<-followerPrepared
+	time.Sleep(100 * time.Millisecond) // the follower joins the leader's store
+	cancel()
+	close(gate.release)
+
+	f := <-follower
+	require.NoError(t, f.err)
+	require.True(t, f.resp.Applied)
+	require.False(t, f.resp.HostRetry, "the follower's group is stored")
+	<-leader // its request ended: whatever it answers, nobody reads it
+	fp := wantFingerprint(t, host.SyftJSON, runningKernel)
+	n, ok, err := st.AgentNode(ctx, "worker-2")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, fp, n.Fingerprint)
+	require.Empty(t, n.LastError)
+	_, ok, err = st.NodeGroup(ctx, fp)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, 1, gate.count(), "the group SBOM is stored once")
+}
+
+// TestIngest_ImagesReportKeepsCoverageCurrent: an images-only report updates the content-store gap at once
+// and keeps the host gaps of the last full report.
+func TestIngest_ImagesReportKeepsCoverageCurrent(t *testing.T) {
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	contentStore := model.NodeCoverageGap{Code: model.GapContentStoreUnreadable,
+		Detail: "no containerd content store on this node; side-loaded images cannot be catalogued from it"}
+	blocked := model.NodeCoverageGap{Code: model.GapNodeAgentBlocked, Detail: "node agent cannot read /var/lib/rpm: permission denied"}
+	h.report(t, fullReport(1, nil, &wire.Images{ContentStore: true},
+		wire.Problem{Code: wire.ProblemPermissionDenied, Path: "/var/lib/rpm", Detail: "permission denied"}))
+	require.Equal(t, []model.NodeCoverageGap{blocked}, h.agentNode(t).Coverage)
+
+	h.report(t, imagesReport(2, &wire.Images{ContentStore: false}))
+	require.Equal(t, []model.NodeCoverageGap{contentStore, blocked}, h.agentNode(t).Coverage, "shown without waiting for a full report")
+	h.report(t, imagesReport(3, nil))
+	require.Equal(t, []model.NodeCoverageGap{contentStore, blocked}, h.agentNode(t).Coverage, "unchanged images keep it")
+	h.report(t, imagesReport(4, &wire.Images{ContentStore: true}))
+	require.Equal(t, []model.NodeCoverageGap{blocked}, h.agentNode(t).Coverage)
+}
+
+// TestIngest_AgentRestartAfterClockStepIsApplied: the clock steps back and the agent restarts in the same
+// boot; the new process's reports are applied although its start reads earlier.
+func TestIngest_AgentRestartAfterClockStepIsApplied(t *testing.T) {
+	h := newHarness(t, testNode("worker-1", "Ubuntu 26.04 LTS"))
+	first := imagesReport(7, nil)
+	first.StartedAt = t0.Add(time.Hour)
+	require.True(t, h.report(t, first).Applied)
+
+	restarted := imagesReport(1, nil)
+	restarted.Instance, restarted.StartedAt = "proc-2", t0
+	require.True(t, h.report(t, restarted).Applied)
+	require.False(t, h.report(t, restarted).Applied, "a replay of the new process's report")
+	next := imagesReport(2, nil)
+	next.Instance, next.StartedAt = "proc-2", t0
+	require.True(t, h.report(t, next).Applied)
+	require.Equal(t, "proc-2", h.agentNode(t).Instance)
 }

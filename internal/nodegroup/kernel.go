@@ -14,11 +14,20 @@ import (
 // <x.y.z>+bpo on Debian backports (6.12.12+bpo).
 const debABI = `\d+\.\d+\.\d+(?:-\d+|\+(?:deb\d+|bpo))`
 
+// debDerivative is the source prefix of the per-release packages of Ubuntu's derivative kernels, which
+// carry no flavour: linux-aws-headers-6.8.0-1015, linux-hwe-6.11-tools-6.11.0-19,
+// linux-lowlatency-hwe-6.11-headers-6.11.0-1011, linux-azure-6.11-cloud-tools-6.11.0-1015.
+const debDerivative = `(?:aws|azure|gcp|oracle|hwe|lowlatency)(?:-hwe)?(?:-\d+\.\d+)?`
+
 // The kernel package rule table: which installed packages belong to which kernel release.
 var (
-	// debKernelRe captures the package kind and the release of a per-release deb kernel package.
-	// Meta packages (linux-image-generic, linux-image-amd64, linux-generic) do not match.
-	debKernelRe = regexp.MustCompile(`^linux-(image|image-unsigned|modules|modules-extra|headers|tools)-(` + debABI + `(?:-[a-z0-9]+)*)$`)
+	// debKernelRe captures the package kind and the release of a per-release deb kernel package:
+	// linux-<kind>-<release> (linux-image-6.8.0-1015-aws, linux-cloud-tools-6.8.0-45-generic,
+	// linux-modules-extra-6.8.0-1021-azure) and linux-<derivative>-<kind>-<release>
+	// (linux-gcp-headers-6.8.0-1019). Meta packages (linux-image-generic, linux-image-amd64,
+	// linux-generic, linux-aws) and the version-less linux-tools-common do not match.
+	debKernelRe = regexp.MustCompile(`^linux-(?:` + debDerivative + `-)?` +
+		`(image|image-unsigned|modules|modules-extra|headers|tools|cloud-tools|buildinfo)-(` + debABI + `(?:-[a-z0-9]+)*)$`)
 	// apkKernelRe captures the flavour of an Alpine kernel package.
 	apkKernelRe = regexp.MustCompile(`^linux-(lts|virt|edge|rpi)$`)
 	// flavourlessReleaseRe matches a deb release without a flavour (linux-headers-7.0.0-34), which

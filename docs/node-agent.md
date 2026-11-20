@@ -38,6 +38,8 @@ The kernel release and boot ID come from `/proc`, with no mount. The content sto
 
 Only the running kernel's packages are matched. Other installed kernels are left out of the node's inventory, and a newer one shows the node as reboot pending: `installed kernel <release> is newer than the running kernel <release>`.
 
+A node whose agent reports but whose host inventory is not stored, or not current, shows the `host_not_inventoried` coverage gap with the reason: not inventoried yet, a host inventory that could not be read or stored, a quarantined host inventory, or no full report for longer than `nodeAgent.reportInterval` (with its jitter) plus `nodeAgent.staleAfter`. It is counted apart from fully reporting nodes.
+
 ## What it never does
 
 - It has no Kubernetes API access. Its ServiceAccount has no Role or ClusterRole bindings; on OpenShift it has only permission to use its own SecurityContextConstraints. Its only credential is a projected token for the audience `ffs-agent`, which the Kubernetes API server does not accept.
@@ -89,7 +91,7 @@ containerd and cri-o findings move between the `ContainerRuntime` owner and `Nod
 
 Exceptions written for the container runtime (owner `ContainerRuntime/containerd` or repository `containerd`) keep applying when its findings move to `Nodes/<cluster>` and back, so neither switch reopens an excepted finding.
 
-The first agent data on a cluster is a baseline: each AlertTarget gets one summary of the node findings instead of one alert per finding. Re-enabling the agent baselines again.
+The first agent data on a cluster is a baseline: each AlertTarget gets one summary of the node findings instead of one alert per finding. The baseline waits until every node the agent runs on is in a matched node group, or until 10 minutes (at most `nodeAgent.staleAfter`) after the first agent report, so node pools that report minutes apart share one summary. Re-enabling the agent baselines again.
 
 ## Distributions
 
@@ -110,11 +112,11 @@ In a cluster with mixed distributions, `auto` uses the most common one, and the 
 ## Platforms
 
 - **GKE Autopilot** does not allow `hostPath` volumes. Install with `--set nodeAgent.enabled=false`.
-- **Managed nodes** that run no DaemonSets, such as EKS Fargate, virtual nodes and Windows nodes, are not covered. They show the `node_agent_missing` gap.
-- **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled.
+- **Managed nodes** that run no DaemonSets, such as EKS Fargate and virtual nodes, are not covered. They show the `node_agent_missing` gap.
+- **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled. Nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector` (Windows nodes, for example) show `not scheduled by the node agent: <reason>` (`node_agent_unsupported`), and do not hold back the switch from node status to the agent. ffs cannot see node taints, so a node the tolerations exclude shows `node_agent_missing`.
 - **SELinux.** On SELinux-enforcing nodes the agent shows `node agent cannot read <path>: permission denied` until `nodeAgent.seLinuxType: spc_t` is set, which runs the collector, and only the collector, with that SELinux type.
 - **OpenShift** needs `nodeAgent.openshift.scc: true`, which creates a SecurityContextConstraints for the agent and lets its ServiceAccount use it.
-- **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one.
+- **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one. A node of any other OS whose package database the agent cannot find shows `package database not mounted; set nodeAgent.packageDatabases`.
 - **Private registries.** The agent pods use the top-level `imagePullSecrets`, and those Secrets must also exist in the agent namespace.
 
 ## Package database mounts
@@ -127,9 +129,10 @@ On Fedora, RHEL 10 and SUSE, `/var/lib/rpm` is a link to `/usr/lib/sysimage/rpm`
 
 - **TLS.** Without cert-manager, the chart generates a CA and a certificate for the agent API Service, valid for 3650 days: the Secret `ffs-agent-tls` in the release namespace and the ConfigMap `ffs-agent-ca` in the agent namespace. On upgrade it looks both up and re-emits them unchanged while the certificate has more than 30 days left (the Secret's `ffs.theitdept.au/not-after` annotation, in unix seconds), and generates a new pair otherwise. Renderers without `lookup`, such as Argo CD and `helm template`, would generate a new pair on every render, so use `nodeAgent.tls.certManager.enabled` with `nodeAgent.tls.certManager.issuerRef` and `nodeAgent.tls.caBundle` there.
 - **Authentication.** The controller checks each agent's token with a TokenReview: the audience `ffs-agent`, the agent ServiceAccount, and the node the agent pod runs on, which must match the report.
-- **Which SBOMs are accepted.** An agent SBOM is accepted only for an image that a pod on that node runs. Its provenance (node, agent version and time) is recorded.
+- **Which SBOMs are accepted.** An agent SBOM is accepted only as the answer to a request the controller made to that node, before the request expires (`nodeAgent.workTimeout`). The controller asks one node at a time, and only a node that runs the image in a pod and holds it complete. Its provenance (node, agent version and time) is recorded, and an image catalogued from one node's SBOM is never replaced by another node's. A request the agent reached but did not answer before it expired counts as a failure of the image, and after two failures the image is not asked for again for 24 hours. The agent works through its requests one at a time, in order, so requests queued behind an unanswered one are not counted. The request the agent was on also counts when its cataloguer was not running or the agent was stopping, as neither sends an answer.
 - **Registry first.** When the registry becomes reachable, a registry SBOM replaces the agent's; ffs retries at most every 6 hours.
-- **Residual risk.** A compromised node can under-report the packages of images that only it runs, and of its own host, because it controls those bytes. It cannot change the inventory of images that other nodes or a registry supply.
+- **Node groups.** Nodes share a group, and with it one stored host SBOM, only when every package field ffs matches on is the same: names, versions and architectures, the distribution, source packages, package URLs and CPEs. A host inventory that differs in any of them gets a group of its own.
+- **Residual risk.** A compromised node can under-report the packages of its own host, and of an image the controller asks it to catalogue, because it controls those bytes. Its kubelet can also claim that a pod on it runs any image, so it can be the node asked. It cannot replace an image SBOM that another node or a registry supplied, or change the host inventory of nodes that report their own.
 
 The NetworkPolicy `ffs-agent-api` (`nodeAgent.networkPolicy.enabled`) allows the agent API port only from the agent pods. The web UI, metrics and health ports stay open as before. If your cluster also uses another policy engine, allow the agent namespace to reach the controller on port 8444.
 
@@ -137,11 +140,13 @@ The NetworkPolicy `ffs-agent-api` (`nodeAgent.networkPolicy.enabled`) allows the
 
 The controller exports:
 
-- `ffs_node_agent_nodes{state}`: nodes by agent state, `reporting`, `stale`, `never` or `disabled`;
+- `ffs_node_agent_nodes{state}`: nodes by agent state, `reporting`, `reporting_without_inventory` (reporting, but with the `host_not_inventoried` gap), `stale`, `never`, `disabled` or `unsupported` (not scheduled by the DaemonSet);
 - `ffs_node_groups{kind}`: node groups by kind, `agent` or `nodeinfo`;
-- `ffs_agent_reports_total{result}`: reports received, `applied`, `duplicate` or `rejected`.
+- `ffs_agent_reports_total{result,reason}`: reports received, `applied`, `duplicate`, `deferred` or `rejected`. Rejected reports and SBOM results carry a `reason`: `unauthenticated`, `rate_limited`, `forbidden`, `bad_request` or `too_large`.
 
-With `prometheusRule.enabled`, the alert `FFSNodeAgentNotReporting` fires when node agents have stopped reporting (state `stale`) for 30 minutes. Nodes the DaemonSet never schedules (other architectures, Windows or virtual nodes) stay `never`. They show in the gauge and in the node coverage gap, and do not fire the alert.
+The controller reads at most 256 MiB of reports and SBOM results at once. Past that, a report waits up to 2 seconds and is then answered 429 with a `Retry-After` of 10 to 60 seconds (`deferred`), and the agent sends it again later without cataloguing the host again.
+
+With `prometheusRule.enabled`, the alert `FFSNodeAgentNotReporting` fires when node agents have stopped reporting (state `stale`) for 30 minutes. Nodes the DaemonSet does not schedule (other architectures, or a `nodeAgent.nodeSelector` mismatch) are `unsupported`, never `stale`, and do not fire it. `FFSNodeAgentNeverReported` fires when no agent has reported for an hour while nodes wait for their first report, as when the agent pods cannot pull their image, are refused by Pod Security admission, cannot mount a host path or cannot reach the controller.
 
 ## Chart values
 

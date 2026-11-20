@@ -18,14 +18,16 @@ import (
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
-// fakeRehomer records the reconciler's engine calls. Recompute also records the stored baseline time it
-// ran under.
+// fakeRehomer records the reconciler's engine calls. Rehome stores its State, as the engine does in the same
+// write; OnOwnersChanged and Recompute also record the stored baseline time they ran under.
 type fakeRehomer struct {
-	st         *store.Store
-	mu         sync.Mutex
-	rehomes    []engine.Rehome
-	changed    [][]string
-	recomputes []recomputeCall
+	st            *store.Store
+	mu            sync.Mutex
+	rehomes       []engine.Rehome
+	changed       [][]string
+	changedDuring []time.Time // the stored BaselineReadyAt at each OnOwnersChanged
+	rehomedDuring []time.Time // the stored BaselineReadyAt at each Rehome, before its State is written
+	recomputes    []recomputeCall
 }
 
 type recomputeCall struct {
@@ -34,17 +36,32 @@ type recomputeCall struct {
 	baselineDuring time.Time
 }
 
-func (f *fakeRehomer) Rehome(_ context.Context, r engine.Rehome) error {
+func (f *fakeRehomer) Rehome(ctx context.Context, r engine.Rehome) error {
+	st, err := f.st.NodesState(ctx)
+	if err != nil {
+		return err
+	}
+	if r.State != nil {
+		if err := f.st.PutNodesState(ctx, *r.State); err != nil {
+			return err
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rehomes = append(f.rehomes, r)
+	f.rehomedDuring = append(f.rehomedDuring, st.BaselineReadyAt)
 	return nil
 }
 
-func (f *fakeRehomer) OnOwnersChanged(_ context.Context, keys []string) error {
+func (f *fakeRehomer) OnOwnersChanged(ctx context.Context, keys []string) error {
+	st, err := f.st.NodesState(ctx)
+	if err != nil {
+		return err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.changed = append(f.changed, keys)
+	f.changedDuring = append(f.changedDuring, st.BaselineReadyAt)
 	return nil
 }
 
@@ -133,6 +150,9 @@ func TestReconciler_NodeMovesGroupWithoutTransitions(t *testing.T) {
 	require.Equal(t, model.TriggerInventoryChange, ts[0].Trigger)
 }
 
+// TestReconciler_BaselineReadyAfterFirstGroupsMatched: the baseline is ready once every scheduled Ready
+// node is in a matched agent group, or, when some never are, min(staleAfter, 10m) after the first fresh
+// report; never while an agent group is unmatched.
 func TestReconciler_BaselineReadyAfterFirstGroupsMatched(t *testing.T) {
 	ctx := context.Background()
 	newFixture := func(t *testing.T, enabled bool) (*recFixture, *fakeRehomer) {
@@ -156,10 +176,18 @@ func TestReconciler_BaselineReadyAfterFirstGroupsMatched(t *testing.T) {
 		require.Equal(t, model.NodeGroupNodeInfo, g.Kind, "no agent group has members while A is unmatched")
 	}
 	require.True(t, f.state(t).BaselineReadyAt.IsZero())
+	require.Equal(t, t0, f.state(t).FirstReportAt, "the settle window starts at the first fresh report")
 	require.Empty(t, fr.recomputes)
 
+	// A is matched, but worker-2 and cp-1 have not reported: the baseline waits for the settle window.
 	require.NoError(t, f.st.MarkMatched(ctx, nodegroup.GroupDigest(grpA)))
 	f.clk.Add(time.Minute)
+	f.pass(t)
+	require.Equal(t, grpA, f.groupOf(t, "worker-1").ID)
+	require.True(t, f.state(t).BaselineReadyAt.IsZero())
+	require.Empty(t, fr.recomputes)
+
+	f.clk.Add(9 * time.Minute) // min(staleAfter 30m, 10m) after the first report
 	f.pass(t)
 	require.Len(t, fr.recomputes, 1)
 	require.Equal(t, []string{testNodesKey}, fr.recomputes[0].keys)
@@ -177,21 +205,109 @@ func TestReconciler_BaselineReadyAfterFirstGroupsMatched(t *testing.T) {
 	f.pass(t)
 	st := f.state(t)
 	require.True(t, st.BaselineReadyAt.IsZero())
+	require.True(t, st.FirstReportAt.IsZero())
 	require.False(t, st.AgentEnabled)
 
+	// Re-enabled: the settle window starts again.
 	f.setConfig(func(c *config.Config) { c.NodeAgent.Enabled = true })
 	f.clk.Add(time.Minute)
 	f.pass(t)
+	require.Len(t, fr.recomputes, 1)
+	require.True(t, f.state(t).BaselineReadyAt.IsZero())
+	require.True(t, f.state(t).AgentEnabled)
+	f.clk.Add(10 * time.Minute)
+	f.pass(t)
 	require.Len(t, fr.recomputes, 2)
 	require.Equal(t, f.clk.Now(), f.state(t).BaselineReadyAt)
-	require.True(t, f.state(t).AgentEnabled)
 
 	f, fr = newFixture(t, false)
 	require.NoError(t, f.st.MarkMatched(ctx, nodegroup.GroupDigest(grpA)))
 	f.pass(t)
+	f.clk.Add(time.Hour)
 	f.pass(t)
 	require.True(t, f.state(t).BaselineReadyAt.IsZero())
 	require.Empty(t, fr.recomputes)
+}
+
+// TestReconciler_BaselineWaitsForStaggeredGroups: node pools whose groups match minutes apart share one
+// baseline. It is ready when the last scheduled Ready node joins a matched group, before the settle window,
+// so the later group's advisories are in the baseline rather than alerting one by one (spec §9.9).
+func TestReconciler_BaselineWaitsForStaggeredGroups(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRehomer{}
+	f := newRecFixture(t, fr)
+	fr.st = f.st
+	seedGroup(t, f.st, grpA, hostPkg(nodegroup.GroupDigest(grpA), "deb", "openssl", "3.0.13-0ubuntu1", ""))
+	seedGroup(t, f.st, grpB, hostPkg(nodegroup.GroupDigest(grpB), "deb", "openssl", "3.0.14-0ubuntu1", ""))
+	for _, g := range []string{grpA, grpB} {
+		require.NoError(t, f.st.MarkUnmatched(ctx, nodegroup.GroupDigest(g), t0))
+	}
+	for node, g := range map[string]string{"worker-1": grpA, "worker-2": grpB, "cp-1": grpB} {
+		report(t, f.st, node, t0)
+		f.fingerprint(t, node, g)
+	}
+	f.pass(t)
+	require.True(t, f.state(t).BaselineReadyAt.IsZero())
+
+	// Group A matches first: worker-1 joins it, the others are still in nodeinfo groups.
+	require.NoError(t, f.st.MarkMatched(ctx, nodegroup.GroupDigest(grpA)))
+	f.clk.Add(time.Minute)
+	f.pass(t)
+	require.Equal(t, grpA, f.groupOf(t, "worker-1").ID)
+	require.Equal(t, model.NodeGroupNodeInfo, f.groupOf(t, "worker-2").Kind)
+	require.True(t, f.state(t).BaselineReadyAt.IsZero(), "one matched group of two is not the baseline")
+	require.Empty(t, fr.recomputes)
+
+	// Group B matches two minutes later: every node is in a matched group, so the baseline is ready now,
+	// well inside the settle window, with both groups in it.
+	require.NoError(t, f.st.MarkMatched(ctx, nodegroup.GroupDigest(grpB)))
+	f.clk.Add(2 * time.Minute)
+	f.pass(t)
+	require.Equal(t, grpB, f.groupOf(t, "worker-2").ID)
+	require.Equal(t, grpB, f.groupOf(t, "cp-1").ID)
+	require.Equal(t, t0.Add(3*time.Minute), f.state(t).BaselineReadyAt)
+	require.Len(t, fr.recomputes, 1)
+	o, ok, err := f.st.GetOwner(ctx, testNodesKey)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, o.Containers, 2, "the baseline recompute covers both groups")
+}
+
+// TestReconciler_DisableClearsBaselineBeforeHostFindingsGo: disabling clears the baseline before the pass
+// moves findings back or deletes the Nodes owner, so a notify pass in between holds those transitions.
+func TestReconciler_DisableClearsBaselineBeforeHostFindingsGo(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRehomer{}
+	f := newRecFixture(t, fr)
+	fr.st = f.st
+	seedGroup(t, f.st, grpA, hostPkg(nodegroup.GroupDigest(grpA), "deb", "openssl", "3.0.13-0ubuntu1", ""))
+	for _, n := range []string{"worker-1", "worker-2", "cp-1"} {
+		report(t, f.st, n, t0)
+		f.fingerprint(t, n, grpA)
+	}
+	f.pass(t)
+	st := f.state(t)
+	require.Equal(t, t0, st.BaselineReadyAt, "every node fresh in a matched group: ready at once")
+	require.True(t, st.RuntimeRetired)
+	require.Len(t, fr.rehomes, 1)
+	require.NotNil(t, fr.rehomes[0].State, "the cutover writes the state with its moves")
+	require.True(t, fr.rehomes[0].State.RuntimeRetired)
+
+	f.setConfig(func(c *config.Config) { c.NodeAgent.Enabled = false })
+	changed := len(fr.changed)
+	f.pass(t)
+	require.Len(t, fr.rehomes, 2, "the back cutover")
+	require.True(t, fr.rehomedDuring[1].IsZero(), "the baseline is cleared before the findings move back")
+	require.False(t, fr.rehomes[1].State.RuntimeRetired)
+	require.True(t, fr.rehomes[1].State.BaselineReadyAt.IsZero())
+	require.Greater(t, len(fr.changed), changed)
+	for i := changed; i < len(fr.changed); i++ {
+		require.Equal(t, []string{testNodesKey}, fr.changed[i])
+		require.True(t, fr.changedDuring[i].IsZero(), "the baseline is cleared before the Nodes owner is deleted")
+	}
+	_, ok, err := f.st.GetOwner(ctx, testNodesKey)
+	require.NoError(t, err)
+	require.False(t, ok)
 }
 
 func TestReconciler_MembershipRules(t *testing.T) {
@@ -341,4 +457,51 @@ func TestNodeEvents_TriggerOnAddDeleteLabelOrReady(t *testing.T) {
 		LastHeartbeatTime: metav1.NewTime(t0)}}
 	h.OnUpdate(node, notReady)
 	require.Equal(t, 4, n)
+}
+
+// TestReconciler_IdlePassWritesNothing: the grouping and the in-use marks are one transaction that writes
+// only what changed, so a pass over an unchanged cluster writes no row; a pod change writes its row only.
+func TestReconciler_IdlePassWritesNothing(t *testing.T) {
+	ctx := context.Background()
+	fr := &fakeRehomer{}
+	f := newRecFixture(t, fr)
+	fr.st = f.st
+	seedGroup(t, f.st, grpA, hostPkg(nodegroup.GroupDigest(grpA), "deb", "openssl", "3.0.13-0ubuntu1", ""))
+	img1, img2 := hexDigest("1"), hexDigest("2")
+	for _, n := range []string{"worker-1", "worker-2", "cp-1"} {
+		report(t, f.st, n, t0)
+		f.fingerprint(t, n, grpA)
+		require.NoError(t, f.st.ReplaceNodeImages(ctx, n, []model.NodeImage{{Digest: img1, Complete: true, Source: "content-store"},
+			{Digest: img2, Complete: true, Source: "content-store"}}))
+	}
+	f.pods.run("worker-1", img1)
+	f.setConfig(func(c *config.Config) { c.NodeAgent.ExposedNodes = "node-role.example.com/edge" })
+	f.pass(t)
+	require.True(t, f.state(t).RuntimeRetired)
+	require.False(t, f.state(t).BaselineReadyAt.IsZero())
+	rows, err := f.st.NodeImages(ctx, "worker-1")
+	require.NoError(t, err)
+	require.True(t, rows[0].InUse)
+	require.False(t, rows[1].InUse)
+
+	changes := func() int64 {
+		t.Helper()
+		n, err := f.st.WriteChanges(ctx)
+		require.NoError(t, err)
+		return n
+	}
+	before := changes()
+	for range 3 {
+		f.clk.Add(time.Minute)
+		f.pass(t)
+	}
+	require.Equal(t, before, changes(), "an idle pass writes nothing")
+
+	f.pods.run("worker-2", img2)
+	f.clk.Add(time.Minute)
+	f.pass(t)
+	require.Equal(t, before+1, changes(), "a new pod writes its image's in-use mark only")
+	rows, err = f.st.NodeImages(ctx, "worker-2")
+	require.NoError(t, err)
+	require.True(t, rows[1].InUse)
 }

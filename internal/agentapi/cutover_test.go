@@ -227,3 +227,72 @@ func TestCutover_FreshNeedsAReadyNode(t *testing.T) {
 	require.Zero(t, x.marker.count())
 	require.Equal(t, grpA, x.groupOf(t, "worker-1").ID, "the stale node is still grouped")
 }
+
+// TestCutover_RacingFlushDoesNotResurrectRuntimeOwner: an inventory flush that read the state before the
+// cutover cannot store the retired ContainerRuntime owner again, and an owner left from before (a crash,
+// an older version) is re-homed onto the Nodes owner and dropped by the next retired pass.
+func TestCutover_RacingFlushDoesNotResurrectRuntimeOwner(t *testing.T) {
+	ctx := context.Background()
+	x := newCutoverFixture(t)
+	read, err := x.st.NodesState(ctx) // the flush reads the state ...
+	require.NoError(t, err)
+	require.False(t, read.RuntimeRetired)
+	x.pass(t) // ... the cutover commits ...
+	x.requireForward(t)
+	mark := x.maxTransition(t)
+
+	// ... and the flush stores the owner it built from the state it read.
+	require.NoError(t, x.st.UpsertOwner(ctx, x.rtOwner))
+	require.NoError(t, x.eng.OnOwnersChanged(ctx, []string{rtRef.Key()}))
+	x.drain(t)
+	require.False(t, x.runtimeOwnerStored(t), "the retired owner is not stored again")
+	require.Empty(t, x.transitionsAfter(t, mark), "nothing is detected again")
+	x.pass(t)
+	x.requireForward(t)
+
+	// An owner stored while the runtime was not retired, left behind: the next retired pass heals it.
+	retired := x.state(t)
+	notRetired := retired
+	notRetired.RuntimeRetired = false
+	require.NoError(t, x.st.PutNodesState(ctx, notRetired))
+	require.NoError(t, x.st.UpsertOwner(ctx, x.rtOwner))
+	require.NoError(t, x.st.PutNodesState(ctx, retired))
+	require.NoError(t, x.eng.Recompute(ctx, []string{rtRef.Key()}, model.TriggerInventoryChange))
+	require.Equal(t, model.StateOpen, x.findings(t, rtRef.Key())[cveContainerd].State, "the zombie owner duplicates the finding")
+	x.pass(t)
+	x.requireForward(t)
+	require.Empty(t, x.findings(t, rtRef.Key()), "its findings moved onto the Nodes owner")
+	require.Equal(t, x.fpNodes, x.findings(t, testNodesKey)[cveContainerd].Fingerprint)
+}
+
+// TestCutover_UnsupportedNodesDoNotBlockCutover: nodes the agent DaemonSet does not schedule on (another
+// architecture, a nodeSelector mismatch) are left out of fresh and recorded with why.
+func TestCutover_UnsupportedNodesDoNotBlockCutover(t *testing.T) {
+	labelled := func(name, arch, os string) *corev1.Node {
+		n := testNode(name, "Ubuntu 26.04 LTS")
+		n.Labels = map[string]string{"kubernetes.io/arch": arch, "kubernetes.io/os": os}
+		return n
+	}
+	x := newCutoverFixture(t, labelled("worker-1", "amd64", "linux"), labelled("arm-1", "arm64", "linux"),
+		labelled("win-1", "amd64", "windows"))
+	x.pass(t)
+	require.False(t, x.state(t).RuntimeRetired, "every Ready node counts while nothing says where the agent runs")
+	require.Nil(t, x.state(t).Unsupported)
+
+	x.setConfig(func(c *config.Config) {
+		c.NodeAgent.Architectures = []string{"amd64"}
+		c.NodeAgent.NodeSelector = map[string]string{"kubernetes.io/os": "linux"}
+	})
+	x.pass(t)
+	x.requireForward(t)
+	st := x.state(t)
+	require.Equal(t, map[string]string{"arm-1": "architecture arm64 is not in nodeAgent.architectures",
+		"win-1": "node labels do not match nodeAgent.nodeSelector"}, st.Unsupported)
+	require.Equal(t, 6*time.Hour+36*time.Minute+30*time.Minute, st.FullReportOverdue, "reportInterval with jitter, plus staleAfter")
+
+	x.setConfig(func(c *config.Config) { c.NodeAgent.Enabled = false })
+	x.pass(t)
+	st = x.state(t)
+	require.Nil(t, st.Unsupported, "nothing is unsupported while the agent is disabled")
+	require.Zero(t, st.FullReportOverdue)
+}

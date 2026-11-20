@@ -37,8 +37,9 @@ var (
 
 // agentStates and groupKinds are every value of the node-agent gauges' labels, each exported even at 0.
 var (
-	agentStates = []model.AgentState{model.AgentReporting, model.AgentStale, model.AgentNever, model.AgentDisabled}
-	groupKinds  = []model.NodeGroupKind{model.NodeGroupAgent, model.NodeGroupNodeInfo}
+	agentStates = []model.AgentState{model.AgentReporting, model.AgentReportingWithoutInventory, model.AgentStale, model.AgentNever,
+		model.AgentDisabled, model.AgentUnsupported}
+	groupKinds = []model.NodeGroupKind{model.NodeGroupAgent, model.NodeGroupNodeInfo}
 )
 
 // CollectorOptions configures a Collector.
@@ -153,7 +154,9 @@ func (c *Collector) Refresh(ctx context.Context) error {
 	return nil
 }
 
-// nodeAgentMetrics counts the nodes by node agent state and the node groups with members by kind.
+// nodeAgentMetrics counts the nodes by node agent state and the node groups with members by kind. A node is
+// counted in its CountState: a reporting node without a current host inventory, and a node the agent does not
+// schedule on, each have their own state rather than reporting, never or stale.
 func (c *Collector) nodeAgentMetrics(ctx context.Context, now time.Time) ([]prometheus.Metric, error) {
 	statuses, err := c.st.AgentStatus(ctx, now, c.o.NodeAgentStaleAfter)
 	if err != nil {
@@ -165,7 +168,7 @@ func (c *Collector) nodeAgentMetrics(ctx context.Context, now time.Time) ([]prom
 	}
 	states := map[model.AgentState]int{}
 	for _, s := range statuses {
-		states[s.State]++
+		states[s.CountState()]++
 	}
 	kinds := map[model.NodeGroupKind]int{}
 	for _, g := range groups {

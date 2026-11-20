@@ -34,6 +34,18 @@ type FindingMove struct {
 // and image repository, replaces resolved targets and keeps the ledger of taken ones, so cutting over
 // again never reopens a finding resolved in an earlier cycle.
 func (s *Store) Rehome(ctx context.Context, upsert *model.Owner, moves []FindingMove, drop []string) error {
+	return s.rehome(ctx, upsert, moves, drop, nil)
+}
+
+// RehomeWithState is Rehome that also stores state as the node-agent state row (PutNodesState) in the
+// same transaction, so a runtime cutover and the state saying it happened are written together: no
+// reader, and no restart, sees one without the other.
+func (s *Store) RehomeWithState(ctx context.Context, upsert *model.Owner, moves []FindingMove, drop []string,
+	state NodesState) error {
+	return s.rehome(ctx, upsert, moves, drop, &state)
+}
+
+func (s *Store) rehome(ctx context.Context, upsert *model.Owner, moves []FindingMove, drop []string, state *NodesState) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		if upsert != nil {
 			if err := upsertOwnerTx(ctx, tx, *upsert); err != nil {
@@ -51,6 +63,11 @@ func (s *Store) Rehome(ctx context.Context, upsert *model.Owner, moves []Finding
 		for _, key := range drop {
 			if err := deleteOwnerTx(ctx, tx, key); err != nil {
 				return fmt.Errorf("store: rehome drop owner %s: %w", key, err)
+			}
+		}
+		if state != nil {
+			if err := putNodesState(ctx, tx, *state); err != nil {
+				return fmt.Errorf("store: rehome nodes state: %w", err)
 			}
 		}
 		return nil

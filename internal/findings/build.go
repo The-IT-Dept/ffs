@@ -411,7 +411,8 @@ func (b builder) rank(f *model.Finding, adv model.Advisory, fixed []string, ctx 
 // without VEX; a not_affected rule then re-ranks the excepted finding.
 //
 // Exceptions follow the runtime cutover in both directions: a rule matches a finding when it
-// matches the finding itself or its cutoverAlias, so re-homing never opens an excepted finding.
+// matches the finding itself or its cutoverAlias, so re-homing never opens an excepted finding. The
+// alias is a cluster-level owner, so only a rule's Kind/Name owner entries can match it (ownerMatches).
 func (b builder) except(f *model.Finding, aliases []string, pin priority.Input) {
 	alias, hasAlias := b.cutoverAlias(*f)
 	i := slices.IndexFunc(b.rules, func(r ExceptionRule) bool {

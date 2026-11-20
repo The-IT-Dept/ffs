@@ -371,3 +371,45 @@ func TestSupersede_StaleAttemptSkipsSources(t *testing.T) {
 	require.Equal(t, "registry", res.Source)
 	require.EqualValues(t, 1, src.calls.Load())
 }
+
+// TestIngestFromNode_NeverReplacesAnotherNodesSBOM: an image catalogued from one node's agent SBOM is not
+// replaced by another node's; the same node may replace its own, and the provenance is recorded with it.
+func TestIngestFromNode_NeverReplacesAnotherNodesSBOM(t *testing.T) {
+	st, clock := acqStore(t), acqClock()
+	a := NewAcquirer(AcquirerOptions{Store: st, Concurrency: 1, Now: clock.Now})
+	prov := func(node, version string) store.AgentProvenance {
+		return store.AgentProvenance{Node: node, AgentVersion: version, ReceivedAt: clock.Now()}
+	}
+	first := syftBytes(t, "")
+	require.NoError(t, a.IngestFromNode(ctx, prov("worker-1", "v0.0.1"), acqReq(), &Result{SyftJSON: first, Source: SourceAgent}))
+	p, ok, err := st.AgentProvenanceOf(ctx, acqDigest)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, store.AgentProvenance{Digest: acqDigest, Node: "worker-1", AgentVersion: "v0.0.1", ReceivedAt: clock.Now()}, p)
+	img := getImg(t, st, acqDigest)
+
+	other := syftBytes(t, "intruder")
+	err = a.IngestFromNode(ctx, prov("worker-2", "v0.0.1"), acqReq(), &Result{SyftJSON: other, Source: SourceAgent})
+	require.ErrorIs(t, err, ErrOtherNode)
+	got, _, err := st.GetSBOM(ctx, acqDigest)
+	require.NoError(t, err)
+	require.Equal(t, first, got, "worker-1's SBOM stands")
+	require.Equal(t, img, getImg(t, st, acqDigest))
+	p, _, err = st.AgentProvenanceOf(ctx, acqDigest)
+	require.NoError(t, err)
+	require.Equal(t, "worker-1", p.Node)
+	stale, err := st.BeginAcquire(ctx, acqDigest, clock.Now())
+	require.NoError(t, err)
+	require.False(t, stale, "the in-flight record is cleared")
+	require.NoError(t, st.EndAcquire(ctx, acqDigest))
+
+	require.NoError(t, a.IngestFromNode(ctx, prov("worker-1", "v0.0.2"), acqReq(), &Result{SyftJSON: other, Source: SourceAgent}))
+	got, _, err = st.GetSBOM(ctx, acqDigest)
+	require.NoError(t, err)
+	require.Equal(t, other, got, "a node may replace its own SBOM")
+	p, _, err = st.AgentProvenanceOf(ctx, acqDigest)
+	require.NoError(t, err)
+	require.Equal(t, "v0.0.2", p.AgentVersion)
+
+	require.Error(t, a.IngestFromNode(ctx, store.AgentProvenance{}, acqReq(), agentRes(t)), "a node is required")
+}

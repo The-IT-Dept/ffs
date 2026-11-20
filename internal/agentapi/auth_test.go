@@ -3,8 +3,11 @@ package agentapi
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -173,11 +176,131 @@ func TestAuth_CachesBySHA256OfToken(t *testing.T) {
 		_, err = a.Authenticate(ctx, "bad")
 		require.ErrorIs(t, err, ErrUnauthenticated)
 	}
-	require.Len(t, *specs, 5, "a rejected token is never cached")
+	require.Len(t, *specs, 4, "a rejected token is answered from the cache")
+	clk.Add(29 * time.Second)
+	_, err = a.Authenticate(ctx, "bad")
+	require.ErrorIs(t, err, ErrUnauthenticated)
+	require.Len(t, *specs, 4)
+	clk.Add(time.Second)
+	refuse["bad"] = false // accepted now: the rejection is cached for 30s only
+	_, err = a.Authenticate(ctx, "bad")
+	require.NoError(t, err)
+	require.Len(t, *specs, 5)
 
-	_, err = a.Authenticate(ctx, "down")
-	require.Error(t, err)
-	require.NotErrorIs(t, err, ErrUnauthenticated, "an unreachable API server is not a rejected token")
+	for range 2 {
+		_, err = a.Authenticate(ctx, "down")
+		require.Error(t, err)
+		require.NotErrorIs(t, err, ErrUnauthenticated, "an unreachable API server is not a rejected token")
+	}
+	require.Len(t, *specs, 7, "an undecided review is never cached")
+}
+
+// jwtWithExp is a JWT-shaped token whose payload carries exp; its signature is not checked here.
+func jwtWithExp(t *testing.T, exp time.Time, nonce string) string {
+	t.Helper()
+	enc := base64.RawURLEncoding.EncodeToString
+	payload, err := json.Marshal(map[string]any{"aud": []string{"ffs-agent"}, "exp": exp.Unix(), "jti": nonce})
+	require.NoError(t, err)
+	return enc([]byte(`{"alg":"RS256","typ":"JWT"}`)) + "." + enc(payload) + "." + enc([]byte("signature"))
+}
+
+func TestAuth_CacheNeverOutlivesTokenExpiry(t *testing.T) {
+	ctx := context.Background()
+	clk := newClock(t0)
+	c, specs := reviewer(t, func(authenticationv1.TokenReviewSpec) (authenticationv1.TokenReviewStatus, error) {
+		return goodStatus(), nil
+	})
+	a := NewTokenReviewAuthenticator(c, fake.NewClientBuilder().Build(),
+		AuthOptions{Namespace: "ffs-agent", ServiceAccount: "ffs-agent", Now: clk.Now})
+
+	soon := jwtWithExp(t, t0.Add(2*time.Minute), "a")
+	_, err := a.Authenticate(ctx, soon)
+	require.NoError(t, err)
+	clk.Add(2*time.Minute - time.Second)
+	_, err = a.Authenticate(ctx, soon)
+	require.NoError(t, err)
+	require.Len(t, *specs, 1, "cached until its exp")
+	clk.Add(time.Second)
+	_, err = a.Authenticate(ctx, soon)
+	require.NoError(t, err)
+	require.Len(t, *specs, 2, "reviewed again at its exp, not 5m after the first review")
+
+	late := jwtWithExp(t, clk.Now().Add(time.Hour), "b")
+	_, err = a.Authenticate(ctx, late)
+	require.NoError(t, err)
+	clk.Add(5*time.Minute - time.Second)
+	_, err = a.Authenticate(ctx, late)
+	require.NoError(t, err)
+	require.Len(t, *specs, 3, "a token valid for an hour is cached for 5m")
+	clk.Add(time.Second)
+	_, err = a.Authenticate(ctx, late)
+	require.NoError(t, err)
+	require.Len(t, *specs, 4)
+
+	expired := jwtWithExp(t, clk.Now().Add(-time.Second), "c")
+	for range 2 {
+		_, err = a.Authenticate(ctx, expired)
+		require.NoError(t, err)
+	}
+	require.Len(t, *specs, 6, "a token past its exp is never cached")
+
+	for name, tok := range map[string]string{"opaque": "opaque-token", "bad base64": "a.!!!.c", "no exp": "a." +
+		base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"x"}`)) + ".c"} {
+		_, ok := tokenExpiry(tok)
+		require.False(t, ok, name)
+	}
+	exp, ok := tokenExpiry(soon)
+	require.True(t, ok)
+	require.True(t, exp.Equal(t0.Add(2*time.Minute)))
+}
+
+func TestServer_RateLimitsFailedAuthenticationsPerSource(t *testing.T) {
+	ctx := context.Background()
+	clk := newClock(t0)
+	c, specs := reviewer(t, func(spec authenticationv1.TokenReviewSpec) (authenticationv1.TokenReviewStatus, error) {
+		if spec.Token == "good" {
+			return goodStatus(), nil
+		}
+		return authenticationv1.TokenReviewStatus{Authenticated: false}, nil
+	})
+	auth := NewTokenReviewAuthenticator(c, fake.NewClientBuilder().Build(),
+		AuthOptions{Namespace: "ffs-agent", ServiceAccount: "ffs-agent", Now: clk.Now})
+	h := NewServer(ServerOptions{Auth: auth, Reports: &reportRecorder{}, Config: func() wire.AgentConfig { return wire.AgentConfig{} },
+		Now: clk.Now}).Handler()
+	get := func(remote, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(ctx, http.MethodGet, wire.PathConfig, nil)
+		req.RemoteAddr = remote
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w
+	}
+
+	for i := range 20 {
+		token := fmt.Sprintf("bad-%d", i)
+		if i%5 == 0 {
+			token = "" // a missing token is a failure too
+		}
+		require.Equal(t, http.StatusUnauthorized, get("192.0.2.1:4000", token).Code, i)
+	}
+	reviewed := len(*specs)
+	w := get("192.0.2.1:4001", "bad-20")
+	require.Equal(t, http.StatusTooManyRequests, w.Code)
+	require.Equal(t, "1", w.Header().Get("Retry-After"))
+	require.Equal(t, http.StatusTooManyRequests, get("192.0.2.1:4002", "good").Code, "the source is limited, whatever its token")
+	require.Len(t, *specs, reviewed, "a limited source's tokens are not reviewed")
+
+	require.Equal(t, http.StatusUnauthorized, get("192.0.2.2:4000", "bad-21").Code, "other sources are not limited")
+	require.Equal(t, http.StatusOK, get("[2001:db8::1]:4000", "good").Code)
+
+	clk.Add(time.Second) // 5 per second refill
+	require.Equal(t, http.StatusOK, get("192.0.2.1:4003", "good").Code)
+	for i := range 5 {
+		require.Equal(t, http.StatusUnauthorized, get("192.0.2.1:4004", fmt.Sprintf("again-%d", i)).Code, i)
+	}
+	require.Equal(t, http.StatusTooManyRequests, get("192.0.2.1:4005", "again-5").Code)
 }
 
 func TestAuth_CacheBounded(t *testing.T) {

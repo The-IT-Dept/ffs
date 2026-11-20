@@ -203,3 +203,93 @@ func TestNodeImages_StatusAndGroupUnion(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 }
+
+// TestAgentStatus_HostNotInventoriedAndUnsupported: a reporting node without a current host inventory
+// carries host_not_inventoried and counts apart from fully reporting nodes; a node the agent DaemonSet
+// does not schedule on carries node_agent_unsupported instead of node_agent_missing, never or stale.
+func TestAgentStatus_HostNotInventoriedAndUnsupported(t *testing.T) {
+	s := newStore(t)
+	now := t0.Add(24 * time.Hour) // 2026-11-20T00:00:00Z
+	names := []string{"arm-1", "w-error", "w-never", "w-ok", "w-overdue", "w-pending", "w-quar", "win-1"}
+	var nodes []model.Node
+	for _, n := range names {
+		nodes = append(nodes, model.Node{Name: n, Ready: true})
+	}
+	require.NoError(t, s.ReplaceNodes(ctx, nodes))
+	for _, n := range []string{"w-error", "w-ok", "w-pending", "w-quar"} {
+		_, err := s.AcceptAgentReport(ctx, fullReport(n, "boot-a", t0, 1, now.Add(-time.Minute)))
+		require.NoError(t, err)
+	}
+	_, err := s.AcceptAgentReport(ctx, fullReport("w-overdue", "boot-a", t0, 1, now.Add(-8*time.Hour)))
+	require.NoError(t, err)
+	heartbeat := fullReport("w-overdue", "boot-a", t0, 2, now.Add(-time.Minute))
+	heartbeat.Full = false
+	_, err = s.AcceptAgentReport(ctx, heartbeat)
+	require.NoError(t, err)
+	_, err = s.AcceptAgentReport(ctx, fullReport("win-1", "boot-a", t0, 1, now.Add(-3*time.Hour)))
+	require.NoError(t, err)
+	require.NoError(t, s.SetAgentError(ctx, "w-error", "host inventory not stored: decoding SBOM"))
+	_, err = s.RecordAgentJobFailure(ctx, "nodehost:w-quar", "w-quar", "preparing the host inventory: panic", now.Add(-time.Hour), 1,
+		24*time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, s.PutNodeGroup(ctx, agentGroup("aaaa01"), now))
+	require.NoError(t, s.ApplyNodeGrouping(ctx, NodeGrouping{Now: now, Fallback: []model.NodeGroup{nodeinfoGroup("ffff06")},
+		Members: map[string]string{"w-error": "aaaa01", "w-ok": "aaaa01", "w-overdue": "aaaa01", "w-quar": "aaaa01",
+			"w-pending": "ffff06", "w-never": "ffff06", "arm-1": "ffff06", "win-1": "ffff06"}}))
+	state := NodesState{AgentEnabled: true, FullReportOverdue: 7 * time.Hour, Unsupported: map[string]string{
+		"arm-1": "architecture arm64 is not in nodeAgent.architectures", "win-1": "node labels do not match nodeAgent.nodeSelector"}}
+	require.NoError(t, s.PutNodesState(ctx, state))
+	got, err := s.NodesState(ctx)
+	require.NoError(t, err)
+	require.Equal(t, state, got)
+
+	st, err := s.AgentStatus(ctx, now, 30*time.Minute)
+	require.NoError(t, err)
+	byNode := map[string]model.NodeAgentStatus{}
+	for _, x := range st {
+		byNode[x.Node] = x
+	}
+	type want struct {
+		state, count model.AgentState
+		gap          model.NodeCoverageGap
+	}
+	notInventoried := func(detail string) model.NodeCoverageGap {
+		return model.NodeCoverageGap{Code: model.GapHostNotInventoried, Detail: detail}
+	}
+	for node, w := range map[string]want{
+		"w-pending": {model.AgentReporting, model.AgentReportingWithoutInventory, notInventoried("host packages not inventoried yet")},
+		"w-error": {model.AgentReporting, model.AgentReportingWithoutInventory,
+			notInventoried("host inventory not stored: decoding SBOM")},
+		"w-quar": {model.AgentReporting, model.AgentReportingWithoutInventory,
+			notInventoried("host inventory quarantined until 2026-11-20T23:00:00Z: preparing the host inventory: panic")},
+		"w-overdue": {model.AgentReporting, model.AgentReportingWithoutInventory,
+			notInventoried("no full host report since 2026-11-19T16:00:00Z")},
+		"arm-1": {model.AgentNever, model.AgentUnsupported, model.NodeCoverageGap{Code: model.GapNodeAgentUnsupported,
+			Detail: "not scheduled by the node agent: architecture arm64 is not in nodeAgent.architectures"}},
+		"win-1": {model.AgentStale, model.AgentUnsupported, model.NodeCoverageGap{Code: model.GapNodeAgentUnsupported,
+			Detail: "not scheduled by the node agent: node labels do not match nodeAgent.nodeSelector"}},
+		"w-never": {model.AgentNever, model.AgentNever, model.NodeCoverageGap{Code: model.GapNodeAgentMissing,
+			Detail: "node agent has not reported"}},
+	} {
+		x := byNode[node]
+		require.Equal(t, w.state, x.State, node)
+		require.Equal(t, w.count, x.CountState(), node)
+		require.Equal(t, []model.NodeCoverageGap{w.gap}, x.Coverage, node)
+	}
+	ok := byNode["w-ok"]
+	require.Equal(t, model.AgentReporting, ok.CountState())
+	require.Empty(t, ok.Coverage)
+
+	one, found, err := s.NodeAgentStatus(ctx, "w-quar", now, 30*time.Minute)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, byNode["w-quar"], one, "one node's status reads its own quarantine")
+
+	// Disabled: every node is disabled with node_agent_missing, unsupported ones included.
+	state.AgentEnabled = false
+	require.NoError(t, s.PutNodesState(ctx, state))
+	arm, _, err := s.NodeAgentStatus(ctx, "arm-1", now, 30*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, model.AgentDisabled, arm.CountState())
+	require.Equal(t, model.GapNodeAgentMissing, arm.Coverage[0].Code)
+}

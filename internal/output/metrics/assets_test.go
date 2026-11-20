@@ -73,16 +73,25 @@ func TestPrometheusRules_AgentFile(t *testing.T) {
 		assert.Equal(t, "ffs-node-agent", g.Name)
 		for _, r := range g.Rules {
 			alerts = append(alerts, r.Alert)
-			assert.Contains(t, r.Expr, `state="stale"`)
-			assert.NotContains(t, r.Expr, "never", "nodes the DaemonSet never schedules must not fire it")
-			assert.Equal(t, "30m", r.For)
+			switch r.Alert {
+			case "FFSNodeAgentNotReporting":
+				assert.Contains(t, r.Expr, `state="stale"`)
+				assert.NotContains(t, r.Expr, "never", "nodes that never reported must not fire it")
+				assert.NotContains(t, r.Expr, "unsupported", "nodes the DaemonSet does not schedule must not fire it")
+				assert.Equal(t, "30m", r.For)
+			case "FFSNodeAgentNeverReported":
+				// No agent reports at all while some node waits for its first report: an install-time failure.
+				assert.Equal(t, `sum(ffs_node_agent_nodes{state=~"reporting|reporting_without_inventory"}) == 0 and `+
+					`sum(ffs_node_agent_nodes{state="never"}) > 0`, r.Expr)
+				assert.Equal(t, "1h", r.For)
+			}
 			assert.Equal(t, "warning", r.Labels["severity"])
 			assert.NotEmpty(t, r.Annotations["summary"])
 			assert.NotEmpty(t, r.Annotations["description"])
 			assertKnownMetrics(t, r.Expr)
 		}
 	}
-	assert.Equal(t, []string{"FFSNodeAgentNotReporting"}, alerts)
+	assert.Equal(t, []string{"FFSNodeAgentNotReporting", "FFSNodeAgentNeverReported"}, alerts)
 }
 
 func TestGrafanaDashboard_File(t *testing.T) {

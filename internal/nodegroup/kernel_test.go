@@ -147,3 +147,114 @@ func TestKernels_RebootPendingWhenNewerInstalled(t *testing.T) {
 		deb("linux-headers-7.0.0-38", "7.0.0-38.38", "linux")}, "7.0.0-34-generic")
 	require.False(t, s.RebootPending)
 }
+
+// TestKernelReleaseOf_UbuntuDerivatives: the per-release packages of Ubuntu's cloud, HWE and lowlatency
+// kernels, as installed on Ubuntu 24.04 and 26.04 cloud images, each belong to their release; the
+// flavourless derivative packages (linux-aws-headers-<abi>) to every flavour of that ABI.
+func TestKernelReleaseOf_UbuntuDerivatives(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want string // "" = not a per-release kernel package
+	}{
+		// Ubuntu 24.04, AWS
+		{"linux-image-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-modules-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-headers-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-tools-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-cloud-tools-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-buildinfo-6.8.0-1021-aws", "6.8.0-1021-aws"},
+		{"linux-aws-headers-6.8.0-1021", "6.8.0-1021"},
+		{"linux-aws-tools-6.8.0-1021", "6.8.0-1021"},
+		{"linux-aws-cloud-tools-6.8.0-1021", "6.8.0-1021"},
+		{"linux-aws-6.14-headers-6.14.0-1011", "6.14.0-1011"},
+		// Ubuntu 24.04, Azure
+		{"linux-image-6.8.0-1020-azure", "6.8.0-1020-azure"},
+		{"linux-modules-extra-6.8.0-1020-azure", "6.8.0-1020-azure"},
+		{"linux-azure-headers-6.8.0-1020", "6.8.0-1020"},
+		{"linux-azure-tools-6.8.0-1020", "6.8.0-1020"},
+		{"linux-azure-cloud-tools-6.8.0-1020", "6.8.0-1020"},
+		{"linux-azure-6.11-headers-6.11.0-1015", "6.11.0-1015"},
+		// Ubuntu 24.04, GCP and Oracle
+		{"linux-image-6.8.0-1019-gcp", "6.8.0-1019-gcp"},
+		{"linux-modules-extra-6.8.0-1019-gcp", "6.8.0-1019-gcp"},
+		{"linux-gcp-headers-6.8.0-1019", "6.8.0-1019"},
+		{"linux-gcp-tools-6.8.0-1019", "6.8.0-1019"},
+		{"linux-image-6.8.0-1013-oracle", "6.8.0-1013-oracle"},
+		{"linux-oracle-headers-6.8.0-1013", "6.8.0-1013"},
+		{"linux-oracle-tools-6.8.0-1013", "6.8.0-1013"},
+		// Ubuntu 24.04, HWE and lowlatency
+		{"linux-image-6.11.0-19-generic", "6.11.0-19-generic"},
+		{"linux-hwe-6.11-headers-6.11.0-19", "6.11.0-19"},
+		{"linux-hwe-6.11-tools-6.11.0-19", "6.11.0-19"},
+		{"linux-image-6.8.0-45-lowlatency", "6.8.0-45-lowlatency"},
+		{"linux-lowlatency-headers-6.8.0-45", "6.8.0-45"},
+		{"linux-lowlatency-tools-6.8.0-45", "6.8.0-45"},
+		{"linux-lowlatency-hwe-6.11-headers-6.11.0-1011", "6.11.0-1011"},
+		// Ubuntu 24.04, generic: flavourless tools of the source linux
+		{"linux-tools-6.8.0-45", "6.8.0-45"},
+		{"linux-cloud-tools-6.8.0-45", "6.8.0-45"},
+		{"linux-cloud-tools-6.8.0-45-generic", "6.8.0-45-generic"},
+		// Ubuntu 26.04 cloud images
+		{"linux-image-7.0.0-1004-aws", "7.0.0-1004-aws"},
+		{"linux-aws-headers-7.0.0-1004", "7.0.0-1004"},
+		{"linux-aws-tools-7.0.0-1004", "7.0.0-1004"},
+		{"linux-image-7.0.0-1003-azure", "7.0.0-1003-azure"},
+		{"linux-azure-cloud-tools-7.0.0-1003", "7.0.0-1003"},
+		{"linux-modules-extra-7.0.0-1005-gcp", "7.0.0-1005-gcp"},
+		{"linux-gcp-headers-7.0.0-1005", "7.0.0-1005"},
+		// Meta and version-less packages: never kernel packages.
+		{"linux-aws", ""},
+		{"linux-image-aws", ""},
+		{"linux-headers-aws", ""},
+		{"linux-tools-aws", ""},
+		{"linux-tools-common", ""},
+		{"linux-cloud-tools-common", ""},
+		{"linux-azure", ""},
+		{"linux-generic-hwe-24.04", ""},
+		{"linux-image-generic-hwe-24.04", ""},
+	} {
+		got, ok := KernelReleaseOf(deb(tc.name, "1", "linux"))
+		require.Equal(t, tc.want != "", ok, tc.name)
+		require.Equal(t, tc.want, got, tc.name)
+	}
+}
+
+// TestKernels_OnlyRunningDerivativeABIKept: on an AWS node running 6.8.0-1021-aws with 6.8.0-1018-aws still
+// installed, only the running ABI's packages are kept, flavourless derivative headers and tools included.
+func TestKernels_OnlyRunningDerivativeABIKept(t *testing.T) {
+	aws := func(name, version string) model.Package { return deb(name, version, "linux-aws") }
+	pkgs := []model.Package{
+		deb("linux-image-6.8.0-1021-aws", "6.8.0-1021.23", "linux-signed-aws"), aws("linux-modules-6.8.0-1021-aws", "6.8.0-1021.23"),
+		aws("linux-headers-6.8.0-1021-aws", "6.8.0-1021.23"), aws("linux-aws-headers-6.8.0-1021", "6.8.0-1021.23"),
+		aws("linux-tools-6.8.0-1021-aws", "6.8.0-1021.23"), aws("linux-aws-tools-6.8.0-1021", "6.8.0-1021.23"),
+		aws("linux-aws-cloud-tools-6.8.0-1021", "6.8.0-1021.23"), aws("linux-cloud-tools-6.8.0-1021-aws", "6.8.0-1021.23"),
+		deb("linux-image-6.8.0-1018-aws", "6.8.0-1018.19", "linux-signed-aws"), aws("linux-modules-6.8.0-1018-aws", "6.8.0-1018.19"),
+		aws("linux-headers-6.8.0-1018-aws", "6.8.0-1018.19"), aws("linux-aws-headers-6.8.0-1018", "6.8.0-1018.19"),
+		aws("linux-tools-6.8.0-1018-aws", "6.8.0-1018.19"), aws("linux-aws-tools-6.8.0-1018", "6.8.0-1018.19"),
+		aws("linux-aws-cloud-tools-6.8.0-1018", "6.8.0-1018.19"),
+		deb("linux-aws", "6.8.0.1021.23", "linux-meta-aws"), deb("linux-image-aws", "6.8.0.1021.23", "linux-meta-aws"),
+		deb("linux-tools-common", "6.8.0-45.45", "linux"), deb("openssl", "3.0.13-0ubuntu3.4", "openssl"),
+	}
+	s := SplitKernels(pkgs, "6.8.0-1021-aws")
+	require.Equal(t, []string{"linux-image-6.8.0-1021-aws", "linux-modules-6.8.0-1021-aws", "linux-headers-6.8.0-1021-aws",
+		"linux-aws-headers-6.8.0-1021", "linux-tools-6.8.0-1021-aws", "linux-aws-tools-6.8.0-1021", "linux-aws-cloud-tools-6.8.0-1021",
+		"linux-cloud-tools-6.8.0-1021-aws", "linux-aws", "linux-image-aws", "linux-tools-common", "openssl"}, names(s.Running))
+	require.Equal(t, []string{"linux-image-6.8.0-1018-aws", "linux-modules-6.8.0-1018-aws", "linux-headers-6.8.0-1018-aws",
+		"linux-aws-headers-6.8.0-1018", "linux-tools-6.8.0-1018-aws", "linux-aws-tools-6.8.0-1018", "linux-aws-cloud-tools-6.8.0-1018"},
+		names(s.Other))
+	require.Equal(t, "linux-image-6.8.0-1021-aws", s.Kernel.Package)
+	require.False(t, s.RebootPending)
+
+	// An HWE node: the running 6.11 kernel's flavourless HWE packages are kept, the GA 6.8 ones are not.
+	hwe := []model.Package{
+		deb("linux-image-6.11.0-19-generic", "6.11.0-19.19~24.04.1", "linux-signed-hwe-6.11"),
+		deb("linux-hwe-6.11-headers-6.11.0-19", "6.11.0-19.19~24.04.1", "linux-hwe-6.11"),
+		deb("linux-hwe-6.11-tools-6.11.0-19", "6.11.0-19.19~24.04.1", "linux-hwe-6.11"),
+		deb("linux-image-6.8.0-45-generic", "6.8.0-45.45", "linux-signed"), deb("linux-headers-6.8.0-45", "6.8.0-45.45", "linux"),
+		deb("linux-tools-6.8.0-45", "6.8.0-45.45", "linux"),
+	}
+	s = SplitKernels(hwe, "6.11.0-19-generic")
+	require.Equal(t, []string{"linux-image-6.11.0-19-generic", "linux-hwe-6.11-headers-6.11.0-19", "linux-hwe-6.11-tools-6.11.0-19"},
+		names(s.Running))
+	require.Equal(t, []string{"linux-image-6.8.0-45-generic", "linux-headers-6.8.0-45", "linux-tools-6.8.0-45"}, names(s.Other))
+}

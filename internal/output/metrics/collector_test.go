@@ -94,7 +94,7 @@ func TestCollector_NoHighCardinalityLabels(t *testing.T) {
 
 	allowed := map[string]bool{}
 	for _, l := range []string{"namespace", "owner_kind", "owner_name", "priority", "fixable", "kev", "feed", "registry", "target",
-		"result", "source", "le", "state", "kind"} {
+		"result", "reason", "source", "le", "state", "kind"} {
 		allowed[l] = true
 	}
 	var n int
@@ -160,9 +160,12 @@ func TestCollector_NodeAgentGauges(t *testing.T) {
 			KubeletVersion: "v1.37.1", ContainerRuntimeVersion: "containerd://2.2.1", Ready: true, UpdatedAt: t0}
 	}
 	cp1 := node("cp-1")
-	require.NoError(t, st.ReplaceNodes(ctx, []model.Node{node("worker-1"), node("worker-2"), cp1}))
-	require.NoError(t, st.PutNodesState(ctx, store.NodesState{AgentEnabled: true}))
-	for name, at := range map[string]time.Time{"worker-1": t0.Add(-time.Minute), "worker-2": t0.Add(-2 * time.Hour)} {
+	require.NoError(t, st.ReplaceNodes(ctx, []model.Node{node("worker-1"), node("worker-2"), node("worker-3"), node("win-1"), cp1}))
+	require.NoError(t, st.PutNodesState(ctx, store.NodesState{AgentEnabled: true,
+		Unsupported: map[string]string{"win-1": "node labels do not match nodeAgent.nodeSelector"}}))
+	// worker-3 reports but is in no agent group: reporting without inventory.
+	for name, at := range map[string]time.Time{"worker-1": t0.Add(-time.Minute), "worker-2": t0.Add(-2 * time.Hour),
+		"worker-3": t0.Add(-time.Minute)} {
 		_, err := st.AcceptAgentReport(ctx, store.AgentReport{Node: name, BootID: "boot", StartedAt: t0.Add(-3 * time.Hour), Seq: 1,
 			At: at, Full: true})
 		require.NoError(t, err)
@@ -172,7 +175,7 @@ func TestCollector_NodeAgentGauges(t *testing.T) {
 		Label: nodegroup.GroupLabel("ubuntu-26.04-k7.0.0-34", grpA), Digest: nodegroup.GroupDigest(grpA), Arch: "amd64"}, t0))
 	fb := nodegroup.FallbackGroups([]model.Node{cp1}, t0)
 	require.NoError(t, st.ApplyNodeGrouping(ctx, store.NodeGrouping{
-		Members:  map[string]string{"worker-1": grpA, "worker-2": grpA, "cp-1": fb[0].ID},
+		Members:  map[string]string{"worker-1": grpA, "worker-2": grpA, "cp-1": fb[0].ID, "worker-3": fb[0].ID, "win-1": fb[0].ID},
 		Fallback: fb, Now: t0}))
 
 	c := metrics.NewCollector(st, metrics.CollectorOptions{NodeAgentStaleAfter: 30 * time.Minute, Now: func() time.Time { return t0 }})
@@ -183,7 +186,9 @@ func TestCollector_NodeAgentGauges(t *testing.T) {
 ffs_node_agent_nodes{state="disabled"} 0
 ffs_node_agent_nodes{state="never"} 1
 ffs_node_agent_nodes{state="reporting"} 1
+ffs_node_agent_nodes{state="reporting_without_inventory"} 1
 ffs_node_agent_nodes{state="stale"} 1
+ffs_node_agent_nodes{state="unsupported"} 1
 # HELP ffs_node_groups Node groups by kind.
 # TYPE ffs_node_groups gauge
 ffs_node_groups{kind="agent"} 1
@@ -201,10 +206,15 @@ func TestMetrics_NamesAndAgentReportsRegistered(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	require.NoError(t, metrics.Register(reg, metrics.NewCollector(newStore(t), metrics.CollectorOptions{})))
 	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(`
-# HELP ffs_agent_reports_total Node agent reports received, by result.
+# HELP ffs_agent_reports_total Node agent reports received, by result; rejected reports and SBOM results also by reason.
 # TYPE ffs_agent_reports_total counter
-ffs_agent_reports_total{result="applied"} 0
-ffs_agent_reports_total{result="duplicate"} 0
-ffs_agent_reports_total{result="rejected"} 0
+ffs_agent_reports_total{reason="",result="applied"} 0
+ffs_agent_reports_total{reason="",result="deferred"} 0
+ffs_agent_reports_total{reason="",result="duplicate"} 0
+ffs_agent_reports_total{reason="bad_request",result="rejected"} 0
+ffs_agent_reports_total{reason="forbidden",result="rejected"} 0
+ffs_agent_reports_total{reason="rate_limited",result="rejected"} 0
+ffs_agent_reports_total{reason="too_large",result="rejected"} 0
+ffs_agent_reports_total{reason="unauthenticated",result="rejected"} 0
 `), "ffs_agent_reports_total"))
 }
