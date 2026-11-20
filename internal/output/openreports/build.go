@@ -118,7 +118,7 @@ func BuildReport(o model.Owner, fs []model.Finding, advs map[string]model.Adviso
 	if r.Namespace == "" {
 		r.Namespace = ns
 	}
-	if av, ok := model.APIVersionForKind(o.Ref.Kind); ok {
+	if av, ok := o.Ref.ObjectAPIVersion(); ok {
 		r.Scope = &corev1.ObjectReference{APIVersion: av, Kind: o.Ref.Kind, Namespace: o.Ref.Namespace,
 			Name: o.Ref.Name, UID: types.UID(o.Ref.UID)}
 	}

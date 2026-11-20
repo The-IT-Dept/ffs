@@ -285,3 +285,80 @@ func TestStore_SuggestionOnlyOnFixedFindings(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, model.TierNone, got.Suggestion.Tier)
 }
+
+func TestStore_SuggestionStaleAndApplied(t *testing.T) {
+	s := newStore(t)
+	const key, repo = "Deployment/netbox/netbox", "ghcr.io/x"
+	sg := model.Suggestion{Repo: repo, FromTag: "1.0", ToTag: "1.1", ToDigest: "sha256:idx", Tier: model.TierPatch,
+		FixedIDs: []string{"CVE-2026-0001"}, ComputedAt: t0}
+	cands := []CandidateDigest{{Tag: "1.1", Tier: model.TierPatch, Platform: "linux/amd64", Digest: "sha256:cand"}}
+	applied := &AppliedUpgrade{Tag: "1.0", Tier: model.TierPatch, Digests: []string{"sha256:run"}, FixedIDs: []string{"CVE-2026-0009"}}
+	require.NoError(t, s.PutSuggestionApplied(ctx, key, sg, cands, applied))
+
+	got, ok, err := s.GetSuggestion(ctx, key, repo)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, OwnerSuggestion{OwnerKey: key, Suggestion: sg, Candidates: cands, Applied: applied}, got)
+
+	require.NoError(t, s.MarkSuggestionsStale(ctx, []SuggestionKey{{key, repo}, {"Deployment/x/y", repo}}))
+	got, _, err = s.GetSuggestion(ctx, key, repo)
+	require.NoError(t, err)
+	require.True(t, got.Stale)
+	require.Equal(t, applied, got.Applied, "marking stale keeps the rest")
+
+	has, err := s.OwnersWithSuggestions(ctx, []string{key, "Deployment/x/y"})
+	require.NoError(t, err)
+	require.Equal(t, map[string]bool{key: true}, has)
+
+	require.NoError(t, s.PutSuggestion(ctx, key, sg, cands))
+	got, _, err = s.GetSuggestion(ctx, key, repo)
+	require.NoError(t, err)
+	require.False(t, got.Stale, "storing it again makes it current")
+	require.Nil(t, got.Applied)
+}
+
+func TestStore_OwnersToResolve(t *testing.T) {
+	s := newStore(t)
+	finding := func(owner model.OwnerRef, repo, id string, p model.Priority, fixable bool) model.Finding {
+		return model.Finding{Fingerprint: model.FindingFingerprint("test", owner, repo, id), Owner: owner, ImageRepo: repo,
+			AdvisoryID: id, State: model.StateOpen, Priority: p, FixAvailable: fixable}
+	}
+	web := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "web"}
+	api := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "api"}
+	low := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "low"}
+	nofix := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "nofix"}
+	cluster := model.OwnerRef{Kind: model.OwnerKindCluster, Name: "test"}
+	nodes := model.NodesOwner("test")
+	cnpg := model.OwnerRef{Kind: model.OwnerKindCluster, Namespace: "db", Name: "pg"} // a workload of kind Cluster
+	excepted := finding(api, "ghcr.io/b", "CVE-2026-0006", model.PriorityUrgent, true)
+	excepted.State = model.StateExcepted
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{
+		finding(web, "ghcr.io/a", "CVE-2026-0001", model.PriorityHigh, true),
+		finding(api, "ghcr.io/a", "CVE-2026-0002", model.PriorityMedium, true),
+		excepted,
+		finding(low, "ghcr.io/a", "CVE-2026-0003", model.PriorityLow, true),
+		finding(nofix, "ghcr.io/a", "CVE-2026-0004", model.PriorityHigh, false),
+		finding(cluster, "kubernetes", "CVE-2026-0005", model.PriorityHigh, false),
+		finding(nodes, model.HostRepo, "CVE-2026-0007", model.PriorityHigh, true),
+		finding(cnpg, "ghcr.io/c", "CVE-2026-0008", model.PriorityHigh, false),
+	}, nil))
+	sg := func(repo string) model.Suggestion {
+		return model.Suggestion{Repo: repo, Tier: model.TierNone, ComputedAt: t0}
+	}
+	require.NoError(t, s.PutSuggestion(ctx, web.Key(), sg("ghcr.io/a"), nil))
+
+	got, err := s.OwnersToResolve(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{cluster.Key(), api.Key()}, got)
+
+	require.NoError(t, s.PutSuggestion(ctx, api.Key(), sg("ghcr.io/a"), nil))
+	require.NoError(t, s.PutSuggestion(ctx, cluster.Key(), sg("kubernetes"), nil))
+	got, err = s.OwnersToResolve(ctx)
+	require.NoError(t, err)
+	require.Empty(t, got)
+
+	require.NoError(t, s.MarkSuggestionsStale(ctx, []SuggestionKey{{web.Key(), "ghcr.io/a"}}))
+	got, err = s.OwnersToResolve(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{web.Key()}, got)
+}

@@ -248,7 +248,7 @@ func TestSyncAll_DeploymentViaReplicaSet(t *testing.T) {
 	require.True(t, h.inv.Synced())
 
 	o := h.owner(t, "Deployment/apps/web")
-	require.Equal(t, model.OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web", UID: "web-uid"}, o.Ref)
+	require.Equal(t, model.OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web", UID: "web-uid", APIVersion: "apps/v1"}, o.Ref)
 	require.Equal(t, []string{"amd64", "arm64"}, o.Arch)
 	require.Equal(t, &model.ManagedBy{Tool: "flux-helmrelease", Name: "web", Namespace: "flux-system"}, o.ManagedBy)
 	require.False(t, o.NotRunning)

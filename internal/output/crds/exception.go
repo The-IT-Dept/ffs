@@ -40,6 +40,10 @@ const (
 	// exceptionResync refreshes an Exception's status counts, which move with findings. An expired
 	// Exception that excepts nothing is not refreshed: nothing can change its counts any more.
 	exceptionResync = 2 * time.Minute
+	// invalidResync checks an invalid Exception again. Only a spec change reconciles it otherwise
+	// (the watch passes generation changes only), and time alone can make it valid: an expiry too
+	// far ahead comes within exceptions.maxDuration.
+	invalidResync = time.Hour
 )
 
 // vexStatuses are the accepted values of spec.vexStatus, besides "".
@@ -97,6 +101,18 @@ func ValidateException(spec v1alpha1.ExceptionSpec, now time.Time, maxDuration t
 	return nil
 }
 
+// invalidRequeue is when to check an invalid Exception again: within invalidResync, or as soon as
+// an expiry too far ahead comes within maxDuration.
+func invalidRequeue(spec v1alpha1.ExceptionSpec, now time.Time, maxDuration time.Duration) time.Duration {
+	d := invalidResync
+	if !spec.Expires.IsZero() {
+		if opens := spec.Expires.Add(-maxDuration).Sub(now); opens > 0 && opens < d {
+			d = opens
+		}
+	}
+	return d
+}
+
 // durationText renders a maximum duration as whole days ("365 days") when it is one.
 func durationText(d time.Duration) string {
 	const day = 24 * time.Hour
@@ -111,7 +127,8 @@ func durationText(d time.Duration) string {
 
 // Reconcile caches or drops one Exception's rule and refreshes its status. A valid Exception is
 // requeued at its expiry or within 2 minutes, whichever is sooner, so its counts stay current; one
-// that has expired and excepts nothing is not requeued.
+// that has expired and excepts nothing is not requeued. An invalid one is requeued within an hour,
+// or when its expiry comes within exceptions.maxDuration if that is sooner.
 // The engine recomputes when the cached rule changed or was dropped, and once per expiry when an
 // expired rule still excepts findings (see reopenExpired); never merely because of the requeue.
 func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
@@ -130,7 +147,10 @@ func (r *ExceptionReconciler) Reconcile(ctx context.Context, req reconcile.Reque
 		st := v1alpha1.ExceptionStatus{ObservedGeneration: ex.Generation, Conditions: slices.Clone(ex.Status.Conditions)}
 		apimeta.RemoveStatusCondition(&st.Conditions, conditionUrgentNotExcepted)
 		setCondition(&st, conditionReady, metav1.ConditionFalse, reasonInvalid, verr.Error(), now)
-		return reconcile.Result{}, r.writeStatus(ctx, &ex, st)
+		if err := r.writeStatus(ctx, &ex, st); err != nil {
+			return reconcile.Result{}, err
+		}
+		return reconcile.Result{RequeueAfter: invalidRequeue(ex.Spec, now, r.Config.Exceptions.MaxDuration)}, nil
 	}
 
 	rule, err := r.rule(ctx, &ex)

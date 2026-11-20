@@ -138,7 +138,7 @@ type UpgradesConfig struct {
 	Enabled              bool                   `yaml:"enabled"`
 	MaxCandidatesPerRepo int                    `yaml:"maxCandidatesPerRepo"`
 	DailyAt              string                 `yaml:"dailyAt"`
-	Overrides            map[string]TagOverride `yaml:"overrides"`            // key: normalised repo, e.g. "docker.io/bitnami/postgresql"
+	Overrides            map[string]TagOverride `yaml:"overrides"`            // key: repository or path.Match glob, normalised by NormalizeRepoKey ("postgres" is "docker.io/library/postgres")
 	KubernetesReleaseURL string                 `yaml:"kubernetesReleaseURL"` // "" = "https://dl.k8s.io/release"
 }
 
@@ -327,16 +327,7 @@ func (c Config) Validate() error {
 			bad("upgrades.dailyAt: must be HH:MM: %v", err)
 		}
 	}
-	for repo, o := range c.Upgrades.Overrides {
-		re, err := regexp.Compile(o.Pattern)
-		if err != nil {
-			bad("upgrades.overrides[%s].pattern: %v", repo, err)
-			continue
-		}
-		if re.SubexpIndex("version") < 0 {
-			bad("upgrades.overrides[%s].pattern: must have a named group \"version\"", repo)
-		}
-	}
+	c.Upgrades.validateOverrides(bad)
 	c.NodeAgent.validate(bad)
 	c.AlertTargets.validate(bad)
 	return errors.Join(errs...)

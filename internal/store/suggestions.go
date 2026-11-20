@@ -25,6 +25,20 @@ type OwnerSuggestion struct {
 	OwnerKey   string
 	Suggestion model.Suggestion
 	Candidates []CandidateDigest // in the order PutSuggestion was given them
+	// Stale is set when a candidate it scored was re-matched (MarkSuggestionsStale): it stands until
+	// the owner is resolved again.
+	Stale bool
+	// Applied is the earlier upgrade the owner now runs, nil when none (PutSuggestionApplied).
+	Applied *AppliedUpgrade
+}
+
+// AppliedUpgrade is an upgrade the resolver suggested and the owner rolled out: the candidate's tag and
+// tier, the platform manifests it scored, and the advisories it was to fix.
+type AppliedUpgrade struct {
+	Tag      string
+	Tier     model.Tier
+	Digests  []string
+	FixedIDs []string
 }
 
 // SuggestionKey identifies a stored suggestion.
@@ -48,7 +62,7 @@ const (
 	deleteRepoCandidates   = deleteOwnerCandidates + ` AND repo` + inList
 	clearRepoFindings      = clearOwnerFindings + ` AND json_extract(data, '$.ImageRepo')` + inList
 
-	suggestionSelect = `SELECT s.owner_key, s.repo, s.data, c.tag, c.tier, c.platform, c.digest
+	suggestionSelect = `SELECT s.owner_key, s.repo, s.data, s.stale, s.applied, c.tag, c.tier, c.platform, c.digest
 		FROM suggestions s LEFT JOIN candidates c ON c.owner_key = s.owner_key AND c.repo = s.repo`
 	suggestionOrder = ` ORDER BY s.owner_key, s.repo, c.rowid`
 
@@ -57,15 +71,35 @@ const (
 )
 
 // PutSuggestion stores sg as the suggestion for ownerKey and sg.Repo, replaces its candidates with
-// cands, and sets it as the Suggestion of the owner's findings on sg.Repo, in one transaction.
+// cands, and sets it as the Suggestion of the owner's findings on sg.Repo, in one transaction. The
+// stored suggestion is not stale and has no applied upgrade.
 func (s *Store) PutSuggestion(ctx context.Context, ownerKey string, sg model.Suggestion, cands []CandidateDigest) error {
+	return s.PutSuggestionApplied(ctx, ownerKey, sg, cands, nil)
+}
+
+// PutSuggestionApplied is PutSuggestion recording applied (nil for none) as the upgrade the owner
+// runs.
+func (s *Store) PutSuggestionApplied(ctx context.Context, ownerKey string, sg model.Suggestion, cands []CandidateDigest,
+	applied *AppliedUpgrade) error {
 	data, err := jsonText(sg)
 	if err != nil {
 		return err
 	}
+	// The replaced row's other columns take their defaults: not stale, no applied upgrade. Without an
+	// applied upgrade the statement names only the columns of migration 009, as a store migrated
+	// before 063 has them.
+	q := `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at) VALUES(?, ?, ?, ?, ?)`
+	args := []any{ownerKey, sg.Repo, sg.FromTag, data, nanos(orNow(sg.ComputedAt))}
+	if applied != nil {
+		app, err := jsonText(applied)
+		if err != nil {
+			return err
+		}
+		q = `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at, applied) VALUES(?, ?, ?, ?, ?, ?)`
+		args = append(args, app)
+	}
 	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO suggestions(owner_key, repo, from_tag, data, computed_at) VALUES(?, ?, ?, ?, ?)`,
-			ownerKey, sg.Repo, sg.FromTag, data, nanos(orNow(sg.ComputedAt))); err != nil {
+		if _, err := tx.ExecContext(ctx, q, args...); err != nil {
 			return fmt.Errorf("store: suggestion %s %s: %w", ownerKey, sg.Repo, err)
 		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM candidates WHERE owner_key = ? AND repo = ?`, ownerKey, sg.Repo); err != nil {
@@ -144,9 +178,62 @@ func (s *Store) SuggestionKeysForDigests(ctx context.Context, digests []string) 
 	}, `SELECT DISTINCT owner_key, repo FROM candidates WHERE digest`+inList+` ORDER BY owner_key, repo`, idList(digests))
 }
 
+// MarkSuggestionsStale marks the suggestions keys as stale. They stay in place, Suggestion of the
+// owners' findings included, until they are stored again or deleted.
+func (s *Store) MarkSuggestionsStale(ctx context.Context, keys []SuggestionKey) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	pairs := make([][2]string, len(keys))
+	for i, k := range keys {
+		pairs[i] = [2]string{k.OwnerKey, k.Repo}
+	}
+	list, err := jsonText(pairs)
+	if err != nil {
+		return err
+	}
+	if _, err := s.wdb.ExecContext(ctx, `UPDATE suggestions SET stale = 1 WHERE stale = 0 AND (owner_key, repo) IN
+		(SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]') FROM json_each(?))`, list); err != nil {
+		return fmt.Errorf("store: mark suggestions stale: %w", err)
+	}
+	return nil
+}
+
+// OwnersWithSuggestions returns which of keys have a stored suggestion.
+func (s *Store) OwnersWithSuggestions(ctx context.Context, keys []string) (map[string]bool, error) {
+	got, err := queryAll(ctx, s.rdb, scanString, `SELECT DISTINCT owner_key FROM suggestions WHERE owner_key`+inList, idList(keys))
+	if err != nil {
+		return nil, fmt.Errorf("store: owners with suggestions: %w", err)
+	}
+	out := make(map[string]bool, len(got))
+	for _, k := range got {
+		out[k] = true
+	}
+	return out, nil
+}
+
+// OwnersToResolve returns, sorted, the owners whose upgrade suggestions a restart may have left out
+// of date: those with a stale suggestion, and those with an open finding at or above medium on an
+// image repository that has no stored suggestion. A workload's finding needs a fix; a Cluster or
+// ContainerRuntime owner's does not, as its advice does not. The Nodes owner is never advised.
+func (s *Store) OwnersToResolve(ctx context.Context) ([]string, error) {
+	got, err := queryAll(ctx, s.rdb, scanString, `SELECT owner_key FROM suggestions WHERE stale = 1
+		UNION
+		SELECT f.owner_key FROM findings f WHERE f.state = ? AND f.priority >= ?
+			AND (f.fix_available = 1 OR (f.namespace = '' AND f.owner_kind IN (?, ?)))
+			AND NOT (f.namespace = '' AND f.owner_kind = ?)
+			AND NOT EXISTS (SELECT 1 FROM suggestions s WHERE s.owner_key = f.owner_key AND s.repo = f.image_repo)
+		ORDER BY 1`,
+		string(model.StateOpen), int(model.PriorityMedium), model.OwnerKindCluster, model.OwnerKindContainerRuntime, model.OwnerKindNodes)
+	if err != nil {
+		return nil, fmt.Errorf("store: owners to resolve: %w", err)
+	}
+	return got, nil
+}
+
 // Announced returns the upgrade target (ToTag, ToDigest) last announced for ownerKey on repo.
-// DeleteSuggestions leaves it in place, so a suggestion withdrawn by a candidate's match change
-// and resolved again to the same target is not announced twice.
+// Storing or deleting a suggestion leaves it in place, so a suggestion replaced by one that
+// recommends nothing, and resolved again to the same target, is not announced twice.
 func (s *Store) Announced(ctx context.Context, ownerKey, repo string) (toTag, toDigest string, ok bool, err error) {
 	err = s.rdb.QueryRowContext(ctx, `SELECT to_tag, to_digest FROM announcements WHERE owner_key = ? AND repo = ?`,
 		ownerKey, repo).Scan(&toTag, &toDigest)
@@ -202,16 +289,23 @@ func (s *Store) querySuggestions(ctx context.Context, query string, args ...any)
 	)
 	for rows.Next() {
 		var (
-			key, repo, data           string
-			tag, tier, platform, dgst sql.NullString
+			key, repo, data                    string
+			stale                              bool
+			applied, tag, tier, platform, dgst sql.NullString
 		)
-		if err := rows.Scan(&key, &repo, &data, &tag, &tier, &platform, &dgst); err != nil {
+		if err := rows.Scan(&key, &repo, &data, &stale, &applied, &tag, &tier, &platform, &dgst); err != nil {
 			return nil, err
 		}
 		if len(out) == 0 || key != lastKey || repo != lastRepo {
-			sg := OwnerSuggestion{OwnerKey: key}
+			sg := OwnerSuggestion{OwnerKey: key, Stale: stale}
 			if err := json.Unmarshal([]byte(data), &sg.Suggestion); err != nil {
 				return nil, fmt.Errorf("suggestion %s %s: %w", key, repo, err)
+			}
+			if applied.Valid {
+				sg.Applied = &AppliedUpgrade{}
+				if err := json.Unmarshal([]byte(applied.String), sg.Applied); err != nil {
+					return nil, fmt.Errorf("applied upgrade %s %s: %w", key, repo, err)
+				}
 			}
 			out = append(out, sg)
 			lastKey, lastRepo = key, repo

@@ -64,7 +64,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `exposure.internalGatewayClasses` | `[]` | GatewayClass names whose Gateways do not count as exposure outside the cluster. |
 | `exposure.internalGateways` | `[]` | Gateways, as `namespace/name`, that do not count as exposure outside the cluster. |
 | `exposure.internalLBAnnotations` | `{}` | Service annotations that mark a LoadBalancer as internal, as annotation key to value. The value `*` matches any value. |
-| `crd.minPriority` | `high` | Lowest priority written as a `Finding` resource. Everything is still in the API and web UI. |
+| `crd.minPriority` | `high` | Lowest priority written as a `Finding` resource. Everything is still in the API and web UI. A `Finding` is named after the workload and the advisory, so a workload with the same advisory on two image repositories gets one resource, for the higher-ranked finding; the metric `ffs_finding_cr_name_collisions` counts the findings left out this way. |
 | `crd.maxFindings` | `2000` | Most `Finding` resources kept; `0` is unlimited. Over the cap the lowest priorities are dropped first, and ffs reports it with an Event and a metric. |
 | `events.minPriority` | `high` | Lowest priority whose transitions emit Kubernetes Events. |
 | `openReports.mode` | `auto` | OpenReports output: `auto` writes reports when the `openreports.io` CRD exists, `on` always writes them, `off` never does. |
@@ -76,7 +76,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `upgrades.enabled` | `true` | Look for image upgrades that fix findings. |
 | `upgrades.maxCandidatesPerRepo` | `4` | Candidate tags scored per image repository and pass, from 1 to 4. |
 | `upgrades.dailyAt` | `03:00` | Time of the daily upgrade pass, `HH:MM` in UTC. |
-| `upgrades.overrides` | `{}` | Per-repository tag parsing, keyed by normalised repository (for example `docker.io/bitnami/postgresql`). Each entry has `pattern`, a regular expression with a named group `version` and optional `suffix` and `revision`, and `ignore`, a list of tag globs dropped before parsing. |
+| `upgrades.overrides` | `{}` | Per-repository tag parsing, keyed by repository or repository glob (`path.Match` syntax). Keys are normalised as image references are: `postgres` means `docker.io/library/postgres` and `bitnami/*` means `docker.io/bitnami/*`. An exact key wins over globs; among matching globs the one with the longest literal text before its first `*`, `?` or `[` wins, then the longer glob, then the alphabetically first. Each entry has `pattern`, a regular expression with a named group `version` and optional `suffix` and `revision`, and `ignore`, a list of tag globs dropped before parsing. A malformed glob, or two keys that name the same repository, fails the configuration load. |
 | `upgrades.kubernetesReleaseURL` | `""` | Base URL for Kubernetes patch releases. Empty means `https://dl.k8s.io/release`. |
 | `nodeAgent.enabled` | `true` | Runs the node agent. When false, ffs moves container runtime findings back to the node-status owner at once and resolves host findings. |
 | `nodeAgent.listen` | `:8444` | The agent API (TLS only, leader only). The chart sets it from `nodeAgent.port`. |

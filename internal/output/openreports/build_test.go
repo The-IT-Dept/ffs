@@ -113,3 +113,22 @@ func TestReportName_DNSSafe(t *testing.T) {
 	assert.NotEqual(t, a, b)
 	assert.Empty(t, validation.IsDNS1123Label(a))
 }
+
+// TestBuildReport_CustomKindScope (F93): a custom-kind owner recorded with its apiVersion gets a
+// scoped Report; one recorded without it gets none rather than a wrong one.
+func TestBuildReport_CustomKindScope(t *testing.T) {
+	fs := []model.Finding{finding("CVE-2026-0001", model.PriorityHigh, model.SeverityHigh)}
+	rollout := model.OwnerRef{Kind: "Rollout", Namespace: "shop", Name: "web", UID: "uid-r", APIVersion: "argoproj.io/v1alpha1"}
+	r, ok := openreports.BuildReport(model.Owner{Ref: rollout}, fs, advisories(fs), 100, "ffs")
+	require.True(t, ok)
+	require.NotNil(t, r.Scope)
+	assert.Equal(t, "argoproj.io/v1alpha1", r.Scope.APIVersion)
+	assert.Equal(t, "Rollout", r.Scope.Kind)
+	assert.Equal(t, "web", r.Scope.Name)
+	assert.EqualValues(t, "uid-r", r.Scope.UID)
+
+	rollout.APIVersion = ""
+	r, ok = openreports.BuildReport(model.Owner{Ref: rollout}, fs, advisories(fs), 100, "ffs")
+	require.True(t, ok)
+	assert.Nil(t, r.Scope)
+}

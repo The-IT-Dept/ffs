@@ -1,10 +1,11 @@
 package upgrade
 
 import (
+	"cmp"
 	"fmt"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -41,6 +42,14 @@ type compiledRule struct {
 }
 
 func compileRule(r rule) (*compiledRule, error) {
+	if _, err := path.Match(r.Repo, ""); err != nil {
+		return nil, fmt.Errorf("repository glob: %w", err)
+	}
+	for _, g := range r.Ignore {
+		if _, err := path.Match(g, ""); err != nil {
+			return nil, fmt.Errorf("ignore %q: %w", g, err)
+		}
+	}
 	re, err := regexp.Compile(r.Pattern)
 	if err != nil {
 		return nil, err
@@ -53,6 +62,7 @@ func compileRule(r rule) (*compiledRule, error) {
 }
 
 // parse applies the rule to a tag. Tags in the ignore list or not matching the pattern are rejected.
+// The ignore globs were checked by compileRule, so path.Match cannot fail here.
 func (c *compiledRule) parse(tag string) (TagVersion, bool) {
 	for _, g := range c.Ignore {
 		if ok, _ := path.Match(g, tag); ok {
@@ -87,7 +97,7 @@ func (c *compiledRule) parse(tag string) (TagVersion, bool) {
 // ruleSet holds compiled rules keyed by repo glob (or exact repo).
 type ruleSet struct {
 	exact map[string]*compiledRule
-	globs []*compiledRule
+	globs []*compiledRule // most specific first (moreSpecific)
 }
 
 func newRuleSet(rules []rule) (*ruleSet, error) {
@@ -97,17 +107,35 @@ func newRuleSet(rules []rule) (*ruleSet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", r.Repo, err)
 		}
-		if strings.ContainsAny(r.Repo, "*?[") {
+		if strings.ContainsAny(r.Repo, globChars) {
 			s.globs = append(s.globs, c)
 		} else {
 			s.exact[r.Repo] = c
 		}
 	}
-	sort.Slice(s.globs, func(i, j int) bool { return s.globs[i].Repo < s.globs[j].Repo })
+	slices.SortFunc(s.globs, func(a, b *compiledRule) int { return moreSpecific(a.Repo, b.Repo) })
 	return s, nil
 }
 
-// lookup returns the rule for repo: an exact key first, then the first matching glob.
+// globChars are the characters that make a repository key a path.Match glob.
+const globChars = "*?[\\"
+
+// moreSpecific orders repository globs most specific first: the longer literal prefix (the text
+// before the first glob character), then the longer glob, then alphabetically. So for
+// docker.io/bitnami/postgresql, "docker.io/bitnami/postgres*" wins over "docker.io/bitnami/*".
+func moreSpecific(a, b string) int {
+	return cmp.Or(cmp.Compare(literalPrefix(b), literalPrefix(a)), cmp.Compare(len(b), len(a)), strings.Compare(a, b))
+}
+
+// literalPrefix is the length of g before its first glob character.
+func literalPrefix(g string) int {
+	if i := strings.IndexAny(g, globChars); i >= 0 {
+		return i
+	}
+	return len(g)
+}
+
+// lookup returns the rule for repo: an exact key first, then the most specific matching glob.
 func (s *ruleSet) lookup(repo string) *compiledRule {
 	if c, ok := s.exact[repo]; ok {
 		return c
@@ -120,10 +148,12 @@ func (s *ruleSet) lookup(repo string) *compiledRule {
 	return nil
 }
 
+// overrideRules turns the configured overrides into rules keyed by normalised repository
+// (config.NormalizeRepoKey), so "postgres" applies to docker.io/library/postgres.
 func overrideRules(o map[string]config.TagOverride) []rule {
 	out := make([]rule, 0, len(o))
 	for repo, v := range o {
-		out = append(out, rule{Repo: repo, Pattern: v.Pattern, Ignore: v.Ignore})
+		out = append(out, rule{Repo: config.NormalizeRepoKey(repo), Pattern: v.Pattern, Ignore: v.Ignore})
 	}
 	return out
 }

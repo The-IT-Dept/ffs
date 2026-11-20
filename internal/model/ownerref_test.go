@@ -47,3 +47,26 @@ func TestNodesOwner(t *testing.T) {
 	_, ok := APIVersionForKind(OwnerKindNodes)
 	require.False(t, ok)
 }
+
+func TestObjectAPIVersion(t *testing.T) {
+	for _, tc := range []struct {
+		ref  OwnerRef
+		want string
+		ok   bool
+	}{
+		{OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r", APIVersion: "argoproj.io/v1alpha1"}, "argoproj.io/v1alpha1", true},
+		{OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg", APIVersion: "postgresql.cnpg.io/v1"}, "postgresql.cnpg.io/v1", true},
+		{OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"}, "apps/v1", true}, // recorded before APIVersion was
+		{OwnerRef{Kind: "CloneSet", Namespace: "web", Name: "c"}, "", false},
+		{OwnerRef{Kind: OwnerKindCluster, Name: "dev"}, "", false},
+		{NodesOwner("dev"), "", false},
+	} {
+		got, ok := tc.ref.ObjectAPIVersion()
+		require.Equal(t, tc.ok, ok, tc.ref.Key())
+		require.Equal(t, tc.want, got, tc.ref.Key())
+	}
+	ref := OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r", APIVersion: "argoproj.io/v1alpha1"}
+	require.Equal(t, "Rollout/web/r", ref.Key(), "the key leaves the apiVersion out")
+	require.Equal(t, FindingFingerprint("prod", OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r"}, "repo", "CVE-1"),
+		FindingFingerprint("prod", ref, "repo", "CVE-1"), "so does the fingerprint")
+}

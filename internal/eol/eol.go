@@ -18,9 +18,13 @@ const warnWithin = 90 * 24 * time.Hour
 
 const dateFmt = "2006-01-02"
 
+// Unknown is the support text of an image or subject whose lifecycle is not known.
+const Unknown = "unknown"
+
 // Status is the lifecycle position of one product version.
 type Status struct {
 	Product, Cycle string
+	Label          string // readable product name ("Alpine Linux"); "" reads as Product
 	EOLDate        *time.Time
 	IsEOL          bool
 	Latest         string
@@ -66,7 +70,7 @@ func (e *Evaluator) Evaluate(product, version string) (Status, bool) {
 		if !ov.rolling {
 			cycle = firstTwo(trimVersion(version))
 		}
-		return Status{Product: product, Cycle: cycle, Note: ov.note}, true
+		return Status{Product: product, Cycle: cycle, Label: Label(product), Note: ov.note}, true
 	}
 	source := product
 	if ov.use != "" {
@@ -95,7 +99,15 @@ func (e *Evaluator) Evaluate(product, version string) (Status, bool) {
 
 func (e *Evaluator) status(product string, c store.EOLCycle) Status {
 	isEOL := c.IsEOL || (c.EOLDate != nil && !e.now().Before(*c.EOLDate))
-	return Status{Product: product, Cycle: c.Cycle, EOLDate: c.EOLDate, IsEOL: isEOL, Latest: c.Latest}
+	return Status{Product: product, Cycle: c.Cycle, Label: Label(product), EOLDate: c.EOLDate, IsEOL: isEOL, Latest: c.Latest}
+}
+
+// name is the product name s is described by: its label, else its endoflife.date product.
+func (s Status) name() string {
+	if s.Label != "" {
+		return s.Label
+	}
+	return s.Product
 }
 
 func trimVersion(v string) string {
@@ -136,17 +148,20 @@ func (e *Evaluator) ImageEOL(repo string, pkgs []model.Package) []Status {
 	return out
 }
 
-// Text describes s as a sentence fragment: "debian 10 reached end of life 2024-06-30", or
-// "containerd 2.0 reaches end of life 2027-01-15" within warnWithin of the date. It is empty when
-// there is nothing to report.
+// Text describes s as a sentence fragment: "Debian 10 reached end of life 2024-06-30",
+// "containerd 2.0 reaches end of life 2027-01-15" within warnWithin of the date, or
+// "Debian 12 supported until 2028-06-30" further ahead. It is empty when there is no end-of-life
+// date to report.
 func Text(s Status, now time.Time) string {
 	switch {
 	case s.IsEOL && s.EOLDate != nil:
-		return fmt.Sprintf("%s %s reached end of life %s", s.Product, s.Cycle, s.EOLDate.Format(dateFmt))
+		return fmt.Sprintf("%s %s reached end of life %s", s.name(), s.Cycle, s.EOLDate.Format(dateFmt))
 	case s.IsEOL:
-		return fmt.Sprintf("%s %s reached end of life", s.Product, s.Cycle)
+		return fmt.Sprintf("%s %s reached end of life", s.name(), s.Cycle)
 	case s.EOLDate != nil && s.EOLDate.Sub(now) <= warnWithin:
-		return fmt.Sprintf("%s %s reaches end of life %s", s.Product, s.Cycle, s.EOLDate.Format(dateFmt))
+		return fmt.Sprintf("%s %s reaches end of life %s", s.name(), s.Cycle, s.EOLDate.Format(dateFmt))
+	case s.EOLDate != nil:
+		return fmt.Sprintf("%s %s supported until %s", s.name(), s.Cycle, s.EOLDate.Format(dateFmt))
 	}
 	return ""
 }
@@ -158,6 +173,35 @@ func JoinText(ss []Status, now time.Time) string {
 		if t := Text(s, now); t != "" {
 			parts = append(parts, t)
 		}
+	}
+	return strings.Join(parts, "; ")
+}
+
+// Support describes s for a support column, never empty: its Text when it has an end-of-life date,
+// else its override note ("Wolfi: rolling release", "Talos Linux 1.9: security updates for the two
+// latest minor releases"), else "Debian 13 supported".
+func Support(s Status, now time.Time) string {
+	if t := Text(s, now); t != "" {
+		return t
+	}
+	subject := s.name()
+	if s.Cycle != "" && s.Cycle != "rolling" {
+		subject += " " + s.Cycle
+	}
+	if s.Note != "" {
+		return subject + ": " + s.Note
+	}
+	return subject + " supported"
+}
+
+// JoinSupport joins the Supports of ss with "; ", or returns Unknown when ss is empty.
+func JoinSupport(ss []Status, now time.Time) string {
+	if len(ss) == 0 {
+		return Unknown
+	}
+	parts := make([]string, len(ss))
+	for i, s := range ss {
+		parts[i] = Support(s, now)
 	}
 	return strings.Join(parts, "; ")
 }

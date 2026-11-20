@@ -26,8 +26,21 @@ func ClusterLevelKey(key string) bool {
 	return OwnerRef{Kind: kind, Namespace: ns}.ClusterLevel()
 }
 
-// APIVersionForKind returns the apiVersion of a workload owner kind, and false for any kind ffs
-// does not reference as a Kubernetes object.
+// ObjectAPIVersion returns the apiVersion of the Kubernetes object r names: its recorded APIVersion,
+// else the built-in one for its kind (APIVersionForKind). ok is false for the cluster-level subjects
+// and for an owner of a custom kind recorded without one.
+func (r OwnerRef) ObjectAPIVersion() (string, bool) {
+	if r.ClusterLevel() {
+		return "", false
+	}
+	if r.APIVersion != "" {
+		return r.APIVersion, true
+	}
+	return APIVersionForKind(r.Kind)
+}
+
+// APIVersionForKind returns the apiVersion of a built-in workload owner kind, and false for any
+// other kind.
 func APIVersionForKind(kind string) (string, bool) {
 	switch kind {
 	case "Deployment", "StatefulSet", "DaemonSet", "ReplicaSet":

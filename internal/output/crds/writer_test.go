@@ -1,6 +1,7 @@
 package crds
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
@@ -292,15 +293,89 @@ func TestCRWriter_ZeroMaxFindingsIsUnlimited(t *testing.T) {
 		c := config.Default()
 		c.CRD.MaxFindings = limit
 		w := NewWriter(WriterOptions{Config: c, Namespace: "ffs"})
-		keep, dropped := w.selectFindings(open, model.PriorityHigh)
+		keep, dropped, _ := w.selectFindings(open, model.PriorityHigh)
 		require.Len(t, keep, 2, "maxFindings %d", limit)
 		require.Zero(t, dropped, "maxFindings %d", limit)
 	}
 
 	c := config.Default()
 	c.CRD.MaxFindings = 1
-	keep, dropped := NewWriter(WriterOptions{Config: c, Namespace: "ffs"}).selectFindings(open, model.PriorityHigh)
+	keep, dropped, _ := NewWriter(WriterOptions{Config: c, Namespace: "ffs"}).selectFindings(open, model.PriorityHigh)
 	require.Len(t, keep, 1)
 	require.Equal(t, model.PriorityUrgent, keep[0].Priority)
 	require.Equal(t, 1, dropped)
+}
+
+// TestSelectFindings_CountsNameCollisions (F54): one owner with the same advisory on two image
+// repositories has one Finding resource name; the lower-ranked finding is left out and counted.
+func TestSelectFindings_CountsNameCollisions(t *testing.T) {
+	api := deployment("web", "api")
+	open := []model.Finding{
+		openFinding(api, debianRepo, cve, model.PriorityHigh, t0),
+		openFinding(api, "docker.io/library/nginx", cve, model.PriorityUrgent, t0),
+		openFinding(deployment("web", "b"), debianRepo, cve, model.PriorityHigh, t0),
+	}
+	keep, dropped, collisions := NewWriter(WriterOptions{Config: config.Default(), Namespace: "ffs"}).selectFindings(open, model.PriorityHigh)
+	require.Len(t, keep, 2)
+	require.Equal(t, "docker.io/library/nginx", keep[0].ImageRepo, "the higher-ranked finding keeps the name")
+	require.Zero(t, dropped)
+	require.Equal(t, 1, collisions)
+}
+
+// recordingStore records the filters the writer lists findings with.
+type recordingStore struct {
+	*store.Store
+	filters []store.FindingFilter
+}
+
+func (r *recordingStore) ListFindings(ctx context.Context, f store.FindingFilter) ([]model.Finding, error) {
+	r.filters = append(r.filters, f)
+	return r.Store.ListFindings(ctx, f)
+}
+
+// TestCRWriter_ReadsEligibleFindings (F87): Sync reads the findings at or above crd.minPriority, then
+// the open findings of the advisories it writes; the Vulnerability still summarises every priority.
+func TestCRWriter_ReadsEligibleFindings(t *testing.T) {
+	needEnv(t)
+	st := newStore(t)
+	seedAdvisory(t, st)
+	const other = "CVE-2026-3333"
+	a := openFinding(deployment("web", "a"), debianRepo, cve, model.PriorityUrgent, t0)
+	b := openFinding(deployment("web", "b"), debianRepo, cve, model.PriorityMedium, t0)
+	c := openFinding(deployment("web", "c"), debianRepo, other, model.PriorityLow, t0)
+	apply(t, st, a, b, c)
+	w, _ := newWriter(t, st, func(c *config.Config) { c.CRD.MinPriority = "high" })
+	rs := &recordingStore{Store: st}
+	w.o.Store = rs
+
+	require.NoError(t, w.Sync(ctx))
+	require.Len(t, rs.filters, 2)
+	require.Equal(t, model.PriorityHigh, rs.filters[0].MinPriority, "the eligible findings are filtered in SQL")
+	require.Equal(t, []string{cve}, rs.filters[1].AdvisoryIDs, "then only the advisories written")
+	require.Equal(t, []string{"web/" + FindingName(a.Owner, cve)}, keysOf(findingCRs(t)))
+	v := vulnerabilityCRs(t)
+	require.Equal(t, []string{"cve-2026-41873"}, keysOf(v))
+	require.Equal(t, int32(2), v["cve-2026-41873"].Status.AffectedOwners, "the medium finding still counts")
+	require.InDelta(t, 0.0, testutil.ToFloat64(FindingCRNameCollisions), 0)
+}
+
+// staleList lists nothing, as a cache that has not seen the writer's earlier writes yet.
+type staleList struct{ client.Client }
+
+func (staleList) List(context.Context, client.ObjectList, ...client.ListOption) error { return nil }
+
+// TestCRWriter_StaleCacheIsNotAnError (F88): a Sync whose list missed the resources already written
+// gets AlreadyExists for each; that is logged at V(1), not returned.
+func TestCRWriter_StaleCacheIsNotAnError(t *testing.T) {
+	needEnv(t)
+	st := newStore(t)
+	seedAdvisory(t, st)
+	apply(t, st, openFinding(deployment("web", "api"), debianRepo, cve, model.PriorityUrgent, t0))
+	w, _ := newWriter(t, st, nil)
+	require.NoError(t, w.Sync(ctx))
+	require.Len(t, findingCRs(t), 1)
+
+	w.o.Client = staleList{env.Client}
+	require.NoError(t, w.Sync(ctx))
+	require.Len(t, findingCRs(t), 1)
 }

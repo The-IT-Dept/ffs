@@ -262,7 +262,7 @@ func TestResolver_RefreshRecommended(t *testing.T) {
 	require.Equal(t, []string{advA, advB}, sg.FixedIDs)
 	require.Empty(t, sg.Alternatives, "patch and minor fix nothing more")
 	require.Empty(t, sg.Notes)
-	require.Empty(t, sg.EOL, "debian 12 is supported")
+	require.Equal(t, "Debian 12 supported until 2028-06-30", sg.EOL)
 	require.Equal(t, rnow, sg.ComputedAt)
 	require.Contains(t, got.Candidates, store.CandidateDigest{Tag: "1.30.6", Tier: model.TierRefresh, Platform: "linux/amd64", Digest: "sha256:new-amd64"})
 	require.Equal(t, []string{"1.30.6", "1.30.7", "1.31.9"}, tags(got.Candidates))
@@ -351,9 +351,16 @@ func TestResolver_NoUpgradePath(t *testing.T) {
 	got := rg.suggestion()
 	require.Equal(t, model.TierNone, got.Suggestion.Tier)
 	require.Equal(t, []string{"no upgrade path in this repository"}, got.Suggestion.Notes)
-	require.Equal(t, "debian 11 reached end of life 2026-08-31", got.Suggestion.EOL)
+	require.Equal(t, "Debian 11 reached end of life 2026-08-31", got.Suggestion.EOL)
 	require.Empty(t, got.Candidates)
 	require.Empty(t, rg.acq.reqs)
+}
+
+func TestResolver_SupportUnknown(t *testing.T) {
+	rg := newRig(t)
+	rg.putImage(curAMD64, curIdx, "99") // a Debian release the lifecycle data does not know
+	rg.resolve()
+	require.Equal(t, "unknown", rg.suggestion().Suggestion.EOL)
 }
 
 func TestResolver_CandidateFailureSkipsCandidate(t *testing.T) {
@@ -414,25 +421,29 @@ func TestResolver_FailedPassWithoutStoredSuggestion(t *testing.T) {
 	require.Empty(t, rg.upgradeTransitions())
 }
 
-func TestResolver_InvalidatesOnCandidateDelta(t *testing.T) {
+func TestResolver_CandidateDeltaMarksStale(t *testing.T) {
 	rg := newRig(t)
 	rg.resolve()
-	rg.suggestion()
+	stored := rg.suggestion()
+	require.False(t, stored.Stale)
 	require.Empty(t, rg.r.Pending())
 
 	rg.r.MatchesReplaced(rctx, []string{"sha256:new-amd64"})
-	_, ok, err := rg.st.GetSuggestion(rctx, webKey, nginx)
-	require.NoError(t, err)
-	require.False(t, ok, "a re-matched candidate withdraws the suggestion")
+	got := rg.suggestion()
+	require.True(t, got.Stale, "a re-matched candidate marks the suggestion stale")
+	require.Equal(t, stored.Suggestion, got.Suggestion, "it stands until the owner is resolved again")
 	require.Equal(t, []string{webKey}, rg.r.Pending())
 	fs, err := rg.st.FindingsForOwner(rctx, webKey)
 	require.NoError(t, err)
 	for _, f := range fs {
-		require.Nil(t, f.Suggestion, f.AdvisoryID)
+		require.NotNil(t, f.Suggestion, f.AdvisoryID)
 	}
 
 	rg.r.MatchesReplaced(rctx, []string{"sha256:unrelated"})
 	require.Equal(t, []string{webKey}, rg.r.Pending(), "queued once")
+
+	rg.r.resolveNext(rctx)
+	require.False(t, rg.suggestion().Stale, "resolving the owner again stores a current suggestion")
 }
 
 func TestResolver_UpgradeAppliedStillAffected(t *testing.T) {
@@ -462,6 +473,133 @@ func TestResolver_UpgradeAppliedStillAffected(t *testing.T) {
 	sg := rg.suggestion().Suggestion
 	require.Equal(t, "1.30.7", sg.FromTag)
 	require.Contains(t, sg.Notes, "upgrade applied, still affected: "+advA)
+}
+
+func TestResolver_AppliedNoteLastsUntilFixed(t *testing.T) {
+	rg := newRig(t)
+	const advC = "CVE-2026-1003"
+	rg.sc.byDigest = map[string][]model.Finding{"sha256:new-amd64": {cf(advA, urgent), cf(advB, high)}}
+	rg.resolve()
+	require.Equal(t, "1.30.7", rg.suggestion().Suggestion.ToTag)
+
+	// 1.30.7 is rolled out: B resolves, A is still there, and C is new
+	rg.putImage("sha256:c77-amd64", "sha256:c77-idx", "12")
+	rg.setOwner(func(o *model.Owner) {
+		o.Containers[0].ImageRef, o.Containers[0].Digest = "nginx:1.30.7", "sha256:c77-amd64"
+	})
+	resolved := func(f model.Finding) model.Finding {
+		at := rnow
+		f.State, f.ResolvedAt = model.StateResolved, &at
+		return f
+	}
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{rg.finding(advA, urgent, "sha256:c77-amd64"),
+		resolved(rg.finding(advB, high, curAMD64)), rg.finding(advC, high, "sha256:c77-amd64")}, nil))
+	rg.resolve()
+	got := rg.suggestion()
+	require.Contains(t, got.Suggestion.Notes, "upgrade applied, still affected: "+advA)
+	require.Equal(t, &store.AppliedUpgrade{Tag: "1.30.7", Tier: model.TierPatch, Digests: []string{"sha256:c77-amd64"},
+		FixedIDs: []string{advA, advB}}, got.Applied)
+	require.NotEqual(t, "1.30.7", got.Suggestion.ToTag, "the new suggestion moves on from the applied upgrade")
+
+	// the next pass resolves from that new suggestion, and the note stays while A is open
+	rg.now = rnow.Add(24 * time.Hour)
+	rg.resolve()
+	got = rg.suggestion()
+	require.Contains(t, got.Suggestion.Notes, "upgrade applied, still affected: "+advA)
+	require.NotNil(t, got.Applied)
+
+	// A is fixed: the note and the applied upgrade go
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{resolved(rg.finding(advA, urgent, "sha256:c77-amd64"))}, nil))
+	rg.resolve()
+	got = rg.suggestion()
+	require.Empty(t, got.Suggestion.Notes)
+	require.Nil(t, got.Applied)
+}
+
+func TestResolver_ConsumeQueuesOwnersLeavingQualifying(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve()                            // webKey holds a suggestion
+	_, err := rg.r.ConsumeTransitions(rctx) // its UpgradeAvailable transitions queue nothing
+	require.NoError(t, err)
+	require.Empty(t, rg.r.Pending())
+	cart := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "cart"} // holds none
+	leave := func(ref model.OwnerRef, id string, toState model.FindingState, from, to model.Priority) model.Transition {
+		return model.Transition{Fingerprint: model.FindingFingerprint("default", ref, nginx, id), Owner: ref, AdvisoryID: id,
+			FromState: model.StateOpen, ToState: toState, FromPriority: from, ToPriority: to, Trigger: model.TriggerPriorityChange, At: rnow}
+	}
+	for _, tc := range []struct {
+		name string
+		t    model.Transition
+		want []string
+	}{
+		{"resolved", leave(webRef, advB, model.StateResolved, high, high), []string{webKey}},
+		{"excepted", leave(webRef, advB, model.StateExcepted, high, high), []string{webKey}},
+		{"lowered below medium", leave(webRef, advB, model.StateOpen, high, low), []string{webKey}},
+		{"lowered within qualifying", leave(webRef, advB, model.StateOpen, high, medium), nil},
+		{"was not qualifying", leave(webRef, advB, model.StateResolved, low, low), nil},
+		{"owner without a suggestion", leave(cart, advB, model.StateResolved, high, high), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rg.r.dequeue(webKey)
+			require.NoError(t, rg.st.ApplyFindings(rctx, nil, []model.Transition{tc.t}))
+			n, err := rg.r.ConsumeTransitions(rctx)
+			require.NoError(t, err)
+			require.Equal(t, 1, n)
+			if tc.want == nil {
+				require.Empty(t, rg.r.Pending())
+			} else {
+				require.Equal(t, tc.want, rg.r.Pending())
+			}
+		})
+	}
+}
+
+func TestResolver_StartupQueuesUnresolvedOwners(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve() // webKey holds a current suggestion
+	require.NoError(t, rg.st.SetCursor(rctx, dailyCursor, rnow.Unix()))
+	api := model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "api"}
+	f := rg.finding("CVE-2026-1009", high, curAMD64)
+	f.Owner, f.Fingerprint = api, model.FindingFingerprint("default", api, nginx, f.AdvisoryID)
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{f}, nil))
+
+	rg.r.startup(rctx)
+	require.Equal(t, []string{api.Key()}, rg.r.Pending(), "a qualifying owner without a suggestion is queued; no daily pass is due")
+
+	rg.r.dequeue(api.Key())
+	rg.r.MatchesReplaced(rctx, []string{"sha256:new-amd64"})
+	restarted := NewResolver(rg.r.o) // a restart loses the in-memory queue
+	restarted.startup(rctx)
+	require.Equal(t, []string{api.Key(), webKey}, restarted.Pending(), "a stale suggestion's owner is queued again")
+}
+
+func TestResolver_StartupConsumesBeforeDailyPass(t *testing.T) {
+	rg := newRig(t)
+	created := model.Transition{Fingerprint: rg.finding(advA, urgent, curAMD64).Fingerprint, Owner: webRef, AdvisoryID: advA,
+		ToState: model.StateOpen, ToPriority: urgent, Trigger: model.TriggerNewAdvisory, At: rnow}
+	require.NoError(t, rg.st.ApplyFindings(rctx, nil, []model.Transition{created}))
+
+	rg.r.startup(rctx) // the last daily pass is older than a day: it never ran
+	require.Empty(t, rg.r.Pending(), "the daily pass resolved and dequeued the owner the outbox queued")
+	require.Len(t, rg.acq.reqs, 3, "each candidate is catalogued once")
+	rg.suggestion()
+	cur, err := rg.st.Cursor(rctx, transitionsCursor)
+	require.NoError(t, err)
+	require.Positive(t, cur)
+	last, err := rg.st.Cursor(rctx, dailyCursor)
+	require.NoError(t, err)
+	require.Equal(t, rnow.Unix(), last)
+}
+
+func TestResolver_UnknownVersionHasNoPathNote(t *testing.T) {
+	rg := newRig(t)
+	rg.setOwner(func(o *model.Owner) { o.Containers[0].ImageRef = "nginx:mainline-build" })
+	rg.reg.resolve["mainline-build"] = curIdx // no refresh either
+	rg.resolve()
+
+	got := rg.suggestion()
+	require.Equal(t, model.TierNone, got.Suggestion.Tier)
+	require.Equal(t, []string{"current version unknown"}, got.Suggestion.Notes, "tags were never listed, so no path is claimed")
 }
 
 func TestResolver_ConsumeTransitions(t *testing.T) {

@@ -39,6 +39,9 @@ var nodeOS = []struct {
 	{regexp.MustCompile(`^Rocky Linux (\d+(?:\.\d+)?)`), "rocky-linux"},
 	{regexp.MustCompile(`^AlmaLinux (\d+(?:\.\d+)?)`), "almalinux"},
 	{regexp.MustCompile(`^CentOS Stream (\d+)`), "centos-stream"},
+	{regexp.MustCompile(`^CentOS Linux (\d+)`), "centos"},
+	{regexp.MustCompile(`^(?:Microsoft )?Azure Linux (\d+\.\d+)`), "azure-linux"},
+	{regexp.MustCompile(`^CBL-Mariner(?:/Linux)? (\d+\.\d+)`), "azure-linux"},
 	{regexp.MustCompile(`^openSUSE Leap (\d+\.\d+)`), "opensuse"},
 	{regexp.MustCompile(`^Fedora (?:Linux )?(\d+)`), "fedora"},
 	{regexp.MustCompile(`^Alpine Linux v(\d+\.\d+(?:\.\d+)?)`), "alpine-linux"},
@@ -64,10 +67,35 @@ func NodeOSProduct(osImage string) (ProductVersion, bool) {
 	return ProductVersion{}, false
 }
 
+// distroProducts maps an os-release ID to its product. Azure Linux 3.0 is "azurelinux"; its 1.0 and
+// 2.0 releases, under the CBL-Mariner name, are "mariner".
 var distroProducts = map[string]string{
 	"debian": "debian", "ubuntu": "ubuntu", "alpine": "alpine-linux", "rhel": "rhel", "rocky": "rocky-linux",
 	"almalinux": "almalinux", "amzn": "amazon-linux", "ol": "oracle-linux", "sles": "sles",
 	"opensuse-leap": "opensuse", "fedora": "fedora", "photon": "photon", "wolfi": "wolfi", "chainguard": "chainguard",
+	"centos": "centos", "azurelinux": "azure-linux", "mariner": "azure-linux",
+}
+
+// labels are the readable names of the products ffs maps, as endoflife.date labels them.
+var labels = map[string]string{
+	"kubernetes": "Kubernetes", "k3s": "k3s", "rke2": "RKE2", "amazon-eks": "Amazon EKS",
+	"google-kubernetes-engine": "Google Kubernetes Engine", "containerd": "containerd",
+	"ubuntu": "Ubuntu", "debian": "Debian", "talos": "Talos Linux", "bottlerocket": "Bottlerocket",
+	"flatcar": "Flatcar Container Linux", "amazon-linux": "Amazon Linux", "sles": "SUSE Linux Enterprise Server",
+	"rhel": "Red Hat Enterprise Linux", "rocky-linux": "Rocky Linux", "almalinux": "AlmaLinux OS",
+	"centos": "CentOS", "centos-stream": "CentOS Stream", "azure-linux": "Azure Linux", "opensuse": "openSUSE Leap",
+	"fedora": "Fedora Linux", "alpine-linux": "Alpine Linux", "oracle-linux": "Oracle Linux", "photon": "Photon OS",
+	"wolfi": "Wolfi", "chainguard": "Chainguard", "distroless": "Distroless",
+	"go": "Go", "nodejs": "Node.js", "python": "Python", "ruby": "Ruby", "php": "PHP",
+}
+
+// Label returns the readable name of an endoflife.date product, or the product itself when it has
+// none.
+func Label(product string) string {
+	if l, ok := labels[product]; ok {
+		return l
+	}
+	return product
 }
 
 // DistroProduct maps an image's distro to its product and version. Images under gcr.io/distroless/

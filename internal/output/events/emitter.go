@@ -4,7 +4,10 @@ package events
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -14,6 +17,7 @@ import (
 
 	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 const (
@@ -25,6 +29,9 @@ const (
 	MaxNoteBytes = 1024
 
 	resyncInterval = 60 * time.Second
+	// staleRepeat is how often FeedStale is emitted again while a feed stays stale: Kubernetes
+	// expires Events after about an hour, so a feed that stays stale keeps a visible Event.
+	staleRepeat = time.Hour
 )
 
 func typesUID(s string) types.UID { return types.UID(s) }
@@ -35,6 +42,7 @@ type Store interface {
 	Cursor(ctx context.Context, consumer string) (int64, error)
 	SetCursor(ctx context.Context, consumer string, id int64) error
 	FindingsForOwner(ctx context.Context, key string) ([]model.Finding, error)
+	FeedState(ctx context.Context, name string) (store.FeedState, error)
 }
 
 // Options configures an Emitter.
@@ -46,16 +54,35 @@ type Options struct {
 	Self    *corev1.ObjectReference
 	Changed <-chan struct{}
 	Log     logr.Logger
+	Now     func() time.Time // nil = time.Now
 }
 
 // Emitter writes one Event per owner and reason for each batch of transitions. It is a
 // leader-only Runnable.
-type Emitter struct{ o Options }
+type Emitter struct {
+	o Options
+
+	mu    sync.Mutex
+	stale map[string]staleFeed // by feed name, while the feed stays stale
+}
+
+// staleFeed is a feed FeedStale reported and when its Event was last emitted.
+type staleFeed struct {
+	lastSuccess time.Time
+	staleAfter  time.Duration
+	emitted     time.Time
+}
 
 // New returns an Emitter.
-func New(o Options) *Emitter { return &Emitter{o: o} }
+func New(o Options) *Emitter {
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	return &Emitter{o: o, stale: map[string]staleFeed{}}
+}
 
-// Start drains on every Changed signal and every 60s until ctx is done.
+// Start drains on every Changed signal and every 60s until ctx is done, and repeats the FeedStale
+// Event of a feed that stays stale (RepeatStale).
 func (e *Emitter) Start(ctx context.Context) error {
 	tick := time.NewTicker(resyncInterval)
 	defer tick.Stop()
@@ -63,6 +90,7 @@ func (e *Emitter) Start(ctx context.Context) error {
 		if err := e.Drain(ctx); err != nil && ctx.Err() == nil {
 			e.o.Log.Error(err, "emitting events failed")
 		}
+		e.RepeatStale(ctx)
 		select {
 		case <-ctx.Done():
 			return nil
@@ -169,11 +197,56 @@ func (e *Emitter) findings(ctx context.Context, ownerKey string) (map[string]*mo
 	return m, nil
 }
 
-// FeedStale emits a Warning on the ffs Deployment that a feed has not synced within staleAfter.
+// FeedStale emits a Warning on the ffs Deployment that a feed has not synced within staleAfter, and
+// remembers the feed so RepeatStale emits it again while the feed stays stale.
 func (e *Emitter) FeedStale(feed string, lastSuccess time.Time, staleAfter time.Duration) {
 	if e.o.Self == nil {
 		return
 	}
+	e.emitStale(feed, lastSuccess, staleAfter)
+	e.mu.Lock()
+	e.stale[feed] = staleFeed{lastSuccess: lastSuccess, staleAfter: staleAfter, emitted: e.o.Now()}
+	e.mu.Unlock()
+}
+
+// RepeatStale emits FeedStale again for every remembered feed whose Event is an hour old, and
+// forgets the feeds that synced since they were reported (the feed state's last success moved on).
+func (e *Emitter) RepeatStale(ctx context.Context) {
+	e.mu.Lock()
+	feeds := make(map[string]staleFeed, len(e.stale))
+	maps.Copy(feeds, e.stale)
+	e.mu.Unlock()
+	for _, name := range slices.Sorted(maps.Keys(feeds)) {
+		sf := feeds[name]
+		st, err := e.o.Store.FeedState(ctx, name)
+		if err != nil {
+			if ctx.Err() == nil {
+				e.o.Log.Error(err, "reading a stale feed's state failed", "feed", name)
+			}
+			continue
+		}
+		now := e.o.Now()
+		synced := st.LastSuccess.After(sf.lastSuccess)
+		if !synced && now.Sub(sf.emitted) < staleRepeat {
+			continue
+		}
+		if !synced {
+			e.emitStale(name, sf.lastSuccess, sf.staleAfter)
+		}
+		e.mu.Lock()
+		if e.stale[name] == sf { // a FeedStale meanwhile starts over
+			if synced {
+				delete(e.stale, name)
+			} else {
+				sf.emitted = now
+				e.stale[name] = sf
+			}
+		}
+		e.mu.Unlock()
+	}
+}
+
+func (e *Emitter) emitStale(feed string, lastSuccess time.Time, staleAfter time.Duration) {
 	var note string
 	if lastSuccess.IsZero() {
 		note = fmt.Sprintf("Feed %s has never synced (stale after %s). Findings may be out of date.", feed, staleAfter)

@@ -73,7 +73,9 @@ const (
 // fixable finding at or above medium (spec §6.7). It scores candidate tags against the owner's
 // findings, stores the result, and announces a new recommendation with UpgradeAvailable
 // transitions, which never change state or priority. Owners are queued by new qualifying findings,
-// by match changes on a stored candidate and by a rollout onto one, and all are resolved daily.
+// by findings that stop qualifying while a suggestion is stored, by match changes on a stored
+// candidate, by a rollout onto one and, at startup, when a restart may have left their suggestion
+// out of date; all are resolved daily.
 type Resolver struct {
 	o Options
 
@@ -98,10 +100,10 @@ func (r *Resolver) now() time.Time { return r.o.Now().UTC() }
 // clusterLevel reports whether kind is a cluster-level subject, whose advice is not an image upgrade.
 func clusterLevel(o model.OwnerRef) bool { return o.ClusterLevel() }
 
-// Run is the leader-only worker (a manager.Runnable). It runs the daily pass first when the last
-// one finished more than a day ago, then, until ctx is done, consumes the transitions outbox every
-// 30 seconds, runs the daily pass at Upgrades.DailyAt (UTC) and resolves queued owners one at a
-// time. Errors are logged, never returned, except an invalid DailyAt.
+// Run is the leader-only worker (a manager.Runnable). It starts as startup describes, then, until
+// ctx is done, consumes the transitions outbox every 30 seconds, runs the daily pass at
+// Upgrades.DailyAt (UTC) and resolves queued owners one at a time. Errors are logged, never
+// returned, except an invalid DailyAt.
 func (r *Resolver) Run(ctx context.Context) error {
 	// Upgrade work is never more urgent than inventory resolution: it leaves a registry's last 20%
 	// of budget to the inventory (and candidate pulls run low-priority in the acquirer anyway).
@@ -110,12 +112,7 @@ func (r *Resolver) Run(ctx context.Context) error {
 	if _, err := nextDaily(r.now(), at); err != nil {
 		return fmt.Errorf("upgrade: dailyAt %q: %w", at, err)
 	}
-	if last, err := r.o.Store.Cursor(ctx, dailyCursor); err != nil {
-		r.o.Log.Error(err, "reading the time of the last daily upgrade pass failed")
-	} else if r.now().Sub(time.Unix(last, 0)) > dailyPeriod {
-		r.dailyPass(ctx)
-	}
-	r.consume(ctx)
+	r.startup(ctx)
 
 	tick := time.NewTicker(consumeInterval)
 	defer tick.Stop()
@@ -135,6 +132,24 @@ func (r *Resolver) Run(ctx context.Context) error {
 		case <-r.wake:
 			r.resolveNext(ctx)
 		}
+	}
+}
+
+// startup drains the transitions outbox, queues the owners whose suggestions a restart may have left
+// out of date (store.OwnersToResolve: the queue is held in memory only), then runs the daily pass
+// when the last one finished more than a day ago. Consuming first lets the daily pass dequeue the
+// owners it resolves, so none is resolved twice.
+func (r *Resolver) startup(ctx context.Context) {
+	r.consume(ctx)
+	if keys, err := r.o.Store.OwnersToResolve(ctx); err != nil {
+		r.o.Log.Error(err, "finding the owners to resolve after a restart failed")
+	} else {
+		r.enqueue(keys...)
+	}
+	if last, err := r.o.Store.Cursor(ctx, dailyCursor); err != nil {
+		r.o.Log.Error(err, "reading the time of the last daily upgrade pass failed")
+	} else if r.now().Sub(time.Unix(last, 0)) > dailyPeriod {
+		r.dailyPass(ctx)
 	}
 }
 
@@ -222,7 +237,9 @@ func (r *Resolver) DailyPass(ctx context.Context) error {
 
 // ConsumeTransitions reads up to 500 transitions after the "upgrade" cursor and queues the owners
 // of findings that newly qualify for a suggestion: open at medium or above, with a fix, and just
-// created, reopened, raised in priority or given a fix. UpgradeAvailable transitions, the
+// created, reopened, raised in priority or given a fix. It also queues every owner with a stored
+// suggestion that has a finding leave a qualifying state (resolved, excepted or lowered below
+// medium), so a suggestion does not outlive its reason. UpgradeAvailable transitions, the
 // resolver's own, are ignored. It advances the cursor and returns the number of transitions read.
 func (r *Resolver) ConsumeTransitions(ctx context.Context) (int, error) {
 	cur, err := r.o.Store.Cursor(ctx, transitionsCursor)
@@ -237,26 +254,40 @@ func (r *Resolver) ConsumeTransitions(ctx context.Context) (int, error) {
 		return 0, nil
 	}
 	var wanted []model.Transition
-	var fps []string
+	var fps, leaving []string
 	for _, t := range ts {
-		if qualifies(t) && !clusterLevel(t.Owner) {
+		switch {
+		case qualifies(t) && !clusterLevel(t.Owner):
 			wanted = append(wanted, t)
 			fps = append(fps, t.Fingerprint)
+		case leaves(t):
+			leaving = append(leaving, t.Owner.Key())
 		}
 	}
+	var keys []string
 	if len(fps) > 0 {
 		fs, err := r.o.Store.FindingsByFingerprint(ctx, fps)
 		if err != nil {
 			return 0, fmt.Errorf("upgrade: findings of transitions: %w", err)
 		}
-		var keys []string
 		for _, t := range wanted {
 			if f, ok := fs[t.Fingerprint]; ok && f.FixAvailable {
 				keys = append(keys, t.Owner.Key())
 			}
 		}
-		r.enqueue(keys...)
 	}
+	if len(leaving) > 0 {
+		has, err := r.o.Store.OwnersWithSuggestions(ctx, leaving)
+		if err != nil {
+			return 0, fmt.Errorf("upgrade: suggestions of transitions: %w", err)
+		}
+		for _, k := range leaving {
+			if has[k] {
+				keys = append(keys, k)
+			}
+		}
+	}
+	r.enqueue(keys...)
 	if err := r.o.Store.SetCursor(ctx, transitionsCursor, ts[len(ts)-1].ID); err != nil {
 		return 0, fmt.Errorf("upgrade: set transitions cursor: %w", err)
 	}
@@ -272,24 +303,30 @@ func qualifies(t model.Transition) bool {
 	return created || reopened || t.ToPriority > t.FromPriority || t.Trigger == model.TriggerFixAvailable
 }
 
+// leaves reports whether t takes a finding out of a qualifying state: from open at medium or above
+// to any other state, or below medium.
+func leaves(t model.Transition) bool {
+	return t.Trigger != model.TriggerUpgradeAvailable && t.FromState == model.StateOpen && t.FromPriority >= model.PriorityMedium &&
+		(t.ToState != model.StateOpen || t.ToPriority < model.PriorityMedium)
+}
+
 // MatchesReplaced is the engine.Observer hook: a stored candidate's matches changed, so the
-// suggestions that scored it are withdrawn and their owners queued to be resolved again.
+// suggestions that scored it are marked stale and their owners queued to be resolved again. A
+// stale suggestion stands until then, and survives a restart, which queues its owner again.
 func (r *Resolver) MatchesReplaced(ctx context.Context, digests []string) {
 	keys, err := r.o.Store.SuggestionKeysForDigests(ctx, digests)
 	if err != nil {
 		r.o.Log.Error(err, "finding the suggestions of re-matched digests failed")
 		return
 	}
-	byOwner := map[string][]string{}
+	if err := r.o.Store.MarkSuggestionsStale(ctx, keys); err != nil {
+		r.o.Log.Error(err, "marking re-matched suggestions stale failed")
+	}
+	owners := map[string]bool{}
 	for _, k := range keys {
-		byOwner[k.OwnerKey] = append(byOwner[k.OwnerKey], k.Repo)
+		owners[k.OwnerKey] = true
 	}
-	for _, owner := range slices.Sorted(maps.Keys(byOwner)) {
-		if err := r.o.Store.DeleteSuggestions(ctx, owner, byOwner[owner]); err != nil {
-			r.o.Log.Error(err, "withdrawing re-matched suggestions failed", "owner", owner)
-		}
-		r.enqueue(owner)
-	}
+	r.enqueue(slices.Sorted(maps.Keys(owners))...)
 }
 
 // OwnersRecomputed is the engine.Observer hook: an owner now running one of its stored candidates
@@ -551,6 +588,10 @@ func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, 
 	if err != nil {
 		return fmt.Errorf("upgrade: suggestion of %s on %s: %w", key, repo, err)
 	}
+	var applied *store.AppliedUpgrade
+	if hadPrev {
+		applied = appliedUpgrade(prev, cur)
+	}
 	cands, incomplete := r.candidates(ctx, repo, cur, log)
 	scored := r.score(ctx, o, repo, cur, before, cands, log)
 	if err := ctx.Err(); err != nil {
@@ -573,26 +614,29 @@ func (r *Resolver) resolveRepo(ctx context.Context, o model.Owner, repo string, 
 	if sg.EOL, err = r.eolText(ctx, repo, cur, now); err != nil {
 		return err
 	}
-	if len(cands) == 0 && !incomplete {
+	// tags are listed only for a known version: without one, nothing says there is no path
+	if len(cands) == 0 && !incomplete && cur.known {
 		sg.Notes = append(sg.Notes, noteNoPath)
 	}
 	if !cur.known {
 		sg.Notes = append(sg.Notes, noteUnknown)
 	}
-	if hadPrev {
-		if ids := stillAffected(prev, cur, before); len(ids) > 0 {
+	if applied != nil {
+		if ids := stillOpen(applied.FixedIDs, before); len(ids) > 0 {
 			sg.Notes = append(sg.Notes, noteStillAffected+strings.Join(ids, ", "))
+		} else {
+			applied = nil // everything it was to fix is fixed: nothing left to say
 		}
 	}
 
-	if err := r.o.Store.PutSuggestion(ctx, key, sg, candidateRows(scored)); err != nil {
+	if err := r.o.Store.PutSuggestionApplied(ctx, key, sg, candidateRows(scored), applied); err != nil {
 		return fmt.Errorf("upgrade: store suggestion of %s on %s: %w", key, repo, err)
 	}
 	if sg.Tier == model.TierNone {
 		return nil
 	}
-	// compared with the last announced target, not the previous suggestion: a candidate's match
-	// change deletes the suggestion, and re-resolving to the same target must not announce it again
+	// compared with the last announced target, not the previous suggestion, which a pass that
+	// recommended nothing may have replaced: resolving to the same target again must not announce it twice
 	toTag, toDigest, announced, err := r.o.Store.Announced(ctx, key, repo)
 	if err != nil {
 		return fmt.Errorf("upgrade: announcement of %s on %s: %w", key, repo, err)
@@ -711,39 +755,56 @@ func suggestionOf(repo, from string, s Scored, now time.Time) model.Suggestion {
 		Fixes: s.Fixes, Remaining: s.Remaining, Introduces: s.Introduces, FixedIDs: s.FixedIDs, ComputedAt: now}
 }
 
-// eolText is the end-of-life status of the distro and runtimes of the image the owner runs.
+// eolText is the support status of the distro and runtimes of the image the owner runs (eol.Support),
+// "unknown" when none is known, and empty without an evaluator.
 func (r *Resolver) eolText(ctx context.Context, repo string, cur repoState, now time.Time) (string, error) {
-	if r.o.EOL == nil || len(cur.digests) == 0 {
+	if r.o.EOL == nil {
 		return "", nil
+	}
+	if len(cur.digests) == 0 {
+		return eol.Unknown, nil
 	}
 	pkgs, err := r.o.Store.PackagesForImage(ctx, cur.digests[0])
 	if err != nil {
 		return "", fmt.Errorf("upgrade: packages of %s: %w", cur.digests[0], err)
 	}
-	return eol.JoinText(r.o.EOL.ImageEOL(repo, pkgs), now), nil
+	return eol.JoinSupport(r.o.EOL.ImageEOL(repo, pkgs), now), nil
 }
 
-// stillAffected returns the sorted advisories the previous recommendation was to fix that are still
-// open, when the owner now runs a manifest of that recommendation; otherwise nil.
-func stillAffected(prev store.OwnerSuggestion, cur repoState, before []model.Finding) []string {
-	sg := prev.Suggestion
-	if sg.Tier == model.TierNone || sg.ToTag == "" {
-		return nil
+// appliedUpgrade returns the upgrade the owner now runs, from its stored suggestion prev: the
+// recommendation when the owner runs one of its manifests, else the upgrade applied earlier while
+// the owner still runs it; otherwise nil.
+func appliedUpgrade(prev store.OwnerSuggestion, cur repoState) *store.AppliedUpgrade {
+	runs := func(ds []string) bool {
+		return slices.ContainsFunc(ds, func(d string) bool { return slices.Contains(cur.digests, d) })
 	}
-	applied := slices.ContainsFunc(prev.Candidates, func(c store.CandidateDigest) bool {
-		return c.Tag == sg.ToTag && c.Tier == sg.Tier && slices.Contains(cur.digests, c.Digest)
-	})
-	if !applied {
-		return nil
-	}
-	var ids []string
-	for _, f := range before {
-		if slices.Contains(sg.FixedIDs, f.AdvisoryID) && !slices.Contains(ids, f.AdvisoryID) {
-			ids = append(ids, f.AdvisoryID)
+	if sg := prev.Suggestion; sg.Tier != model.TierNone && sg.ToTag != "" {
+		var ds []string
+		for _, c := range prev.Candidates {
+			if c.Tag == sg.ToTag && c.Tier == sg.Tier {
+				ds = append(ds, c.Digest)
+			}
+		}
+		if runs(ds) {
+			return &store.AppliedUpgrade{Tag: sg.ToTag, Tier: sg.Tier, Digests: ds, FixedIDs: slices.Clone(sg.FixedIDs)}
 		}
 	}
-	slices.Sort(ids)
-	return ids
+	if a := prev.Applied; a != nil && runs(a.Digests) {
+		return a
+	}
+	return nil
+}
+
+// stillOpen returns the sorted advisories of ids that have an open finding in before.
+func stillOpen(ids []string, before []model.Finding) []string {
+	var out []string
+	for _, f := range before {
+		if f.State == model.StateOpen && slices.Contains(ids, f.AdvisoryID) && !slices.Contains(out, f.AdvisoryID) {
+			out = append(out, f.AdvisoryID)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // candidateRows lists every scored candidate's platform manifests, in candidate then platform order.
