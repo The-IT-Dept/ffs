@@ -138,6 +138,7 @@ type VulnerabilityView struct {
 	Malicious       bool           `json:"malicious"`
 	Withdrawn       bool           `json:"withdrawn"`
 	Published       *time.Time     `json:"published,omitempty"`
+	Observed        *time.Time     `json:"observed,omitempty"` // when ffs first saw the advisory
 }
 
 type VulnerabilityDetail struct {
@@ -528,7 +529,7 @@ func vulnerabilityView(a model.Advisory, haveAdvisory bool, r store.AdvisoryRoll
 		v.Aliases, v.Title = nz(a.Aliases), a.Title
 		v.EPSS, v.EPSSPercentile = a.EPSS, a.EPSSPercentile
 		v.Malicious, v.Withdrawn = a.Malicious, a.Withdrawn
-		v.Published = utc(a.Published)
+		v.Published, v.Observed = utc(a.Published), utc(a.Observed)
 		if a.KEVAdded != nil {
 			v.KEV, v.KEVAdded = true, a.KEVAdded.UTC().Format(dateFmt)
 		}

@@ -1,9 +1,9 @@
 {{define "content"}}
 <h2>Excepted findings</h2>
 <table>
-<thead><tr><th>Advisory</th><th>Owner</th><th>Excepted by</th></tr></thead>
+<thead><tr><th>Advisory</th><th>Owner</th><th>Excepted by</th><th>Published / seen / matched</th></tr></thead>
 <tbody>
-{{range .Findings}}<tr><td><a href="/vulnerabilities/{{.Advisory}}">{{.Advisory}}</a></td><td><a href="/owners/{{.OwnerPath}}">{{keyLabel .Owner}}</a></td><td>{{.ExceptedBy}}</td></tr>{{end}}
+{{range .Findings}}<tr><td><a href="/vulnerabilities/{{.Advisory}}">{{.Advisory}}</a></td><td><a href="/owners/{{.OwnerPath}}">{{keyLabel .Owner}}</a></td><td>{{.ExceptedBy}}</td>{{template "times" .}}</tr>{{end}}
 </tbody>
 </table>
 <h2>Exceptions</h2>

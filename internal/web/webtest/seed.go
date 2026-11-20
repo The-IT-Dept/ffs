@@ -195,6 +195,7 @@ func Seed(t testing.TB) (*api.Service, *store.Store) {
 	f1 := finding(Web, repoNginx, "CVE-2026-0001", model.SeverityCritical, model.PriorityUrgent, model.StateOpen,
 		model.FindingPackage{Name: "openssl", Ecosystem: "deb", Installed: "3.0.15-1~deb12u1", Fixed: []string{"3.0.16-1~deb12u1"}})
 	f1.Reasons = []string{"actively exploited (CISA KEV, added 2026-11-02)", "exposed via HTTPRoute shop/web on Gateway public/edge"}
+	f1.Published, f1.Observed, f1.Matched = date(2026, 10, 1), Now.Add(-3*time.Hour), Now.Add(-2*time.Hour)
 	f2 := finding(Web, repoNginx, "CVE-2026-0002", model.SeverityHigh, model.PriorityHigh, model.StateOpen,
 		model.FindingPackage{Name: "php-cli", Ecosystem: "binary", Installed: "8.3.14", Fixed: []string{"8.3.15"}})
 	f3 := finding(Worker, repoWorker, "CVE-2026-0004", model.SeverityMedium, model.PriorityMedium, model.StateOpen,

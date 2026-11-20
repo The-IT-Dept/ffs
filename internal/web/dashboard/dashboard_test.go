@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -313,4 +314,21 @@ func TestDashboard_NeverReadsAllClearWhenBlind(t *testing.T) {
 	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0099", Title: "Not matched anywhere", Observed: webtest.Now}))
 	body = get(t, srv, "/vulnerabilities/CVE-2026-0099", 200)
 	contains(t, body, "No open findings for this advisory in the catalogued images.", "5 images in use are not catalogued, so this answer may be incomplete.")
+}
+
+// TestDashboard_FindingTimes is the regression test for F44: G3 says every finding shows when the
+// advisory was published, when ffs saw it and when it matched; no dashboard page showed them.
+func TestDashboard_FindingTimes(t *testing.T) {
+	svc, st := webtest.Seed(t)
+	webtest.ExecSQL(t, st, `UPDATE findings SET state = 'excepted', data = json_set(data, '$.State', 'excepted') WHERE advisory_id = 'CVE-2026-0001'`)
+	srv := serve(t, svc)
+	times := []string{"Published / seen / matched", "Published 2026-10-01 00:00 UTC", "Seen by ffs 2026-11-18 21:00 UTC",
+		"Matched 2026-11-18 22:00 UTC"}
+	contains(t, get(t, srv, "/owners/Deployment/shop/web", 200), times...)
+	contains(t, get(t, srv, "/vulnerabilities/CVE-2026-0002", 200), "Published / seen / matched", "Matched 2026-11-19 00:00 UTC")
+	contains(t, get(t, srv, "/excepted", 200), times...)
+	// the advisory header: published, and first seen by ffs
+	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0002", Published: webtest.Now.Add(-48 * time.Hour)}))
+	contains(t, get(t, srv, "/vulnerabilities/CVE-2026-0002", 200), "Published 2026-11-17 00:00 UTC; first seen by ffs 2026-11-19 00:00 UTC.")
+	contains(t, get(t, srv, "/", 200), "Published / seen / matched", "Matched 2026-11-19 00:00 UTC")
 }
