@@ -179,3 +179,70 @@ func TestBuild_RuntimeExceptionFollowsRehome(t *testing.T) {
 	assert.Equal(t, nodesRule.Key(), f.ExceptedBy)
 	assert.Equal(t, "containerd", f.ImageRepo)
 }
+
+// TestException_BareNameNeverMatchesClusterLevel: the Nodes and Cluster owners are both named after the
+// cluster, so a bare owner entry naming the cluster must not except Cluster, Nodes or ContainerRuntime
+// findings, directly or through the runtime cutover alias. Only the Kind/Name form names them.
+func TestException_BareNameNeverMatchesClusterLevel(t *testing.T) {
+	expires := now.Add(time.Hour)
+	rule := func(owners ...string) ExceptionRule {
+		return ExceptionRule{Namespace: "ffs", Name: "accept", ClusterWide: true, Owners: owners, Expires: expires}
+	}
+	// Each case builds one finding: on the Nodes owner (a host package, and a containerd module whose
+	// alias is ContainerRuntime/containerd), on the Cluster owner, and on the ContainerRuntime owner
+	// (whose alias is Nodes/prod).
+	builds := map[string]func(rules ...ExceptionRule) model.Finding{
+		"Nodes host package": func(rules ...ExceptionRule) model.Finding {
+			in := input([]model.Match{match(model.SourceGrype, hostA, "CVE-2026-0001", fixedIn("3.0.13-0ubuntu3.6"))})
+			in.Owner = nodesOwner()
+			addPkgs(&in, hostA)
+			in.Exceptions = rules
+			return one(t, Build(in))
+		},
+		"Nodes containerd (ContainerRuntime alias)": func(rules ...ExceptionRule) model.Finding {
+			in := input([]model.Match{match(model.SourceGrype, ctrMod, "CVE-2026-0004", fixedIn("v2.1.5"))})
+			in.Owner = nodesOwner()
+			addPkgs(&in, ctrMod)
+			in.Exceptions = rules
+			return one(t, Build(in))
+		},
+		"Cluster": func(rules ...ExceptionRule) model.Finding {
+			in := input([]model.Match{match(model.SourceGrype, kubernetes, "CVE-2026-0005", fixedIn("1.31.3"))})
+			in.Owner = clusterOwner()
+			in.Exceptions = rules
+			return one(t, Build(in))
+		},
+		"ContainerRuntime (Nodes alias)": func(rules ...ExceptionRule) model.Finding {
+			in := input([]model.Match{match(model.SourceGrype, containerd, "CVE-2026-0006", fixedIn("v1.7.21"))})
+			in.Owner = runtimeOwner()
+			in.Exceptions = rules
+			return one(t, Build(in))
+		},
+	}
+	kindName := map[string][]string{
+		"Nodes host package":                        {"Nodes/prod", "nodes/PROD"},
+		"Nodes containerd (ContainerRuntime alias)": {"Nodes/prod", "ContainerRuntime/containerd"},
+		"Cluster":                        {"Cluster/prod", "cluster/Prod"},
+		"ContainerRuntime (Nodes alias)": {"ContainerRuntime/containerd", "Nodes/prod"},
+	}
+	for name, build := range builds {
+		for _, bare := range []string{"prod", "PROD", "containerd"} {
+			f := build(rule(bare))
+			assert.Equal(t, model.StateOpen, f.State, "%s: bare %q must not except it", name, bare)
+			assert.Empty(t, f.ExceptedBy, "%s: bare %q", name, bare)
+		}
+		for _, kn := range kindName[name] {
+			f := build(rule(kn))
+			assert.Equal(t, model.StateExcepted, f.State, "%s: %q excepts it", name, kn)
+		}
+	}
+
+	// A bare name still matches a namespaced owner, including a namespaced Cluster CR named after the cluster.
+	cnpg := model.OwnerRef{Kind: "Cluster", Namespace: "db", Name: "prod"}
+	assert.True(t, rule("prod").Matches(model.Finding{Owner: cnpg, AdvisoryID: "CVE-2026-0007"}, nil, now))
+	assert.True(t, rule("api").Matches(model.Finding{Owner: api().Ref, AdvisoryID: "CVE-2026-0007"}, nil, now))
+	for _, ref := range []model.OwnerRef{nodesRef, clusterOwner().Ref, runtimeOwner().Ref} {
+		assert.False(t, rule(ref.Name).Matches(model.Finding{Owner: ref, AdvisoryID: "CVE-2026-0007"}, nil, now), ref.Key())
+		assert.True(t, rule(ref.Kind+"/"+ref.Name).Matches(model.Finding{Owner: ref, AdvisoryID: "CVE-2026-0007"}, nil, now), ref.Key())
+	}
+}
