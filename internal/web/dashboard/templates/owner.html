@@ -19,7 +19,7 @@
 {{template "findingRows" .Rest}}
 </tbody>
 </table>
-{{else}}<p>No open findings. See Coverage for what was not inventoried.</p>{{end}}
+{{else}}<p>No open findings{{if .CoverageNotes}}; see Coverage for what was not inventoried{{end}}.</p>{{end}}
 {{if .Suggestions}}<h2>Upgrade suggestions</h2>{{range .Suggestions}}{{template "suggestion" .}}{{end}}{{end}}
 {{template "coverage" .CoverageNotes}}
 {{end}}

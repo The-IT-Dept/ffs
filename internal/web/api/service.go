@@ -144,6 +144,16 @@ type VulnerabilityDetail struct {
 	VulnerabilityView
 	Links    []string      `json:"links"`
 	Findings []FindingView `json:"findings"`
+	// Uncatalogued counts the in-use images with no catalogue, which no finding can cover.
+	Uncatalogued int `json:"uncatalogued"`
+}
+
+// HealthView is what limits ffs's view: feeds past their staleness threshold (or never synced) and
+// the in-use container images it has not catalogued.
+type HealthView struct {
+	StaleFeeds         []FeedView `json:"staleFeeds"`
+	ImagesCatalogued   int        `json:"imagesCatalogued"`
+	ImagesUncatalogued int        `json:"imagesUncatalogued"`
 }
 
 type ManagedByView struct {
@@ -180,7 +190,11 @@ type OwnerView struct {
 	Arch                  []string               `json:"arch"`
 	Containers            []ContainerView        `json:"containers"`
 	Counts                map[model.Priority]int `json:"counts"` // open findings by priority
-	UpdatedAt             *time.Time             `json:"updatedAt,omitempty"`
+	// Images counts the owner's container images; ImagesCatalogued those catalogued. Counts cover
+	// only the catalogued ones.
+	Images           int        `json:"images"`
+	ImagesCatalogued int        `json:"imagesCatalogued"`
+	UpdatedAt        *time.Time `json:"updatedAt,omitempty"`
 }
 
 type OwnerDetail struct {
@@ -585,12 +599,21 @@ func (s *Service) Vulnerability(ctx context.Context, id string) (VulnerabilityDe
 	if err != nil {
 		return VulnerabilityDetail{}, false, err
 	}
-	return VulnerabilityDetail{VulnerabilityView: vulnerabilityView(a, ok, rollup(canon, fs)), Links: nz(a.Links), Findings: fvs}, true, nil
+	_, uncatalogued, err := s.o.Store.InUseImageCoverage(ctx)
+	if err != nil {
+		return VulnerabilityDetail{}, false, err
+	}
+	return VulnerabilityDetail{VulnerabilityView: vulnerabilityView(a, ok, rollup(canon, fs)), Links: nz(a.Links), Findings: fvs,
+		Uncatalogued: uncatalogued}, true, nil
 }
 
 // ---- images ----
 
-const noteCPE = "daily, CPE-based coverage only: "
+const (
+	noteCPE           = "daily, CPE-based coverage only: "
+	noteNotCatalogued = "image not catalogued yet: "
+	noteNotResolved   = "image not resolved yet: "
+)
 
 // imageView shapes img. pkgs are its packages, or only the classified ones (store.ClassifiedPackages):
 // the read-time coverage note looks at nothing else.
@@ -676,7 +699,37 @@ func (s *Service) Image(ctx context.Context, digest string) (ImageDetail, bool, 
 
 // ---- owners ----
 
-func ownerView(o model.Owner, counts map[model.Priority]int) OwnerView {
+// containerDigests lists the distinct digests the owners' containers run.
+func containerDigests(owners ...model.Owner) []string {
+	var out []string
+	for _, o := range owners {
+		for _, c := range o.Containers {
+			if c.Digest != "" && !slices.Contains(out, c.Digest) {
+				out = append(out, c.Digest)
+			}
+		}
+	}
+	return out
+}
+
+// imageCounts counts o's container images, one per distinct digest and one per container with no
+// digest yet, and how many of them statuses has as catalogued.
+func imageCounts(o model.Owner, statuses map[string]model.ImageStatus) (images, catalogued int) {
+	seen := map[string]bool{}
+	for _, c := range o.Containers {
+		if c.Digest != "" && seen[c.Digest] {
+			continue
+		}
+		seen[c.Digest] = true
+		images++
+		if c.Digest != "" && statuses[c.Digest] == model.ImageCatalogued {
+			catalogued++
+		}
+	}
+	return images, catalogued
+}
+
+func ownerView(o model.Owner, counts map[model.Priority]int, statuses map[string]model.ImageStatus) OwnerView {
 	v := OwnerView{
 		ID: o.Ref.Key(), Path: OwnerPath(o.Ref), Kind: o.Ref.Kind, Namespace: o.Ref.Namespace, Name: o.Ref.Name,
 		NotRunning: o.NotRunning, ServiceAccount: o.ServiceAccount, Exposed: o.Context.Exposed,
@@ -685,6 +738,7 @@ func ownerView(o model.Owner, counts map[model.Priority]int) OwnerView {
 		ServiceAccountReasons: nz(o.Context.SAReasons), Arch: nz(o.Arch), Containers: []ContainerView{},
 		Counts: countMap(counts), UpdatedAt: utc(o.UpdatedAt),
 	}
+	v.Images, v.ImagesCatalogued = imageCounts(o, statuses)
 	if m := o.ManagedBy; m != nil {
 		v.ManagedBy = &ManagedByView{Tool: m.Tool, Name: m.Name, Namespace: m.Namespace}
 	}
@@ -705,9 +759,13 @@ func (s *Service) Owners(ctx context.Context) ([]OwnerView, error) {
 	if err != nil {
 		return nil, err
 	}
+	statuses, err := s.o.Store.ImageStatuses(ctx, containerDigests(owners...))
+	if err != nil {
+		return nil, err
+	}
 	out := make([]OwnerView, 0, len(owners))
 	for _, o := range owners {
-		out = append(out, ownerView(o, counts[o.Ref.Key()]))
+		out = append(out, ownerView(o, counts[o.Ref.Key()], statuses))
 	}
 	return out, nil
 }
@@ -719,15 +777,23 @@ func (s *Service) OwnerViews(ctx context.Context, keys []string) (map[string]Own
 	if err != nil {
 		return nil, err
 	}
-	out := make(map[string]OwnerView, len(keys))
+	var owners []model.Owner
 	for _, k := range keys {
 		o, ok, err := s.o.Store.GetOwner(ctx, k)
 		if err != nil {
 			return nil, err
 		}
 		if ok {
-			out[k] = ownerView(o, counts[k])
+			owners = append(owners, o)
 		}
+	}
+	statuses, err := s.o.Store.ImageStatuses(ctx, containerDigests(owners...))
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]OwnerView, len(owners))
+	for _, o := range owners {
+		out[o.Ref.Key()] = ownerView(o, counts[o.Ref.Key()], statuses)
 	}
 	return out, nil
 }
@@ -763,11 +829,16 @@ func (s *Service) Owner(ctx context.Context, ref model.OwnerRef) (OwnerDetail, b
 	if err != nil {
 		return OwnerDetail{}, false, err
 	}
-	return OwnerDetail{OwnerView: ownerView(o, counts), CoverageNotes: notes, Findings: fvs, Suggestions: sugs}, true, nil
+	statuses, err := s.o.Store.ImageStatuses(ctx, containerDigests(o))
+	if err != nil {
+		return OwnerDetail{}, false, err
+	}
+	return OwnerDetail{OwnerView: ownerView(o, counts, statuses), CoverageNotes: notes, Findings: fvs, Suggestions: sugs}, true, nil
 }
 
 // ownerCoverageNotes is the de-duplicated union of its images' coverage notes, plus why any of
-// them could not be catalogued: an image without a catalogue is never reported as clean.
+// them has no catalogue (not resolved yet, not catalogued yet, unresolvable or failed), so an owner
+// whose images were never catalogued does not read as one with no findings.
 func (s *Service) ownerCoverageNotes(ctx context.Context, o model.Owner) ([]string, error) {
 	var notes []string
 	add := func(n string) {
@@ -787,6 +858,7 @@ func (s *Service) ownerCoverageNotes(ctx context.Context, o model.Owner) ([]stri
 	}
 	for _, c := range o.Containers {
 		if c.Digest == "" {
+			add(noteNotResolved + cmp.Or(c.ImageRef, c.Repo, c.Name))
 			continue
 		}
 		img, ok, err := s.o.Store.GetImage(ctx, c.Digest)
@@ -794,12 +866,15 @@ func (s *Service) ownerCoverageNotes(ctx context.Context, o model.Owner) ([]stri
 			return nil, err
 		}
 		if !ok {
+			add(noteNotCatalogued + cmp.Or(c.Repo, c.ImageRef, c.Digest))
 			continue
 		}
 		for _, n := range imageView(img, nil, classified[c.Digest]).Coverage.Notes {
 			add(n)
 		}
 		switch img.Status {
+		case model.ImagePending:
+			add(noteNotCatalogued + cmp.Or(img.Repo, c.Repo, c.Digest))
 		case model.ImageUnresolvable:
 			add(cmp.Or(img.StatusReason, "image could not be resolved"))
 		case model.ImageCatalogFailed:
@@ -1018,6 +1093,23 @@ func (s *Service) Feeds(ctx context.Context) ([]FeedView, error) {
 	return out, nil
 }
 
+// Health reports what limits ffs's view: the stale or never-synced feeds, and how many of the
+// in-use container images are catalogued. A page that reports no findings shows it first.
+func (s *Service) Health(ctx context.Context) (HealthView, error) {
+	feeds, err := s.Feeds(ctx)
+	if err != nil {
+		return HealthView{}, err
+	}
+	h := HealthView{StaleFeeds: []FeedView{}}
+	for _, f := range feeds {
+		if f.Stale {
+			h.StaleFeeds = append(h.StaleFeeds, f)
+		}
+	}
+	h.ImagesCatalogued, h.ImagesUncatalogued, err = s.o.Store.InUseImageCoverage(ctx)
+	return h, err
+}
+
 // ---- search ----
 
 // Search finds packages, advisories and images matching q. A non-empty lt keeps only package hits
@@ -1058,18 +1150,8 @@ func (s *Service) Search(ctx context.Context, q, lt string) (SearchResult, error
 			res.Images = append(res.Images, ImageHit{ID: h.ID, Repo: h.Label, Owners: nz(owners)})
 		}
 	}
-	inUse, err := s.o.Store.DigestsInUse(ctx)
-	if err != nil {
+	if _, res.Uncatalogued, err = s.o.Store.InUseImageCoverage(ctx); err != nil {
 		return SearchResult{}, err
-	}
-	for _, d := range inUse {
-		img, ok, err := s.o.Store.GetImage(ctx, d)
-		if err != nil {
-			return SearchResult{}, err
-		}
-		if !ok || img.Status != model.ImageCatalogued {
-			res.Uncatalogued++
-		}
 	}
 	return res, nil
 }

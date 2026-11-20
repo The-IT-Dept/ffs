@@ -202,6 +202,12 @@ func TestAPI_OwnersAndClusterLevelPath(t *testing.T) {
 
 	_, d, _ = get(t, srv, "/api/v1/owners")
 	require.Len(t, items(t, d), 5)
+	for _, o := range items(t, d) {
+		if o["id"] == "Deployment/shop/worker" {
+			require.EqualValues(t, 2, o["images"], "worker and its sidecar")
+			require.EqualValues(t, 1, o["imagesCatalogued"], "the sidecar's catalogue failed")
+		}
+	}
 }
 
 func TestAPI_ImagesStatusAndCoverage(t *testing.T) {
@@ -448,10 +454,10 @@ func TestAPI_ListsDecodeOnlyWhatTheyShow(t *testing.T) {
 	srv := httptest.NewServer(api.NewHandler(svc))
 	t.Cleanup(srv.Close)
 	// the worker's open medium finding: counted on the lists, decoded only on its own pages
-	webtest.Corrupt(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE fingerprint = ?`,
+	webtest.ExecSQL(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE fingerprint = ?`,
 		fp(webtest.Worker, "ghcr.io/example/worker", "CVE-2026-0004"))
 	// an unclassified package: the image list's coverage note needs only classified ones
-	webtest.Corrupt(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
+	webtest.ExecSQL(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
 
 	code, d, body := get(t, srv, "/api/v1/owners")
 	require.Equal(t, 200, code, body)

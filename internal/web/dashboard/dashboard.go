@@ -58,6 +58,8 @@ var funcs = template.FuncMap{
 	},
 	"join":      strings.Join,
 	"imagePath": imagePath,
+	"plural":    plural,
+	"shortDur":  shortDur,
 	"refLabel":  func(kind, ns, name string) string { return keyLabel(kind + "/" + ns + "/" + name) },
 }
 
@@ -80,6 +82,26 @@ func statusLabel(s string) string {
 		return "Catalogue failed"
 	}
 	return s
+}
+
+// plural is "1 image" or "3 images": n, then one or many.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return fmt.Sprintf("%d %s", n, many)
+}
+
+// shortDur renders a Go duration string without zero minutes and seconds: "24h0m0s" is "24h".
+func shortDur(s string) string {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return s
+	}
+	if d >= time.Hour && d%time.Hour == 0 {
+		return fmt.Sprintf("%dh", d/time.Hour)
+	}
+	return d.String()
 }
 
 // imagePath is an image ID as a path below /images/: each segment escaped, the slashes of a
@@ -212,8 +234,22 @@ func (d *Dashboard) attention(w http.ResponseWriter, r *http.Request) {
 		d.fail(w, r, err)
 		return
 	}
-	d.render(w, r, http.StatusOK, "attention", "Needs attention", Attention(fs, byKey, sgs))
+	health, err := d.svc.Health(ctx)
+	if err != nil {
+		d.fail(w, r, err)
+		return
+	}
+	d.render(w, r, http.StatusOK, "attention", "Needs attention", attentionPage{Groups: Attention(fs, byKey, sgs), Health: health})
 }
+
+// attentionPage leads with what limits ffs's view, so an empty list never reads as all clear.
+type attentionPage struct {
+	Groups []AttentionGroup
+	Health api.HealthView
+}
+
+// InUse is the number of container images in use.
+func (p attentionPage) InUse() int { return p.Health.ImagesCatalogued + p.Health.ImagesUncatalogued }
 
 func (d *Dashboard) workloads(w http.ResponseWriter, r *http.Request) {
 	os, err := d.svc.Owners(r.Context())

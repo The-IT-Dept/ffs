@@ -63,7 +63,7 @@ func TestDashboard_NeedsAttention(t *testing.T) {
 }
 
 func TestDashboard_NeedsAttentionEmpty(t *testing.T) {
-	contains(t, get(t, serve(t, webtest.Empty(t)), "/", 200), "Nothing needs attention.")
+	contains(t, get(t, serve(t, webtest.Empty(t)), "/", 200), "No urgent or high findings in 0 catalogued images.")
 }
 
 func TestDashboard_Workloads(t *testing.T) {
@@ -256,10 +256,61 @@ func TestDashboard_PlaceholderImage(t *testing.T) {
 func TestDashboard_PagesDecodeOnlyWhatTheyShow(t *testing.T) {
 	svc, st := webtest.Seed(t)
 	srv := serve(t, svc)
-	webtest.Corrupt(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE advisory_id = 'CVE-2026-0004'`)
-	webtest.Corrupt(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
+	webtest.ExecSQL(t, st, `UPDATE findings SET data = json_set(data, '$.Packages', 'not a list') WHERE advisory_id = 'CVE-2026-0004'`)
+	webtest.ExecSQL(t, st, `UPDATE packages SET cpes = 'not json' WHERE name = 'openssl'`)
 	contains(t, get(t, srv, "/", 200), "CVE-2026-0001")
 	contains(t, get(t, srv, "/workloads", 200), "shop/worker")
 	contains(t, get(t, srv, "/vulnerabilities", 200), "CVE-2026-0004")
 	contains(t, get(t, srv, "/images", 200), "Partial coverage")
+}
+
+// TestDashboard_NeverReadsAllClearWhenBlind is the regression test for F38: with feeds stale or
+// never synced and images not catalogued, every page used to read as if nothing were wrong.
+func TestDashboard_NeverReadsAllClearWhenBlind(t *testing.T) {
+	// a fresh install: three feeds that never synced, nothing catalogued
+	body := get(t, serve(t, webtest.Empty(t)), "/", 200)
+	require.NotContains(t, body, "Nothing needs attention")
+	contains(t, body, "Incomplete data", "Feed eol has never synced", "Feed kev has never synced", "Feed osv has never synced",
+		`href="/feeds"`, "No urgent or high findings in 0 catalogued images.")
+
+	// the seed: kev is 30 h old against 24 h, and three of the five container images are not catalogued
+	svc, st := webtest.Seed(t)
+	webtest.SeedPlaceholder(t, st)
+	srv := serve(t, svc)
+	body = get(t, srv, "/", 200)
+	contains(t, body, "Feed kev last synced 2026-11-17 18:00 UTC, more than 24h ago", "3 of 5 images in use are not catalogued",
+		`href="/images"`)
+	require.NotContains(t, body, "Feed osv")
+	require.Less(t, strings.Index(body, "Incomplete data"), strings.Index(body, "Deployment shop/web"), "health leads the page")
+
+	// only the healthy part remains: the all-clear names how many images it covers
+	webtest.ExecSQL(t, st, `UPDATE findings SET state = 'resolved' WHERE priority >= 3`)
+	contains(t, get(t, srv, "/", 200), "No urgent or high findings in 2 catalogued images.")
+
+	// a pending image and a digest with no image row are named on the owner page
+	webtest.ExecSQL(t, st, `UPDATE images SET status = 'pending' WHERE digest = ?`, webtest.DigestWorker)
+	require.NoError(t, st.UpsertOwner(t.Context(), model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "fresh"},
+		Containers: []model.ContainerUse{{Name: "app", Kind: model.ContainerRegular, ImageRef: "ghcr.io/example/fresh:1.0",
+			Repo: "ghcr.io/example/fresh", Digest: "sha256:" + strings.Repeat("f", 64)}}}))
+	body = get(t, srv, "/owners/Deployment/shop/fresh", 200)
+	contains(t, body, "image not catalogued yet: ghcr.io/example/fresh", "No open findings; see Coverage for what was not inventoried.")
+	contains(t, get(t, srv, "/owners/Deployment/shop/worker", 200), "image not catalogued yet: ghcr.io/example/worker")
+
+	// Workloads shows how many of each workload's images are catalogued
+	body = get(t, srv, "/workloads", 200)
+	contains(t, body, "Images catalogued")
+	row := func(name string) string {
+		t.Helper()
+		i := strings.Index(body, name)
+		require.GreaterOrEqual(t, i, 0, name)
+		return body[i : i+strings.Index(body[i:], "</tr>")]
+	}
+	require.Contains(t, row("shop/fresh"), "0 of 1")
+	require.Contains(t, row("shop/worker"), "0 of 2")
+	require.Contains(t, row("shop/web"), "1 of 1")
+
+	// an advisory with no open finding carries the caveat
+	require.NoError(t, st.UpsertAdvisory(t.Context(), model.Advisory{ID: "CVE-2026-0099", Title: "Not matched anywhere", Observed: webtest.Now}))
+	body = get(t, srv, "/vulnerabilities/CVE-2026-0099", 200)
+	contains(t, body, "No open findings for this advisory in the catalogued images.", "5 images in use are not catalogued, so this answer may be incomplete.")
 }

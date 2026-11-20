@@ -1,6 +1,13 @@
 {{define "content"}}
-{{if not .}}<p>Nothing needs attention.</p>{{end}}
-{{range .}}
+{{with .Health}}{{if or .StaleFeeds .ImagesUncatalogued}}<section class="health">
+<h2>Incomplete data</h2>
+<ul>
+{{range .StaleFeeds}}<li>Feed {{.Name}} {{if .LastSuccess}}last synced {{date .LastSuccess}}, more than {{shortDur .StaleAfter}} ago{{else}}has never synced{{end}}, so findings may be missing or out of date. See <a href="/feeds">Feeds</a>.</li>
+{{end}}{{if .ImagesUncatalogued}}<li>{{.ImagesUncatalogued}} of {{plural $.InUse "image" "images"}} in use {{if eq .ImagesUncatalogued 1}}is{{else}}are{{end}} not catalogued, so their findings are unknown. See <a href="/images">Images</a>.</li>
+{{end}}</ul>
+</section>{{end}}{{end}}
+{{if not .Groups}}<p>No urgent or high findings in {{plural .Health.ImagesCatalogued "catalogued image" "catalogued images"}}.</p>{{end}}
+{{range .Groups}}
 <section class="group">
 <h2><span class="badge {{priorityClass .Highest}}">{{.Highest}}</span> <a href="/owners/{{keyPath .Owner.ID}}">{{keyLabel .Owner.ID}}</a></h2>
 {{if .Owner.Exposed}}<p class="sub">{{range .Owner.ExposurePaths}}Exposed via {{.}}. {{end}}</p>{{end}}

@@ -1,6 +1,6 @@
 {{define "content"}}
 {{if .Query}}
-{{if .Uncatalogued}}<p class="note">{{.Uncatalogued}} images are not catalogued, so this answer may be incomplete.</p>{{end}}
+{{if .Uncatalogued}}<p class="note">{{plural .Uncatalogued "image is" "images are"}} not catalogued, so this answer may be incomplete.</p>{{end}}
 {{if .Truncated}}<p class="note">Results are truncated.</p>{{end}}
 <h2>Packages</h2>
 <table>

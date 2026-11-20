@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/glebarez/go-sqlite" // the driver the store uses, for Corrupt
+	_ "github.com/glebarez/go-sqlite" // the driver the store uses, for ExecSQL
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -61,7 +61,7 @@ func service(t testing.TB, st *store.Store, kube client.Reader) *api.Service {
 	return api.NewService(api.Options{Store: st, Config: cfg, Feeds: feedInfos, EOL: ev, Kube: kube, Now: func() time.Time { return Now }})
 }
 
-// dbPaths records the database file of every store openStore opened, for Corrupt.
+// dbPaths records the database file of every store openStore opened, for ExecSQL.
 var dbPaths sync.Map // *store.Store → string
 
 func openStore(t testing.TB) *store.Store {
@@ -74,9 +74,10 @@ func openStore(t testing.TB) *store.Store {
 	return st
 }
 
-// Corrupt runs a raw SQL statement against the database behind st, which Seed or Empty opened: a
-// test uses it to plant a row the store cannot decode, proving a page never reads that row.
-func Corrupt(t testing.TB, st *store.Store, query string, args ...any) {
+// ExecSQL runs a raw SQL statement against the database behind st, which Seed or Empty opened, and
+// requires it to change a row: for states the store API cannot produce, such as a row it cannot
+// decode, which proves a page never reads that row.
+func ExecSQL(t testing.TB, st *store.Store, query string, args ...any) {
 	t.Helper()
 	path, ok := dbPaths.Load(st)
 	require.True(t, ok, "store not opened by webtest")
