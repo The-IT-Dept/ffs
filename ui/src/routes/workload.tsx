@@ -13,6 +13,7 @@ import type { FixGroupKind } from '@/components/fix/FixGroupList'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { AppLink } from '@/components/layout/AppLink'
 import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { Field, FieldList } from '@/components/layout/FieldList'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { CoverageMark } from '@/components/signals/CoverageMark'
@@ -185,22 +186,19 @@ function RbacView({ d }: { d: Detail }) {
       </ul>
     ) : null
   return (
-    <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-2 text-[12px]">
-      <dt className="text-muted-foreground">{w.serviceAccount}</dt>
-      <dd>
+    <FieldList className="gap-y-2 text-[12px]">
+      <Field label={w.serviceAccount}>
         <Mono wrap>{d.serviceAccount}</Mono>
-      </dd>
-      <dt className="text-muted-foreground">{w.saPower}</dt>
-      <dd>
+      </Field>
+      <Field label={w.saPower}>
         {yesNo(d.saPower)}
         {reasons(d.saReasons)}
-      </dd>
-      <dt className="text-muted-foreground">{w.privilegedTitle}</dt>
-      <dd>
+      </Field>
+      <Field label={w.privilegedTitle}>
         {yesNo(d.privileged)}
         {reasons(d.privilegeReasons)}
-      </dd>
-    </dl>
+      </Field>
+    </FieldList>
   )
 }
 

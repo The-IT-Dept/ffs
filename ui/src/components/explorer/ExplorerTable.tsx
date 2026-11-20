@@ -17,7 +17,9 @@ function sortDirection(sort: string): 'descending' | 'ascending' {
 }
 
 // ExplorerTable is a dense table of server rows: 30 px rows, tabular numbers, and sortable
-// headers that ask the server to sort. It never sorts or filters rows itself.
+// headers that ask the server to sort. It never sorts or filters rows itself. Below the lg
+// breakpoint rows and sort buttons are 40 px tall, for touch (spec §12); the 30 px rows of §5 are
+// the desktop density.
 export function ExplorerTable<R>({
   columns,
   rows,
@@ -36,7 +38,7 @@ export function ExplorerTable<R>({
   return (
     <Table className="text-[12px]">
       <TableHeader>
-        <TableRow className="h-[30px] hover:bg-transparent">
+        <TableRow className="h-[30px] hover:bg-transparent max-lg:h-10">
           {columns.map((c) => {
             const active = c.sort !== undefined && c.sort === sort
             const Icon = active ? (sortDirection(c.sort!) === 'descending' ? ArrowDown : ArrowUp) : null
@@ -44,13 +46,13 @@ export function ExplorerTable<R>({
               <TableHead
                 key={c.id}
                 aria-sort={active ? sortDirection(c.sort!) : undefined}
-                className={cn('h-[30px] py-0 text-[11px] font-medium text-muted-foreground', c.align === 'right' && 'text-right')}
+                className={cn('h-[30px] py-0 text-[11px] font-medium text-muted-foreground max-lg:h-10', c.align === 'right' && 'text-right')}
               >
                 {c.sort && onSort ? (
                   <Button
                     variant="ghost"
                     size="xs"
-                    className={cn('-mx-2 h-6 px-2 text-[11px] font-medium', active ? 'text-foreground' : 'text-muted-foreground')}
+                    className={cn('-mx-2 h-6 px-2 text-[11px] font-medium max-lg:h-10', active ? 'text-foreground' : 'text-muted-foreground')}
                     onClick={() => onSort(c.sort!)}
                   >
                     {c.header}
@@ -66,9 +68,9 @@ export function ExplorerTable<R>({
       </TableHeader>
       <TableBody className={cn(busy && 'opacity-60')}>
         {rows.map((r) => (
-          <TableRow key={rowKey(r)} className="h-[30px]">
-            {columns.map((c) => (
-              <TableCell key={c.id} className={cn('max-w-[28rem] truncate py-0 tabular-nums', c.align === 'right' && 'text-right')}>
+          <TableRow key={rowKey(r)} className="h-[30px] max-lg:h-10">
+            {columns.map((c, i) => (
+              <TableCell key={c.id} className={cn('max-w-[28rem] truncate py-0 tabular-nums', i === 0 && 'max-sm:max-w-[60vw]', c.align === 'right' && 'text-right')}>
                 {c.cell(r)}
               </TableCell>
             ))}

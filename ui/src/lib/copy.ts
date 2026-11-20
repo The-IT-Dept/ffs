@@ -226,6 +226,7 @@ export const copy = {
     id === 'siblings' && scope.kind === 'workload' ? `Siblings in ${scope.value.split('/')[1] ?? ''}` : relatedLabel[id],
   shell: {
     openNavigation: 'Open navigation',
+    openNavigationTo: (scope: string) => (scope ? `Open navigation: ${scope}` : 'Open navigation'),
     navigation: 'Navigation',
     close: 'Close',
   },

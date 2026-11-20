@@ -6,6 +6,7 @@ import type { S } from '@/api/types'
 import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { AppLink } from '@/components/layout/AppLink'
 import { EmptyState, useScopeTrust } from '@/components/layout/EmptyState'
+import { Field, FieldList } from '@/components/layout/FieldList'
 import { goneState } from '@/components/layout/GoneNotice'
 import { PageHeader } from '@/components/layout/PageHeader'
 import { ProblemNotice } from '@/components/layout/ProblemNotice'
@@ -64,45 +65,38 @@ function KernelView({ d }: { d: Detail }) {
   const k = copy.nodes.kernelCols
   return (
     <div className="text-[12px]">
-      <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
-        <dt className="text-muted-foreground">{f.kernel}</dt>
-        <dd>
+      <FieldList>
+        <Field label={f.kernel}>
           <Mono wrap>{g.kernelRelease}</Mono>
-        </dd>
-        <dt className="text-muted-foreground">{f.runtime}</dt>
-        <dd>
+        </Field>
+        <Field label={f.runtime}>
           <Mono wrap>{g.containerRuntimeVersion}</Mono>
-        </dd>
-        <dt className="text-muted-foreground">{f.kubelet}</dt>
-        <dd>
+        </Field>
+        <Field label={f.kubelet}>
           <Mono wrap>{g.kubeletVersion}</Mono>
-        </dd>
-        <dt className="text-muted-foreground">{f.osImage}</dt>
-        <dd>{g.osImage}</dd>
-        <dt className="text-muted-foreground">{copy.nodes.packageDb}</dt>
-        <dd>{g.packageDb ? `${g.packageDb} · ${formatCount(g.packageCount)}` : <span className="text-muted-foreground">{copy.noValue}</span>}</dd>
-      </dl>
+        </Field>
+        <Field label={f.osImage}>{g.osImage}</Field>
+        <Field label={copy.nodes.packageDb}>
+          {g.packageDb ? `${g.packageDb} · ${formatCount(g.packageCount)}` : <span className="text-muted-foreground">{copy.noValue}</span>}
+        </Field>
+      </FieldList>
       <div className="mt-4">
         <AgentGate agentData={d.agentData} agents={d.members.map((m) => m.agent)}>
           {g.kernel ? (
-            <dl className="grid max-w-2xl grid-cols-[10rem_minmax(0,1fr)] wrap-anywhere max-sm:grid-cols-[7rem_minmax(0,1fr)] gap-x-4 gap-y-1.5">
-              <dt className="text-muted-foreground">{copy.nodes.kernelFields.release}</dt>
-              <dd>
+            <FieldList>
+              <Field label={copy.nodes.kernelFields.release}>
                 <Mono wrap>{g.kernel.release}</Mono>
-              </dd>
-              <dt className="text-muted-foreground">{copy.nodes.kernelFields.package}</dt>
-              <dd>
+              </Field>
+              <Field label={copy.nodes.kernelFields.package}>
                 <Mono wrap>{g.kernel.package}</Mono>
-              </dd>
-              <dt className="text-muted-foreground">{copy.nodes.kernelFields.version}</dt>
-              <dd>
+              </Field>
+              <Field label={copy.nodes.kernelFields.version}>
                 <Mono wrap>{g.kernel.version}</Mono>
-              </dd>
-              <dt className="text-muted-foreground">{copy.nodes.kernelFields.source}</dt>
-              <dd>
+              </Field>
+              <Field label={copy.nodes.kernelFields.source}>
                 <Mono wrap>{g.kernel.sourceName}</Mono>
-              </dd>
-            </dl>
+              </Field>
+            </FieldList>
           ) : null}
           {g.binaries.length > 0 ? (
             <Table className="mt-3 text-[12px]">

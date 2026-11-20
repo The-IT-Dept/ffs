@@ -17,6 +17,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { copy, countsLine } from '@/lib/copy'
 import { formatCount, formatDate } from '@/lib/format'
 import { nodeGroupPath } from '@/lib/links'
+import { cn, touchBlock } from '@/lib/utils'
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -247,7 +248,7 @@ function AdvisoryPage() {
                         href={l}
                         target="_blank"
                         rel="noreferrer noopener"
-                        className="break-all underline underline-offset-2 hover:text-foreground max-lg:flex max-lg:min-h-10 max-lg:items-center"
+                        className={cn('break-all underline underline-offset-2 hover:text-foreground', touchBlock)}
                       >
                         {l}
                       </a>

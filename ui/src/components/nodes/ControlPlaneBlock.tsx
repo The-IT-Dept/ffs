@@ -3,6 +3,7 @@ import { AppLink } from '@/components/layout/AppLink'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { copy } from '@/lib/copy'
+import { cn, touchLink } from '@/lib/utils'
 
 function Version({ name, version, nodes, eol }: { name?: string; version: string; nodes: number; eol?: S<'EOL'> }) {
   return (
@@ -21,7 +22,7 @@ export function ControlPlaneBlock({ controlPlane, link }: { controlPlane: S<'Con
   return (
     <section className="mb-4 rounded-md border px-3 py-2 text-[12px]">
       {link ? (
-        <AppLink href="/controlplane" className="font-semibold hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+        <AppLink href="/controlplane" className={cn('font-semibold hover:underline', touchLink)}>
           {copy.page.controlplane}
         </AppLink>
       ) : null}

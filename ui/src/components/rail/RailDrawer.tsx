@@ -8,19 +8,22 @@ import { Rail, useRailScope } from './Rail'
 
 // RailDrawer is the rail below the lg breakpoint: a menu button in the top bar, labelled with the
 // current scope, opens it as a sheet from the left. Any navigation closes it, and so does a tap on
-// any of its links, even one to the page already open.
+// any of its links, even one to the page already open. The button's accessible name starts with
+// what it does and includes the scope it shows (WCAG 2.5.3, label in name).
 export function RailDrawer() {
   const { rs, q } = useRailScope()
   const href = useRouterState({ select: (s) => s.location.href })
   const [open, setOpen] = useState(false)
-  const [openedAt, setOpenedAt] = useState(href)
-  if (openedAt !== href) {
-    setOpenedAt(href)
+  // The href this drawer last rendered at; a different one means the router navigated.
+  const [seenHref, setSeenHref] = useState(href)
+  if (seenHref !== href) {
+    setSeenHref(href)
     setOpen(false)
   }
 
   const kind = copy.scopeKind(rs.scope)
   const name = q.data?.title
+  const visible = [name !== kind ? kind : '', name ?? ''].filter((x) => x !== '').join(' ')
   const onLinkClick = (e: MouseEvent) => {
     if (e.target instanceof Element && e.target.closest('a[href]')) setOpen(false)
   }
@@ -30,7 +33,7 @@ export function RailDrawer() {
       <SheetTrigger asChild>
         <Button
           variant="ghost"
-          aria-label={copy.shell.openNavigation}
+          aria-label={copy.shell.openNavigationTo(visible)}
           title={name && name !== kind ? `${kind}: ${name}` : kind}
           className="h-10 min-w-0 shrink justify-start gap-1.5 px-2 text-[13px] font-normal"
         >

@@ -4,7 +4,7 @@ import { CoverageMark } from '@/components/signals/CoverageMark'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy, facetValueLabel } from '@/lib/copy'
 import { ownerHref, ownerLabel } from '@/lib/links'
-import { cn } from '@/lib/utils'
+import { cn, touchLink } from '@/lib/utils'
 import { EcosystemBreakdown } from './EcosystemBreakdown'
 
 function Heading({ children }: { children: string }) {
@@ -83,7 +83,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           <ul className="flex flex-wrap gap-x-3 gap-y-1">
             {image.usedBy.map((w) => (
               <li key={w.scope}>
-                <AppLink href={ownerHref(w)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+                <AppLink href={ownerHref(w)} className={cn('hover:underline', touchLink)}>
                   {ownerLabel(w)}
                 </AppLink>{' '}
                 <span className="text-muted-foreground">{w.namespace}</span>

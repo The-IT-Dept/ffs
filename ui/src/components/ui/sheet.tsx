@@ -45,7 +45,8 @@ function SheetOverlay({
 
 // SheetContent takes focus itself when it opens (unless onOpenAutoFocus says otherwise), rather
 // than its first field, so opening a sheet on a phone never raises the on-screen keyboard. Tab
-// then moves through it, and focus stays inside until it closes.
+// then moves through it, and focus stays inside until it closes. Radix dispatches the open event
+// on the content node, so a ref the caller passes does not get in the way.
 function SheetContent({
   className,
   children,
@@ -59,18 +60,17 @@ function SheetContent({
   showCloseButton?: boolean
   closeLabel?: string
 }) {
-  const ref = React.useRef<HTMLDivElement>(null)
   return (
     <SheetPortal>
       <SheetOverlay />
       <SheetPrimitive.Content
-        ref={ref}
         data-slot="sheet-content"
         onOpenAutoFocus={
           onOpenAutoFocus ??
           ((e) => {
             e.preventDefault()
-            ref.current?.focus()
+            const content = e.currentTarget as HTMLElement
+            content.focus()
           })
         }
         className={cn(

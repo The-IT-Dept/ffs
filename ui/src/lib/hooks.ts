@@ -10,9 +10,10 @@ export function useDebounced<T>(value: T, ms: number): T {
   return settled
 }
 
-// WIDE is Tailwind's lg breakpoint: from here up the rail and the explorer facets sit inline; below
-// it they open as sheets.
-export const WIDE = '(min-width: 1024px)'
+// WIDE is Tailwind's lg breakpoint (64rem, as lg: and max-lg: are, so the JS layout and the CSS
+// agree whatever the browser's font size): from here up the rail and the explorer facets sit
+// inline; below it they open as sheets.
+export const WIDE = '(min-width: 64rem)'
 
 function matchesNow(query: string): boolean {
   return typeof window.matchMedia === 'function' && window.matchMedia(query).matches

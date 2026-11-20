@@ -23,11 +23,13 @@ Element.prototype.scrollTo ??= function scrollTo() {} as typeof Element.prototyp
 
 // Width queries are answered against window.innerWidth, which jsdom sets to 1024, so pages render
 // their wide layout unless a test says otherwise; every other query (the colour scheme) is false.
+// Widths in rem count 16 px each, the browser default.
 function widthMatches(query: string): boolean {
-  const min = /\(min-width:\s*(\d+)px\)/.exec(query)
-  const max = /\(max-width:\s*(\d+(?:\.\d+)?)px\)/.exec(query)
-  if (!min && !max) return false
-  return (!min || window.innerWidth >= Number(min[1])) && (!max || window.innerWidth <= Number(max[1]))
+  const px = (m: RegExpExecArray | null) => (m ? Number(m[1]) * (m[2] === 'rem' ? 16 : 1) : undefined)
+  const min = px(/\(min-width:\s*(\d+(?:\.\d+)?)(px|rem)\)/.exec(query))
+  const max = px(/\(max-width:\s*(\d+(?:\.\d+)?)(px|rem)\)/.exec(query))
+  if (min === undefined && max === undefined) return false
+  return (min === undefined || window.innerWidth >= min) && (max === undefined || window.innerWidth <= max)
 }
 
 if (typeof window.matchMedia !== 'function') {

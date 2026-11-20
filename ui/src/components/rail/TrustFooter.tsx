@@ -5,13 +5,14 @@ import { CoverageMark } from '@/components/signals/CoverageMark'
 import { copy } from '@/lib/copy'
 import { formatAge } from '@/lib/format'
 import type { Scope } from '@/lib/scope'
+import { cn, touchBlock, touchLink } from '@/lib/utils'
 
 // TrustFooter says how far to trust the counts above it: feed freshness, coverage for the scope,
 // and at image level the SBOM source and unattributed executables.
 export function TrustFooter({ trust }: { trust: S<'Trust'>; scope: Scope }) {
   return (
     <div className="flex flex-col gap-1 border-t pt-2 text-[11px] text-muted-foreground">
-      <AppLink href="/feeds" className="hover:text-foreground max-lg:flex max-lg:min-h-10 max-lg:items-center">
+      <AppLink href="/feeds" className={cn('hover:text-foreground', touchBlock)}>
         {trust.feeds.fresh ? (
           <span>
             {copy.trust.feedsFresh}
@@ -33,11 +34,11 @@ export function TrustFooter({ trust }: { trust: S<'Trust'>; scope: Scope }) {
       {trust.settings ? (
         <div className="flex items-center gap-1.5">
           <span aria-hidden="true">⚙</span>
-          <AppLink href="/exceptions" className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+          <AppLink href="/exceptions" className={cn('hover:text-foreground hover:underline', touchLink)}>
             {copy.trust.exceptions}
           </AppLink>
           <span aria-hidden="true">·</span>
-          <AppLink href="/settings" className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+          <AppLink href="/settings" className={cn('hover:text-foreground hover:underline', touchLink)}>
             {copy.trust.settings}
           </AppLink>
         </div>

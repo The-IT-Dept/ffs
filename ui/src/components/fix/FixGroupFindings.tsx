@@ -7,6 +7,7 @@ import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
 import { explorerHref } from '@/lib/links'
+import { cn, touchLink } from '@/lib/utils'
 import { type FixGroupKind, FixGroupList } from './FixGroupList'
 
 // FixGroupFindings is a scope's findings view: its findings grouped by the fix that clears them
@@ -27,10 +28,7 @@ export function FixGroupFindings({ scope, group = 'fix', empty, notice }: { scop
         {q.data.total > rows.length ? (
           <p className="mt-2 text-[11px] text-muted-foreground">
             {copy.fixList.showing(rows.length, q.data.total)} ·{' '}
-            <AppLink
-              href={explorerHref('findings', { scope, group })}
-              className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center"
-            >
+            <AppLink href={explorerHref('findings', { scope, group })} className={cn('hover:text-foreground hover:underline', touchLink)}>
               {copy.fixList.openExplorer}
             </AppLink>
           </p>

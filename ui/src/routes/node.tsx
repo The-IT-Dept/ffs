@@ -13,6 +13,7 @@ import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
 import { nodeGroupPath } from '@/lib/links'
+import { cn, touchLink } from '@/lib/utils'
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -51,7 +52,7 @@ function NodePage() {
         <>
           <div className="flex flex-wrap items-center gap-2 text-[12px]">
             {d.group ? (
-              <AppLink href={nodeGroupPath(d.group.id)} className="hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+              <AppLink href={nodeGroupPath(d.group.id)} className={cn('hover:underline', touchLink)}>
                 {d.group.label}
               </AppLink>
             ) : (

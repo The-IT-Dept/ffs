@@ -16,6 +16,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { copy, countsLine, fixGroupHeader } from '@/lib/copy'
 import { advisoryPath, explorerHref } from '@/lib/links'
 import { type ExplorerSearch, parsePackageKey } from '@/lib/query'
+import { cn, touchLink } from '@/lib/utils'
 
 export type FixGroupKind = 'fix' | 'advisory' | 'package'
 
@@ -92,7 +93,7 @@ function GroupFindings({ row, group, base }: { row: Row; group: FixGroupKind; ba
       {row.findings > GROUP_PREVIEW ? (
         <AppLink
           href={explorerHref('findings', filter)}
-          className="mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center"
+          className={cn('mt-1 inline-block text-[11px] text-muted-foreground hover:text-foreground hover:underline', touchLink)}
         >
           {copy.fixList.more(row.findings - GROUP_PREVIEW)}
         </AppLink>

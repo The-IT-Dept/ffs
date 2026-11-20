@@ -16,12 +16,18 @@ function hrefOf(scope: string): string | undefined {
 }
 
 // ScopeCard heads the rail: breadcrumbs back up, the kind, the name and a one-line summary. The
-// cluster card switches cluster (only one exists for now).
+// cluster card switches cluster (only one exists for now). A trail too long for the card ends in an
+// ellipsis, with the whole trail as its title; its links stay inline so the ellipsis can apply, and
+// below lg the line is 40 px tall with the links padded to fill it, for touch.
 export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope }) {
   return (
     <div className="rounded-md border bg-background p-2.5 shadow-xs">
       {card.breadcrumbs.length > 0 ? (
-        <nav aria-label="Parent scopes" className="mb-1.5 truncate text-[10.5px] text-muted-foreground">
+        <nav
+          aria-label="Parent scopes"
+          title={card.breadcrumbs.map((b) => b.label).join(' › ')}
+          className="mb-1.5 truncate text-[10.5px] text-muted-foreground max-lg:min-h-10 max-lg:leading-10"
+        >
           <span aria-hidden="true">↑ </span>
           {card.breadcrumbs.map((b, i) => {
             const href = hrefOf(b.scope)
@@ -29,7 +35,7 @@ export function ScopeCard({ card, scope }: { card: S<'ScopeCard'>; scope: Scope 
               <Fragment key={b.scope}>
                 {i > 0 ? <span aria-hidden="true"> › </span> : null}
                 {href ? (
-                  <AppLink href={href} className="hover:text-foreground hover:underline max-lg:inline-flex max-lg:min-h-10 max-lg:items-center">
+                  <AppLink href={href} className="hover:text-foreground hover:underline max-lg:py-3">
                     {b.label}
                   </AppLink>
                 ) : (

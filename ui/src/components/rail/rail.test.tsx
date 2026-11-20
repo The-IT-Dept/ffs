@@ -97,3 +97,24 @@ test('trust footer hatches stale feeds and links exceptions and settings at clus
   expect(within(rail).getByRole('link', { name: 'Exceptions' })).toHaveAttribute('href', '/exceptions')
   expect(within(rail).getByRole('link', { name: 'Settings' })).toHaveAttribute('href', '/settings')
 })
+
+test('a long parent trail ends in an ellipsis with the whole trail as its title', async () => {
+  mockApi().on(
+    '/scope',
+    scopeCard({
+      scope: { scope: 'workload:Deployment/shop/web', kind: 'workload', label: 'web' },
+      title: 'web',
+      breadcrumbs: [
+        { scope: 'cluster', kind: 'cluster', label: 'test' },
+        { scope: 'namespace:shop', kind: 'namespace', label: 'shop' },
+      ],
+    }),
+  )
+  renderApp('/vulnerabilities?scope=workload:Deployment/shop/web')
+  const rail = await screen.findByRole('complementary', { name: 'Scope' })
+  const trail = await within(rail).findByRole('navigation', { name: 'Parent scopes' })
+  expect(trail).toHaveAttribute('title', 'test › shop')
+  expect(trail).toHaveClass('truncate')
+  // Inline links, so the ellipsis applies; atomic inline-flex boxes would clip without one.
+  for (const a of within(trail).getAllByRole('link')) expect(a.className).not.toMatch(/inline-flex/)
+})
