@@ -29,7 +29,7 @@ controller:
       memory: 512Mi
     # Resource ceilings.
     limits:
-      # Memory limit, as a byte count or a whole quantity such as 1536Mi. GOMEMLIMIT is set to 90% of it.
+      # Memory limit, as a byte count or a quantity such as 1536Mi or 1.5Gi. GOMEMLIMIT is set to 90% of it.
       memory: 1Gi
   # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
   tmpSizeLimit: 1Gi
@@ -46,7 +46,7 @@ catalog:
       memory: 256Mi
     # Resource ceilings.
     limits:
-      # Memory limit, as a byte count or a whole quantity such as 2Gi. GOMEMLIMIT is set to 90% of it; the catalog workers share it less 128Mi.
+      # Memory limit, as a byte count or a quantity such as 2Gi or 1.5Gi. GOMEMLIMIT is set to 90% of it; the catalog workers share it less 128Mi.
       memory: 2Gi
   # Size limit of the catalog scratch emptyDir.
   scratchSizeLimit: 20Gi
@@ -83,6 +83,10 @@ web:
     enabled: false
     # Service port for the web UI.
     port: 8080
+  # Who may reach the web UI port through the ffs pod's NetworkPolicy, which nodeAgent.networkPolicy.enabled creates, with or without the node agent.
+  networkPolicy:
+    # NetworkPolicyPeers (podSelector, namespaceSelector or ipBlock) admitted to the web UI port, such as your authenticating proxy's pods. Empty admits none. Required with web.service.enabled while nodeAgent.networkPolicy.enabled is true, and refused while it is false, which leaves the port to a NetworkPolicy of your own.
+    from: []
 
 # Authenticated metrics endpoint.
 metrics:
@@ -149,7 +153,7 @@ nodeAgent:
     - operator: Exists
   # Priority class of the agent pods.
   priorityClassName: ""
-  # Agent container resources. Memory limits are byte counts or whole quantities; GOMEMLIMIT is 90% of each, and the cataloguer's workers get its limit less 128Mi.
+  # Agent container resources. Memory limits are byte counts or quantities such as 640Mi or 1.5Gi; GOMEMLIMIT is 90% of each, and the cataloguer's workers get its limit less 128Mi.
   resources:
     # Collector container.
     collector:
@@ -209,7 +213,7 @@ nodeAgent:
     scc: false
   # NetworkPolicy settings.
   networkPolicy:
-    # Create a NetworkPolicy limiting the agent API to the agent pods.
+    # Create a NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while nodeAgent.enabled, metrics and health from anywhere, the web UI only from web.networkPolicy.from.
     enabled: true
 
 # ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.

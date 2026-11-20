@@ -194,10 +194,7 @@ func Small(ctx context.Context, path string) (*Fixture, error) {
 func date(y int, m time.Month, d int) time.Time { return time.Date(y, m, d, 0, 0, 0, 0, time.UTC) }
 
 func (f *Fixture) seed(ctx context.Context) error {
-	f.Config = config.Default()
-	f.Config.ClusterName = ClusterName
-	f.Feeds = []apiserver.FeedInfo{{Name: "eol", StaleAfter: 72 * time.Hour}, {Name: "kev", StaleAfter: 24 * time.Hour},
-		{Name: "osv", StaleAfter: 2 * time.Hour}}
+	f.seedConfig()
 	for _, step := range []func(context.Context) error{
 		f.seedLifecycle, f.seedInventory, f.seedImages, f.seedAdvisories, f.seedMatches, f.seedFindings,
 		f.seedSuggestions, f.seedFeedsAndNodes, f.seedExceptions, f.seedNodeAgent,

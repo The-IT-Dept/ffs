@@ -57,6 +57,8 @@ The baseline and restricted Pod Security Standards forbid `hostPath` volumes, an
 
 With `nodeAgent.createNamespace: false`, create the namespace yourself with those labels. `nodeAgent.namespace` must differ from the release namespace.
 
+Treat the agent namespace like `kube-system`. Anyone who can create pods in it, directly or through a Deployment, Job or other controller, can get root on the node, because Pod Security admission there allows privileged pods and any hostPath volume. On OpenShift, such a pod can also name the agent ServiceAccount and so use the agent's SecurityContextConstraints, which allows any hostPath volume, any user and any SELinux type. Grant no one but cluster administrators rights to create pods or workloads in the agent namespace.
+
 ## Footprint
 
 | Container | Requests | Limits |
@@ -80,7 +82,7 @@ The liveness probe checks a heartbeat file the collector touches every minute wh
 
 ## Turning it off
 
-Install or upgrade with `--set nodeAgent.enabled=false`. No agent objects are installed, and the controller's agent API is not served. What you lose:
+Install or upgrade with `--set nodeAgent.enabled=false`. No agent objects are installed, and the controller's agent API is not served. The chart still creates the ffs pod's NetworkPolicy, without its agent API rule (see [Trust](#trust)). What you lose:
 
 - host package and kernel findings resolve;
 - the container runtime findings that ffs reads from node status return at once;
@@ -99,7 +101,7 @@ The first agent data on a cluster is a baseline: each AlertTarget gets one summa
 
 - **containerd**: `/var/lib/containerd`.
 - **k3s**: the binaries under `/var/lib/rancher/k3s/data` and the content store under `/var/lib/rancher/k3s/agent/containerd`.
-- **RKE2**: the binaries through `/var/lib/rancher/rke2/bin`, RKE2's link to its current data directory, and the content store under `/var/lib/rancher/rke2/agent/containerd`. RKE2 creates the link before it starts the kubelet; the agent pods do not start on a node without it. The link is followed when the collector container starts, so after an RKE2 upgrade or rollback the node reports the binaries RKE2 now runs once the collector restarts (for example with `kubectl rollout restart daemonset/ffs-agent -n ffs-agent`).
+- **RKE2**: the binaries through `/var/lib/rancher/rke2/bin`, RKE2's link to its current data directory, and the content store under `/var/lib/rancher/rke2/agent/containerd`. The link is mounted as a hostPath of type `Directory`, so it must exist: RKE2 creates it before it starts the kubelet, and on a node without it the agent pod does not start. The link is followed once, when the collector container starts. After an in-place RKE2 upgrade or rollback, the node keeps reporting the binaries of the data directory the link pointed to when the collector started, so restart the agent pods afterwards: `kubectl rollout restart daemonset/ffs-agent -n ffs-agent`.
 - **CRI-O** (`crio`): nodes report host packages and binaries, but there is no containerd content store, so side-loaded images cannot be catalogued from them. Each node shows `no containerd content store on this node; side-loaded images cannot be catalogued from it`.
 - **Other containerd roots.** k0s, MicroK8s and custom installs keep containerd elsewhere. The content store mount must exist, or the agent pods never start, so set `nodeAgent.hostPaths.containerdRoot` to containerd's root directory (the agent reads `io.containerd.content.v1.content` under it):
   - k0s: `--set nodeAgent.hostPaths.containerdRoot=/var/lib/k0s/containerd`. k0s reports a `+k0s` kubelet version, which `auto` reads as containerd.
@@ -115,7 +117,7 @@ In a cluster with mixed distributions, `auto` uses the most common one, and the 
 - **Managed nodes** that run no DaemonSets, such as EKS Fargate and virtual nodes, are not covered. They show the `node_agent_missing` gap.
 - **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled. Nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector` (Windows nodes, for example) show `not scheduled by the node agent: <reason>` (`node_agent_unsupported`), and do not hold back the switch from node status to the agent. ffs cannot see node taints, so a node the tolerations exclude shows `node_agent_missing`.
 - **SELinux.** On SELinux-enforcing nodes the agent shows `node agent cannot read <path>: permission denied` until `nodeAgent.seLinuxType: spc_t` is set, which runs the collector, and only the collector, with that SELinux type.
-- **OpenShift** needs `nodeAgent.openshift.scc: true`, which creates a SecurityContextConstraints for the agent and lets its ServiceAccount use it.
+- **OpenShift** needs `nodeAgent.openshift.scc: true`, which creates a SecurityContextConstraints for the agent and lets its ServiceAccount use it, and `nodeAgent.seLinuxType: spc_t`: Red Hat CoreOS enforces SELinux, so without it every node shows `node agent cannot read <path>: permission denied`.
 - **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one. A node of any other OS whose package database the agent cannot find shows `package database not mounted; set nodeAgent.packageDatabases`.
 - **Private registries.** The agent pods use the top-level `imagePullSecrets`, and those Secrets must also exist in the agent namespace.
 
@@ -127,14 +129,25 @@ On Fedora, RHEL 10 and SUSE, `/var/lib/rpm` is a link to `/usr/lib/sysimage/rpm`
 
 ## Trust
 
-- **TLS.** Without cert-manager, the chart generates a CA and a certificate for the agent API Service, valid for 3650 days: the Secret `ffs-agent-tls` in the release namespace and the ConfigMap `ffs-agent-ca` in the agent namespace. On upgrade it looks both up and re-emits them unchanged while the certificate has more than 30 days left (the Secret's `ffs.theitdept.au/not-after` annotation, in unix seconds), and generates a new pair otherwise. Renderers without `lookup`, such as Argo CD and `helm template`, would generate a new pair on every render, so use `nodeAgent.tls.certManager.enabled` with `nodeAgent.tls.certManager.issuerRef` and `nodeAgent.tls.caBundle` there.
+- **TLS.** Without cert-manager, the chart generates a CA and a certificate for the agent API Service, valid for 3650 days: the Secret `ffs-agent-tls` in the release namespace and the ConfigMap `ffs-agent-ca` in the agent namespace. On upgrade it looks both up and re-emits them unchanged while the certificate has more than 30 days left (the Secret's `ffs.theitdept.au/not-after` annotation, in unix seconds), and generates a new pair otherwise. Renderers without `lookup`, such as Argo CD and `helm template`, would generate a new pair on every render, so use `nodeAgent.tls.certManager.enabled` with `nodeAgent.tls.certManager.issuerRef` and `nodeAgent.tls.caBundle` there. With cert-manager, the Certificate `ffs-agent-tls` writes a Secret of its own, `ffs-agent-cert-manager-tls`, so `nodeAgent.tls.certManager.enabled` can be switched either way: Helm and cert-manager never claim the same Secret. After you switch cert-manager off, delete `ffs-agent-cert-manager-tls` if cert-manager left it behind.
 - **Authentication.** The controller checks each agent's token with a TokenReview: the audience `ffs-agent`, the agent ServiceAccount, and the node the agent pod runs on, which must match the report.
 - **Which SBOMs are accepted.** An agent SBOM is accepted only as the answer to a request the controller made to that node, before the request expires (`nodeAgent.workTimeout`). The controller asks one node at a time, and only a node that runs the image in a pod and holds it complete. Its provenance (node, agent version and time) is recorded, and an image catalogued from one node's SBOM is never replaced by another node's. A request the agent reached but did not answer before it expired counts as a failure of the image, and after two failures the image is not asked for again for 24 hours. The agent works through its requests one at a time, in order, so requests queued behind an unanswered one are not counted. The request the agent was on also counts when its cataloguer was not running or the agent was stopping, as neither sends an answer.
 - **Registry first.** When the registry becomes reachable, a registry SBOM replaces the agent's; ffs retries at most every 6 hours.
 - **Node groups.** Nodes share a group, and with it one stored host SBOM, only when every package field ffs matches on is the same: names, versions and architectures, the distribution, source packages, package URLs and CPEs. A host inventory that differs in any of them gets a group of its own.
 - **Residual risk.** A compromised node can under-report the packages of its own host, and of an image the controller asks it to catalogue, because it controls those bytes. Its kubelet can also claim that a pod on it runs any image, so it can be the node asked. It cannot replace an image SBOM that another node or a registry supplied, or change the host inventory of nodes that report their own.
 
-The NetworkPolicy `ffs-agent-api` (`nodeAgent.networkPolicy.enabled`) allows the agent API port only from the agent pods. The web UI, metrics and health ports stay open as before. If your cluster also uses another policy engine, allow the agent namespace to reach the controller on port 8444.
+The NetworkPolicy `ffs` (`nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
+
+- the agent API port, only from the agent pods, while `nodeAgent.enabled` is true;
+- the metrics and health ports, from anywhere: metrics answers only requests that pass Kubernetes authentication and authorisation, and health serves only the kubelet's probes;
+- the web UI and API port (the port of `config.listen`), only from the peers in `web.networkPolicy.from`, and only when `config.listen` is bound beyond loopback. The list is empty by default, so no other pod reaches the web UI; `kubectl port-forward` is not affected. See [Exposing the web UI](configuration.md#exposing-the-web-ui).
+
+If your cluster also uses another policy engine, allow the agent namespace to reach the controller on port 8444.
+
+**Upgrading from 0.0.1-rc.8 or earlier.**
+
+- Release candidates rc.5 to rc.8 admitted the web UI port from every source in this NetworkPolicy, then named `ffs-agent-api` and created only with the node agent, and earlier ones created no NetworkPolicy for the ffs pod. It is now `ffs`, and the chart creates it with `nodeAgent.enabled: false` too. If you serve the web UI beyond `kubectl port-forward`, set `web.networkPolicy.from` to your proxy's pods before you upgrade: with `web.service.enabled` the chart refuses to render without it, and with a Service of your own the web UI stops answering other pods.
+- In rc.5 to rc.8, cert-manager wrote the agent API certificate to the Secret `ffs-agent-tls`. After the upgrade it issues `ffs-agent-cert-manager-tls` instead. Delete the old `ffs-agent-tls` Secret before you set `nodeAgent.tls.certManager.enabled: false`, because Helm does not take over a Secret it did not create.
 
 ## Monitoring
 
@@ -165,12 +178,12 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods. |
 | `nodeAgent.tolerations` | `[{operator: Exists}]` | Tolerations of the agent pods; the default runs on every node. |
 | `nodeAgent.priorityClassName` | `""` | Priority class of the agent pods. |
-| `nodeAgent.resources` | see [Footprint](#footprint) | Requests and limits of the `collector` and `catalog` containers. Memory limits are byte counts or whole quantities such as `640Mi`: `GOMEMLIMIT` is 90% of each, and the cataloguer's workers get its limit less 128Mi, so it must be at least 192Mi. |
+| `nodeAgent.resources` | see [Footprint](#footprint) | Requests and limits of the `collector` and `catalog` containers. Memory limits are byte counts or quantities such as `640Mi` or `1.5Gi`: `GOMEMLIMIT` is 90% of each, and the cataloguer's workers get its limit less 128Mi, so it must be at least 192Mi. |
 | `nodeAgent.scratchSizeLimit` | `4Gi` | Total size limit of the agent's scratch volumes. The staging volume takes `nodeAgent.maxImageBytes` or 512Mi, whichever is larger, plus 256Mi, and the cataloguer's volume the rest, which must be at least 512Mi. |
 | `nodeAgent.scratchRequest` | `1Gi` | Ephemeral storage the collector requests for the scratch volumes. An `ephemeral-storage` request in `nodeAgent.resources.collector` takes precedence; empty requests none. |
 | `nodeAgent.updateStrategy` | `{type: RollingUpdate, rollingUpdate: {maxUnavailable: 10%}}` | Update strategy of the agent DaemonSet. |
 | `nodeAgent.maxImageBytes` | `1Gi` | Largest image the agent catalogues. |
-| `nodeAgent.port` | `8444` | Port of the agent API on the controller; not 8080, 8081 or 8443. |
+| `nodeAgent.port` | `8444` | Port of the agent API on the controller; not the port of `config.listen` (8080 by default), 8081 or 8443. |
 | `nodeAgent.exposedNodes` | `""` | Node label selector; host findings on matching nodes count as exposed. |
 | `nodeAgent.reportInterval` | `6h` | Time between full host reports per node. |
 | `nodeAgent.imageListInterval` | `5m` | Time between cached-image checks, which are also the heartbeat. |
@@ -184,4 +197,4 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |
 | `nodeAgent.seLinuxType` | `""` | SELinux type of the collector container, for example `spc_t`. |
 | `nodeAgent.openshift.scc` | `false` | Create a SecurityContextConstraints for the agent and bind its ServiceAccount to it. |
-| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy that limits the agent API to the agent pods. |
+| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while `nodeAgent.enabled` is true, metrics and health from anywhere, and the web UI only from `web.networkPolicy.from`. While false, the chart refuses a non-empty `web.networkPolicy.from`. See [Trust](#trust). |

@@ -215,7 +215,8 @@ jobs:
           ID="https://github.com/The-IT-Dept/ffs/.github/workflows/release.yml@refs/tags/$TAG"
           ISS=https://token.actions.githubusercontent.com
           cosign verify ghcr.io/the-it-dept/ffs@$D --certificate-identity "$ID" --certificate-oidc-issuer $ISS
-          for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '.manifests[].digest'); do
+          # Every platform manifest of the index; a single-platform push is its own platform manifest.
+          for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r --arg d "$D" '(.manifests // [{digest: $d}])[].digest'); do
             cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
             cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
           done

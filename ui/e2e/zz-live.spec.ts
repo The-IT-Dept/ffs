@@ -1,6 +1,10 @@
 import { expect, test } from '@playwright/test'
 import { api, CONTROL_URL, settled, WEB_SCOPE, type S } from './support'
 
+// This spec adds a finding (CVE-2099-*) to the shared server's store, so its file name sorts last:
+// the specs run in file order on one worker, and the others, the screenshots above all, see the
+// fixture as seeded.
+
 test('a new urgent finding appears without a reload', async ({ page, request }) => {
   const q = { scope: WEB_SCOPE, priority: 'urgent' }
   const before = await api<S['FindingsPage']>(request, '/findings', q)

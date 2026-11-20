@@ -23,6 +23,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -199,11 +200,7 @@ func TestChart_AgentSecurityPosture(t *testing.T) {
 		require.Equal(t, corev1.VolumeMount{Name: "token", MountPath: "/var/run/secrets/ffs-agent", ReadOnly: true}, mounts(col)["token"])
 		require.NotContains(t, mounts(cat), "token")
 
-		env := map[string]corev1.EnvVar{}
-		for _, e := range col.Env {
-			env[e.Name] = e
-		}
-		require.Equal(t, "spec.nodeName", env["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
+		require.Equal(t, "spec.nodeName", envOf(col)["NODE_NAME"].ValueFrom.FieldRef.FieldPath)
 		require.Equal(t, "120795955", envOf(col)["GOMEMLIMIT"].Value, "90% of the collector's 128Mi")
 		require.Equal(t, "603979776", envOf(cat)["GOMEMLIMIT"].Value, "90% of the cataloguer's 640Mi")
 
@@ -481,43 +478,96 @@ data:
 	require.EqualValues(t, 8444, svc.Spec.Ports[0].Port)
 	require.Equal(t, intstr.FromString("agent-api"), svc.Spec.Ports[0].TargetPort)
 
-	o = render(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer",
-		"nodeAgent.tls.certManager.issuerRef.kind=ClusterIssuer", "nodeAgent.tls.caBundle="+testCABundle)
+	certManager := []string{"nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer",
+		"nodeAgent.tls.certManager.issuerRef.kind=ClusterIssuer", "nodeAgent.tls.caBundle=" + testCABundle}
+	o = render(t, certManager...)
 	crt := o.get(t, "Certificate", "ffs-agent-tls")
 	require.Equal(t, "ffs", crt.GetNamespace())
 	spec, _, err := unstructured.NestedMap(crt.Object, "spec")
 	require.NoError(t, err)
 	require.Len(t, spec, 3)
-	require.Equal(t, "ffs-agent-tls", spec["secretName"])
+	// cert-manager's Secret has a name of its own, so switching certManager.enabled either way never asks Helm to
+	// adopt cert-manager's Secret, or cert-manager to take over the chart's.
+	require.Equal(t, "ffs-agent-cert-manager-tls", spec["secretName"])
+	require.Equal(t, "ffs-agent-cert-manager-tls", volumes(podSpec(t, certManager...))["agent-tls"].Secret.SecretName)
 	require.Equal(t, []any{"ffs-agent-api", "ffs-agent-api.ffs", "ffs-agent-api.ffs.svc", "ffs-agent-api.ffs.svc.cluster.local"}, spec["dnsNames"])
 	require.Equal(t, map[string]any{"name": "ca-issuer", "kind": "ClusterIssuer"}, spec["issuerRef"])
 	require.False(t, o.has("Secret", "ffs-agent-tls"))
+	require.False(t, o.has("Secret", "ffs-agent-cert-manager-tls"), "cert-manager writes it, not the chart")
 	require.Equal(t, testCABundle, as[corev1.ConfigMap](t, o.get(t, "ConfigMap", "ffs-agent-ca")).Data["ca.crt"])
 
 	_, err = renderErr(t, "nodeAgent.tls.certManager.enabled=true", "nodeAgent.tls.certManager.issuerRef.name=ca-issuer")
 	require.ErrorContains(t, err, "nodeAgent.tls.caBundle is required when nodeAgent.tls.certManager.enabled is true")
 }
 
-func TestChart_AgentNetworkPolicy(t *testing.T) {
-	np := as[networkingv1.NetworkPolicy](t, render(t).get(t, "NetworkPolicy", "ffs-agent-api"))
+// TestChart_NetworkPolicy: the ffs pod's NetworkPolicy admits the agent API from the agent pods while the agent
+// runs, metrics and health from anywhere, and the web UI port only from web.networkPolicy.from on a listen address
+// beyond loopback. It renders with or without the node agent, so web.networkPolicy.from is always in force: a web
+// UI Service without those peers is refused, because the policy would close it, and peers without the policy are
+// refused, because nothing would apply them.
+func TestChart_NetworkPolicy(t *testing.T) {
+	policy := func(sets ...string) networkingv1.NetworkPolicy {
+		t.Helper()
+		return as[networkingv1.NetworkPolicy](t, render(t, sets...).get(t, "NetworkPolicy", "ffs"))
+	}
+	np := policy()
 	require.Equal(t, "ffs", np.Namespace)
 	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs"}, np.Spec.PodSelector.MatchLabels)
 	require.Equal(t, []networkingv1.PolicyType{networkingv1.PolicyTypeIngress}, np.Spec.PolicyTypes)
-	require.Len(t, np.Spec.Ingress, 2)
+	require.Len(t, np.Spec.Ingress, 2, "no web UI rule by default")
 	tcp := corev1.ProtocolTCP
-	port := func(name string) networkingv1.NetworkPolicyPort {
-		p := intstr.FromString(name)
+	port := func(p intstr.IntOrString) networkingv1.NetworkPolicyPort {
 		return networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &p}
 	}
 	in := np.Spec.Ingress[0]
 	require.Len(t, in.From, 1)
 	require.Equal(t, map[string]string{"kubernetes.io/metadata.name": "ffs-agent"}, in.From[0].NamespaceSelector.MatchLabels)
 	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs-agent"}, in.From[0].PodSelector.MatchLabels)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{port("agent-api")}, in.Ports)
-	require.Empty(t, np.Spec.Ingress[1].From)
-	require.Equal(t, []networkingv1.NetworkPolicyPort{port("http"), port("metrics"), port("health")}, np.Spec.Ingress[1].Ports)
+	require.Equal(t, []networkingv1.NetworkPolicyPort{port(intstr.FromString("agent-api"))}, in.Ports)
+	open := networkingv1.NetworkPolicyIngressRule{Ports: []networkingv1.NetworkPolicyPort{port(intstr.FromString("metrics")), port(intstr.FromString("health"))}}
+	require.Equal(t, open, np.Spec.Ingress[1])
+	webRule := networkingv1.NetworkPolicyIngressRule{
+		From:  []networkingv1.NetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "oauth2-proxy"}}}},
+		Ports: []networkingv1.NetworkPolicyPort{port(intstr.FromInt32(9090))}, // the port of config.listen
+	}
 
-	require.False(t, render(t, "nodeAgent.networkPolicy.enabled=false").has("NetworkPolicy", "ffs-agent-api"))
+	for _, sets := range [][]string{
+		{"web.service.enabled=true", "config.listen=0.0.0.0:9090", webPeer},
+		{"config.listen=0.0.0.0:9090", webPeer}, // a Service of your own
+	} {
+		np = policy(sets...)
+		require.Len(t, np.Spec.Ingress, 3, sets)
+		require.Equal(t, webRule, np.Spec.Ingress[2], sets)
+	}
+	require.Len(t, policy(webPeer).Spec.Ingress, 2, "nothing outside the pod reaches a loopback listener")
+	for _, rule := range policy("config.listen=0.0.0.0:8080").Spec.Ingress {
+		for _, p := range rule.Ports {
+			require.NotEqual(t, intstr.FromInt32(8080), *p.Port, "no web UI rule without peers")
+			require.NotEqual(t, intstr.FromString("http"), *p.Port)
+		}
+	}
+
+	// Without the node agent the policy stays, minus the agent API rule.
+	require.Equal(t, []networkingv1.NetworkPolicyIngressRule{open}, policy("nodeAgent.enabled=false").Spec.Ingress)
+	require.Equal(t, []networkingv1.NetworkPolicyIngressRule{open, webRule},
+		policy("nodeAgent.enabled=false", "web.service.enabled=true", "config.listen=0.0.0.0:9090", webPeer).Spec.Ingress)
+
+	for _, agent := range []string{"nodeAgent.enabled=true", "nodeAgent.enabled=false"} {
+		_, err := renderErr(t, agent, "web.service.enabled=true", "config.listen=0.0.0.0:8080")
+		require.ErrorContains(t, err, "web.service.enabled needs web.networkPolicy.from: the NetworkPolicy of nodeAgent.networkPolicy.enabled "+
+			"admits the web UI port only from the peers listed there", agent)
+
+		off := []string{agent, "nodeAgent.networkPolicy.enabled=false"}
+		o := render(t, append(off, "web.service.enabled=true", "config.listen=0.0.0.0:8080")...)
+		require.False(t, o.has("NetworkPolicy", "ffs"), off)
+		require.False(t, o.has("NetworkPolicy", "ffs-agent-api"), off)
+		require.True(t, o.has("Service", "ffs-web"), off)
+		for _, sets := range [][]string{{webPeer}, {"web.service.enabled=true", "config.listen=0.0.0.0:8080", webPeer}} {
+			_, err = renderErr(t, append(off, sets...)...)
+			require.ErrorContains(t, err, "web.networkPolicy.from takes effect only through the NetworkPolicy of nodeAgent.networkPolicy.enabled, "+
+				"which is false", "%v %v", off, sets)
+		}
+	}
 }
 
 func TestChart_AgentOptIns(t *testing.T) {
@@ -605,6 +655,81 @@ func TestChart_AgentMemoryLimits(t *testing.T) {
 	cc = container(t, podSpec(t, "catalog.resources.limits=null"), "catalog")
 	require.Equal(t, "limits.memory", envOf(cc)["GOMEMLIMIT"].ValueFrom.ResourceFieldRef.Resource)
 	require.False(t, slices.ContainsFunc(cc.Args, func(a string) bool { return strings.HasPrefix(a, "--worker-memory-limit") }))
+}
+
+// TestChart_FractionalMemoryLimits: memory limits with a decimal fraction, as Kubernetes takes them, keep
+// rendering: 1.5Gi is 1536Mi for every container's GOMEMLIMIT and worker limit, beside the whole 2Gi.
+func TestChart_FractionalMemoryLimits(t *testing.T) {
+	for _, c := range []struct {
+		limit            string
+		goMemLimit       string // 90%
+		agentWorkerLimit string // less 128Mi
+		workerLimit      string // less 128Mi, over the default 2 jobs
+	}{
+		{"1.5Gi", "1449551462", "--worker-memory-limit=1476395008", "--worker-memory-limit=738197504"},
+		{"1536Mi", "1449551462", "--worker-memory-limit=1476395008", "--worker-memory-limit=738197504"},
+		{"2Gi", "1932735283", "--worker-memory-limit=2013265920", "--worker-memory-limit=1006632960"},
+	} {
+		o := render(t, "controller.resources.limits.memory="+c.limit, "catalog.resources.limits.memory="+c.limit,
+			"nodeAgent.resources.collector.limits.memory="+c.limit, "nodeAgent.resources.catalog.limits.memory="+c.limit)
+		ps := as[appsv1.Deployment](t, o.get(t, "Deployment", "ffs")).Spec.Template.Spec
+		ds := as[appsv1.DaemonSet](t, o.get(t, "DaemonSet", "ffs-agent"))
+		for _, ctr := range []corev1.Container{container(t, ps, "controller"), container(t, ps, "catalog"),
+			agentContainer(t, ds, "collector"), agentContainer(t, ds, "catalog")} {
+			require.Equal(t, c.goMemLimit, envOf(ctr)["GOMEMLIMIT"].Value, "%s %s", c.limit, ctr.Name)
+		}
+		require.Contains(t, container(t, ps, "catalog").Args, c.workerLimit, c.limit)
+		require.Contains(t, agentContainer(t, ds, "catalog").Args, c.agentWorkerLimit, c.limit)
+	}
+}
+
+// TestChart_BytesQuantities: ffs.bytes reads byte counts and Kubernetes quantities, whole or with up to six
+// decimal digits, rounding a fraction of a byte up as Kubernetes does, and refuses anything else.
+func TestChart_BytesQuantities(t *testing.T) {
+	dir := copyChart(t, map[string]string{"zz-bytes.yaml": `{{- range $i, $v := .Values.byteCases }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bytes-{{ $i }}
+data:
+  result: {{ include "ffs.bytes" (list "case" $v) | quote }}
+{{- end }}
+`})
+	cases := []struct {
+		in   any
+		want string
+	}{
+		{"2Gi", "2147483648"},
+		{"1.5Gi", "1610612736"},
+		{"0.5Gi", "536870912"},
+		{"1536Mi", "1610612736"},
+		{"1.05Gi", "1127428916"}, // 1127428915.2, rounded up; 05 is decimal, not octal
+		{"1.5G", "1500000000"},
+		{"0.25Ki", "256"},
+		{"0.1", "1"},
+		{"128974848", "128974848"},
+		{128974848, "128974848"},
+		{"1.000001Ti", "1099512727288"},
+	}
+	values := make([]any, len(cases))
+	for i, c := range cases {
+		values[i] = c.in
+	}
+	got := helperResults(t, dir, map[string]any{"byteCases": values}, "bytes", len(cases))
+	for i, c := range cases {
+		require.Equal(t, c.want, got[i], "%v", c.in)
+		if s, ok := c.in.(string); ok {
+			want, err := resource.ParseQuantity(s)
+			require.NoError(t, err, s)
+			require.Equal(t, strconv.FormatInt(want.Value(), 10), got[i], "%s as Kubernetes reads it", s)
+		}
+	}
+
+	for _, bad := range []string{"1.5GB", ".5Gi", "1.Gi", "1.1234567Gi", "01Gi", "1.5.0Gi", "1e9", "-1Gi"} {
+		_, err := renderErr(t, "controller.resources.limits.memory="+bad)
+		require.ErrorContains(t, err, fmt.Sprintf("controller.resources.limits.memory must be a byte count or a quantity such as 18Gi, not %q", bad), bad)
+	}
 }
 
 // TestChart_AgentScratchVolumes: nodeAgent.scratchSizeLimit is split between the collector's staging volume
@@ -714,6 +839,10 @@ func TestChart_AgentValueGuards(t *testing.T) {
 		"nodeAgent.hostPaths.extraBinDirs={/usr/bin}":          "nodeAgent.hostPaths.extraBinDirs: /usr/bin is searched already; list only other directories",
 		"nodeAgent.hostPaths.extraBinDirs={/usr/sbin}":         "nodeAgent.hostPaths.extraBinDirs: /usr/sbin is searched already",
 		"nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}":    "nodeAgent.hostPaths.extraBinDirs: /usr/local/bin is searched already",
+		"nodeAgent.hostPaths.extraBinDirs={/usr/./bin}":        "nodeAgent.hostPaths.extraBinDirs: /usr/./bin is not allowed; use a directory under /usr or /opt",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/../etc}":       "nodeAgent.hostPaths.extraBinDirs: /opt/../etc is not allowed",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/tools/.}":      "nodeAgent.hostPaths.extraBinDirs: /opt/tools/. is not allowed",
+		"nodeAgent.hostPaths.extraBinDirs={/opt/tools/..}":     "nodeAgent.hostPaths.extraBinDirs: /opt/tools/.. is not allowed",
 		"nodeAgent.architectures=null":                         "nodeAgent.architectures must list at least one node architecture",
 		"nodeAgent.architectures={}":                           "nodeAgent.architectures must list at least one node architecture",
 	} {
@@ -723,6 +852,8 @@ func TestChart_AgentValueGuards(t *testing.T) {
 	// On image-based OSes /usr/local/bin is not mounted, so it may be listed.
 	hm := hostMounts(t, daemonSet(t, "nodeAgent.packageDatabases={}", "nodeAgent.hostPaths.extraBinDirs={/usr/local/bin}"))
 	require.Equal(t, "Directory", hm["/usr/local/bin"])
+	// A dot inside a name is not a . or .. component.
+	require.Equal(t, "Directory", hostMounts(t, daemonSet(t, "nodeAgent.hostPaths.extraBinDirs={/opt/tools..v2/bin}"))["/opt/tools..v2/bin"])
 	ps := daemonSet(t, "nodeAgent.architectures={amd64,,arm64}").Spec.Template.Spec
 	require.Equal(t, []string{"amd64", "arm64"},
 		ps.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.NodeSelectorTerms[0].MatchExpressions[0].Values)

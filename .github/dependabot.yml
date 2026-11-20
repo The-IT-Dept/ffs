@@ -26,6 +26,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+    ignore:
+      # Node is bumped by hand, with ui/.nvmrc and the engines field of ui/package.json
+      # (TestShipping_NodeVersionPinnedConsistently).
+      - dependency-name: node
   - package-ecosystem: npm
     directory: /ui
     schedule:

@@ -3,6 +3,7 @@ package repo
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -63,6 +64,12 @@ type dependabotUpdate struct {
 		DefaultDays int `json:"default-days"`
 	} `json:"cooldown"`
 	Groups map[string]dependabotGroup `json:"groups"`
+	Ignore []dependabotIgnore         `json:"ignore"`
+}
+
+type dependabotIgnore struct {
+	DependencyName string   `json:"dependency-name"`
+	UpdateTypes    []string `json:"update-types"`
 }
 
 type dependabotGroup struct {
@@ -81,6 +88,67 @@ func TestShipping_DependabotUpdatesUIWeeklyInOneGroup(t *testing.T) {
 	require.Equal(t, "weekly", u.Schedule.Interval)
 	require.Equal(t, 7, u.Cooldown.DefaultDays)
 	require.Equal(t, map[string]dependabotGroup{"ui": {Patterns: []string{"*"}}}, u.Groups)
+}
+
+// TestShipping_DependabotLeavesNodeToHand: a node image bump alone would break
+// TestShipping_NodeVersionPinnedConsistently, so Node is bumped by hand with ui/.nvmrc and the engines field,
+// and the docker updates wait out the same cooldown as the others.
+func TestShipping_DependabotLeavesNodeToHand(t *testing.T) {
+	var cfg struct {
+		Updates []dependabotUpdate `json:"updates"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../.github/dependabot.yml")), &cfg))
+	docker := slices.DeleteFunc(slices.Clone(cfg.Updates), func(u dependabotUpdate) bool { return u.Ecosystem != "docker" })
+	require.Len(t, docker, 1)
+	require.Equal(t, 7, docker[0].Cooldown.DefaultDays)
+	i := slices.IndexFunc(docker[0].Ignore, func(ig dependabotIgnore) bool { return ig.DependencyName == "node" })
+	require.GreaterOrEqual(t, i, 0, "dependabot ignores the node image")
+	require.Empty(t, docker[0].Ignore[i].UpdateTypes, "every node update, digests included, is left to hand")
+	for _, u := range cfg.Updates {
+		require.Equal(t, 7, u.Cooldown.DefaultDays, u.Ecosystem)
+	}
+}
+
+// makeCall matches a make invocation in a workflow run: "make", then its flags, variable assignments and targets.
+var makeCall = regexp.MustCompile(`(?m)(?:^|[;&|(]\s*|\s)make((?:[ \t]+[^\s;&|()\\]+)+)`)
+
+// makeTarget matches a rule's targets in a Makefile, but not a variable assignment (:=, ::=).
+var makeTarget = regexp.MustCompile(`(?m)^([A-Za-z0-9_./-]+(?:[ \t]+[A-Za-z0-9_./-]+)*)[ \t]*::?(?:[^=]|$)`)
+
+// TestShipping_WorkflowMakeTargetsExist: every make target a workflow runs is a rule in the Makefile, so a renamed
+// or missing target fails here rather than in CI.
+func TestShipping_WorkflowMakeTargetsExist(t *testing.T) {
+	rules := map[string]bool{}
+	for _, m := range makeTarget.FindAllStringSubmatch(readFile(t, "../../Makefile"), -1) {
+		for _, name := range strings.Fields(m[1]) {
+			rules[name] = true
+		}
+	}
+	require.True(t, rules["test"] && rules["ui-e2e"] && rules["bench-api"], "the Makefile parses: %v", slices.Sorted(maps.Keys(rules)))
+	require.False(t, rules["GOFLAGS"] || rules["export"], "assignments are not rules")
+
+	files, err := filepath.Glob("../../.github/workflows/*.y*ml")
+	require.NoError(t, err)
+	require.NotEmpty(t, files)
+	called := map[string][]string{} // target -> where
+	for _, path := range files {
+		for name, j := range readWorkflow(t, path) {
+			for _, m := range makeCall.FindAllStringSubmatch(runs(j), -1) {
+				for _, arg := range strings.Fields(m[1]) {
+					if strings.HasPrefix(arg, "-") || strings.Contains(arg, "=") {
+						continue // a flag or a variable
+					}
+					called[arg] = append(called[arg], filepath.Base(path)+"/"+name)
+				}
+			}
+		}
+	}
+	for _, want := range []string{"generate", "test", "licenses", "ui-e2e", "bench-api", "e2e"} {
+		require.Contains(t, called, want, "the workflows' make calls parse")
+	}
+	for target, where := range called {
+		require.True(t, rules[target], "%v run make %s, which the Makefile does not define", where, target)
+	}
 }
 
 // ciStep and ciJob are the parts of a workflow the shipping checks read.

@@ -26,10 +26,11 @@ TAG=v0.0.1 V=0.0.1   # the release to verify
 ID="https://github.com/The-IT-Dept/ffs/.github/workflows/release.yml@refs/tags/$TAG"
 ISS=https://token.actions.githubusercontent.com
 
-# The image index, then each platform image and its SBOM attestation.
+# The image index, then each platform image and its SBOM attestation. A single-platform push is its
+# own platform image.
 D=$(crane digest ghcr.io/the-it-dept/ffs:$V)
 cosign verify ghcr.io/the-it-dept/ffs@$D --certificate-identity "$ID" --certificate-oidc-issuer $ISS
-for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '.manifests[].digest'); do
+for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r --arg d "$D" '(.manifests // [{digest: $d}])[].digest'); do
   cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
   cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
 done

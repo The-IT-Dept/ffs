@@ -3,6 +3,7 @@
 {{- $ns := .Release.Namespace }}
 {{- $agentNs := include "ffs.agentNamespace" . }}
 {{- $svc := printf "%s-agent-api" $fullname }}
+{{- $secretName := include "ffs.agentTLSSecret" . }}
 {{- $tls := .Values.nodeAgent.tls }}
 {{- if $tls.certManager.enabled }}
 {{- if not $tls.caBundle }}
@@ -16,7 +17,7 @@ metadata:
   labels:
     {{- include "ffs.labels" . | nindent 4 }}
 spec:
-  secretName: {{ $fullname }}-agent-tls
+  secretName: {{ $secretName }}
   dnsNames:
     - {{ $svc }}
     - {{ $svc }}.{{ $ns }}
@@ -35,14 +36,14 @@ metadata:
 data:
   ca.crt: {{ $tls.caBundle | quote }}
 {{- else }}
-{{- $secret := lookup "v1" "Secret" $ns (printf "%s-agent-tls" $fullname) }}
+{{- $secret := lookup "v1" "Secret" $ns $secretName }}
 {{- $cm := lookup "v1" "ConfigMap" $agentNs (printf "%s-agent-ca" $fullname) }}
 {{- $pair := include "ffs.agentTLSPair" (dict "secret" $secret "configMap" $cm "root" .) | fromJson }}
 apiVersion: v1
 kind: Secret
 type: kubernetes.io/tls
 metadata:
-  name: {{ $fullname }}-agent-tls
+  name: {{ $secretName }}
   namespace: {{ $ns }}
   labels:
     {{- include "ffs.labels" . | nindent 4 }}

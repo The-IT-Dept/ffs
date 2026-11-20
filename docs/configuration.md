@@ -87,8 +87,10 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `nodeAgent.staleAfter` | `30m` | After this long without a report, a node shows "node agent not reporting". At least twice `imageListInterval`. |
 | `nodeAgent.runtimeGrace` | `2h` | How long nodes must lack fresh reports before runtime findings move back to the node-status owner. |
 | `nodeAgent.workPerReport` | `3` | Side-loaded and unresolvable image SBOM requests handed out with each report, 0 to 10; 0 turns them off. |
-| `nodeAgent.workTimeout` | `30m` | How long a request stays with the node it was offered to. |
+| `nodeAgent.workTimeout` | `20m` | How long a request stays with the node it was offered to. `workTimeout` plus `imageListInterval` must be shorter than `staleAfter`: an agent reports between jobs, not during one. |
 | `nodeAgent.exposedNodes` | `""` | A Kubernetes node label selector, for example `node-role.example.com/edge`. Host findings on matching nodes count as exposed. Empty exposes no node. |
+| `nodeAgent.architectures` | `[amd64]` | Node architectures the agent DaemonSet schedules on; the chart sets it from `nodeAgent.architectures`. Other nodes show `node_agent_unsupported` and do not hold back the switch from node status to the agent. Empty means every node; the chart requires at least one. |
+| `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods; the chart sets it from `nodeAgent.nodeSelector`. Nodes it does not match show `node_agent_unsupported`. Empty means every node. |
 
 ## Helm-only values
 
@@ -102,9 +104,9 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `image.pullPolicy` | `IfNotPresent` | Image pull policy. |
 | `imagePullSecrets` | `[]` | Pull secrets for the ffs image itself. |
 | `rbac.readPullSecrets` | `true` | Grant cluster-wide `get` on Secrets so pull secrets of pods and ServiceAccounts can be read. When false, private images that need them show as `unresolvable`. |
-| `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. The memory limit is a byte count or a whole quantity such as `1536Mi`; `GOMEMLIMIT` is set to 90% of it. |
+| `controller.resources` | requests `200m` CPU and `512Mi` memory, limit `1Gi` memory | Controller container resources. The memory limit is a byte count or a quantity such as `1536Mi` or `1.5Gi`; `GOMEMLIMIT` is set to 90% of it. |
 | `controller.tmpSizeLimit` | `1Gi` | Size limit of the controller's `/tmp` volume. SQLite's temporary files do not use it: they go to `<dataDir>/tmp` on the persistent volume, or to `SQLITE_TMPDIR` when that is set. |
-| `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. |
+| `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. The memory limit is a byte count or a quantity such as `2Gi` or `1.5Gi`; `GOMEMLIMIT` is set to 90% of it, and each catalog worker gets the limit less 128Mi for the catalog server, divided by `config.catalog.concurrency` (at least 64Mi each). |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |
 | `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch space the catalogue jobs may use together, as a byte count or a quantity such as `18Gi`. It must be greater than 0 and below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod; the chart refuses to render otherwise. |
 | `persistence.size` | `20Gi` | Size of the volume for the store and feed data. While a Grype DB update runs, the volume holds two builds (the November 2026 database is 2.7 GB before indexing), and diffing them takes about 2.5 GB more of SQLite temporary files. Keep at least 10Gi. |
@@ -118,6 +120,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `priorityClassName` | `""` | Pod priority class. |
 | `web.service.enabled` | `false` | Create a ClusterIP Service for the web UI. Requires `config.listen` bound beyond loopback. |
 | `web.service.port` | `8080` | Port of the web UI Service. |
+| `web.networkPolicy.from` | `[]` | NetworkPolicy peers (`podSelector`, `namespaceSelector` or `ipBlock` entries) admitted to the web UI port by the ffs pod's NetworkPolicy, for example your authenticating proxy's pods. Empty admits none. That NetworkPolicy exists while `nodeAgent.networkPolicy.enabled` is true, with or without the node agent. Required with `web.service.enabled` while it is true, and refused while it is false. |
 | `metrics.service.enabled` | `false` | Create the metrics Service. |
 | `metrics.service.port` | `8443` | Port of the metrics Service. |
 | `metrics.serviceMonitor.enabled` | `false` | Create a Prometheus Operator ServiceMonitor (and the metrics Service). |
@@ -125,10 +128,10 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `metrics.serviceMonitor.labels` | `{}` | Extra ServiceMonitor labels. |
 | `prometheusRule.enabled` | `false` | Create a PrometheusRule with the ffs alert rules. |
 | `prometheusRule.labels` | `{}` | Extra PrometheusRule labels. |
-| `grafanaDashboard.enabled` | `false` | Create a ConfigMap holding the Grafana dashboard. |
-| `grafanaDashboard.namespace` | `""` | Namespace of the dashboard ConfigMap; empty uses the release namespace. |
-| `grafanaDashboard.labels` | `grafana_dashboard: "1"` | Dashboard ConfigMap labels, including the one the Grafana sidecar selects on. |
-| `grafanaDashboard.annotations` | `{}` | Extra dashboard ConfigMap annotations. |
+| `grafanaDashboard.enabled` | `false` | Create a ConfigMap carrying the Grafana dashboard. |
+| `grafanaDashboard.namespace` | `""` | Namespace of the Grafana dashboard ConfigMap; empty uses the release namespace. |
+| `grafanaDashboard.labels` | `grafana_dashboard: "1"` | Grafana dashboard ConfigMap labels, including the one the Grafana sidecar selects on. |
+| `grafanaDashboard.annotations` | `{}` | Extra Grafana dashboard ConfigMap annotations. |
 
 Metrics are served on port 8443 behind Kubernetes authentication and authorisation. A scraper needs `get` on the `/metrics` non-resource URL, which the chart's ClusterRole `ffs-metrics-reader` grants; bind it to the scraper's ServiceAccount.
 
@@ -148,10 +151,22 @@ config:
 web:
   service:
     enabled: true
+  networkPolicy:
+    from:
+      - namespaceSelector:
+          matchLabels:
+            kubernetes.io/metadata.name: oauth2-proxy
+        podSelector:
+          matchLabels:
+            app.kubernetes.io/name: oauth2-proxy
 ```
+
+Serve the web UI at the root of its host name, such as `https://ffs.example.com/`. It loads its files and the API from absolute paths (`/assets/…`, `/api/v1/…`), so a proxy that serves it under a path prefix, such as `https://example.com/ffs/`, is not supported in v0.0.1.
 
 The web UI answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
 
-This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the web UI shows, so restrict it with a NetworkPolicy to the proxy alone, and do not expose the Service directly through an Ingress or Gateway.
+This creates the ClusterIP Service `ffs-web`. Anything that can reach that Service can read everything the web UI shows. The chart's NetworkPolicy `ffs` admits the web UI port only from the peers in `web.networkPolicy.from`, so list your proxy's pods there and nothing else. It is created while `nodeAgent.networkPolicy.enabled` is true (the default), with `nodeAgent.enabled: false` too. With `web.service.enabled` and an empty `web.networkPolicy.from`, the chart refuses to render. If you set `nodeAgent.networkPolicy.enabled: false`, no NetworkPolicy of the chart selects the ffs pod and the chart refuses a non-empty `web.networkPolicy.from`, so restrict the port to the proxy with a NetworkPolicy of your own. Do not expose the Service directly through an Ingress or Gateway.
+
+**Upgrading from 0.0.1-rc.8 or earlier.** Earlier release candidates left the web UI port open to every pod: rc.5 to rc.8 admitted it from every source in the node agent's NetworkPolicy `ffs-agent-api`, which they created only with the node agent, and earlier ones created no NetworkPolicy for the ffs pod. The NetworkPolicy is now `ffs` and is created with `nodeAgent.enabled: false` too. Set `web.networkPolicy.from` before you upgrade if anything but `kubectl port-forward` reaches the web UI.
 
 The API itself is described in [api.md](api.md).

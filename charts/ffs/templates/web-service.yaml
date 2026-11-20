@@ -1,5 +1,4 @@
-{{- $listenHost := regexReplaceAll ":[0-9]*$" .Values.config.listen "" }}
-{{- if and .Values.web.service.enabled (or (hasPrefix "127." $listenHost) (eq $listenHost "localhost" "[::1]")) }}
+{{- if and .Values.web.service.enabled (include "ffs.listenLoopback" .) }}
 {{- fail "web.service.enabled needs config.listen bound beyond loopback, e.g. 0.0.0.0:8080" }}
 {{- end }}
 {{- if .Values.web.service.enabled }}

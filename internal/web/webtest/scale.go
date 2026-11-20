@@ -43,6 +43,46 @@ const (
 	scalePending      = 5
 )
 
+// scaleImageStatus is the status of image i of a fixture with images images.
+func scaleImageStatus(i, images int) model.ImageStatus {
+	switch {
+	case i > 0 && i >= images-scaleUnresolvable:
+		return model.ImageUnresolvable
+	case i > 0 && i >= images-scaleUnresolvable-scalePending:
+		return model.ImagePending
+	}
+	return model.ImageCatalogued
+}
+
+// scaleWorkloadImages returns the images workload i runs, in container order: image i%Images, and
+// for every third workload also image 7i%Images.
+func scaleWorkloadImages(i int, n ScaleSize) []int {
+	images := []int{i % n.Images}
+	if i%3 == 2 {
+		images = append(images, 7*i%n.Images)
+	}
+	return images
+}
+
+// scaleBearer is a workload that carries findings, and the image they are on.
+type scaleBearer struct{ workload, image int }
+
+// scaleBearers returns the workloads that carry findings, in order: every workload that runs a
+// catalogued image, with the first one it runs. A workload whose images are all pending or
+// unresolvable has no SBOM to match, so it carries none. Workload 0 always carries findings.
+func scaleBearers(n ScaleSize) []scaleBearer {
+	var out []scaleBearer
+	for w := range n.Workloads {
+		for _, i := range scaleWorkloadImages(w, n) {
+			if scaleImageStatus(i, n.Images) == model.ImageCatalogued {
+				out = append(out, scaleBearer{workload: w, image: i})
+				break
+			}
+		}
+	}
+	return out
+}
+
 // Scale opens a store at path and seeds a deterministic cluster of n's size: the cluster-level
 // owners and their findings, n.Workloads Deployments over n.Namespaces namespaces and n.Images
 // images, n.OpenFindings/8 advisories, and the open, excepted and resolved findings, transitions and
@@ -52,8 +92,9 @@ func Scale(ctx context.Context, path string, n ScaleSize) (*Fixture, error) {
 	if n.Namespaces < 1 || n.Workloads < 1 || n.Images < 1 || n.PackagesPerImage < 1 || n.OpenFindings < 16 {
 		return nil, errors.New("webtest: scale needs a namespace, a workload, an image, a package and 16 open findings")
 	}
-	if n.OpenFindings-controlPlaneFindings+n.Excepted+n.Resolved > n.Workloads*(n.OpenFindings/8) {
-		return nil, errors.New("webtest: scale has more findings than workload and advisory pairs")
+	bearers := scaleBearers(n)
+	if n.OpenFindings-controlPlaneFindings+n.Excepted+n.Resolved > len(bearers)*(n.OpenFindings/8) {
+		return nil, errors.New("webtest: scale has more findings than pairs of an advisory and a workload with a catalogued image")
 	}
 	st, err := store.Open(ctx, path)
 	if err != nil {
@@ -61,7 +102,7 @@ func Scale(ctx context.Context, path string, n ScaleSize) (*Fixture, error) {
 	}
 	dbPaths.Store(st, path)
 	f := &Fixture{Store: st, Pods: PodCounts{}}
-	s := &scaler{f: f, n: n, rng: rand.New(rand.NewPCG(1, 2)), ts: map[int]model.Transition{}} //nolint:gosec // G404: a fixed seed makes the fixture deterministic
+	s := &scaler{f: f, n: n, bearers: bearers, rng: rand.New(rand.NewPCG(1, 2)), ts: map[int]model.Transition{}} //nolint:gosec // G404: a fixed seed makes the fixture deterministic
 	if err := s.seed(ctx); err != nil {
 		return nil, errors.Join(fmt.Errorf("webtest: scale: %w", err), f.Close())
 	}
@@ -70,9 +111,10 @@ func Scale(ctx context.Context, path string, n ScaleSize) (*Fixture, error) {
 
 // scaler seeds one Scale fixture.
 type scaler struct {
-	f   *Fixture
-	n   ScaleSize
-	rng *rand.Rand
+	f       *Fixture
+	n       ScaleSize
+	bearers []scaleBearer // the workloads that carry findings, from scaleBearers
+	rng     *rand.Rand
 
 	owners     []model.Owner    // the workloads, by index
 	images     []model.Image    // by index
@@ -81,11 +123,17 @@ type scaler struct {
 	ts         map[int]model.Transition // creation transitions, by index in findings
 }
 
-func (s *scaler) seed(ctx context.Context) error {
-	s.f.Config = config.Default()
-	s.f.Config.ClusterName = ClusterName
-	s.f.Feeds = []apiserver.FeedInfo{{Name: "eol", StaleAfter: 72 * time.Hour}, {Name: "kev", StaleAfter: 24 * time.Hour},
+// seedConfig sets what Small and Scale serve alike: the default configuration for cluster "test", and
+// the eol, kev and osv feeds with their default stale-after times.
+func (f *Fixture) seedConfig() {
+	f.Config = config.Default()
+	f.Config.ClusterName = ClusterName
+	f.Feeds = []apiserver.FeedInfo{{Name: "eol", StaleAfter: 72 * time.Hour}, {Name: "kev", StaleAfter: 24 * time.Hour},
 		{Name: "osv", StaleAfter: 2 * time.Hour}}
+}
+
+func (s *scaler) seed(ctx context.Context) error {
+	s.f.seedConfig()
 	for _, step := range []func(context.Context) error{
 		s.f.seedLifecycle, s.seedBase, s.seedClusterLevel, s.seedImages, s.seedWorkloads, s.seedAdvisories,
 		s.seedFindings, s.seedSuggestions,
@@ -186,11 +234,11 @@ func (s *scaler) seedImages(ctx context.Context) error {
 		repo := fmt.Sprintf("ghcr.io/example/img-%d", i)
 		img := model.Image{Digest: scaleDigest(i), Repo: repo, Platform: "linux/amd64", Status: model.ImageCatalogued,
 			Source: "registry", CataloguedAt: Now}
-		switch {
-		case i > 0 && i >= s.n.Images-scaleUnresolvable:
+		switch scaleImageStatus(i, s.n.Images) {
+		case model.ImageUnresolvable:
 			img = model.Image{Digest: img.Digest, Repo: repo, Status: model.ImageUnresolvable,
 				StatusReason: fmt.Sprintf(registry.ReasonUnauthorized, repo)}
-		case i > 0 && i >= s.n.Images-scaleUnresolvable-scalePending:
+		case model.ImagePending:
 			img = model.Image{Digest: img.Digest, Repo: repo, Status: model.ImagePending}
 		default:
 			if i%20 == 19 {
@@ -214,11 +262,10 @@ func (s *scaler) seedImages(ctx context.Context) error {
 	return nil
 }
 
-// seedWorkloads writes n.Workloads Deployments. Workload i runs image i%Images, and every third
-// also image 7i%Images. The first n.ExposedWorkloads are exposed: every tenth of them through its
-// own LoadBalancer Service, the rest through one of four public Gateways. Every fifteenth workload
-// also has an internal Ingress, every 25th is privileged and every 30th has a powerful service
-// account.
+// seedWorkloads writes n.Workloads Deployments, each running the images scaleWorkloadImages gives
+// it. The first n.ExposedWorkloads are exposed: every tenth of them through its own LoadBalancer
+// Service, the rest through one of four public Gateways. Every fifteenth workload also has an
+// internal Ingress, every 25th is privileged and every 30th has a powerful service account.
 func (s *scaler) seedWorkloads(ctx context.Context) error {
 	s.owners = make([]model.Owner, s.n.Workloads)
 	for i := range s.owners {
@@ -227,10 +274,10 @@ func (s *scaler) seedWorkloads(ctx context.Context) error {
 		use := func(cname string, img model.Image) model.ContainerUse {
 			return container(cname, model.ContainerRegular, img.Repo+":1.0.0", img.Repo, img.Digest)
 		}
-		o := model.Owner{Ref: ref, ServiceAccount: name, UpdatedAt: Now,
-			Containers: []model.ContainerUse{use("app", s.images[i%s.n.Images])}}
-		if i%3 == 2 {
-			o.Containers = append(o.Containers, use("helper", s.images[7*i%s.n.Images]))
+		o := model.Owner{Ref: ref, ServiceAccount: name, UpdatedAt: Now}
+		names := []string{"app", "helper"}
+		for c, img := range scaleWorkloadImages(i, s.n) {
+			o.Containers = append(o.Containers, use(names[c], s.images[img]))
 		}
 		o.Context = s.workloadContext(i, ns, name)
 		s.owners[i] = o
@@ -329,9 +376,9 @@ var scaleSeverity = map[model.Priority]model.Severity{model.PriorityUrgent: mode
 const controlPlaneFindings = 2
 
 // seedFindings writes the control-plane findings, then finding k for k from 0: open, then
-// n.Excepted excepted and n.Resolved resolved ones. Finding k belongs to workload k%Workloads and
-// advisory (k/Workloads)%Advisories, on the workload's first image, so no two share a key. Every
-// tenth finding has a creation transition.
+// n.Excepted excepted and n.Resolved resolved ones. Finding k belongs to bearer k%len(bearers) and
+// advisory (k/len(bearers))%Advisories, on the bearer's first catalogued image, so no two share a key
+// and none is on an image without an SBOM. Every tenth finding has a creation transition.
 func (s *scaler) seedFindings(ctx context.Context) error {
 	s.controlPlane()
 	open := s.n.OpenFindings - controlPlaneFindings
@@ -387,9 +434,10 @@ func (s *scaler) controlPlane() {
 
 // finding adds finding k in state.
 func (s *scaler) finding(k int, state model.FindingState) {
-	o := s.owners[k%s.n.Workloads]
-	adv := s.advisories[(k/s.n.Workloads)%len(s.advisories)]
-	img := s.images[(k%s.n.Workloads)%s.n.Images]
+	b := s.bearers[k%len(s.bearers)]
+	o := s.owners[b.workload]
+	adv := s.advisories[(k/len(s.bearers))%len(s.advisories)]
+	img := s.images[b.image]
 	priority, fix := s.priorityDraw(), s.fixDraw()
 	p := s.rng.IntN(s.n.PackagesPerImage)
 	if fix == model.FixKindRebuild {
@@ -447,12 +495,12 @@ func (s *scaler) finding(k int, state model.FindingState) {
 	s.findings = append(s.findings, f)
 }
 
-// seedSuggestions writes a patch suggestion for each of the first n.Suggestions workloads, on its
-// first image, fixing that workload's first five advisories.
+// seedSuggestions writes a patch suggestion for each of the first n.Suggestions workloads that carry
+// findings, on the image they are on, fixing that workload's first five advisories.
 func (s *scaler) seedSuggestions(ctx context.Context) error {
-	for w := range min(s.n.Suggestions, s.n.Workloads) {
-		o := s.owners[w]
-		repo := o.Containers[0].Repo
+	for _, b := range s.bearers[:min(s.n.Suggestions, len(s.bearers))] {
+		o := s.owners[b.workload]
+		repo := s.images[b.image].Repo
 		var (
 			ids   []string
 			fixes = map[model.Priority]int{}
