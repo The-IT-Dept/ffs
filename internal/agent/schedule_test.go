@@ -197,12 +197,51 @@ func TestRun_HostKeptForResendOnlyWhenTheControllerMayTakeIt(t *testing.T) {
 	}
 }
 
+// TestKeepHostAfter: the host inventory is kept for the resend only after a failure that may pass: no answer
+// (a network error, a refused connection, a timeout), 429 or 5xx. A refusal, an encoding failure, or a token,
+// CA bundle or spooled host SBOM that cannot be read drops it.
 func TestKeepHostAfter(t *testing.T) {
-	require.True(t, keepHostAfter(syscall.ECONNREFUSED), "the controller did not answer")
+	sent := clientSendErrors(t)
+	require.True(t, keepHostAfter(sent.refused), "the controller did not answer")
+	require.True(t, keepHostAfter(syscall.ECONNREFUSED))
 	require.True(t, keepHostAfter(&net.OpError{Op: "dial", Err: errors.New("i/o timeout")}))
+	require.True(t, keepHostAfter(fmt.Errorf("sending a full report: %w", context.DeadlineExceeded)))
+	require.True(t, keepHostAfter(&StatusError{Code: http.StatusTooManyRequests, RetryAfter: 30 * time.Second}))
 	require.True(t, keepHostAfter(&StatusError{Code: http.StatusBadGateway}))
 	require.False(t, keepHostAfter(&StatusError{Code: http.StatusUnauthorized}))
 	require.False(t, keepHostAfter(fmt.Errorf("%w: %w", errEncoding, errors.New("json: unsupported value"))))
+	require.False(t, keepHostAfter(sent.spool), "the spooled host SBOM cannot be opened")
+	require.False(t, keepHostAfter(sent.token), "the token cannot be read")
+	require.False(t, keepHostAfter(sent.ca), "the CA bundle cannot be read")
+}
+
+// TestFullReport_HostDroppedWhenItsSpoolCannotBeOpened: a kept host inventory whose spooled SBOM is gone fails
+// every resend the same way, so it is dropped, and the next full report collects the host afresh rather than
+// sending none until the inventory ages out.
+func TestFullReport_HostDroppedWhenItsSpoolCannotBeOpened(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	hosts := countingHost(e)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	a.cfg = testConfig()
+	a.host = &hostInventory{packageDB: "dpkg", sbom: sbomFile{path: filepath.Join(e.scratch, "sbom-host-gone.json"), size: 64},
+		collected: a.o.Now()}
+	s := &schedule{}
+
+	require.Nil(t, a.fullReport(ctx, s))
+	require.Nil(t, a.host, "the inventory is dropped")
+	select {
+	case r := <-e.ctl.reports:
+		t.Fatalf("a report could not be sent without its spooled SBOM, yet %+v arrived", r)
+	default:
+	}
+
+	a.fullReport(ctx, s)
+	r := e.ctl.nextFull(t)
+	require.NotNil(t, r.Host)
+	require.JSONEq(t, `{"artifacts":[],"source":{"id":"host-1"}}`, string(r.Host.SyftJSON), "collected afresh")
+	require.Equal(t, int32(1), hosts.Load())
 }
 
 func TestRun_ImagesSuccessDoesNotResetFullBackoff(t *testing.T) {

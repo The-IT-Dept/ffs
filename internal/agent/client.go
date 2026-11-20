@@ -11,12 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/agentapi/wire"
@@ -25,8 +27,9 @@ import (
 
 const (
 	// clientTimeout bounds one request. It is longer than the controller may queue host preparation during a
-	// DaemonSet rollout; the agent API server's write timeout is longer still.
-	clientTimeout = 10 * time.Minute
+	// DaemonSet rollout, or hold an SBOM result before it reads it; the agent API server's write timeout is
+	// longer still.
+	clientTimeout = wire.ClientTimeout
 	// maxErrorBody bounds the {"error": …} body of a non-2xx response.
 	maxErrorBody = 64 << 10
 	// maxResponseBody bounds a report response or the agent config.
@@ -109,8 +112,28 @@ func (c *Client) token() (string, error) {
 	return tok, nil
 }
 
-// do sends one request and decodes a 2xx JSON answer into out (when non-nil).
-func (c *Client) do(ctx context.Context, method, path string, body *splicedBody, out any) error {
+// transient reports whether a request that failed with err may succeed when sent again as it was: the
+// controller did not answer (a network error, a timeout) or answered 429 or 5xx. A local failure, such as a CA
+// bundle, token or spooled SBOM that cannot be read, would fail the same way again, as would any other answer.
+func transient(err error) bool {
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code == http.StatusTooManyRequests || se.Code >= http.StatusInternalServerError
+	}
+	var ue *url.Error // every error of the HTTP client's round trip
+	if errors.As(err, &ue) || errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	if errors.As(err, &ne) {
+		_, errno := ne.(syscall.Errno) // an errno a file operation wrapped (ENOENT, EACCES) is not the network
+		return !errno
+	}
+	return false
+}
+
+// do sends one request, with header added, and decodes a 2xx JSON answer into out (when non-nil).
+func (c *Client) do(ctx context.Context, method, path string, body *splicedBody, header http.Header, out any) error {
 	hc, err := c.httpClient()
 	if err != nil {
 		return err
@@ -135,6 +158,11 @@ func (c *Client) do(ctx context.Context, method, path string, body *splicedBody,
 	if body != nil {
 		req.ContentLength = body.size()
 		req.Header.Set("Content-Type", "application/json")
+	}
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("User-Agent", version.UserAgent())
@@ -197,24 +225,29 @@ func (c *Client) Report(ctx context.Context, r wire.Report, hostSBOM *sbomFile) 
 // sendReport sends an encoded report (encodeReport) to POST /agent/v1/report.
 func (c *Client) sendReport(ctx context.Context, body *splicedBody) (wire.ReportResponse, error) {
 	var resp wire.ReportResponse
-	err := c.do(ctx, http.MethodPost, wire.PathReport, body, &resp)
+	err := c.do(ctx, http.MethodPost, wire.PathReport, body, nil, &resp)
 	return resp, err
 }
 
-// SBOM sends res to POST /agent/v1/sbom. When doc is set, the SBOM is streamed from that file in place of
-// res.SyftJSON.
+// SBOM sends res to POST /agent/v1/sbom, naming its request in wire.HeaderWorkID. When doc is set, the SBOM is
+// streamed from that file in place of res.SyftJSON.
 func (c *Client) SBOM(ctx context.Context, res wire.SBOMResult, doc *sbomFile) error {
 	body, err := encodeSpliced(&res, &res.SyftJSON, doc)
 	if err != nil {
 		return err
 	}
-	return c.do(ctx, http.MethodPost, wire.PathSBOM, &body, nil)
+	var header http.Header
+	if res.ID != "" {
+		header = http.Header{}
+		header.Set(wire.HeaderWorkID, res.ID)
+	}
+	return c.do(ctx, http.MethodPost, wire.PathSBOM, &body, header, nil)
 }
 
 // Config fetches GET /agent/v1/config.
 func (c *Client) Config(ctx context.Context) (wire.AgentConfig, error) {
 	var cfg wire.AgentConfig
-	err := c.do(ctx, http.MethodGet, wire.PathConfig, nil, &cfg)
+	err := c.do(ctx, http.MethodGet, wire.PathConfig, nil, nil, &cfg)
 	return cfg, err
 }
 

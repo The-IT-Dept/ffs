@@ -38,6 +38,10 @@ const minJobShare = 4
 // stopSkipTimeout bounds sending the skipped results of the jobs a stopping agent still holds.
 const stopSkipTimeout = 5 * time.Second
 
+// resultResends are the waits before each resend of a result the controller did not take; the last one
+// repeats. Each is jittered by backoffJitterPercent. Tests shorten them.
+var resultResends = []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
 // queuedJob is a work request and when the agent received it: its offer gave it Deadline minus received.
 type queuedJob struct {
 	w        wire.WorkRequest
@@ -71,15 +75,17 @@ func (a *agent) runJob(ctx context.Context, w wire.WorkRequest, received time.Ti
 	defer cancel()
 
 	res := wire.SBOMResult{ID: w.ID, Node: a.o.NodeName, AgentVersion: version.Version, Digest: w.Digest}
-	doc := a.job(ctx, jctx, w, &res)
+	doc := a.job(jctx, w, &res)
 	if doc != nil {
 		defer func() { _ = os.Remove(doc.path) }()
 	}
-	if ctx.Err() != nil { // the agent is stopping: whatever the job got to, the image is offered again
+	// The stopping rule lives here alone: whatever the job got to, a stopping agent answers skipped, and the
+	// image is offered again.
+	if ctx.Err() != nil {
 		a.skip(ctx, w)
 		return
 	}
-	a.post(ctx, res, doc)
+	a.post(ctx, w, res, doc)
 }
 
 // skip answers each of ws skipped. While the agent is stopping (ctx has ended), they are sent detached from
@@ -91,34 +97,57 @@ func (a *agent) skip(ctx context.Context, ws ...wire.WorkRequest) {
 		defer cancel()
 	}
 	for _, w := range ws {
-		a.post(ctx, wire.SBOMResult{ID: w.ID, Node: a.o.NodeName, AgentVersion: version.Version, Digest: w.Digest,
+		a.post(ctx, w, wire.SBOMResult{ID: w.ID, Node: a.o.NodeName, AgentVersion: version.Version, Digest: w.Digest,
 			Unavailable: wire.UnavailableSkipped}, nil)
 	}
 }
 
-// post sends one result.
-func (a *agent) post(ctx context.Context, res wire.SBOMResult, doc *sbomFile) {
-	if err := a.client.SBOM(ctx, res, doc); err != nil && ctx.Err() == nil {
-		a.logFailure(err, "sending an SBOM result", "id", res.ID, "digest", res.Digest)
+// post sends res, the result of w. A result the controller did not take (no answer, 429 or 5xx) would leave
+// w unanswered, and an unanswered request counts against its image, so it is sent again after each of
+// resultResends in turn, or the controller's Retry-After when longer, while the controller still takes a
+// result for w: until wire.ResultGrace after its deadline. Any other answer is final.
+func (a *agent) post(ctx context.Context, w wire.WorkRequest, res wire.SBOMResult, doc *sbomFile) {
+	until := w.Deadline.Add(wire.ResultGrace)
+	for i := 0; ; i++ {
+		err := a.client.SBOM(ctx, res, doc)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		wait := jittered(resultResends[min(i, len(resultResends)-1)], backoffJitterPercent, a.o.Jitter)
+		var se *StatusError
+		if errors.As(err, &se) && se.RetryAfter > wait {
+			wait = se.RetryAfter
+		}
+		if !transient(err) || !a.o.Now().Add(wait).Before(until) {
+			a.logFailure(err, "sending an SBOM result", "id", res.ID, "digest", res.Digest)
+			return
+		}
+		a.o.Log.Info("the controller did not take an SBOM result; sending it again", "id", res.ID, "digest", res.Digest,
+			"retryIn", wait, "reason", err.Error())
+		a.lease(wait + clientTimeout)
+		if !a.sleepUntil(ctx, a.o.Now().Add(wait)) {
+			return
+		}
 	}
 }
 
-// job fills res for w. doc is the spooled SBOM, when the cataloguer made one.
-func (a *agent) job(ctx, jctx context.Context, w wire.WorkRequest, res *wire.SBOMResult) (doc *sbomFile) {
+// job fills res for w, within jctx. doc is the spooled SBOM, when the cataloguer made one. When the agent
+// stops during the job, runJob answers skipped, whatever res says.
+func (a *agent) job(jctx context.Context, w wire.WorkRequest, res *wire.SBOMResult) (doc *sbomFile) {
 	if a.store == nil {
 		res.Unavailable = wire.UnavailableNotFound
 		return nil
 	}
 	t, err := a.store.Resolve(jctx, w.Digest, w.Platform)
 	if err != nil {
-		a.stagingFailed(ctx, w, err, res)
+		a.stagingFailed(w, err, res)
 		return nil
 	}
 	dir := a.workDir(w.ID)
 	defer func() { _ = os.RemoveAll(dir) }()
 	maxImage := a.maxImageBytes()
 	if err := a.store.Stage(jctx, t, dir, maxImage); err != nil {
-		a.stagingFailed(ctx, w, err, res)
+		a.stagingFailed(w, err, res)
 		return nil
 	}
 	timeout := int(w.Deadline.Sub(a.o.Now()) / time.Second)
@@ -128,8 +157,6 @@ func (a *agent) job(ctx, jctx context.Context, w wire.WorkRequest, res *wire.SBO
 		var se *catalog.ScratchError
 		kind, msg := workErrorOf(err)
 		switch {
-		case ctx.Err() != nil: // the agent is stopping: not the image's fault
-			res.Unavailable = wire.UnavailableSkipped
 		case errors.As(err, &se):
 			a.o.Log.Error(err, "spooling an SBOM to scratch; the controller will offer the work again", "id", w.ID,
 				"digest", w.Digest)
@@ -154,10 +181,8 @@ func (a *agent) spoolPath(dir string) string {
 }
 
 // stagingFailed maps a Resolve or Stage error onto res.
-func (a *agent) stagingFailed(ctx context.Context, w wire.WorkRequest, err error, res *wire.SBOMResult) {
+func (a *agent) stagingFailed(w wire.WorkRequest, err error, res *wire.SBOMResult) {
 	switch {
-	case ctx.Err() != nil: // the agent is stopping
-		res.Unavailable = wire.UnavailableSkipped
 	case errors.Is(err, contentstore.ErrScratch):
 		a.o.Log.Error(err, "staging an image in scratch; the controller will offer the work again", "id", w.ID,
 			"digest", w.Digest)

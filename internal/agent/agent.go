@@ -429,12 +429,17 @@ func (a *agent) probe(ctx context.Context) error {
 	return nil
 }
 
-// answered records the controller's answer to r.
+// answered records the controller's answer to r. An applied full report without Images (its content-store
+// scan failed) leaves the controller showing that the scan failed, so the next images report sends the list
+// again, even unchanged, which clears that within an image-list interval rather than at the next full report.
 func (a *agent) answered(now time.Time, r wire.Report, resp wire.ReportResponse) {
 	a.lastContact = now
 	a.adopt(resp.Config)
-	if resp.Applied && r.Images != nil {
+	switch {
+	case resp.Applied && r.Images != nil:
 		a.acceptedHash, a.accepted = imagesHash(r.Images), true
+	case resp.Applied && r.Kind == wire.KindFull:
+		a.acceptedHash, a.accepted = [sha256.Size]byte{}, false
 	}
 	if resp.Applied {
 		a.unapplied = 0
@@ -470,16 +475,12 @@ func (a *agent) logFailure(err error, msg string, kv ...any) {
 }
 
 // keepHostAfter reports whether a full report whose send failed with err keeps its host inventory for the
-// resend: when the controller deferred it (429) or failed (5xx), or did not answer at all (a network error).
-// Any other answer (400, 401, 403, 413) would refuse the same inventory again, and a report that could not be
-// encoded would fail again, so the inventory is dropped and collected afresh for the next report.
-func keepHostAfter(err error) bool {
-	var se *StatusError
-	if errors.As(err, &se) {
-		return se.Code == http.StatusTooManyRequests || se.Code >= http.StatusInternalServerError
-	}
-	return !errors.Is(err, errEncoding)
-}
+// resend: only when the failure may pass (transient), because the controller did not answer (a network error,
+// a refused connection, a timeout) or deferred (429) or failed (5xx) the report. Any other answer (400, 401,
+// 403, 413) would refuse the same inventory again, and a report that could not be encoded, a spooled host SBOM
+// that cannot be opened, or a token or CA bundle that cannot be read would fail the same way again, so the
+// inventory is dropped and collected afresh for the next report.
+func keepHostAfter(err error) bool { return transient(err) }
 
 // controllerUnavailable reports whether err means the controller is not (yet) taking reports.
 func controllerUnavailable(err error) bool {

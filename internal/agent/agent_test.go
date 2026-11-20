@@ -54,13 +54,18 @@ type fakeController struct {
 	reports chan wire.Report
 	sboms   chan wire.SBOMResult
 
-	mu      sync.Mutex
-	config  func() (int, wire.AgentConfig)
-	answer  func(r wire.Report) (int, wire.ReportResponse)
-	headers func(r wire.Report) http.Header // extra headers of the report answer; nil: none
-	events  []string                        // "config", the report kinds and "sbom:<id>", in arrival order
-	times   []time.Time                     // when each event arrived
+	mu        sync.Mutex
+	config    func() (int, wire.AgentConfig)
+	answer    func(r wire.Report) (int, wire.ReportResponse)
+	headers   func(r wire.Report) http.Header // extra headers of the report answer; nil: none
+	events    []string                        // "config", the report kinds and "sbom:<id>", in arrival order
+	times     []time.Time                     // when each event arrived
+	sbomFails []int                           // answers to the next SBOM results instead of taking them: a status or dropConnection
+	workIDs   []string                        // the wire.HeaderWorkID of each SBOM result, in arrival order
 }
+
+// dropConnection, as an SBOM result's answer, drops the request without an answer.
+const dropConnection = -1
 
 func newFakeController(t *testing.T, caFile string) *fakeController {
 	t.Helper()
@@ -110,7 +115,19 @@ func newFakeController(t *testing.T, caFile string) *fakeController {
 		}
 		c.mu.Lock()
 		c.record("sbom:" + res.ID)
+		c.workIDs = append(c.workIDs, r.Header.Get(wire.HeaderWorkID))
+		fail := 0
+		if len(c.sbomFails) > 0 {
+			fail, c.sbomFails = c.sbomFails[0], c.sbomFails[1:]
+		}
 		c.mu.Unlock()
+		switch {
+		case fail == dropConnection:
+			panic(http.ErrAbortHandler)
+		case fail != 0:
+			reply(w, fail, nil)
+			return
+		}
 		c.sboms <- res
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -139,6 +156,20 @@ func (c *fakeController) log() ([]string, []time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return slices.Clone(c.events), slices.Clone(c.times)
+}
+
+// failSBOMs answers the next SBOM results with answers, one each, instead of taking them.
+func (c *fakeController) failSBOMs(answers ...int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sbomFails = append(c.sbomFails, answers...)
+}
+
+// sentWorkIDs returns the wire.HeaderWorkID of each SBOM result so far.
+func (c *fakeController) sentWorkIDs() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.workIDs)
 }
 
 func (c *fakeController) setHeaders(f func(r wire.Report) http.Header) {
@@ -599,6 +630,41 @@ func TestRun_ScanErrorSendsImagesUnchanged(t *testing.T) {
 	require.GreaterOrEqual(t, i, 0, "%v", r.Problems)
 	require.Equal(t, storeHostPath, r.Problems[i].Path)
 	require.NotNil(t, r.Host)
+}
+
+// TestImagesReport_ResendsTheListAfterAFailedScan: a full report whose content-store scan failed leaves the
+// controller showing that, so the next images report sends the list again, unchanged as it is, and the
+// controller clears it within an image-list interval, not at the next full report.
+func TestImagesReport_ResendsTheListAfterAFailedScan(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	s := &schedule{}
+	a.fullReport(ctx, s)
+	r := e.ctl.next(t)
+	require.NotNil(t, r.Images)
+	a.imagesReport(ctx, s)
+	require.Nil(t, e.ctl.next(t).Images, "unchanged since the list the controller applied")
+
+	blobs := filepath.Join(e.storeDir(), "blobs", "sha256")
+	require.NoError(t, os.Rename(blobs, blobs+".away"))
+	writeTestFile(t, blobs, []byte("not a directory")) // the scan fails
+	a.fullReport(ctx, s)
+	r = e.ctl.next(t)
+	require.Equal(t, wire.KindFull, r.Kind)
+	require.Nil(t, r.Images, "the scan failed")
+	require.True(t, slices.ContainsFunc(r.Problems, func(p wire.Problem) bool { return p.Code == wire.ProblemContentStore }))
+
+	require.NoError(t, os.Remove(blobs))
+	require.NoError(t, os.Rename(blobs+".away", blobs))
+	a.imagesReport(ctx, s)
+	r = e.ctl.next(t)
+	require.NotNil(t, r.Images, "the unchanged list is sent again after the failed scan")
+	require.Len(t, r.Images.Digests, 1)
+	require.Equal(t, e.manifest, r.Images.Digests[0].Digest)
+	a.imagesReport(ctx, s)
+	require.Nil(t, e.ctl.next(t).Images, "and not again once the controller applied it")
 }
 
 func TestNewAgent_ScratchDirReadableByCataloguer(t *testing.T) {

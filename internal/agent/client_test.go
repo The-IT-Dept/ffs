@@ -11,13 +11,17 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -298,4 +302,63 @@ func TestClient_StatusErrorCarriesRetryAfter(t *testing.T) {
 	var se *StatusError
 	require.ErrorAs(t, err, &se)
 	require.Equal(t, &StatusError{Code: http.StatusTooManyRequests, RetryAfter: 17 * time.Second}, se)
+}
+
+// sendErrors are the errors of a real client failing before the controller answers: the CA bundle, the token
+// or a spooled SBOM cannot be read, or the controller refuses the connection.
+type sendErrors struct{ ca, token, spool, refused error }
+
+func clientSendErrors(t *testing.T) sendErrors {
+	t.Helper()
+	ctx := context.Background()
+	ln, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	closed := "https://" + ln.Addr().String()
+	require.NoError(t, ln.Close())
+	dir := t.TempDir()
+	caFile, tokenFile := filepath.Join(dir, "ca.crt"), filepath.Join(dir, "token")
+	var errs sendErrors
+
+	c, err := NewClient(closed, caFile, tokenFile)
+	require.NoError(t, err)
+	_, errs.ca = c.Config(ctx)
+	require.ErrorContains(t, errs.ca, "reading the controller CA")
+	writeTestFile(t, caFile, newCA(t, "ca").pem)
+	_, errs.token = c.Config(ctx)
+	require.ErrorContains(t, errs.token, "reading the agent token")
+	writeTestFile(t, tokenFile, []byte("tok"))
+	errs.spool = c.SBOM(ctx, wire.SBOMResult{ID: "w1"}, &sbomFile{path: filepath.Join(dir, "gone.json"), size: 2})
+	require.ErrorContains(t, errs.spool, "opening the spooled SBOM")
+	_, errs.refused = c.Config(ctx)
+	require.ErrorIs(t, errs.refused, syscall.ECONNREFUSED)
+	return errs
+}
+
+// TestTransient: a request is worth sending again when the controller did not answer or answered 429 or 5xx;
+// not after any other answer, nor when the agent could not read what it sends.
+func TestTransient(t *testing.T) {
+	sent := clientSendErrors(t)
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"429":                     {&StatusError{Code: http.StatusTooManyRequests, RetryAfter: time.Second}, true},
+		"500":                     {&StatusError{Code: http.StatusInternalServerError}, true},
+		"503":                     {fmt.Errorf("sending: %w", &StatusError{Code: http.StatusServiceUnavailable}), true},
+		"connection refused":      {sent.refused, true},
+		"bare connection refused": {syscall.ECONNREFUSED, true},
+		"dial timeout":            {&net.OpError{Op: "dial", Net: "tcp", Err: errors.New("i/o timeout")}, true},
+		"dropped connection":      {&url.Error{Op: "Post", URL: "https://ffs-agent-api.ffs.svc:8444/agent/v1/sbom", Err: io.EOF}, true},
+		"deadline":                {fmt.Errorf("sending: %w", context.DeadlineExceeded), true},
+		"400":                     {&StatusError{Code: http.StatusBadRequest}, false},
+		"401":                     {&StatusError{Code: http.StatusUnauthorized}, false},
+		"403":                     {&StatusError{Code: http.StatusForbidden}, false},
+		"413":                     {&StatusError{Code: http.StatusRequestEntityTooLarge}, false},
+		"CA unreadable":           {sent.ca, false},
+		"token unreadable":        {sent.token, false},
+		"spooled SBOM gone":       {sent.spool, false},
+		"answer not decoded":      {fmt.Errorf("decoding the controller's answer: %w", errors.New("unexpected EOF")), false},
+	} {
+		require.Equal(t, tc.want, transient(tc.err), "%s: %v", name, tc.err)
+	}
 }
