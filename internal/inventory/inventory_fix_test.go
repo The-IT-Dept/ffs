@@ -288,3 +288,75 @@ func TestSyncAll_ExpiredUnresolvableViaIndexRetried(t *testing.T) {
 	require.NoError(t, h.inv.SyncAll(ctx))
 	require.Equal(t, []string{mA, mA}, h.acq.digests())
 }
+
+// TestFlush_QuarantineRetriedInSameProcess (R1): an image handed to the acquirer that the acquirer
+// then quarantines is handed back once the quarantine ends, by the same process and without its
+// owner changing in between: the RetryPoll flush of the owners the store lists is enough.
+func TestFlush_QuarantineRetriedInSameProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status model.ImageStatus
+		retry  time.Duration
+	}{
+		{"catalogFailed", model.ImageCatalogFailed, 24 * time.Hour},
+		{"unresolvable", model.ImageUnresolvable, 6 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, newNode("n1", "amd64"), newPod("web", "n1", nil, "nginx:1.27", nginx+"@"+mA))
+			h.res.platforms[mA+"|linux/amd64"] = registryManifest(mA, "", "linux/amd64")
+			require.NoError(t, h.inv.SyncAll(ctx))
+			require.Equal(t, []string{mA}, h.acq.digests())
+
+			// The acquirer's attempt fails a little later and quarantines the image.
+			h.now = t0.Add(2 * time.Minute)
+			require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: mA, Repo: nginx, Platform: "linux/amd64",
+				Status: tc.status, StatusReason: "failed", Attempts: 2, QuarantinedUntil: h.now.Add(tc.retry)}))
+
+			// Nothing flushes the owner during the quarantine. Once it has ended, the store lists
+			// the owner and its flush hands the image back.
+			h.now = h.now.Add(tc.retry + time.Second)
+			keys, err := h.st.OwnersOfExpiredQuarantine(ctx, h.now)
+			require.NoError(t, err)
+			require.Equal(t, []string{"Pod/apps/web"}, keys)
+			require.NoError(t, h.inv.Flush(ctx, keys))
+			require.Equal(t, []string{mA, mA}, h.acq.digests())
+
+			// Not again while that retry is outstanding, however often the owner is flushed.
+			h.now = h.now.Add(time.Hour)
+			require.NoError(t, h.inv.Flush(ctx, keys))
+			require.Equal(t, []string{mA, mA}, h.acq.digests())
+
+			// A retry that fails again is retried again when its new quarantine ends, also when the
+			// owner was flushed during it.
+			require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: mA, Repo: nginx, Platform: "linux/amd64",
+				Status: tc.status, StatusReason: "failed", Attempts: 3, QuarantinedUntil: h.now.Add(tc.retry)}))
+			h.now = h.now.Add(time.Hour)
+			require.NoError(t, h.inv.Flush(ctx, keys))
+			require.Equal(t, []string{mA, mA}, h.acq.digests())
+			h.now = h.now.Add(tc.retry)
+			require.NoError(t, h.inv.Flush(ctx, keys))
+			require.Equal(t, []string{mA, mA, mA}, h.acq.digests())
+		})
+	}
+}
+
+// TestFlush_SideLoadedQuarantinedImageWaits (R1): a side-loaded image resolves through the registry
+// to a platform manifest the normaliser returns as pending. When the store holds a quarantine for
+// that manifest, the quarantine decides: nothing is handed off until it ends, then one request.
+func TestFlush_SideLoadedQuarantinedImageWaits(t *testing.T) {
+	h := newHarness(t, newNode("n1", "amd64"), newPod("web", "n1", nil, "nginx:1.27", cfg))
+	h.res.tags[nginx+":1.27"] = mA
+	h.res.platforms[mA+"|linux/amd64"] = registryManifest(mA, "", "linux/amd64")
+	h.res.configs[mA] = cfg
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: mA, Repo: nginx, Platform: "linux/amd64",
+		Status: model.ImageCatalogFailed, StatusReason: "failed", Attempts: 2, QuarantinedUntil: t0.Add(time.Hour)}))
+
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.NoError(t, h.inv.Flush(ctx, []string{"Pod/apps/web"}))
+	require.Empty(t, h.acq.digests(), "quarantined")
+
+	h.now = t0.Add(time.Hour + time.Second)
+	require.NoError(t, h.inv.Flush(ctx, []string{"Pod/apps/web"}))
+	require.NoError(t, h.inv.Flush(ctx, []string{"Pod/apps/web"}))
+	require.Equal(t, []string{mA}, h.acq.digests())
+}

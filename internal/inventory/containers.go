@@ -340,9 +340,13 @@ func (inv *Inventory) unconfirmed(ctx context.Context, err error, lookup, repo s
 }
 
 // recordImage stores a new image row (or a refreshed unresolvable one) and collects an SBOM request
-// for an image this process has not yet handed to the acquirer: a pending one, or one whose
-// catalogFailed quarantine has ended (the retry spec §6.3 promises, which must survive a restart).
-
+// for an image that is not handed to the acquirer already: a pending one, or one whose catalogFailed
+// quarantine has ended (the retry spec §6.3 promises, which must survive a restart).
+//
+// What is outstanding is read from the store. A hand-off is outstanding until the stored row shows
+// a quarantine written after it (the acquirer's attempt failed: catalogFailed or unresolvable with
+// a later end), so an image the acquirer quarantined is handed back once that quarantine ends, by
+// this process and without its owner changing (the RetryPoll flushes the owners the store lists).
 func (inv *Inventory) recordImage(ctx context.Context, f *flushState, u use) error {
 	img := u.Image
 	if img.Digest == "" {
@@ -359,17 +363,33 @@ func (inv *Inventory) recordImage(ctx context.Context, f *flushState, u use) err
 			return err
 		}
 	}
+	if ok && !refreshed && quarantined(stored) && f.now.Before(stored.QuarantinedUntil) {
+		// Still quarantined, whatever the normaliser resolved (a side-loaded image resolves through
+		// the registry to a platform manifest the acquirer quarantined, say): nothing to hand off.
+		delete(inv.enqueued, img.Digest)
+		return nil
+	}
+	if at, handed := inv.enqueued[img.Digest]; handed && ok && quarantined(stored) && stored.QuarantinedUntil.After(at) {
+		delete(inv.enqueued, img.Digest) // the hand-off ended in a quarantine, which has ended too
+	}
 	due := img.Status == model.ImageCatalogFailed && !f.now.Before(img.QuarantinedUntil)
 	if img.Status != model.ImagePending && !due {
 		delete(inv.enqueued, img.Digest)
 		return nil
 	}
-	if !inv.enqueued[img.Digest] {
-		inv.enqueued[img.Digest] = true
+	if _, handed := inv.enqueued[img.Digest]; !handed {
+		inv.enqueued[img.Digest] = f.now
 		f.reqs = append(f.reqs, sbom.Request{Repo: img.Repo, Digest: img.Digest, IndexDigest: img.IndexDigest,
 			Platform: img.Platform, Creds: u.Creds})
 	}
 	return nil
+}
+
+// quarantined reports whether img holds a catalogFailed or unresolvable quarantine, ended or not.
+// An image is handed off only while it holds none in force, so a quarantine that ends after a
+// hand-off was written by an attempt that followed it.
+func quarantined(img model.Image) bool {
+	return img.Status == model.ImageCatalogFailed || img.Status == model.ImageUnresolvable
 }
 
 func hasImageID(p *corev1.Pod) bool {

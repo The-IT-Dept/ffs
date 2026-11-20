@@ -96,7 +96,7 @@ type Inventory struct {
 	flushMu      sync.Mutex
 	podOwner     map[string]model.OwnerRef      // pod key → owner
 	ownerPods    map[string]map[string]struct{} // owner key → pod keys
-	enqueued     map[string]bool                // pending digests this process has handed to the acquirer
+	enqueued     map[string]time.Time           // digests this process has handed to the acquirer → when
 	catalogRetry map[string]bool                // synthetic digests whose OnImageCatalogued failed
 	unreported   map[string]bool                // owner keys whose OnOwnersChanged failed
 
@@ -124,7 +124,7 @@ func New(o Options) *Inventory {
 		o.Now = time.Now
 	}
 	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
-		enqueued: map[string]bool{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
+		enqueued: map[string]time.Time{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
 		known: map[string]bool{}, templateBacked: map[string]bool{}}
 	inv.batch = newBatcher(o.Debounce, func(ctx context.Context, keys []string) {
 		if err := inv.Flush(ctx, keys); err != nil {
