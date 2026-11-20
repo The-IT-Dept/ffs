@@ -15,6 +15,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/anchore/syft/syft/artifact"
+	"github.com/anchore/syft/syft/file"
+	"github.com/anchore/syft/syft/linux"
+	"github.com/anchore/syft/syft/pkg"
+	syftsbom "github.com/anchore/syft/syft/sbom"
+	"github.com/anchore/syft/syft/source"
 	"github.com/stretchr/testify/require"
 	authenticationv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -23,6 +29,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/the-it-dept/ffs/internal/sbom"
+	"github.com/the-it-dept/ffs/internal/store"
 )
 
 var t0 = time.Date(2026, 11, 20, 0, 0, 0, 0, time.UTC)
@@ -45,6 +54,50 @@ func (c *clock) Add(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.now = c.now.Add(d)
+}
+
+func newStore(t *testing.T) *store.Store {
+	t.Helper()
+	st, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "ffs.db"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	return st
+}
+
+// syftDoc is a host syft-json document of pkgs (each given its ID), with one evident-by relationship from each
+// package to its first location, as the cataloguer produces.
+func syftDoc(t *testing.T, distro *linux.Release, pkgs ...pkg.Package) []byte {
+	t.Helper()
+	var rels []artifact.Relationship
+	for i := range pkgs {
+		pkgs[i].SetID()
+		if locs := pkgs[i].Locations.ToSlice(); len(locs) > 0 {
+			rels = append(rels, artifact.Relationship{From: pkgs[i], To: locs[0].Coordinates, Type: artifact.EvidentByRelationship})
+		}
+	}
+	doc := &syftsbom.SBOM{
+		Artifacts:     syftsbom.Artifacts{Packages: pkg.NewCollection(pkgs...), LinuxDistribution: distro},
+		Relationships: rels,
+		Source:        source.Description{ID: "host", Name: "host", Metadata: source.DirectoryMetadata{Path: "/"}},
+		Descriptor:    syftsbom.Descriptor{Name: "syft", Version: "1.57.2"},
+	}
+	b, err := sbom.EncodeSyftJSON(doc)
+	require.NoError(t, err)
+	return b
+}
+
+// debPkg is a dpkg package of the host.
+func debPkg(name, version string) pkg.Package {
+	return pkg.Package{Name: name, Version: version, Type: pkg.DebPkg, PURL: "pkg:deb/ubuntu/" + name + "@" + version,
+		Locations: file.NewLocationSet(file.NewLocation("/var/lib/dpkg/status")),
+		Metadata:  pkg.DpkgDBEntry{Package: name, Version: version, Architecture: "amd64"}}
+}
+
+// goPkg is a Go module found in the binary at path, whose main module is mainModule.
+func goPkg(name, version, path, mainModule string) pkg.Package {
+	return pkg.Package{Name: name, Version: version, Type: pkg.GoModulePkg, PURL: "pkg:golang/" + name + "@" + version,
+		Locations: file.NewLocationSet(file.NewLocation(path)),
+		Metadata:  pkg.GolangBinaryBuildinfoEntry{MainModule: mainModule, GoCompiledVersion: "go1.25.4", Architecture: "amd64"}}
 }
 
 // agentPod is a running pod on node whose containers report imageIDs.
