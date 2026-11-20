@@ -117,6 +117,10 @@ type Acquirer struct {
 	soloBusy  bool            // a solo job is running
 	transient map[string]int  // consecutive transient failures per digest
 	stopped   bool
+	ingesting map[string]bool // digests Ingest is storing
+
+	// ingested carries the digests Ingest stored to the one goroutine that matches them.
+	ingested chan string
 
 	catalogued, failed, quarantined atomic.Uint64
 }
@@ -145,7 +149,8 @@ func NewAcquirer(o AcquirerOptions) *Acquirer {
 		o.MatchTimeout = defaultMatchTimeout
 	}
 	a := &Acquirer{o: o, decode: semaphore.NewWeighted(MaxSBOMBytes), jobs: map[string]*job{},
-		running: map[*job]struct{}{}, solo: map[string]bool{}, transient: map[string]int{}}
+		running: map[*job]struct{}{}, solo: map[string]bool{}, transient: map[string]int{},
+		ingesting: map[string]bool{}, ingested: make(chan string, ingestQueue)}
 	a.cond = sync.NewCond(&a.mu)
 	return a
 }
@@ -205,7 +210,8 @@ func (a *Acquirer) Stats() AcquirerStats {
 }
 
 // Start runs the workers until ctx is done. At start and then hourly it matches again the
-// catalogued images whose match did not complete.
+// catalogued images whose match did not complete. The same goroutine matches the digests Ingest
+// stored, one at a time on ctx, so a match is detached from the request that delivered the SBOM.
 func (a *Acquirer) Start(ctx context.Context) error {
 	var wg sync.WaitGroup
 	for i := 0; i < a.o.Concurrency; i++ {
@@ -227,6 +233,8 @@ func (a *Acquirer) Start(ctx context.Context) error {
 				return
 			case <-t.C:
 				a.rematch(ctx)
+			case d := <-a.ingested:
+				a.matchIngested(ctx, d)
 			}
 		}
 	}()
@@ -339,6 +347,13 @@ type processed struct {
 func (a *Acquirer) process(ctx context.Context, j *job) (*Result, time.Duration, error) {
 	r := j.req
 	st := a.o.Store
+	a.mu.Lock()
+	ingesting := a.ingesting[r.Digest]
+	a.mu.Unlock()
+	if ingesting {
+		// Ingest is storing an agent SBOM for the digest: try again once it is done, uncounted.
+		return nil, a.transientDelay(ctx, r.Digest), &AcquireError{Kind: FailTransient, Reason: reasonInProgress}
+	}
 	img, ok, err := st.GetImage(ctx, r.Digest)
 	if err != nil {
 		return nil, a.transientDelay(ctx, r.Digest), err
@@ -346,6 +361,8 @@ func (a *Acquirer) process(ctx context.Context, j *job) (*Result, time.Duration,
 	now := a.o.Now()
 	if ok {
 		switch {
+		case r.Supersede && img.Status == model.ImageCatalogued && img.Source == SourceAgent:
+			return a.supersede(ctx, img, r)
 		case img.Status == model.ImageCatalogued:
 			res, err := a.fromStore(ctx, img)
 			return res, 0, err
@@ -557,7 +574,8 @@ func (a *Acquirer) match(ctx context.Context, digest string) {
 }
 
 // rematch matches again every catalogued image whose match did not complete: the controller
-// stopped during it, or it failed.
+// stopped during it, or it failed. A digest being acquired or ingested is skipped; its own path
+// matches it.
 func (a *Acquirer) rematch(ctx context.Context) {
 	unmatched, err := a.o.Store.UnmatchedImages(ctx)
 	if err != nil {
@@ -572,6 +590,7 @@ func (a *Acquirer) rematch(ctx context.Context) {
 		}
 		a.mu.Lock()
 		_, busy := a.jobs[u.Digest]
+		busy = busy || a.ingesting[u.Digest]
 		a.mu.Unlock()
 		if !busy {
 			a.match(ctx, u.Digest)
