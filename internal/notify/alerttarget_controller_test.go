@@ -3,11 +3,13 @@ package notify_test
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -412,4 +414,51 @@ func TestTargetReconciler_StartupRetainLogsErrors(t *testing.T) {
 	require.NoError(t, h.r.StartupRetain(ctx), "a store error does not stop the manager")
 	require.Len(t, logged, 2)
 	assert.Contains(t, logged[1], "notify: retain")
+}
+
+// TestTargetReconciler_NamespaceGone pins F95's reconciler half: a target with a namespace
+// selector learns that a namespace is deleted (not found); one without a selector does not need
+// to, since spec.namespaces matches by name.
+func TestTargetReconciler_NamespaceGone(t *testing.T) {
+	h := newRecHarness(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "web", Labels: map[string]string{"team": "a"}}})
+	at := alertTarget("slack", "s")
+	assert.Nil(t, h.r.NamespaceGone(at))
+	at.Spec.Namespaces = []string{"prod"}
+	assert.Nil(t, h.r.NamespaceGone(at))
+
+	at.Spec.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "a"}}
+	gone := h.r.NamespaceGone(at)
+	require.NotNil(t, gone)
+	assert.False(t, gone("web"))
+	assert.True(t, gone("deleted"))
+}
+
+// TestBlockedRanges pins F98's ranges: the configured alertTargets.blockedCIDRs and the pod CIDRs
+// of every node in the cache, IPv4 and globally routable IPv6, with host bits cleared. A failed
+// node list leaves the configured ranges.
+func TestBlockedRanges(t *testing.T) {
+	node := func(name string, cidrs ...string) *corev1.Node {
+		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: corev1.NodeSpec{PodCIDRs: cidrs}}
+		if len(cidrs) > 0 {
+			n.Spec.PodCIDR = cidrs[0]
+		}
+		return n
+	}
+	c := fake.NewClientBuilder().WithScheme(newScheme(t)).WithObjects(
+		node("worker-1", "10.42.1.0/24", "2001:db8:42:1::/64"), node("cp-1", "2001:db8:42:2::5/64"), node("worker-2")).Build()
+	configured := []netip.Prefix{netip.MustParsePrefix("2001:db8:ffff::/48")}
+	got := notify.BlockedRanges(c, configured, logr.Discard())(ctx)
+	assert.ElementsMatch(t, []netip.Prefix{netip.MustParsePrefix("2001:db8:ffff::/48"), netip.MustParsePrefix("10.42.1.0/24"),
+		netip.MustParsePrefix("2001:db8:42:1::/64"), netip.MustParsePrefix("2001:db8:42:2::/64")}, got)
+
+	var logged []string
+	failing := interceptor.NewClient(c, interceptor.Funcs{
+		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
+			return errors.New("the server is currently unable to handle the request")
+		}})
+	got = notify.BlockedRanges(failing, configured, funcr.New(func(_, args string) { logged = append(logged, args) },
+		funcr.Options{}))(ctx)
+	assert.Equal(t, configured, got)
+	require.Len(t, logged, 1)
+	assert.Contains(t, logged[0], "pod CIDRs")
 }

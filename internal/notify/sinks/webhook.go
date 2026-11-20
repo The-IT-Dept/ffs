@@ -83,6 +83,9 @@ type wireData struct {
 	Summary      *wireSummary `json:"summary,omitempty"`
 	Feeds        []wireFeed   `json:"feeds,omitempty"`
 	DashboardURL string       `json:"dashboardUrl,omitempty"`
+	// Truncated counts the items left out of Items: a message lists at most notify.MaxItems, and
+	// its payload is kept within notify.MaxPayloadBytes.
+	Truncated int `json:"truncated"`
 }
 
 type wireItem struct {
@@ -101,6 +104,10 @@ type wireItem struct {
 	Observed    time.Time       `json:"observed,omitzero"`
 	Links       []string        `json:"links"`
 	Provisional bool            `json:"provisional"`
+	// TruncatedOwners and TruncatedPackages count the owners and packages left out to keep the
+	// payload within notify.MaxPayloadBytes; omitted when none were.
+	TruncatedOwners   int `json:"truncatedOwners,omitempty"`
+	TruncatedPackages int `json:"truncatedPackages,omitempty"`
 }
 
 type wireOwner struct {
@@ -127,6 +134,7 @@ type wireSuggestion struct {
 }
 
 type wireSummary struct {
+	Findings  int        `json:"findings"`
 	Workloads int        `json:"workloads"`
 	Counts    wireCounts `json:"counts"`
 }
@@ -161,12 +169,13 @@ func counts(m map[model.Priority]int) map[model.Priority]int {
 
 func wireOf(m notify.Message) wireData {
 	d := wireData{Kind: m.Kind, Cluster: m.Cluster, Target: m.TargetName, Title: m.Title,
-		DashboardURL: m.DashboardURL, Items: make([]wireItem, 0, len(m.Items))}
+		DashboardURL: m.DashboardURL, Items: make([]wireItem, 0, len(m.Items)), Truncated: m.Truncated}
 	for _, it := range m.Items {
 		wi := wireItem{Event: it.Event, AdvisoryID: it.AdvisoryID, Title: it.Title, Advisories: it.Grouped,
 			Priority: it.Priority, Reasons: nonNil(it.Reasons), FixedIn: nonNil(it.FixedIn), Links: nonNil(it.Links),
 			Owners: []wireOwner{}, NodeGroups: it.NodeGroups, Packages: []wirePackage{}, Published: it.Published,
-			Observed: it.Observed, Provisional: it.Provisional}
+			Observed: it.Observed, Provisional: it.Provisional, TruncatedOwners: it.TruncatedOwners,
+			TruncatedPackages: it.TruncatedPackages}
 		for _, o := range it.Owners {
 			wi.Owners = append(wi.Owners, wireOwner{Kind: o.Kind, Namespace: o.Namespace, Name: o.Name})
 		}
@@ -179,7 +188,7 @@ func wireOf(m notify.Message) wireData {
 		d.Items = append(d.Items, wi)
 	}
 	if s := m.Summary; s != nil {
-		d.Summary = &wireSummary{Workloads: s.Workloads, Counts: wireCounts{
+		d.Summary = &wireSummary{Findings: s.Findings, Workloads: s.Workloads, Counts: wireCounts{
 			Urgent: s.Counts[model.PriorityUrgent], High: s.Counts[model.PriorityHigh],
 			Medium: s.Counts[model.PriorityMedium], Low: s.Counts[model.PriorityLow]}}
 	}

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -29,12 +30,31 @@ const (
 type Poster struct {
 	direct, proxied *http.Client
 	allowPrivate    bool
-	// lookup resolves the destination host before sending; nil skips the check (tests only).
+	// lookup resolves the destination host before a direct send; nil skips the check (tests only).
 	lookup func(ctx context.Context, host string) ([]netip.Addr, error)
+	// proxy picks the proxy for a request, nil for none: http.ProxyFromEnvironment, or nil in tests
+	// that always go direct.
+	proxy func(*http.Request) (*url.URL, error)
+	// blocked returns the ranges refused besides the built-in private ones; nil means none. Each
+	// send reads it once and keeps the result in dialBlocked for the dial guard.
+	blocked     func(ctx context.Context) []netip.Prefix
+	dialBlocked atomic.Pointer[[]netip.Prefix]
 }
 
 // NewPoster returns a Poster. allowPrivate lets it reach private and carrier-grade NAT addresses.
-func NewPoster(allowPrivate bool) *Poster {
+func NewPoster(allowPrivate bool) *Poster { return newPoster(allowPrivate, nil) }
+
+// newPoster returns a Poster that also refuses, unless allowPrivate is set, the ranges blocked
+// returns.
+func newPoster(allowPrivate bool, blocked func(ctx context.Context) []netip.Prefix) *Poster {
+	p := &Poster{
+		allowPrivate: allowPrivate,
+		lookup: func(ctx context.Context, host string) ([]netip.Addr, error) {
+			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		},
+		proxy:   http.ProxyFromEnvironment,
+		blocked: blocked,
+	}
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(_, address string, _ syscall.RawConn) error {
@@ -46,22 +66,21 @@ func NewPoster(allowPrivate bool) *Poster {
 			if err != nil {
 				return err
 			}
-			return CheckAddr(a, allowPrivate)
+			var extra []netip.Prefix
+			if b := p.dialBlocked.Load(); b != nil {
+				extra = *b
+			}
+			return CheckAddr(a, allowPrivate, extra...)
 		},
 	}
 	redirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &Poster{
-		direct: &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
-			Transport: &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 10 * time.Second,
-				IdleConnTimeout: idleConnTimeout}},
-		proxied: &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
-			Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, TLSHandshakeTimeout: 10 * time.Second,
-				IdleConnTimeout: idleConnTimeout}},
-		allowPrivate: allowPrivate,
-		lookup: func(ctx context.Context, host string) ([]netip.Addr, error) {
-			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-		},
-	}
+	p.direct = &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
+		Transport: &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 10 * time.Second,
+			IdleConnTimeout: idleConnTimeout}}
+	p.proxied = &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
+		Transport: &http.Transport{Proxy: func(r *http.Request) (*url.URL, error) { return p.proxy(r) },
+			TLSHandshakeTimeout: 10 * time.Second, IdleConnTimeout: idleConnTimeout}}
+	return p
 }
 
 // CloseIdleConnections closes the Poster's idle kept-alive connections; a send under way finishes.
@@ -87,18 +106,37 @@ func (p *Poster) Post(ctx context.Context, rawURL, contentType string, body []by
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("User-Agent", version.UserAgent())
 
-	client := p.direct
-	if proxy, _ := http.ProxyFromEnvironment(req); proxy != nil {
-		client = p.proxied
+	client, proxied := p.direct, false
+	if p.proxy != nil {
+		if u, _ := p.proxy(req); u != nil {
+			client, proxied = p.proxied, true
+		}
 	}
-	if p.lookup != nil {
+	var blocked []netip.Prefix
+	if p.blocked != nil {
+		blocked = p.blocked(ctx)
+		p.dialBlocked.Store(&blocked)
+	}
+	refuse := func(err error) error {
+		return &notify.DeliveryError{Permanent: true, Msg: fmt.Sprintf("%s: %v", host, err)}
+	}
+	switch {
+	case proxied:
+		// The proxy resolves the host, and the cluster may have no DNS for it: only an address
+		// literal is checked here.
+		if a, err := netip.ParseAddr(host); err == nil {
+			if err := CheckAddr(a, p.allowPrivate, blocked...); err != nil {
+				return refuse(err)
+			}
+		}
+	case p.lookup != nil:
 		addrs, err := p.lookup(ctx, host)
 		if err != nil {
 			return transportError(host, err)
 		}
 		for _, a := range addrs {
-			if err := CheckAddr(a, p.allowPrivate); err != nil {
-				return &notify.DeliveryError{Permanent: true, Msg: fmt.Sprintf("%s: %v", host, err)}
+			if err := CheckAddr(a, p.allowPrivate, blocked...); err != nil {
+				return refuse(err)
 			}
 		}
 	}

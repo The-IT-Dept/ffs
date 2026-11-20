@@ -38,11 +38,12 @@ func textBlock(text string, extra map[string]any) map[string]any {
 	return b
 }
 
-// teamsPayload builds an Adaptive Card message, dropping trailing advisories until it fits.
+// teamsPayload builds an Adaptive Card message, dropping trailing advisories until it fits. Text
+// from feeds, images and advisories is escaped, so its markdown shows as written.
 func teamsPayload(m notify.Message) map[string]any {
-	items, _ := capItems(m.Items)
+	items, _ := capItems(m)
 	for n := len(items); ; n-- {
-		p := teamsCard(m, items[:n], len(m.Items)-n)
+		p := teamsCard(m, items[:n], len(m.Items)-n+m.Truncated)
 		b, err := json.Marshal(p)
 		if err != nil || len(b) <= teamsMaxBytes || n == 0 {
 			return p
@@ -51,14 +52,14 @@ func teamsPayload(m notify.Message) map[string]any {
 }
 
 func teamsCard(m notify.Message, items []notify.Item, hidden int) map[string]any {
-	body := []any{textBlock(m.Title, map[string]any{"weight": "Bolder", "size": "Medium"})}
-	if extra := extraLines(m); len(extra) > 0 {
+	body := []any{textBlock(escapeMarkdown(m.Title), map[string]any{"weight": "Bolder", "size": "Medium"})}
+	if extra := extraLines(m, escapeMarkdown); len(extra) > 0 {
 		body = append(body, textBlock(strings.Join(extra, "\n\n"), nil))
 	}
 	for _, it := range items {
-		body = append(body, textBlock(heading(it), map[string]any{"weight": "Bolder", "separator": true}))
-		body = append(body, textBlock(strings.Join(itemLines(it), "\n\n"), nil))
-		if owners, extra := ownerLines(it); len(owners) > 0 {
+		body = append(body, textBlock(heading(it, escapeMarkdown), map[string]any{"weight": "Bolder", "separator": true}))
+		body = append(body, textBlock(strings.Join(itemLines(it, escapeMarkdown), "\n\n"), nil))
+		if owners, extra := ownerLines(it, escapeMarkdown); len(owners) > 0 {
 			for i, o := range owners {
 				owners[i] = "- " + o
 			}

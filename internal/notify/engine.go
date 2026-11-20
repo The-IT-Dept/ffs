@@ -6,7 +6,6 @@ package notify
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
@@ -577,14 +576,12 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 	}
 	var open []model.Finding
 	var ledger []store.LedgerEntry
-	counts := map[model.Priority]int{}
 	ids := map[string]bool{}
 	for _, f := range all {
 		if !t.cfg.allows(f.Owner.Namespace) || (!nodesReady && isNodes(f.Owner)) {
 			continue
 		}
 		open = append(open, f)
-		counts[f.Priority]++
 		ids[f.AdvisoryID] = true
 		ledger = append(ledger, store.LedgerEntry{Target: uid, Fingerprint: f.Fingerprint, MaxPriority: f.Priority,
 			LastState: model.StateOpen, UpdatedAt: now})
@@ -602,10 +599,11 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 		}
 		c.NodesBaselineAt = nodesBaselineAt(now, ns.BaselineReadyAt)
 	}
+	sum := summarise(open)
 	m := e.message(t, KindBaseline, strconv.FormatInt(maxID, 10),
-		baselineTitle(n, counts[model.PriorityUrgent], counts[model.PriorityHigh]), now)
+		baselineTitle(n, sum.Counts[model.PriorityUrgent], sum.Counts[model.PriorityHigh]), now)
 	m.Items = b.baselineItems(open)
-	m.Summary = &Summary{Workloads: n, Counts: counts}
+	m.Summary = sum
 	d, err := delivery(m, now)
 	if err != nil {
 		return err
@@ -662,11 +660,12 @@ func (e *Engine) message(t *target, kind Kind, key, title string, now time.Time)
 		Title: title, DashboardURL: e.o.DashboardURL, At: now}
 }
 
-// delivery wraps m as a pending delivery to its target, not sent before notBefore. The outbox
-// sends by creation time, then ID, and the messages of one pass share its time, m.At; the
-// delivery is created sendRank(m) nanoseconds after it, so a pass's messages go out by priority.
+// delivery wraps m as a pending delivery to its target, not sent before notBefore. Its payload is
+// m cut to MaxItems items and MaxPayloadBytes (see encodePayload). The outbox sends by creation
+// time, then ID, and the messages of one pass share its time, m.At; the delivery is created
+// sendRank(m) nanoseconds after it, so a pass's messages go out by priority.
 func delivery(m Message, notBefore time.Time) (store.Delivery, error) {
-	payload, err := json.Marshal(m)
+	payload, err := encodePayload(m)
 	if err != nil {
 		return store.Delivery{}, fmt.Errorf("encode message: %w", err)
 	}

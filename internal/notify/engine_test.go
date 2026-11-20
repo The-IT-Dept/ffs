@@ -287,6 +287,7 @@ func TestNotify_BaselineOnFirstSight(t *testing.T) {
 	assert.Len(t, m.Items[0].Owners, 2)
 	assert.LessOrEqual(t, len(m.Items), 10)
 	require.NotNil(t, m.Summary)
+	assert.Equal(t, 4, m.Summary.Findings)
 	assert.Equal(t, 3, m.Summary.Workloads)
 	assert.Equal(t, map[model.Priority]int{urgent: 2, high: 1, medium: 1}, m.Summary.Counts)
 	assert.Equal(t, "ops", m.TargetName)
@@ -560,6 +561,50 @@ func TestNotify_NamespaceFilter(t *testing.T) {
 	imm := h.sink.ofKind(notify.KindImmediate)
 	require.Len(t, imm, 1)
 	assert.Equal(t, "CVE-2026-0003", imm[0].Items[0].AdvisoryID)
+}
+
+// TestNotify_DeletedNamespaceLetsResolutionsThrough pins F95: for a target limited by a namespace
+// selector, a deleted namespace no longer matches, but the resolutions of findings sent from it
+// still go out, immediately or in the digest, and close their ledger entries. New findings there
+// are not sent.
+func TestNotify_DeletedNamespaceLetsResolutionsThrough(t *testing.T) {
+	h := newHarness(t)
+	deleted := false
+	h.target("ops", func(c *notify.TargetConfig) {
+		c.NamespaceMatch = func(ns string) bool { return ns == "team-a" && !deleted }
+		c.NamespaceGone = func(ns string) bool { return ns == "team-a" && deleted }
+	})
+	h.process() // baseline
+
+	u := h.open(dep("team-a", "web"), "CVE-2026-0001", urgent) // sent immediately
+	m := h.open(dep("team-a", "api"), "CVE-2026-0002", medium) // sent in the digest
+	h.process()
+	assert.Equal(t, []string{"CVE-2026-0001"}, advisories(h.sink.ofKind(notify.KindImmediate)))
+	h.at("2026-11-19T09:00Z")
+	h.process()
+	assert.Equal(t, []string{"CVE-2026-0002"}, ids(h.sink.lastOfKind(notify.KindDigest), notify.EventDetected))
+
+	deleted = true
+	h.at("2026-11-19T10:00Z")
+	h.move(u, model.StateResolved, urgent, model.TriggerInventoryChange)
+	h.move(m, model.StateResolved, medium, model.TriggerInventoryChange)
+	late := h.open(dep("team-a", "late"), "CVE-2026-0003", urgent)
+	h.process()
+	imm := h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 2, "the resolution, not the new finding")
+	assert.Equal(t, notify.EventResolved, imm[1].Items[0].Event)
+	assert.Equal(t, "CVE-2026-0001", imm[1].Items[0].AdvisoryID)
+
+	h.at("2026-11-20T09:00Z")
+	h.process()
+	d := h.sink.lastOfKind(notify.KindDigest)
+	assert.Equal(t, []string{"CVE-2026-0002"}, ids(d, notify.EventResolved))
+	assert.Empty(t, ids(d, notify.EventDetected))
+	l, err := h.st.Ledger(ctx, "uid-ops", []string{u, m, late})
+	require.NoError(t, err)
+	assert.Equal(t, model.StateResolved, l[u].LastState)
+	assert.Equal(t, model.StateResolved, l[m].LastState)
+	assert.NotContains(t, l, late)
 }
 
 func TestNotify_PausedAdvancesWithoutSending(t *testing.T) {

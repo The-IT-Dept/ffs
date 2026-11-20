@@ -53,6 +53,9 @@ type Message struct {
 	Feeds                      []FeedStatus
 	DashboardURL               string
 	At                         time.Time
+	// Truncated counts the items left out of Items to keep the message within MaxItems and
+	// MaxPayloadBytes: the last ones, which are the lowest priority. Title and Summary count them.
+	Truncated int
 }
 
 // Item is one advisory (or one Go standard library version) and the workloads it affects.
@@ -73,14 +76,31 @@ type Item struct {
 	// NodeGroups names the node groups a Nodes finding affects: sorted labels, at most
 	// maxNodeGroupNames, then "+N more".
 	NodeGroups []string
+	// TruncatedOwners and TruncatedPackages count the owners and packages left out of Owners and
+	// Packages to keep the message within MaxPayloadBytes.
+	TruncatedOwners, TruncatedPackages int
 
 	nodeGroupCount int // node groups in all, before NodeGroups is capped
 }
 
-// Summary counts what a baseline or digest covers.
+// Summary counts the findings a baseline or digest covers: how many, how many workloads they are
+// in, and how many at each priority.
 type Summary struct {
+	Findings  int
 	Workloads int
 	Counts    map[model.Priority]int
+}
+
+// summarise counts fs for a Summary.
+func summarise(fs []model.Finding) *Summary {
+	owners := map[string]bool{}
+	s := &Summary{Findings: len(fs), Counts: map[model.Priority]int{}}
+	for _, f := range fs {
+		owners[f.Owner.Key()] = true
+		s.Counts[f.Priority]++
+	}
+	s.Workloads = len(owners)
+	return s
 }
 
 // FeedStatus is the freshness of one feed.

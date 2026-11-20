@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"io"
 	"mime"
 	"net/http"
@@ -168,4 +169,47 @@ func TestWebhook_NodeGroups(t *testing.T) {
 	b, err := json.Marshal(wireOf(immediate(2)))
 	require.NoError(t, err)
 	assert.NotContains(t, string(b), "nodeGroups", "omitted for workload items, so the golden payload is unchanged")
+}
+
+// TestWebhook_TruncatedAndFindings pins the webhook schema of F92 and F97: data.truncated counts
+// the items left out (0 when none), items carry truncatedOwners and truncatedPackages when some
+// were left out, and the summary has findings.
+func TestWebhook_TruncatedAndFindings(t *testing.T) {
+	m := digest(1)
+	m.Truncated = 3
+	m.Items[0].TruncatedOwners, m.Items[0].TruncatedPackages = 2, 1
+	m.Summary.Findings = 9
+	var ce struct {
+		Data struct {
+			Truncated int
+			Items     []map[string]any
+			Summary   struct{ Findings, Workloads int }
+		}
+	}
+	require.NoError(t, json.Unmarshal(send(t, m).body, &ce))
+	assert.Equal(t, 3, ce.Data.Truncated)
+	assert.EqualValues(t, 2, ce.Data.Items[0]["truncatedOwners"])
+	assert.EqualValues(t, 1, ce.Data.Items[0]["truncatedPackages"])
+	assert.Equal(t, 9, ce.Data.Summary.Findings)
+	assert.Equal(t, 7, ce.Data.Summary.Workloads)
+
+	var raw struct{ Data map[string]any }
+	require.NoError(t, json.Unmarshal(send(t, immediate(2)).body, &raw))
+	assert.EqualValues(t, 0, raw.Data["truncated"])
+	assert.NotContains(t, raw.Data["items"].([]any)[0], "truncatedOwners")
+}
+
+// TestWebhook_BodyTracksStoredPayload pins the other half of F92: the webhook body of a message
+// is no larger than its stored payload, which notify caps at MaxPayloadBytes, plus the envelope,
+// so a receiver's request size limit is not reached by our size.
+func TestWebhook_BodyTracksStoredPayload(t *testing.T) {
+	m := digest(0)
+	for len(m.Items) < 60 {
+		m.Items = append(m.Items, item(fmt.Sprintf("CVE-2026-%04d", len(m.Items)), 40))
+	}
+	stored, err := json.Marshal(m)
+	require.NoError(t, err)
+	require.LessOrEqual(t, len(stored), notify.MaxPayloadBytes)
+	body := send(t, m).body
+	assert.LessOrEqual(t, len(body), len(stored)+1024)
 }

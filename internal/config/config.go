@@ -36,6 +36,7 @@ type Config struct {
 	OpenReports    OpenReportsConfig `yaml:"openReports"`
 	Exceptions     ExceptionsConfig  `yaml:"exceptions"`
 	Retention      RetentionConfig   `yaml:"retention"`
+	AlertTargets   AlertTargetConfig `yaml:"alertTargets"`
 	Upgrades       UpgradesConfig    `yaml:"upgrades"`
 	NodeAgent      NodeAgentConfig   `yaml:"nodeAgent"`
 }
@@ -308,6 +309,7 @@ func (c Config) Validate() error {
 		}
 	}
 	c.NodeAgent.validate(bad)
+	c.AlertTargets.validate(bad)
 	return errors.Join(errs...)
 }
 

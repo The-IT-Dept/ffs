@@ -6,6 +6,8 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -178,4 +180,41 @@ func TestPoster_IdleConnections(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		require.Fail(t, "the idle connection is still open")
 	}
+}
+
+// TestPoster_ProxySkipsLookup pins F96: through a proxy the endpoint's host is not resolved
+// first (the proxy resolves it, and the cluster may have no DNS for it); an address literal is
+// still checked. Sent directly, the host is resolved and checked first.
+func TestPoster_ProxySkipsLookup(t *testing.T) {
+	var proxied atomic.Int32
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxied.Add(1)
+		assert.Equal(t, "hooks.example.invalid", r.Host)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer proxy.Close()
+	proxyURL, err := url.Parse(proxy.URL)
+	require.NoError(t, err)
+
+	p := NewPoster(false)
+	var lookups atomic.Int32
+	p.lookup = func(context.Context, string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		return nil, &net.DNSError{Err: "no such host", Name: "hooks.example.invalid", IsNotFound: true}
+	}
+	p.proxy = func(*http.Request) (*url.URL, error) { return proxyURL, nil }
+	require.NoError(t, p.Post(context.Background(), "http://hooks.example.invalid/hook", "application/json", []byte("{}"), nil))
+	assert.EqualValues(t, 1, proxied.Load())
+	assert.Zero(t, lookups.Load(), "no lookup on the proxy path")
+
+	err = p.Post(context.Background(), "http://10.0.0.1/hook", "application/json", []byte("{}"), nil)
+	require.Error(t, err)
+	assert.True(t, deliveryErr(t, err).Permanent, "an address literal is still checked")
+	assert.EqualValues(t, 1, proxied.Load())
+
+	p.proxy = func(*http.Request) (*url.URL, error) { return nil, nil } // NO_PROXY, or no proxy at all
+	err = p.Post(context.Background(), "http://hooks.example.invalid/hook", "application/json", []byte("{}"), nil)
+	require.Error(t, err)
+	assert.EqualValues(t, 1, lookups.Load(), "resolved first when sent directly")
+	assert.False(t, deliveryErr(t, err).Permanent)
 }

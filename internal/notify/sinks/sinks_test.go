@@ -1,6 +1,7 @@
 package sinks
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/netip"
@@ -160,10 +161,10 @@ func TestTeams_DropsItemsToFit(t *testing.T) {
 
 func TestFormat_Lines(t *testing.T) {
 	assert.Equal(t, "Deployment/x", ownerLine(model.OwnerRef{Kind: "Deployment", Name: "x"}))
-	assert.Equal(t, "web 1 (no fix yet)", pkgLine(model.FindingPackage{Name: "web", Installed: "1"}))
+	assert.Equal(t, "web 1 (no fix yet)", pkgLine(model.FindingPackage{Name: "web", Installed: "1"}, plain))
 	assert.Equal(t, "Suggested: r:1 → 2 (minor), fixes 2 high, 1 medium, introduces none",
 		suggestionLine(&model.Suggestion{Repo: "r", FromTag: "1", ToTag: "2", Tier: model.TierMinor,
-			Fixes: map[model.Priority]int{model.PriorityMedium: 1, model.PriorityHigh: 2}}))
+			Fixes: map[model.Priority]int{model.PriorityMedium: 1, model.PriorityHigh: 2}}, plain))
 	assert.Equal(t, "Published 2026-11-17 03:04 UTC, seen by ffs 2026-11-19 03:04 UTC", timesLine(item("X", 1)))
 }
 
@@ -218,18 +219,88 @@ func TestFormat_TierNoneHasNoSuggestedLine(t *testing.T) {
 	it := item("CVE-2026-0001", 1)
 	it.Suggestion = &model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", Tier: model.TierNone,
 		Alternatives: []model.Suggestion{{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "2.0.0", Tier: model.TierMajor}}}
-	for _, l := range itemLines(it) {
+	for _, l := range itemLines(it, plain) {
 		assert.NotContains(t, l, "Suggested:")
 		assert.NotContains(t, l, "(none)")
 	}
 	it = item("CVE-2026-0001", 1)
-	assert.Contains(t, itemLines(it), "Suggested: docker.io/x/app:1.0 → 1.1 (patch), fixes 2 high, 1 medium, introduces none")
+	assert.Contains(t, itemLines(it, plain), "Suggested: docker.io/x/app:1.0 → 1.1 (patch), fixes 2 high, 1 medium, introduces none")
 }
 
 func TestFormat_NodeGroupsLine(t *testing.T) {
 	it := notify.Item{Priority: model.PriorityHigh, Event: notify.EventDetected, NodeGroups: []string{"a", "b", "c", "+2 more"}}
-	assert.Contains(t, itemLines(it), "Node groups: a, b, c, +2 more")
-	for _, l := range itemLines(item("CVE-2026-0001", 1)) {
+	assert.Contains(t, itemLines(it, plain), "Node groups: a, b, c, +2 more")
+	for _, l := range itemLines(item("CVE-2026-0001", 1), plain) {
 		assert.NotContains(t, l, "Node groups")
 	}
+}
+
+// TestSinks_CountWhatTheMessageLeftOut pins F92 in chat messages: the advisories and workloads a
+// message left out to stay within its caps are counted in the "and N more" lines.
+func TestSinks_CountWhatTheMessageLeftOut(t *testing.T) {
+	m := digest(25)
+	m.Truncated = 175
+	m.Items[0].TruncatedOwners = 70
+	m.Items[0].TruncatedPackages = 4
+
+	slackText := marshalMap(t, slackPayload(m))["text"].(string)
+	assert.Contains(t, slackText, "and 180 more advisories")
+	assert.Contains(t, slackText, "urgent priority, 100 workloads")
+	assert.Contains(t, marshalMap(t, discordPayload(m))["content"], "more advisories")
+	b, err := json.Marshal(teamsPayload(m))
+	require.NoError(t, err)
+	assert.Contains(t, string(b), "more advisories")
+
+	lines := itemLines(m.Items[0], plain)
+	assert.Contains(t, lines, "and 4 more packages")
+	_, extra := ownerLines(m.Items[0], plain)
+	assert.Equal(t, 90, extra) // 30 owners, 10 shown, and 70 the message left out
+}
+
+// TestFormat_SummaryCountsFindings pins F97's wording: "N findings in M workloads".
+func TestFormat_SummaryCountsFindings(t *testing.T) {
+	m := digest(1)
+	m.Summary = &notify.Summary{Findings: 5, Workloads: 3, Counts: map[model.Priority]int{model.PriorityUrgent: 2, model.PriorityHigh: 3}}
+	assert.Equal(t, "5 findings in 3 workloads: 2 urgent, 3 high", extraLines(m, plain)[0])
+	m.Summary = &notify.Summary{Findings: 1, Workloads: 1, Counts: map[model.Priority]int{model.PriorityLow: 1}}
+	assert.Equal(t, "1 finding in 1 workload: 1 low", extraLines(m, plain)[0])
+}
+
+// TestGuard_BlockedRanges pins F98 in the guard: a globally routable IPv6 pod CIDR and a configured
+// range are refused like private addresses, unless allowPrivate is set.
+func TestGuard_BlockedRanges(t *testing.T) {
+	podCIDR, configured := netip.MustParsePrefix("2001:db8:42:1::/64"), netip.MustParsePrefix("203.0.113.0/24")
+	for _, s := range []string{"2001:db8:42:1::10", "203.0.113.9"} {
+		a := netip.MustParseAddr(s)
+		err := CheckAddr(a, false, podCIDR, configured)
+		require.Error(t, err, s)
+		assert.Contains(t, err.Error(), "alertTargets.blockedCIDRs")
+		assert.NoError(t, CheckAddr(a, true, podCIDR, configured), s)
+		assert.NoError(t, CheckAddr(a, false), s)
+	}
+	assert.NoError(t, CheckAddr(netip.MustParseAddr("2001:db8:42:2::10"), false, podCIDR, configured))
+	assert.Error(t, CheckAddr(netip.MustParseAddr("::1"), true, podCIDR), "loopback stays refused")
+}
+
+// TestNew_SinkRefusesBlockedRanges pins F98 end to end in a sink: the ranges SinkConfig.Blocked
+// returns are refused before sending, permanently, and checked again when dialling.
+func TestNew_SinkRefusesBlockedRanges(t *testing.T) {
+	podCIDR := netip.MustParsePrefix("2001:db8:42:1::/64")
+	calls := 0
+	blocked := func(context.Context) []netip.Prefix { calls++; return []netip.Prefix{podCIDR} }
+	s, err := New("webhook", notify.SinkConfig{URL: "https://[2001:db8:42:1::10]/hook", SigningSecret: testSecret, Blocked: blocked})
+	require.NoError(t, err)
+	err = s.Send(context.Background(), immediate(1))
+	require.Error(t, err)
+	var de *notify.DeliveryError
+	require.ErrorAs(t, err, &de)
+	assert.True(t, de.Permanent)
+	assert.Contains(t, de.Msg, "alertTargets.blockedCIDRs")
+	assert.Equal(t, 1, calls, "read once per send")
+
+	p := newPoster(false, blocked)
+	p.lookup = nil // the dial guard alone must refuse
+	err = p.Post(context.Background(), "https://[2001:db8:42:1::10]/hook", "application/json", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alertTargets.blockedCIDRs")
 }

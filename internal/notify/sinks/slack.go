@@ -83,20 +83,20 @@ func slackContext(text string) map[string]any {
 }
 
 func slackPayload(m notify.Message) map[string]any {
-	items, hidden := capItems(m.Items)
+	items, hidden := capItems(m)
 	blocks := []any{map[string]any{"type": "header", "text": map[string]any{"type": "plain_text", "text": truncate(m.Title, slackHeaderMax)}}}
 	text := []string{m.Title}
 
-	if extra := extraLines(m); len(extra) > 0 {
+	if extra := extraLines(m, plain); len(extra) > 0 {
 		blocks = append(blocks, slackContext(slackEsc(strings.Join(extra, "\n"))))
 		text = append(text, extra...)
 	}
 	for _, it := range items {
-		lines := []string{"*" + slackEsc(heading(it)) + "*"}
-		for _, l := range itemLines(it) {
+		lines := []string{"*" + slackEsc(heading(it, plain)) + "*"}
+		for _, l := range itemLines(it, plain) {
 			lines = append(lines, slackEsc(l))
 		}
-		owners, extraOwners := ownerLines(it)
+		owners, extraOwners := ownerLines(it, plain)
 		for _, o := range owners {
 			lines = append(lines, "• "+slackEsc(o))
 		}
@@ -110,7 +110,7 @@ func slackPayload(m notify.Message) map[string]any {
 		if extraOwners > 0 {
 			blocks = append(blocks, slackContext(more(extraOwners, "workload", "workloads")))
 		}
-		text = append(text, fmt.Sprintf("- %s: %s priority, %s", heading(it), it.Priority, workloads(len(it.Owners))))
+		text = append(text, fmt.Sprintf("- %s: %s priority, %s", heading(it, plain), it.Priority, workloads(len(it.Owners)+it.TruncatedOwners)))
 	}
 	if hidden > 0 {
 		blocks = append(blocks, slackContext(more(hidden, "advisory", "advisories")))

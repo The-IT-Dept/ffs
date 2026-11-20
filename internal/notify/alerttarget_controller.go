@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strings"
 	"time"
@@ -41,6 +42,9 @@ const (
 type SinkConfig struct {
 	Name, URL, SigningSecret, Cluster string
 	AllowPrivate                      bool
+	// Blocked returns, on each send, the address ranges refused unless AllowPrivate is set, besides
+	// the built-in private ones; nil means none.
+	Blocked func(ctx context.Context) []netip.Prefix
 }
 
 // SinkFactory builds the sink for a target of type typ. Its errors must not contain the URL.
@@ -173,7 +177,9 @@ type TargetReconciler struct {
 	Namespace string
 	Cluster   string
 	NewSink   SinkFactory
-	Log       logr.Logger
+	// Blocked is passed to every sink as SinkConfig.Blocked.
+	Blocked func(ctx context.Context) []netip.Prefix
+	Log     logr.Logger
 }
 
 // Reconcile registers the AlertTarget req names, or forgets it when it is gone. A target that
@@ -231,7 +237,8 @@ func (r *TargetReconciler) register(ctx context.Context, at *ffsv1alpha1.AlertTa
 		}
 		return notReady("InvalidSpec", err.Error())
 	}
-	sc.Cluster = r.Cluster
+	cfg.NamespaceGone = r.namespaceGone(at)
+	sc.Cluster, sc.Blocked = r.Cluster, r.Blocked
 	// A resync with nothing changed keeps the registered sink, and with it its idle connections.
 	sink, ok := r.Engine.sinkFor(cfg.UID, cfg.ConfigHash)
 	if !ok {
@@ -327,6 +334,19 @@ func (r *TargetReconciler) namespaceMatch(at *ffsv1alpha1.AlertTarget) func(stri
 			return false
 		}
 		return selector.Matches(labels.Set(n.Labels))
+	}
+}
+
+// namespaceGone reports, for a target with a namespace selector, that a namespace has been
+// deleted, so the resolutions of findings sent from it still reach the target; nil without a
+// selector, since spec.namespaces matches by name whether the namespace exists or not.
+func (r *TargetReconciler) namespaceGone(at *ffsv1alpha1.AlertTarget) func(string) bool {
+	if at.Spec.NamespaceSelector == nil {
+		return nil
+	}
+	return func(ns string) bool {
+		var n corev1.Namespace
+		return apierrors.IsNotFound(r.Client.Get(context.Background(), types.NamespacedName{Name: ns}, &n))
 	}
 }
 

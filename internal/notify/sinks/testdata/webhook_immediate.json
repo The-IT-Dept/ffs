@@ -62,5 +62,6 @@
   ],
   "kind": "immediate",
   "target": "ops",
-  "title": "New urgent finding: CVE-2026-0001 affects 1 workload"
+  "title": "New urgent finding: CVE-2026-0001 affects 1 workload",
+  "truncated": 0
 }
