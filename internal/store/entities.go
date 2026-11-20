@@ -528,28 +528,6 @@ func (s *Store) ImagesPage(ctx context.Context, q ImageQuery) (ImagePage, error)
 	return page, rows.Err()
 }
 
-// imageScan reads the 13 imageCols columns of a row that may have no images row.
-type imageScan struct {
-	digest, index, repo, platform, status, reason, source, version, user, coverage string
-	catalogued, quarantined                                                        sql.NullInt64
-	attempts                                                                       int
-}
-
-func (x *imageScan) dest() []any {
-	return []any{&x.digest, &x.index, &x.repo, &x.platform, &x.status, &x.reason, &x.source, &x.version, &x.user, &x.coverage,
-		&x.catalogued, &x.attempts, &x.quarantined}
-}
-
-func (x *imageScan) image() (model.Image, error) {
-	img := model.Image{Digest: x.digest, IndexDigest: x.index, Repo: x.repo, Platform: x.platform, Status: model.ImageStatus(x.status),
-		StatusReason: x.reason, Source: x.source, VersionAnnotation: x.version, ConfigUser: x.user, CataloguedAt: fromNanos(x.catalogued),
-		Attempts: x.attempts, QuarantinedUntil: fromNanos(x.quarantined)}
-	if err := json.Unmarshal([]byte(x.coverage), &img.Coverage); err != nil {
-		return model.Image{}, fmt.Errorf("image %s coverage: %w", x.digest, err)
-	}
-	return img, nil
-}
-
 // imageStatusValues are the values of the image status facet.
 var imageStatusValues = []string{string(model.ImagePending), string(model.ImageCatalogued), string(model.ImageUnresolvable),
 	string(model.ImageCatalogFailed)}
@@ -878,32 +856,6 @@ func prefixedCols(before, cols, after string) string {
 		parts[i] = before + strings.TrimSpace(c) + after
 	}
 	return strings.Join(parts, ", ")
-}
-
-// packageScan reads packageCols with trailing columns, as scanPackage reads them alone.
-type packageScan struct {
-	p    model.Package
-	d    model.Distro
-	cpes string
-}
-
-func (x *packageScan) dest() []any {
-	p := &x.p
-	return []any{&p.ID, &p.ImageDigest, &p.Ecosystem, &x.d.ID, &x.d.VersionID, &x.d.Codename, &p.Name, &p.Version, &p.Epoch,
-		&p.Arch, &p.SourceName, &p.SourceVersion, &p.PURL, &x.cpes, &p.Path, &p.Layer, &p.Classifier, &p.GoStdlib, &p.SyftID}
-}
-
-func (x *packageScan) pkg() (model.Package, error) {
-	p := x.p
-	if x.d != (model.Distro{}) {
-		d := x.d
-		p.Distro = &d
-	}
-	var err error
-	if p.CPEs, err = textStrings(x.cpes); err != nil {
-		return model.Package{}, fmt.Errorf("package %s cpes: %w", p.ID, err)
-	}
-	return p, nil
 }
 
 // ImageEcosystems counts digest's packages per ecosystem, most first, then by ecosystem.

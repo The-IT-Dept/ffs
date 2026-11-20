@@ -137,21 +137,34 @@ func (s *Store) PruneImages(ctx context.Context, now time.Time, unusedFor time.D
 	return n, err
 }
 
+// scanImage reads a row of the imageCols columns alone.
 func scanImage(r scanner) (model.Image, error) {
-	var (
-		img                     model.Image
-		status, coverage        string
-		catalogued, quarantined sql.NullInt64
-	)
-	if err := r.Scan(&img.Digest, &img.IndexDigest, &img.Repo, &img.Platform, &status, &img.StatusReason, &img.Source,
-		&img.VersionAnnotation, &img.ConfigUser, &coverage, &catalogued, &img.Attempts, &quarantined); err != nil {
+	x := &imageScan{}
+	if err := r.Scan(x.dest()...); err != nil {
 		return model.Image{}, err
 	}
-	img.Status = model.ImageStatus(status)
-	img.CataloguedAt = fromNanos(catalogued)
-	img.QuarantinedUntil = fromNanos(quarantined)
-	if err := json.Unmarshal([]byte(coverage), &img.Coverage); err != nil {
-		return model.Image{}, fmt.Errorf("image %s coverage: %w", img.Digest, err)
+	return x.image()
+}
+
+// imageScan is the scan destination of the imageCols columns, in their order. A reader that selects
+// further columns after them appends their destinations to dest().
+type imageScan struct {
+	digest, index, repo, platform, status, reason, source, version, user, coverage string
+	catalogued, quarantined                                                        sql.NullInt64
+	attempts                                                                       int
+}
+
+func (x *imageScan) dest() []any {
+	return []any{&x.digest, &x.index, &x.repo, &x.platform, &x.status, &x.reason, &x.source, &x.version, &x.user, &x.coverage,
+		&x.catalogued, &x.attempts, &x.quarantined}
+}
+
+func (x *imageScan) image() (model.Image, error) {
+	img := model.Image{Digest: x.digest, IndexDigest: x.index, Repo: x.repo, Platform: x.platform, Status: model.ImageStatus(x.status),
+		StatusReason: x.reason, Source: x.source, VersionAnnotation: x.version, ConfigUser: x.user, CataloguedAt: fromNanos(x.catalogued),
+		Attempts: x.attempts, QuarantinedUntil: fromNanos(x.quarantined)}
+	if err := json.Unmarshal([]byte(x.coverage), &img.Coverage); err != nil {
+		return model.Image{}, fmt.Errorf("image %s coverage: %w", x.digest, err)
 	}
 	return img, nil
 }
@@ -284,21 +297,37 @@ func (s *Store) EcosystemsInUse(ctx context.Context) ([]EcosystemKey, error) {
 	}, `SELECT DISTINCT ecosystem, distro_id, distro_version FROM packages ORDER BY 1, 2, 3`)
 }
 
+// scanPackage reads a row of the packageCols columns alone.
 func scanPackage(r scanner) (model.Package, error) {
-	var (
-		p    model.Package
-		d    model.Distro
-		cpes string
-	)
-	if err := r.Scan(&p.ID, &p.ImageDigest, &p.Ecosystem, &d.ID, &d.VersionID, &d.Codename, &p.Name, &p.Version, &p.Epoch,
-		&p.Arch, &p.SourceName, &p.SourceVersion, &p.PURL, &cpes, &p.Path, &p.Layer, &p.Classifier, &p.GoStdlib, &p.SyftID); err != nil {
+	x := &packageScan{}
+	if err := r.Scan(x.dest()...); err != nil {
 		return model.Package{}, err
 	}
-	if d != (model.Distro{}) {
+	return x.pkg()
+}
+
+// packageScan is the scan destination of the packageCols columns, in their order. A reader that
+// selects further columns after them appends their destinations to dest().
+type packageScan struct {
+	p    model.Package
+	d    model.Distro
+	cpes string
+}
+
+func (x *packageScan) dest() []any {
+	p := &x.p
+	return []any{&p.ID, &p.ImageDigest, &p.Ecosystem, &x.d.ID, &x.d.VersionID, &x.d.Codename, &p.Name, &p.Version, &p.Epoch,
+		&p.Arch, &p.SourceName, &p.SourceVersion, &p.PURL, &x.cpes, &p.Path, &p.Layer, &p.Classifier, &p.GoStdlib, &p.SyftID}
+}
+
+func (x *packageScan) pkg() (model.Package, error) {
+	p := x.p
+	if x.d != (model.Distro{}) {
+		d := x.d
 		p.Distro = &d
 	}
 	var err error
-	if p.CPEs, err = textStrings(cpes); err != nil {
+	if p.CPEs, err = textStrings(x.cpes); err != nil {
 		return model.Package{}, fmt.Errorf("package %s cpes: %w", p.ID, err)
 	}
 	return p, nil
