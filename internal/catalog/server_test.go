@@ -130,6 +130,12 @@ type tarEntry struct {
 // returns its digest reference.
 func pushLayerImage(t *testing.T, reg *regtest.Server, user string, entries ...tarEntry) string {
 	t.Helper()
+	return reg.Host + "/app@" + reg.Push(t, "app", layerImage(t, user, entries...))
+}
+
+// layerImage builds a linux/amd64 image with one layer holding entries and the config user.
+func layerImage(t *testing.T, user string, entries ...tarEntry) v1.Image {
+	t.Helper()
 	var buf bytes.Buffer
 	tw := tar.NewWriter(&buf)
 	for _, e := range entries {
@@ -152,7 +158,7 @@ func pushLayerImage(t *testing.T, reg *regtest.Server, user string, entries ...t
 	cf.OS, cf.Architecture, cf.Config.User = "linux", "amd64", user
 	img, err = mutate.ConfigFile(img, cf)
 	require.NoError(t, err)
-	return reg.Host + "/app@" + reg.Push(t, "app", img)
+	return img
 }
 
 func TestCatalog_PathTraversalRejected(t *testing.T) {
@@ -334,27 +340,35 @@ func TestCatalog_CredentialsNotLogged(t *testing.T) {
 	require.NotContains(t, out, password)
 }
 
+// debianLayer is a minimal Debian 12 image layer: os-release and a dpkg database holding libssl3.
+var debianLayer = []tarEntry{
+	{tar.Header{Name: "etc/os-release"}, "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\n" +
+		"VERSION_ID=\"12\"\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\nID=debian\n"},
+	{tar.Header{Name: "var/lib/dpkg/status"}, "Package: libssl3\nStatus: install ok installed\nPriority: optional\n" +
+		"Section: libs\nInstalled-Size: 6000\nMaintainer: Debian OpenSSL Team <pkg-openssl-devel@example.org>\n" +
+		"Architecture: amd64\nMulti-Arch: same\nSource: openssl\nVersion: 3.0.15-1~deb12u1\n" +
+		"Description: Secure Sockets Layer toolkit - shared libraries\n\n"},
+}
+
 // TestCatalog_DebianImage runs Syft in process on a minimal Debian image: the worker must produce an
 // SBOM that normalises to the dpkg package with its distro and the image's config user.
 func TestCatalog_DebianImage(t *testing.T) {
 	reg := regtest.Start(t)
-	ref := pushLayerImage(t, reg, "65532:65532",
-		tarEntry{tar.Header{Name: "etc/os-release"}, "PRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\nNAME=\"Debian GNU/Linux\"\n" +
-			"VERSION_ID=\"12\"\nVERSION=\"12 (bookworm)\"\nVERSION_CODENAME=bookworm\nID=debian\n"},
-		tarEntry{tar.Header{Name: "var/lib/dpkg/status"}, "Package: libssl3\nStatus: install ok installed\nPriority: optional\n" +
-			"Section: libs\nInstalled-Size: 6000\nMaintainer: Debian OpenSSL Team <pkg-openssl-devel@example.org>\n" +
-			"Architecture: amd64\nMulti-Arch: same\nSource: openssl\nVersion: 3.0.15-1~deb12u1\n" +
-			"Description: Secure Sockets Layer toolkit - shared libraries\n\n"},
-	)
+	ref := pushLayerImage(t, reg, "65532:65532", debianLayer...)
 	t.Setenv("TMPDIR", t.TempDir())
 
 	resp, err := catalog.Catalog(ctx, sbom.CatalogRequest{Ref: ref, Platform: "linux/amd64", MaxBytes: 1 << 30, TimeoutSeconds: 60})
 	require.NoError(t, err)
+	requireDebianSBOM(t, ref[strings.LastIndex(ref, "@")+1:], resp)
+}
+
+// requireDebianSBOM checks resp is the SBOM of an image of debianLayer with config user 65532:65532.
+func requireDebianSBOM(t *testing.T, digest string, resp *sbom.CatalogResponse) {
+	t.Helper()
 	doc, err := sbom.DecodeSyftJSON(resp.SyftJSON)
 	require.NoError(t, err)
 	require.Equal(t, "65532:65532", sbom.ConfigUser(doc))
 
-	digest := ref[strings.LastIndex(ref, "@")+1:]
 	pkgs, cov := sbom.Normalize(digest, doc)
 	require.Equal(t, resp.Coverage, cov)
 	found := false
@@ -404,4 +418,135 @@ func TestExecRunner_SignalNamedOnce(t *testing.T) {
 	require.ErrorAs(t, err, &we)
 	require.Equal(t, sbom.KindFailed, we.Kind)
 	require.Equal(t, "cataloguer worker ended by signal 9 (killed)", we.Msg)
+}
+
+func TestCatalog_LocalSourcesNeedLocalRoot(t *testing.T) {
+	var calls atomic.Int32
+	c := serve(t, &catalog.Server{ScratchDir: t.TempDir(), Run: okRunner(&calls)})
+	status, ce := post(t, c, sbom.CatalogRequest{Source: sbom.CatalogSourceOCIDir, Path: t.TempDir(), Platform: "linux/amd64",
+		MaxBytes: 1 << 20, TimeoutSeconds: 5})
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, sbom.CatalogError{Kind: sbom.KindBadRequest, Error: "local sources are disabled: the cataloguer has no --local-root"}, ce)
+	require.Zero(t, calls.Load())
+}
+
+// localRoot makes base/stage with base/stage/work-1 holding one file of size bytes, base/other, and
+// the symlinks stage/escape (absolute, to base/other) and stage/rel ("../other").
+func localRoot(t *testing.T, size int) (root, inside, outside string) {
+	t.Helper()
+	base := t.TempDir()
+	root, outside = filepath.Join(base, "stage"), filepath.Join(base, "other")
+	inside = filepath.Join(root, "work-1")
+	require.NoError(t, os.MkdirAll(inside, 0o700))
+	require.NoError(t, os.MkdirAll(outside, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(inside, "index.json"), make([]byte, size), 0o600))
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape")))
+	require.NoError(t, os.Symlink("../other", filepath.Join(root, "rel")))
+	return root, inside, outside
+}
+
+func TestCatalog_LocalPathMustResolveInsideRoot(t *testing.T) {
+	root, inside, outside := localRoot(t, 16)
+	var (
+		mu   sync.Mutex
+		seen []sbom.CatalogRequest
+	)
+	c := serve(t, &catalog.Server{ScratchDir: t.TempDir(), LocalRoot: root,
+		Run: func(_ context.Context, req sbom.CatalogRequest, _ string) (*sbom.CatalogResponse, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			seen = append(seen, req)
+			return &sbom.CatalogResponse{SyftJSON: json.RawMessage(`{}`)}, nil
+		}})
+	req := func(source, path, platform string) sbom.CatalogRequest {
+		return sbom.CatalogRequest{Source: source, Path: path, Platform: platform, MaxBytes: 1 << 20, TimeoutSeconds: 5}
+	}
+	for path, msg := range map[string]string{
+		outside:                       fmt.Sprintf("path %q is outside the local root", outside),
+		filepath.Join(root, "escape"): fmt.Sprintf("path %q is outside the local root", filepath.Join(root, "escape")),
+		filepath.Join(root, "rel"):    fmt.Sprintf("path %q is outside the local root", filepath.Join(root, "rel")),
+		"stage/work-1":                `path "stage/work-1" must be absolute`,
+		root:                          fmt.Sprintf("path %q is outside the local root", root),
+	} {
+		status, ce := post(t, c, req(sbom.CatalogSourceOCIDir, path, "linux/amd64"))
+		require.Equal(t, http.StatusBadRequest, status, path)
+		require.Equal(t, sbom.CatalogError{Kind: sbom.KindBadRequest, Error: msg}, ce, path)
+	}
+	status, ce := post(t, c, req("foo", inside, "linux/amd64"))
+	require.Equal(t, http.StatusBadRequest, status)
+	require.Equal(t, `unknown source "foo"`, ce.Error)
+
+	status, _ = post(t, c, req(sbom.CatalogSourceOCIDir, inside, "linux/amd64"))
+	require.Equal(t, http.StatusOK, status)
+	status, _ = post(t, c, req(sbom.CatalogSourceHostDir, inside, ""))
+	require.Equal(t, http.StatusOK, status, "host-dir needs no platform")
+	status, ce = post(t, c, req(sbom.CatalogSourceOCIDir, inside, ""))
+	require.Equal(t, http.StatusBadRequest, status, "oci-dir needs a platform")
+	require.Equal(t, sbom.KindBadRequest, ce.Kind)
+
+	resolved, err := filepath.EvalSymlinks(inside)
+	require.NoError(t, err)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, seen, 2)
+	require.Equal(t, resolved, seen[0].Path)
+	require.Equal(t, sbom.CatalogSourceOCIDir, seen[0].Source)
+	require.Equal(t, sbom.CatalogSourceHostDir, seen[1].Source)
+	require.Empty(t, seen[0].Ref, "no registry is involved")
+}
+
+func TestCatalog_LocalSizeLimit(t *testing.T) {
+	root, inside, _ := localRoot(t, 2048)
+	var calls atomic.Int32
+	c := serve(t, &catalog.Server{ScratchDir: t.TempDir(), LocalRoot: root, Run: okRunner(&calls)})
+	status, ce := post(t, c, sbom.CatalogRequest{Source: sbom.CatalogSourceOCIDir, Path: inside, Platform: "linux/amd64",
+		MaxBytes: 1000, TimeoutSeconds: 5})
+	require.Equal(t, http.StatusRequestEntityTooLarge, status)
+	require.Equal(t, sbom.CatalogError{Kind: sbom.KindTooLarge, Error: "local source holds 2048 bytes, limit 1000 bytes"}, ce)
+	require.Zero(t, calls.Load())
+}
+
+func TestCatalog_ScratchDirCreated(t *testing.T) {
+	scratch := filepath.Join(t.TempDir(), "catalog")
+	var calls atomic.Int32
+	serve(t, &catalog.Server{ScratchDir: scratch, Run: okRunner(&calls)})
+	fi, err := os.Stat(scratch)
+	require.NoError(t, err)
+	require.True(t, fi.IsDir())
+	require.Equal(t, fs.FileMode(0o700), fi.Mode().Perm())
+}
+
+// TestExecRunner_NiceAppliedToWorker: WithNice lowers the worker's priority right after it starts.
+func TestExecRunner_NiceAppliedToWorker(t *testing.T) {
+	// The worker polls its own nice value for up to 2s until it is not 0, writes it to $OUT and
+	// answers an empty response.
+	const worker = `#!/bin/sh
+i=0
+n=$(ps -o nice= -p $$ | tr -d ' ')
+while [ "$n" = "0" ] && [ $i -lt 20 ]; do
+  sleep 0.1
+  i=$((i+1))
+  n=$(ps -o nice= -p $$ | tr -d ' ')
+done
+printf '%s' "$n" > "$OUT"
+echo '{}'
+`
+	script := filepath.Join(t.TempDir(), "worker.sh")
+	require.NoError(t, os.WriteFile(script, []byte(worker), 0o700)) //nolint:gosec // G306: the test runs it
+	req := sbom.CatalogRequest{Ref: "r@sha256:" + strings.Repeat("a", 64)}
+	for _, tc := range []struct {
+		opts []catalog.ExecOption
+		want string
+	}{
+		{[]catalog.ExecOption{catalog.WithNice(10)}, "10"},
+		{nil, "0"},
+	} {
+		out := filepath.Join(t.TempDir(), "nice")
+		t.Setenv("OUT", out)
+		_, err := catalog.ExecRunner(script, tc.opts...)(ctx, req, t.TempDir())
+		require.NoError(t, err)
+		got, err := os.ReadFile(out) //nolint:gosec // G304: the test's own file
+		require.NoError(t, err)
+		require.Equal(t, tc.want, string(got))
+	}
 }

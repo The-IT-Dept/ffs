@@ -5,7 +5,6 @@
 package notify
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -342,6 +341,14 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 	if err != nil {
 		return err
 	}
+	ns, err := e.st.NodesState(ctx)
+	if err != nil {
+		return err
+	}
+	// Node findings are held until the target's node inventory baseline, which follows the node
+	// agent's first data, and again after the agent is disabled and enabled (BaselineReadyAt is
+	// cleared, then set again), so the first host data is never an alert per finding (spec §9.9).
+	holdNodes := st.NodesBaselineAt.IsZero() || ns.BaselineReadyAt.IsZero() || st.NodesBaselineAt.Before(ns.BaselineReadyAt)
 	if t.cfg.Paused || st.Disabled {
 		// Move past everything without sending, so nothing old arrives once it is resumed. A digest
 		// fire time that passes meanwhile is spent too, so the first digest after resuming comes on
@@ -352,12 +359,18 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 		return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid,
 			Cursors: map[string]int64{immediateCursor(uid): last, digestCursor(uid): last}, LastDigestAt: now})
 	}
+	if holdNodes && !ns.BaselineReadyAt.IsZero() {
+		if err := e.nodesBaseline(ctx, t, ns.BaselineReadyAt, now); err != nil {
+			return err
+		}
+		holdNodes = false
+	}
 	if len(ts) > 0 {
-		if err := e.immediate(ctx, t, ts, last, now); err != nil {
+		if err := e.immediate(ctx, t, ts, last, now, holdNodes); err != nil {
 			return err
 		}
 	}
-	if err := e.digest(ctx, t, st, last, now); err != nil {
+	if err := e.digest(ctx, t, st, last, now, holdNodes); err != nil {
 		return err
 	}
 	return e.feedStale(ctx, t, now)
@@ -396,8 +409,9 @@ func (e *Engine) transitionsAfter(ctx context.Context, cursor int64, limit int) 
 }
 
 // immediate queues one message per advisory and event for the transitions eligible to be sent now,
-// and records them in the ledger, together with the cursor in one commit.
-func (e *Engine) immediate(ctx context.Context, t *target, ts []model.Transition, last int64, now time.Time) error {
+// and records them in the ledger, together with the cursor in one commit. With holdNodes the
+// transitions of Nodes findings are passed over: no message and no ledger entry.
+func (e *Engine) immediate(ctx context.Context, t *target, ts []model.Transition, last int64, now time.Time, holdNodes bool) error {
 	uid := t.cfg.UID
 	r := reduce(ts)
 	ledger, err := e.st.Ledger(ctx, uid, r.order)
@@ -408,6 +422,9 @@ func (e *Engine) immediate(ctx context.Context, t *target, ts []model.Transition
 	byEvent := map[Event][]string{}
 	for _, fp := range r.order {
 		tr, l := r.final[fp], entry(ledger, fp)
+		if holdNodes && isNodes(tr.Owner) {
+			continue
+		}
 		ev := classify(tr, l)
 		if immediateEligible(t.cfg, ev, tr, l) {
 			byEvent[ev] = append(byEvent[ev], fp)
@@ -473,7 +490,7 @@ func (e *Engine) immediateMessages(ctx context.Context, t *target, r latest, byE
 }
 
 // views loads the findings of fps as of their final transitions in r, and an item builder over
-// their advisories.
+// their advisories, with the node group labels when any of them is a Nodes finding.
 func (e *Engine) views(ctx context.Context, fps []string, r latest) (map[string]model.Finding, itemBuilder, error) {
 	stored, err := e.st.FindingsByFingerprint(ctx, fps)
 	if err != nil {
@@ -481,27 +498,42 @@ func (e *Engine) views(ctx context.Context, fps []string, r latest) (map[string]
 	}
 	views := make(map[string]model.Finding, len(fps))
 	ids := map[string]bool{}
+	nodes := false
 	for _, fp := range fps {
 		f, ok := stored[fp]
 		views[fp] = view(f, ok, r.final[fp])
 		ids[r.final[fp].AdvisoryID] = true
+		nodes = nodes || isNodes(views[fp].Owner)
 	}
 	advs, err := e.st.Advisories(ctx, slices.Sorted(maps.Keys(ids)))
 	if err != nil {
 		return nil, itemBuilder{}, err
 	}
-	return views, itemBuilder{advisories: advs, dashboardURL: e.o.DashboardURL}, nil
+	b := itemBuilder{advisories: advs, dashboardURL: e.o.DashboardURL}
+	if nodes {
+		if b.nodeGroups, _, err = e.groupLabels(ctx); err != nil {
+			return nil, itemBuilder{}, err
+		}
+	}
+	return views, b, nil
 }
 
 // baseline sends a new target one summary of the open findings instead of an alert for each, and
 // starts both of its cursors at the newest transition (spec §6.10). The newest ID is read before
-// the findings, so a finding created in between is in the summary rather than lost.
+// the findings, so a finding created in between is in the summary rather than lost. Node findings
+// are in it only once the node inventory is ready to baseline, which it then also records;
+// before that they are held for the node inventory baseline (nodesBaseline).
 func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 	uid := t.cfg.UID
 	maxID, err := e.st.MaxTransitionID(ctx)
 	if err != nil {
 		return err
 	}
+	ns, err := e.st.NodesState(ctx)
+	if err != nil {
+		return err
+	}
+	nodesReady := !ns.BaselineReadyAt.IsZero()
 	all, err := e.st.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}})
 	if err != nil {
 		return err
@@ -521,7 +553,7 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 	counts := map[model.Priority]int{}
 	ids := map[string]bool{}
 	for _, f := range all {
-		if !t.cfg.allows(f.Owner.Namespace) {
+		if !t.cfg.allows(f.Owner.Namespace) || (!nodesReady && isNodes(f.Owner)) {
 			continue
 		}
 		open = append(open, f)
@@ -535,24 +567,24 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 		return err
 	}
 	b := itemBuilder{advisories: advs, dashboardURL: e.o.DashboardURL}
-	var items []Item
-	for _, fs := range byAdvisory(open) {
-		items = append(items, b.advisoryItem("", fs[0].AdvisoryID, fs))
+	c := store.NotifyCommit{Target: uid, Cursors: map[string]int64{immediateCursor(uid): maxID, digestCursor(uid): maxID},
+		Ledger: ledger, BaselineAt: now, LastDigestAt: now}
+	if nodesReady {
+		if b.nodeGroups, _, err = e.groupLabels(ctx); err != nil {
+			return err
+		}
+		c.NodesBaselineAt = nodesBaselineAt(now, ns.BaselineReadyAt)
 	}
-	slices.SortFunc(items, func(a, b Item) int {
-		return cmp.Or(cmp.Compare(b.Priority, a.Priority), cmp.Compare(len(b.Owners), len(a.Owners)), strings.Compare(a.AdvisoryID, b.AdvisoryID))
-	})
 	m := e.message(t, KindBaseline, strconv.FormatInt(maxID, 10),
 		baselineTitle(n, counts[model.PriorityUrgent], counts[model.PriorityHigh]), now)
-	m.Items = items[:min(len(items), baselineItems)]
+	m.Items = b.baselineItems(open)
 	m.Summary = &Summary{Workloads: n, Counts: counts}
 	d, err := delivery(m, now)
 	if err != nil {
 		return err
 	}
-	return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid,
-		Cursors: map[string]int64{immediateCursor(uid): maxID, digestCursor(uid): maxID},
-		Ledger:  ledger, Deliveries: []store.Delivery{d}, BaselineAt: now, LastDigestAt: now})
+	c.Deliveries = []store.Delivery{d}
+	return e.st.CommitNotify(ctx, c)
 }
 
 // feedStale queues one alert per stale feed and episode for a target that opted in (spec §6.4).

@@ -13,6 +13,10 @@ import (
 type Request struct {
 	Repo, Digest, IndexDigest, Platform string
 	Creds                               registry.CredSet
+	// Supersede asks to replace an SBOM a node agent supplied with one from the sources. It applies only
+	// while the stored image is catalogued with Source "agent" (SourceAgent): success replaces the SBOM,
+	// and failure writes and counts nothing and is not retried. In any other state it is ignored.
+	Supersede bool
 }
 
 // Result is what a Source produced for a Request.

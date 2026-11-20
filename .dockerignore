@@ -10,3 +10,9 @@ test
 # Local, gitignored state: never part of a CI build context.
 .cache
 .superpowers
+ui/node_modules
+ui/test-results
+ui/playwright-report
+ui/e2e/screenshots
+internal/web/ui/dist/*
+!internal/web/ui/dist/.keep

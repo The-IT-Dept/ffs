@@ -225,3 +225,11 @@ func TestFormat_TierNoneHasNoSuggestedLine(t *testing.T) {
 	it = item("CVE-2026-0001", 1)
 	assert.Contains(t, itemLines(it), "Suggested: docker.io/x/app:1.0 → 1.1 (patch), fixes 2 high, 1 medium, introduces none")
 }
+
+func TestFormat_NodeGroupsLine(t *testing.T) {
+	it := notify.Item{Priority: model.PriorityHigh, Event: notify.EventDetected, NodeGroups: []string{"a", "b", "c", "+2 more"}}
+	assert.Contains(t, itemLines(it), "Node groups: a, b, c, +2 more")
+	for _, l := range itemLines(item("CVE-2026-0001", 1)) {
+		assert.NotContains(t, l, "Node groups")
+	}
+}

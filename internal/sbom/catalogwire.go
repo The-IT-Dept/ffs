@@ -6,15 +6,25 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
-// CatalogRequest asks the cataloguer for the SBOM of one platform manifest. It is sent over the
-// catalog container's unix socket and, from there, on the worker's stdin.
+// CatalogRequest asks the cataloguer for the SBOM of one platform manifest, pulled from a registry
+// or read from a local source. It is sent over the catalog container's unix socket and, from there,
+// on the worker's stdin.
 type CatalogRequest struct {
 	Ref            string      `json:"ref"`      // pull location "repo@sha256:..." (mirror applied); must contain "@sha256:"
-	Platform       string      `json:"platform"` // "linux/amd64"
+	Platform       string      `json:"platform"` // "linux/amd64"; host-dir takes none
 	Auth           CatalogAuth `json:"auth"`
 	MaxBytes       int64       `json:"maxBytes"`
 	TimeoutSeconds int         `json:"timeoutSeconds"`
+	Source         string      `json:"source,omitempty"` // "" or CatalogSourceRegistry: pull Ref; local sources read Path
+	Path           string      `json:"path,omitempty"`   // local sources: absolute path inside the server's --local-root
 }
+
+// Catalog request sources.
+const (
+	CatalogSourceRegistry = "registry"
+	CatalogSourceOCIDir   = "oci-dir"  // an OCI image layout with exactly one image in index.json
+	CatalogSourceHostDir  = "host-dir" // a staged copy of host inputs (os-release, package DBs, binaries)
+)
 
 // CatalogAuth carries the pull credentials for one job. It is never logged.
 type CatalogAuth struct {

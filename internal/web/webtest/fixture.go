@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -24,6 +25,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/eol"
 	"github.com/the-it-dept/ffs/internal/inventory"
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/store"
 	"github.com/the-it-dept/ffs/internal/web/apiserver"
@@ -69,6 +71,21 @@ const (
 	webPath = "HTTPRoute shop/web on Gateway gateway/public"
 )
 
+// Node groups of Small: worker-1 and worker-2 report through the node agent and share one host
+// fingerprint; cp-1 never reports, so it is grouped by its node status alone.
+var (
+	// AgentGroupID is the host fingerprint of worker-1 and worker-2 (label "ubuntu-24.04-k6.8.0-88-3f9c1a").
+	AgentGroupID = "3f9c1a" + strings.Repeat("0", 58)
+	// CP1GroupID is the nodeinfo group of cp-1: nodegroup.FallbackID of its Node.
+	CP1GroupID = nodegroup.FallbackID(smallNode("cp-1", kernelCP1))
+)
+
+const (
+	kernelCP1    = "6.8.0-85-generic"
+	kernelWorker = "6.8.0-88-generic"
+	osImage      = "Ubuntu 24.04.4 LTS"
+)
+
 // Owners of Small.
 var (
 	Web      = model.OwnerRef{Kind: "Deployment", Namespace: "shop", Name: "web"}
@@ -80,6 +97,7 @@ var (
 	CoreDNS  = model.OwnerRef{Kind: "Deployment", Namespace: "kube-system", Name: "coredns"}
 	Cluster  = model.OwnerRef{Kind: model.OwnerKindCluster, Name: ClusterName}
 	Runtime  = model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Name: "containerd"}
+	Nodes    = model.NodesOwner(ClusterName)
 )
 
 // PodCounts is a fixed pod count per owner key. It implements apiserver.PodCounter.
@@ -149,7 +167,9 @@ func ExecSQL(t testing.TB, st *store.Store, query string, args ...any) {
 // workloads in shop, payments, ops and kube-system, the cluster and container runtime owners, ten
 // in-use container images in every catalogue state, findings F1–F12 in every priority, fix kind and
 // state, transitions T1–T4, two suggestions, feed states (kev stale), lifecycle cycles, three nodes
-// and one Exception.
+// and one Exception; then the node agent's data: an agent group of worker-1 (reporting) and
+// worker-2 (stale) with its host SBOM, a nodeinfo group of cp-1 (never reported), the Nodes owner
+// with host finding F13, and one image cached on worker-1.
 func Small(ctx context.Context, path string) (*Fixture, error) {
 	st, err := store.Open(ctx, path)
 	if err != nil {
@@ -172,7 +192,7 @@ func (f *Fixture) seed(ctx context.Context) error {
 		{Name: "osv", StaleAfter: 2 * time.Hour}}
 	for _, step := range []func(context.Context) error{
 		f.seedLifecycle, f.seedInventory, f.seedImages, f.seedAdvisories, f.seedMatches, f.seedFindings,
-		f.seedSuggestions, f.seedFeedsAndNodes, f.seedExceptions,
+		f.seedSuggestions, f.seedFeedsAndNodes, f.seedExceptions, f.seedNodeAgent,
 	} {
 		if err := step(ctx); err != nil {
 			return err
@@ -519,16 +539,18 @@ func (f *Fixture) seedFeedsAndNodes(ctx context.Context) error {
 			return err
 		}
 	}
-	node := func(name, kernel string) model.Node {
-		return model.Node{Name: name, OS: "linux", Arch: "amd64", OSImage: "Ubuntu 24.04.4 LTS", KernelVersion: kernel,
-			KubeletVersion: "v1.34.2", ContainerRuntimeVersion: "containerd://2.2.1", Ready: true, UpdatedAt: Now}
-	}
 	if err := f.Store.ReplaceNodes(ctx, []model.Node{
-		node("cp-1", "6.8.0-85-generic"), node("worker-1", "6.8.0-88-generic"), node("worker-2", "6.8.0-88-generic"),
+		smallNode("cp-1", kernelCP1), smallNode("worker-1", kernelWorker), smallNode("worker-2", kernelWorker),
 	}); err != nil {
 		return err
 	}
 	return f.Store.PutClusterInfo(ctx, model.ClusterInfo{Name: ClusterName, GitVersion: "v1.34.2", Version: "1.34.2", UpdatedAt: Now})
+}
+
+// smallNode is one of Small's nodes, as the inventory stores it.
+func smallNode(name, kernel string) model.Node {
+	return model.Node{Name: name, OS: "linux", Arch: "amd64", OSImage: osImage, KernelVersion: kernel,
+		KubeletVersion: "v1.34.2", ContainerRuntimeVersion: "containerd://2.2.1", Ready: true, UpdatedAt: Now}
 }
 
 func (f *Fixture) seedExceptions(context.Context) error {
@@ -544,4 +566,85 @@ func (f *Fixture) seedExceptions(context.Context) error {
 	}
 	f.Kube = fake.NewClientBuilder().WithScheme(sc).WithObjects(exc).Build()
 	return nil
+}
+
+// seedNodeAgent writes the node agent's data in the order its reconciler does: the agent reports,
+// their host fingerprints, then the group and the grouping. It then stores the group's host SBOM,
+// the Nodes owner with finding F13, the agent state and worker-1's cached image.
+func (f *Fixture) seedNodeAgent(ctx context.Context) error {
+	ubuntu := &model.Distro{ID: "ubuntu", VersionID: "24.04", Codename: "noble"}
+	digest := nodegroup.GroupDigest(AgentGroupID)
+	for _, r := range []struct {
+		node string
+		ago  time.Duration
+	}{{"worker-1", 5 * time.Minute}, {"worker-2", 2 * time.Hour}} {
+		at := Now.Add(-r.ago)
+		if _, err := f.Store.AcceptAgentReport(ctx, store.AgentReport{Node: r.node, AgentVersion: "v0.1.0", BootID: "boot-" + r.node,
+			StartedAt: at.Add(-time.Minute), Seq: 1, At: at, Full: true, KernelRelease: kernelWorker, Arch: "amd64",
+			PackageDB: "dpkg"}); err != nil {
+			return err
+		}
+	}
+	for _, node := range []string{"worker-1", "worker-2"} {
+		if err := f.Store.SetAgentFingerprint(ctx, node, AgentGroupID); err != nil {
+			return err
+		}
+	}
+	name := "ubuntu-24.04-k6.8.0-88"
+	group := model.NodeGroup{ID: AgentGroupID, Kind: model.NodeGroupAgent, Name: name, Label: nodegroup.GroupLabel(name, AgentGroupID),
+		Digest: digest, Distro: ubuntu, OSImage: osImage, KernelRelease: kernelWorker,
+		ContainerRuntimeVersion: "containerd://2.2.1", KubeletVersion: "v1.34.2", Arch: "amd64",
+		Kernel:    &model.NodeKernel{Release: kernelWorker, Package: "linux-image-" + kernelWorker, Version: "6.8.0-88.89", SourceName: "linux"},
+		PackageDB: "dpkg", PackageCount: 2}
+	if err := f.Store.PutNodeGroup(ctx, group, Now); err != nil {
+		return err
+	}
+	if err := f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{
+		Members:  map[string]string{"worker-1": AgentGroupID, "worker-2": AgentGroupID, "cp-1": CP1GroupID},
+		Fallback: nodegroup.FallbackGroups([]model.Node{smallNode("cp-1", kernelCP1)}, Now),
+		Exposed:  map[string][]string{AgentGroupID: {"worker-1"}},
+		Now:      Now,
+	}); err != nil {
+		return err
+	}
+
+	if err := f.Store.UpsertImage(ctx, model.Image{Digest: digest, Repo: model.HostRepo, Platform: "linux/amd64",
+		Status: model.ImageCatalogued, Source: "agent", CataloguedAt: Now}); err != nil {
+		return err
+	}
+	if err := f.Store.PutSBOM(ctx, digest, nil, []model.Package{
+		{Ecosystem: "deb", Distro: ubuntu, Name: "linux-image-" + kernelWorker, Version: "6.8.0-88.89", Arch: "amd64"},
+		{Ecosystem: "deb", Distro: ubuntu, Name: "openssl", Version: "3.0.13-0ubuntu3", Arch: "amd64"},
+	}); err != nil {
+		return err
+	}
+	if err := f.Store.PutAgentProvenance(ctx, store.AgentProvenance{Digest: digest, Node: "worker-1", AgentVersion: "v0.1.0",
+		ReceivedAt: Now.Add(-5 * time.Minute)}); err != nil {
+		return err
+	}
+
+	if err := f.Store.UpsertOwner(ctx, model.Owner{Ref: Nodes, UpdatedAt: Now, Containers: []model.ContainerUse{{
+		Name: group.Label, Kind: model.ContainerRegular, ImageRef: group.Label, Repo: model.HostRepo, Digest: digest,
+		Platform: "linux/amd64", ExposurePaths: []string{fmt.Sprintf(model.NodeExposurePathFmt, "worker-1")},
+	}}}); err != nil {
+		return err
+	}
+	if err := f.Store.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-0012", Title: "OpenSSL host flaw",
+		CNASeverity: model.SeverityHigh, Observed: Now}); err != nil {
+		return err
+	}
+	f13 := smallFinding{owner: Nodes, repo: model.HostRepo, digest: digest, advisory: "CVE-2026-0012",
+		pkg:      model.FindingPackage{Name: "openssl", Ecosystem: "deb", Installed: "3.0.13-0ubuntu3", Fixed: []string{"3.0.13-0ubuntu3.1"}},
+		severity: model.SeverityHigh, priority: model.PriorityHigh, state: model.StateOpen, fixState: model.FixFixed,
+		fix: packageFix("deb", "openssl", "3.0.13-0ubuntu3", "3.0.13-0ubuntu3.1"), signals: model.FindingSignals{Exposed: true},
+		reasons: []string{"exposed via node worker-1"}}
+	if err := f.Store.ApplyFindings(ctx, []model.Finding{f13.finding()}, nil); err != nil {
+		return err
+	}
+
+	if err := f.Store.PutNodesState(ctx, store.NodesState{AgentEnabled: true}); err != nil {
+		return err
+	}
+	return f.Store.ReplaceNodeImages(ctx, "worker-1", []model.NodeImage{{Digest: DigestWeb, Names: []string{repoNginx + ":1.30.6"},
+		Kind: "manifest", Complete: true, InUse: true, Source: "both"}})
 }

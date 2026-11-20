@@ -263,3 +263,26 @@ func TestStoreNotify_PruneAndMaxTransitionID(t *testing.T) {
 	assert.Len(t, l, 1)
 	assert.Contains(t, l, "open-old")
 }
+
+func TestStoreNotify_NodesBaselineAt(t *testing.T) {
+	st := newStore(t)
+	t1 := t0.Add(time.Hour)
+	require.NoError(t, st.PutNotifyTarget(ctx, "u1", "ops", "h1"))
+	got, ok, err := st.NotifyTarget(ctx, "u1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, got.NodesBaselineAt.IsZero())
+
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", NodesBaselineAt: t1}))
+	got, _, err = st.NotifyTarget(ctx, "u1")
+	require.NoError(t, err)
+	require.True(t, got.NodesBaselineAt.Equal(t1))
+
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Cursors: map[string]int64{"notify:u1": 7}}))
+	got, _, err = st.NotifyTarget(ctx, "u1")
+	require.NoError(t, err)
+	require.True(t, got.NodesBaselineAt.Equal(t1), "a zero NodesBaselineAt leaves it alone")
+	all, err := st.NotifyTargets(ctx)
+	require.NoError(t, err)
+	require.True(t, all[0].NodesBaselineAt.Equal(t1))
+}

@@ -62,10 +62,12 @@ func TestSettings_OmitsDeploymentDetails(t *testing.T) {
 	var got map[string]any
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &got))
 	require.ElementsMatch(t, []string{"cluster", "generatedAt", "version", "clusterName", "feeds", "priority", "exposure", "crd", "events",
-		"openReports", "exceptions", "retention", "upgrades"}, slices.Collect(maps.Keys(got)))
-	for _, k := range []string{"registry", "listen", "allowedHosts", "storePath", "dataDir", "catalog", "nodeAgent"} {
+		"openReports", "exceptions", "retention", "upgrades", "nodeAgent"}, slices.Collect(maps.Keys(got)))
+	for _, k := range []string{"registry", "listen", "allowedHosts", "storePath", "dataDir", "catalog"} {
 		require.NotContains(t, got, k)
 	}
+	// The node agent's listen address, TLS directory and namespace are deployment details too.
+	require.ElementsMatch(t, []string{"enabled", "staleAfter"}, slices.Collect(maps.Keys(got["nodeAgent"].(map[string]any))))
 	require.InDelta(t, 0.1, got["priority"].(map[string]any)["epssBump"], 1e-9)
 
 	var feeds []string

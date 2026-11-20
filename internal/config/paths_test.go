@@ -13,7 +13,8 @@ func TestFieldPaths(t *testing.T) {
 	require.True(t, sort.StringsAreSorted(p))
 	require.Len(t, p, len(slices.Compact(slices.Clone(p)))) // unique
 	for _, want := range []string{"clusterName", "listen", "catalog.socket", "catalog.maxImageBytes",
-		"registry.mirrors", "feeds.osv.interval", "feeds.grypedb.staleAfter", "crd.maxFindings", "upgrades.overrides"} {
+		"registry.mirrors", "feeds.osv.interval", "feeds.grypedb.staleAfter", "crd.maxFindings", "upgrades.overrides",
+		"nodeAgent.exposedNodes", "nodeAgent.staleAfter"} {
 		require.Contains(t, p, want)
 	}
 	for _, s := range p {

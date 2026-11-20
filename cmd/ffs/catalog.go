@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 
@@ -12,15 +13,18 @@ import (
 
 func newCatalogCmd() *cobra.Command {
 	var (
-		socket, scratch string
-		scratchLimit    int64
-		maxConcurrent   int
+		socket, scratch, localRoot string
+		scratchLimit               int64
+		maxConcurrent, nice        int
 	)
 	cmd := &cobra.Command{
 		Use:   "catalog",
 		Short: "Build the software catalog",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if nice < 0 || nice > 19 {
+				return errors.New("--nice must be between 0 and 19")
+			}
 			self, err := os.Executable()
 			if err != nil {
 				return err
@@ -29,7 +33,8 @@ func newCatalogCmd() *cobra.Command {
 				ScratchDir:    scratch,
 				ScratchLimit:  scratchLimit,
 				MaxConcurrent: maxConcurrent,
-				Run:           catalog.ExecRunner(self),
+				LocalRoot:     localRoot,
+				Run:           catalog.ExecRunner(self, catalog.WithNice(nice)),
 				Log:           funcr.NewJSON(func(obj string) { fmt.Fprintln(os.Stderr, obj) }, funcr.Options{}),
 			}
 			return srv.ListenAndServe(cmd.Context(), socket)
@@ -40,6 +45,8 @@ func newCatalogCmd() *cobra.Command {
 	f.StringVar(&scratch, "scratch", "/scratch", "directory for per-job scratch space")
 	f.Int64Var(&scratchLimit, "scratch-limit", 19327352832, "bytes of scratch space all jobs may use together")
 	f.IntVar(&maxConcurrent, "max-concurrent", 2, "jobs run at once; further requests are refused as busy")
+	f.StringVar(&localRoot, "local-root", "", "local sources (oci-dir, host-dir) must resolve inside this directory; empty refuses them")
+	f.IntVar(&nice, "nice", 0, "nice value of catalog workers, 0 to 19")
 
 	cmd.AddCommand(&cobra.Command{
 		Use:    "worker",

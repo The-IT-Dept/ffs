@@ -238,6 +238,19 @@ func get(ctx context.Context, url string, w io.Writer) (int, error) {
 	return resp.StatusCode, err
 }
 
+// fetch GETs url and returns the status, the headers and the whole body.
+func fetch(t *testing.T, url string) (int, http.Header, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, resp.Header, body
+}
+
 // apiObjects GETs an ffs API path and returns every JSON object in the response, at any depth.
 func apiObjects(t *testing.T, base, path string) []map[string]any {
 	t.Helper()

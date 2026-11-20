@@ -163,6 +163,11 @@ func (s *Server) GetImage(ctx context.Context, req apigen.GetImageRequestObject)
 	} else if ok {
 		sbom.Tool, sbom.ToolVersion = optString(name), optString(version)
 	}
+	if p, ok, err := s.o.Store.AgentProvenanceOf(ctx, digest); err != nil {
+		return nil, err
+	} else if ok {
+		sbom.Agent = &apigen.AgentProvenance{Node: p.Node, AgentVersion: p.AgentVersion, ReceivedAt: p.ReceivedAt.UTC()}
+	}
 	ecosystems, err := s.o.Store.ImageEcosystems(ctx, digest)
 	if err != nil {
 		return nil, err

@@ -43,6 +43,8 @@ func regarding(o model.OwnerRef, self *corev1.ObjectReference) (ref *corev1.Obje
 	switch {
 	case o.ClusterLevel() && o.Kind == model.OwnerKindCluster:
 		return self, "Kubernetes: ", self != nil
+	case o.ClusterLevel() && o.Kind == model.OwnerKindNodes:
+		return self, "Nodes: ", self != nil
 	case o.ClusterLevel():
 		return self, "Container runtime " + o.Name + ": ", self != nil
 	}

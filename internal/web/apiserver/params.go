@@ -116,12 +116,19 @@ func textParam(name string, p *string, maxLen int) (string, error) {
 	return *p, nil
 }
 
-// resolveScope narrows a parsed scope to one the store answers. A node scope needs the node agent's
-// grouping, which this build does not have, so it is 400 invalid_scope; every other scope is
+// resolveScope narrows a parsed scope to one the store answers: a node scope is its group's
+// (host findings are per group), and a node in no group is 400 invalid_scope. Every other scope is
 // returned unchanged.
-func (s *Server) resolveScope(_ context.Context, sc model.Scope) (model.Scope, error) {
-	if sc.Kind == model.ScopeNode {
-		return model.Scope{}, scopeProblem("node scopes need the node agent")
+func (s *Server) resolveScope(ctx context.Context, sc model.Scope) (model.Scope, error) {
+	if sc.Kind != model.ScopeNode {
+		return sc, nil
 	}
-	return sc, nil
+	g, ok, err := s.groupOf(ctx, sc.Value)
+	if err != nil {
+		return model.Scope{}, err
+	}
+	if !ok {
+		return model.Scope{}, scopeProblem("node " + sc.Value + " not found")
+	}
+	return model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID}, nil
 }

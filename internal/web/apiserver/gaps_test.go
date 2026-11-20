@@ -21,6 +21,7 @@ func TestUnresolvableGap_ClassifiesReasons(t *testing.T) {
 		fmt.Sprintf(inventory.ReasonUnreachable, "r", "dial"):       apigen.GapCodeUnresolvableUnreachable,
 		"x": apigen.GapCodeUnresolvableOther,
 		fmt.Sprintf(inventory.ReasonNoPlatform, "sha256:1", "linux/arm64"): apigen.GapCodeUnresolvableOther,
+		inventory.ReasonLayersDiscarded:                                    apigen.GapCodeLayersDiscarded,
 	} {
 		require.Equal(t, want, unresolvableGap(reason), reason)
 	}

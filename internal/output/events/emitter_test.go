@@ -164,6 +164,17 @@ func TestEvents_ClusterSubjectsOnFFSDeployment(t *testing.T) {
 	require.Empty(t, h2.rec.Snapshot())
 }
 
+func TestEvents_NodesOnFFSDeployment(t *testing.T) {
+	h := newHarness(t, self)
+	h.seed(t, create(model.NodesOwner("prod"), "CVE-2026-1113", model.PriorityHigh),
+		&model.FindingPackage{Name: "openssl", Installed: "3.0.13-0ubuntu3.4", Fixed: []string{"3.0.13-0ubuntu3.6"}})
+	require.NoError(t, h.em.Drain(context.Background()))
+	ev := h.rec.Snapshot()
+	require.Len(t, ev, 1)
+	require.Equal(t, self, ev[0].Regarding)
+	require.Equal(t, "Nodes: 1 new: CVE-2026-1113 (high, openssl 3.0.13-0ubuntu3.4 -> 3.0.13-0ubuntu3.6)", ev[0].Note)
+}
+
 func TestEvents_SkipsExceptedAndUnknownKinds(t *testing.T) {
 	h := newHarness(t, self)
 	o := model.OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"}

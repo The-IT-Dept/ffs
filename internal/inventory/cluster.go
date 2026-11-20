@@ -78,13 +78,24 @@ type Synthetic struct {
 	Packages map[string][]model.Package
 }
 
+// ClusterOptions adjusts BuildClusterInventory.
+type ClusterOptions struct {
+	// RuntimeRetired: the node agent reports the container runtime (the Nodes owner), so no
+	// ContainerRuntime owners are built and the Kubernetes images drop NoteBundled.
+	RuntimeRetired bool
+}
+
 // BuildClusterInventory builds the synthetic Cluster owner (control plane, kubelet and kube-proxy
-// versions as "k8s:<v>" digests) and one ContainerRuntime owner per containerd or CRI-O runtime
-// ("runtime:<name>@<v>" digests). An owner with no versions is not emitted.
-func BuildClusterInventory(clusterName string, ci model.ClusterInfo, nodes []model.Node, now time.Time) []Synthetic {
+// versions as "k8s:<v>" digests) and, unless o.RuntimeRetired, one ContainerRuntime owner per
+// containerd or CRI-O runtime ("runtime:<name>@<v>" digests). An owner with no versions is not
+// emitted.
+func BuildClusterInventory(clusterName string, ci model.ClusterInfo, nodes []model.Node, now time.Time, o ClusterOptions) []Synthetic {
 	var out []Synthetic
-	if s, ok := clusterSynthetic(clusterName, ci, nodes, now); ok {
+	if s, ok := clusterSynthetic(clusterName, ci, nodes, now, o); ok {
 		out = append(out, s)
+	}
+	if o.RuntimeRetired {
+		return out
 	}
 	return append(out, runtimeSynthetics(nodes, now)...)
 }
@@ -104,7 +115,7 @@ func smallest(cur, v string) string {
 	return cur
 }
 
-func clusterSynthetic(clusterName string, ci model.ClusterInfo, nodes []model.Node, now time.Time) (Synthetic, bool) {
+func clusterSynthetic(clusterName string, ci model.ClusterInfo, nodes []model.Node, now time.Time, o ClusterOptions) (Synthetic, bool) {
 	versions := map[string]*k8sRoles{}
 	get := func(v string) *k8sRoles {
 		if versions[v] == nil {
@@ -161,7 +172,10 @@ func clusterSynthetic(clusterName string, ci model.ClusterInfo, nodes []model.No
 		case raw == "":
 			raw = "v" + v
 		}
-		notes := []string{NoteBundled}
+		var notes []string
+		if !o.RuntimeRetired {
+			notes = append(notes, NoteBundled)
+		}
 		if lowRaw != "" {
 			notes = append(notes, fmt.Sprintf(NoteVendorVersion, lowRaw))
 		}
@@ -260,8 +274,15 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // flushCluster stores the nodes and control-plane version and brings the synthetic Cluster and
-// ContainerRuntime owners up to date. Synthetic owners are never deleted here.
+// ContainerRuntime owners up to date. While the node agent has retired the runtime owner
+// (store.NodesState.RuntimeRetired), no ContainerRuntime owner is built. Synthetic owners are never
+// deleted here: a ContainerRuntime owner is dropped only by engine.Rehome, which moves its findings
+// onto the Nodes owner in the same write.
 func (inv *Inventory) flushCluster(ctx context.Context, f *flushState) error {
+	state, err := inv.o.Store.NodesState(ctx)
+	if err != nil {
+		return err
+	}
 	if err := inv.o.Store.ReplaceNodes(ctx, f.nodeList); err != nil {
 		return err
 	}
@@ -273,7 +294,7 @@ func (inv *Inventory) flushCluster(ctx context.Context, f *flushState) error {
 		return err
 	}
 	var errs []error
-	for _, s := range BuildClusterInventory(inv.o.ClusterName, ci, f.nodeList, f.now) {
+	for _, s := range BuildClusterInventory(inv.o.ClusterName, ci, f.nodeList, f.now, ClusterOptions{RuntimeRetired: state.RuntimeRetired}) {
 		for _, img := range s.Images {
 			if err := inv.recordSynthetic(ctx, img, s.Packages[img.Digest]); err != nil {
 				errs = append(errs, err)

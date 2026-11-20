@@ -161,3 +161,11 @@ func TestWebhook_SameIDAcrossRetries(t *testing.T) {
 	assert.Equal(t, a["id"], b["id"])
 	assert.NotEqual(t, g[0].req.Header.Get("webhook-timestamp"), g[1].req.Header.Get("webhook-timestamp"))
 }
+
+func TestWebhook_NodeGroups(t *testing.T) {
+	d := wireOf(notify.Message{Kind: notify.KindImmediate, Items: []notify.Item{{NodeGroups: []string{"a"}}}})
+	assert.Equal(t, []string{"a"}, d.Items[0].NodeGroups)
+	b, err := json.Marshal(wireOf(immediate(2)))
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "nodeGroups", "omitted for workload items, so the golden payload is unchanged")
+}

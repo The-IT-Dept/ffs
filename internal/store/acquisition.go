@@ -99,3 +99,13 @@ func (s *Store) OwnersOfExpiredQuarantine(ctx context.Context, now time.Time) ([
 		WHERE i.status IN (?, ?) AND i.quarantined_until IS NOT NULL AND i.quarantined_until <= ? ORDER BY o.owner_key`,
 		string(model.ImageCatalogFailed), string(model.ImageUnresolvable), now.UTC().UnixNano())
 }
+
+// OwnersOfAgentImages returns the sorted keys of the namespaced owners that run a catalogued image
+// whose SBOM a node agent supplied, so the inventory can ask the registry to supersede it. The
+// literal 'agent' is sbom.SourceAgent, which the store cannot import.
+func (s *Store) OwnersOfAgentImages(ctx context.Context) ([]string, error) {
+	return queryAll(ctx, s.rdb, scanString, `SELECT DISTINCT o.owner_key FROM owner_images o JOIN images i ON i.digest = o.digest
+		JOIN owners w ON w.key = o.owner_key
+		WHERE i.status = ? AND i.source = 'agent' AND w.namespace <> '' ORDER BY o.owner_key`,
+		string(model.ImageCatalogued))
+}
