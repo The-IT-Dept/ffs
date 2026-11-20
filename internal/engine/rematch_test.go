@@ -119,6 +119,70 @@ func TestEngine_GrypeDBSkipsFailingDigest(t *testing.T) {
 	require.Equal(t, []time.Time{dbBuilt}, builds)
 }
 
+// failingGrype is the real grype matcher, failing on the digests in fail as a database that cannot
+// be read would.
+type failingGrype struct {
+	*grype.Matcher
+	fail map[string]bool
+}
+
+func (g *failingGrype) MatchImage(ctx context.Context, in match.ImageInput) ([]model.Match, error) {
+	if g.fail[in.Digest] {
+		return nil, errors.New("grype: match " + in.Digest + ": database disk image is malformed")
+	}
+	return g.Matcher.MatchImage(ctx, in)
+}
+
+// TestEngine_GrypeDBIncrementalSkipsUnreadableDigest (R2): grype stores an image's search keys only
+// once it has read the SBOM, so an image whose SBOM it cannot read awaits grype at every update.
+// Re-matched only for that reason, its failure is skipped and the incremental update is recorded;
+// the update still fails when grype failed on every image the diff selected.
+func TestEngine_GrypeDBIncrementalSkipsUnreadableDigest(t *testing.T) {
+	st := openStore(t)
+	const good, bad = "sha256:good", "sha256:bad"
+	debianImage(t, st, good, "web", "140.4.0esr-1~deb12u1")
+	storeImage(t, st, bad, "broken", []byte("{not a syft document"), []model.Package{{ImageDigest: bad, ID: "bad-pkg",
+		Ecosystem: "deb", Name: "firefox-esr", Version: "140.4.0esr-1~deb12u1"}})
+	g := &failingGrype{Matcher: grype.New(st), fail: map[string]bool{}}
+	e := engine.New(engine.Options{Config: config.Default(), Store: st, Grype: g,
+		Now: func() time.Time { return dbBuilt.Add(time.Hour) }})
+	builds := func() []time.Time {
+		t.Helper()
+		bs, err := st.GrypeDBBuilds(ctx)
+		require.NoError(t, err)
+		return bs
+	}
+
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: grypedbtest.BuildDB(t, dbBuilt, "**/debian-12/*.json"),
+		Built: dbBuilt, Full: true}))
+	require.Equal(t, []time.Time{dbBuilt}, builds())
+	waiting, err := st.DigestsAwaitingGrype(ctx, dbBuilt.Add(24*time.Hour))
+	require.NoError(t, err)
+	require.Equal(t, []string{bad}, waiting, "grype never read the broken image, so it has no search keys")
+
+	// The diff touches no live image's packages: the broken image is the only one re-matched.
+	day2 := dbBuilt.Add(24 * time.Hour)
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: grypedbtest.BuildDB(t, day2, "**/debian-12/*.json"),
+		Built: day2, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "unrelated"}}}))
+	require.Equal(t, []time.Time{dbBuilt, day2}, builds())
+
+	// The diff selects the readable image and grype fails on it: the update is not recorded.
+	g.fail[good] = true
+	day3 := dbBuilt.Add(48 * time.Hour)
+	require.Error(t, e.OnGrypeDB(ctx, grypedb.Update{Path: grypedbtest.BuildDB(t, day3, "**/debian-12/*.json"),
+		Built: day3, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}}}))
+	require.Equal(t, []time.Time{dbBuilt, day2}, builds())
+
+	// Once grype matches it again, the same update is recorded, the broken image still skipped.
+	g.fail[good] = false
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: grypedbtest.BuildDB(t, day3, "**/debian-12/*.json"),
+		Built: day3, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "firefox-esr"}}}))
+	require.Equal(t, []time.Time{dbBuilt, day2, day3}, builds())
+	got := storedMatches(t, st, good, model.SourceGrype)
+	require.Len(t, got, 1)
+	require.Equal(t, day3, got[0].DBBuilt)
+}
+
 // TestEngine_GrypeDBRematchesOSVRuledDigests is the F24 regression. grype matched the image with DB
 // one before the OSV fast path saw the advisory, so it had no hint to form its not-affected opinion
 // from. DB two does not change firefox-esr, yet it must re-match the image so that its opinion forms.

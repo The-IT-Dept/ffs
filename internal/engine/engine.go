@@ -261,16 +261,20 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 //   - otherwise, with grype alone, the digests whose packages the diff changed plus those with OSV
 //     matches grype has not ruled on yet (store.DigestsAwaitingGrype).
 //
-// A digest that fails is logged, counted and left for the next DB; only when grype failed on every
-// digest, or the re-match is cancelled, is the error returned, before the build is recorded, so
-// the feed offers it again. The build is recorded once the re-match is done, since it counts
-// towards settling provisional findings, and every owner is then queued.
+// A digest that fails is logged and left for the next DB; it never fails the update on its own. The
+// update fails, before the build is recorded so the feed offers it again, only when it is cancelled
+// or when grype failed on every digest that tests the DB: every live digest of a full update, and
+// on an incremental one every digest the diff selected. Those have search keys, so grype read them
+// before and their failing says the DB is at fault. A digest re-matched only because it awaits
+// grype says nothing about the DB (grype may never have read its SBOM, and then it awaits grype at
+// every update), so its failure is skipped. The build is recorded once the re-match is done, since
+// it counts towards settling provisional findings, and every owner is then queued.
 func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	defer observe(metrics.RematchDuration.WithLabelValues("grypedb"), time.Now())
 	if err := e.o.Grype.Load(u.Path, u.Built); err != nil {
 		return fmt.Errorf("engine: load grype database: %w", err)
 	}
-	digests, err := e.grypeTargets(ctx, u)
+	digests, tests, err := e.grypeTargets(ctx, u)
 	if err != nil {
 		return err
 	}
@@ -279,8 +283,8 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 		mode = matchPersist
 	}
 	var (
-		failed, grypeFailed int
-		lastErr             error
+		failed, skipped, grypeFailed int
+		lastErr                      error
 	)
 	for _, d := range digests {
 		if err := ctx.Err(); err != nil {
@@ -289,18 +293,23 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 		r, err := e.matchImage(ctx, d, mode)
 		if err != nil {
 			failed++
-			lastErr = err
 			e.o.Log.Error(err, "re-matching an image with the new Grype DB failed; it waits for the next one", "digest", d)
 		}
-		if r.grypeFailed {
+		switch {
+		case !r.grypeFailed:
+		case tests[d]:
 			grypeFailed++
+			lastErr = err
+		default:
+			skipped++
 		}
 	}
-	if grypeFailed > 0 && grypeFailed == len(digests) {
+	if grypeFailed > 0 && grypeFailed == len(tests) {
 		return fmt.Errorf("engine: grype re-match failed on all %d images: %w", grypeFailed, lastErr)
 	}
 	if failed > 0 {
-		e.o.Log.Info("some images were not re-matched with the new Grype DB", "failed", failed, "images", len(digests))
+		e.o.Log.Info("some images were not re-matched with the new Grype DB", "failed", failed,
+			"awaitingGrypeSkipped", skipped, "images", len(digests))
 	}
 	if err := e.o.Store.RecordGrypeDBBuild(ctx, u.Built); err != nil {
 		return fmt.Errorf("engine: record grype database build: %w", err)
@@ -308,31 +317,38 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	return e.enqueueAll(ctx, model.TriggerNewAdvisory)
 }
 
-// grypeTargets returns the digests OnGrypeDB re-matches for u.
-func (e *Engine) grypeTargets(ctx context.Context, u grypedb.Update) ([]string, error) {
+// grypeTargets returns the digests OnGrypeDB re-matches for u, and those of them that test the DB:
+// all of them on a full update, and otherwise the live digests the diff selected (the others await
+// grype: store.DigestsAwaitingGrype).
+func (e *Engine) grypeTargets(ctx context.Context, u grypedb.Update) ([]string, map[string]bool, error) {
+	live, err := e.o.Store.LiveDigests(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("engine: live digests: %w", err)
+	}
 	if u.Full {
-		ds, err := e.o.Store.LiveDigests(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("engine: live digests: %w", err)
-		}
-		return ds, nil
+		return live, setOf(live), nil
 	}
 	changed, err := e.o.Grype.Affected(ctx, u.Changed)
 	if err != nil {
-		return nil, fmt.Errorf("engine: digests the grype database changed: %w", err)
-	}
-	live, err := e.o.Store.LiveDigests(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("engine: live digests: %w", err)
+		return nil, nil, fmt.Errorf("engine: digests the grype database changed: %w", err)
 	}
 	waiting, err := e.o.Store.DigestsAwaitingGrype(ctx, u.Built)
 	if err != nil {
-		return nil, fmt.Errorf("engine: digests awaiting grype: %w", err)
+		return nil, nil, fmt.Errorf("engine: digests awaiting grype: %w", err)
 	}
-	out := slices.DeleteFunc(changed, func(d string) bool { _, ok := slices.BinarySearch(live, d); return !ok })
-	out = append(out, waiting...)
+	selected := slices.DeleteFunc(changed, func(d string) bool { _, ok := slices.BinarySearch(live, d); return !ok })
+	tests := setOf(selected)
+	out := append(slices.Clone(selected), waiting...)
 	slices.Sort(out)
-	return slices.Compact(out), nil
+	return slices.Compact(out), tests, nil
+}
+
+func setOf(ss []string) map[string]bool {
+	m := make(map[string]bool, len(ss))
+	for _, s := range ss {
+		m[s] = true
+	}
+	return m
 }
 
 // MatchCandidate runs every matcher over a catalogued digest and returns the matches without
