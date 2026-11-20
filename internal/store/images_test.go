@@ -113,6 +113,27 @@ func TestPackagesByName(t *testing.T) {
 	require.Equal(t, []EcosystemKey{{"deb", "debian", "11"}, {"deb", "debian", "12"}, {"npm", "", ""}, {"npm", "debian", "12"}}, ecos)
 }
 
+func TestPackagesByNames(t *testing.T) {
+	s := newStore(t)
+	d12 := &model.Distro{ID: "debian", VersionID: "12"}
+	put(t, s, "sha256:a", pkg("deb", d12, "libssl3", "openssl"), pkg("deb", d12, "zlib1g", ""), pkg("deb", d12, "curl", "curl"),
+		pkg("python", nil, "Jinja2", ""), pkg("python", nil, "typing_extensions", ""))
+	put(t, s, "sha256:b", pkg("deb", nil, "openssl", ""))
+
+	bySource, err := s.PackagesByNames(ctx, "deb", []string{"openssl", "zlib1g", "linux"}, true)
+	require.NoError(t, err)
+	require.Equal(t, []string{"libssl3", "zlib1g", "openssl"}, names(bySource))
+	byName, err := s.PackagesByNames(ctx, "deb", []string{"curl", "libssl3"}, false)
+	require.NoError(t, err)
+	require.Equal(t, []string{"curl", "libssl3"}, names(byName))
+	none, err := s.PackagesByNames(ctx, "deb", nil, true)
+	require.NoError(t, err)
+	require.Empty(t, none)
+	folded, err := s.PackagesByFoldedNames(ctx, "python", []string{"jinja2", "Typing.Extensions"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"Jinja2", "typing_extensions"}, names(folded))
+}
+
 // TestPackagesByName_EmptySourceAndName pins the empty-name case of the source lookup: every
 // package with an empty source name, once.
 func TestPackagesByName_EmptySourceAndName(t *testing.T) {
@@ -133,7 +154,7 @@ func TestPackagesByNameQuery_Indexed(t *testing.T) {
 		distro   *model.Distro
 		bySource bool
 	}{{nil, true}, {nil, false}, {d12, true}, {d12, false}} {
-		q, args := packagesByNameQuery("deb", tc.distro, "openssl", tc.bySource)
+		q, args := packagesByNameQuery("deb", tc.distro, []string{"openssl", "linux"}, tc.bySource)
 		rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+q, args...)
 		require.NoError(t, err)
 		var plan []string
