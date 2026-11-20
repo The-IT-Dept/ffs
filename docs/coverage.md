@@ -111,7 +111,7 @@ ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachabl
 
 Most of the time between a vulnerability becoming known and a finding appearing is spent upstream: advisory databases and distributions triage before they publish.
 
-**What ffs shows:** every finding has four timestamps: `published` (by the advisory source), `observed` (when ffs first saw the advisory), `matched` (when the finding was created) and `lastSeen`. The gap between them shows where any delay came from. Feed freshness is on the Feeds page, and a stale feed raises a `FeedStale` Event.
+**What ffs shows:** every finding has four timestamps: `published` (by the advisory source), `observed` (when ffs first saw the advisory), `matched` (when the finding was created) and `lastSeen`. The gap between them shows where any delay came from. Feed freshness is on the Feeds page, and a stale feed raises a `FeedStale` Event, repeated hourly while it stays stale.
 
 ## SBOM sources
 

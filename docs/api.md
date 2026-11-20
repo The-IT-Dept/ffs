@@ -131,13 +131,13 @@ Errors are RFC 9457 problem documents, `application/problem+json`, with `type`, 
 | `/api/v1/images/{digest}/packages` | A page of one image's packages, searchable with `q` and filtered by `ecosystem`. |
 | `/api/v1/packages` | The packages explorer: package versions in the scope's images, with facets. Scopes: `cluster`, `namespace`, `workload`, `image`. |
 | `/api/v1/nodegroups` | The control plane and the node groups, with node agent status. |
-| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. `id` is the group's key: its stable name, with `-<arch>`, `-nodeinfo` or `@<member node>` added when other groups share the name, which survives package updates; a label or ID is also accepted. |
+| `/api/v1/nodegroups/{id}` | One node group: members, drift against other groups (`compare`), counts and cached images. `id` is the group's key: its stable name, with `-<arch>`, `-nodeinfo@<member node>` or `@<member node>` added when other groups share the name. The key survives package updates, and a key with a member node opens the group of that name that holds the node; a label or ID, or a key without its member node, is also accepted. |
 | `/api/v1/nodes/{name}` | One node: its group, node agent status, counts and cached images. |
 | `/api/v1/coverage` | The coverage funnel and every coverage gap, with a remedy code; see [coverage.md](coverage.md#gaps-and-what-to-do). Scopes: `cluster`, `namespace`, `workload`. |
 | `/api/v1/feeds` | Feed freshness, and the data sources with their licences and attribution. |
 | `/api/v1/exceptions` | Exceptions with what they match. |
 | `/api/v1/settings` | The effective settings that shape findings, without registry, listener or storage settings. |
-| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups (by name, or holding a matching host-only package), nodes, the control plane and Nodes, at most 20. Labels starting with `q` come first, the kinds taking turns, and `truncated` is set when more matched. |
+| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups (by name, or holding a matching host-only package), nodes, and the Control plane and Nodes pages (hit kinds `controlplane` and `nodes`, whose `id` is the cluster name), at most 20. Labels starting with `q` come first, the kinds taking turns, and `truncated` is set when more matched. |
 | `/api/v1/stream` | Change notifications; see [Live updates](#live-updates). |
 
 Each row of `/api/v1/nodegroups` counts its members by node agent state in `agents`: `reporting` (the host inventory is stored), `reportingWithoutInventory` (the agent reports, but the host inventory is not stored or not current; the node shows the `host_not_inventoried` gap), `stale`, `never`, `disabled`, and `unsupported` (the node agent does not schedule on the node; it shows the `node_agent_unsupported` gap).

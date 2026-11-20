@@ -57,7 +57,7 @@ catalog:
 
 # Persistent storage for the store and feed data.
 persistence:
-  # PVC size for the store and feed data. A Grype DB update holds two builds of a few GB each plus about 2.5 GB of SQLite temporary files; keep at least 10Gi.
+  # PVC size for the store and feed data. A Grype DB update holds two builds of a few GB each; a diffed one also holds a copy of the current build and about 2.5 GB of SQLite temporary files. Keep at least 10Gi, or 15Gi when updates are diffed (config.feeds.grypedb.diffMinImages).
   size: 20Gi
   # PVC storage class; empty uses the cluster default.
   storageClass: ""

@@ -34,7 +34,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `feeds.osv.url` | `https://osv-vulnerabilities.storage.googleapis.com` | Base URL of the OSV bucket. A Cloud Storage bucket (`https://<bucket>.storage.googleapis.com` or `https://storage.googleapis.com/<bucket>`) is read through the Cloud Storage JSON API, because the bucket host's cache can serve objects up to an hour old. Any other URL is a mirror, read as `<url>/<ecosystem>/<file>`. |
 | `feeds.osv.interval` | `5m` | How often to poll for changed records, per ecosystem present in the inventory. |
 | `feeds.osv.staleAfter` | `2h` | Age after which the feed is reported stale. |
-| `feeds.cvelist.enabled` | `true` | Use the CVE List V5 hourly deltas for CNA severity and upstream-runtime version ranges. |
+| `feeds.cvelist.enabled` | `true` | Use the CVE List V5 hourly deltas for CNA severity and upstream-runtime version ranges. A delta over 64 MiB is skipped and counted in `ffs_feed_skipped_total`. |
 | `feeds.cvelist.url` | `https://github.com/CVEProject/cvelistV5/releases/download` | Base URL of the release assets. |
 | `feeds.cvelist.interval` | `1h` | How often to fetch the delta. |
 | `feeds.cvelist.staleAfter` | `6h` | Age after which the feed is reported stale. |
@@ -50,16 +50,16 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `feeds.eol.url` | `https://endoflife.date/api/v1` | Base URL of the endoflife.date API. |
 | `feeds.eol.interval` | `24h` | How often to refresh it. |
 | `feeds.eol.staleAfter` | `72h` | Age after which the feed is reported stale. |
-| `feeds.nvd.enabled` | `false` | Reserved; not supported in v0.0.1. Setting it to `true` is rejected at startup. |
-| `feeds.nvd.url` | `https://services.nvd.nist.gov/rest/json/cves/2.0` | Reserved; not supported in v0.0.1. |
-| `feeds.nvd.interval` | `0s` | Reserved; not supported in v0.0.1. |
-| `feeds.nvd.staleAfter` | `0s` | Reserved; not supported in v0.0.1. |
+| `feeds.nvd.enabled` | `false` | Reserved; not supported in this release. Setting it to `true` is rejected at startup. |
+| `feeds.nvd.url` | `https://services.nvd.nist.gov/rest/json/cves/2.0` | Reserved; not supported in this release. |
+| `feeds.nvd.interval` | `0s` | Reserved; not supported in this release. |
+| `feeds.nvd.staleAfter` | `0s` | Reserved; not supported in this release. |
 | `feeds.chainguardOSV.enabled` | `false` | Add the Chainguard and Wolfi OSV data to the OSV feed, on the OSV schedule. That data is licensed CC-BY-NC-ND-4.0; check its terms before enabling. Only `enabled` is read. |
 | `feeds.chainguardOSV.url` | `https://packages.cgr.dev/chainguard/osv` | Not read; only `enabled` is read. |
 | `feeds.chainguardOSV.interval` | `0s` | Not read; only `enabled` is read. |
 | `feeds.chainguardOSV.staleAfter` | `0s` | Not read; only `enabled` is read. |
-| `priority.epssHigh` | `0.5` | EPSS score at or above which a finding is ranked `high`. Modifiers such as won't-fix and not running still apply. |
-| `priority.epssBump` | `0.1` | EPSS score at or above which a finding moves up one priority, but not above `high`. Must satisfy `0 < epssBump <= epssHigh <= 1`. |
+| `priority.epssHigh` | `0.5` | EPSS score at or above which a finding is ranked `high`. A finding ranked this way keeps it until its score falls below 90% of this (0.45 by default). Modifiers such as won't-fix and not running still apply. |
+| `priority.epssBump` | `0.1` | EPSS score at or above which a finding moves up one priority, but not above `high`. A finding keeps the move until its score falls below 90% of this (0.09 by default). Must satisfy `0 < epssBump <= epssHigh <= 1`. |
 | `exposure.internalIngressClasses` | `[]` | IngressClass names whose Ingresses do not count as exposure outside the cluster. |
 | `exposure.internalGatewayClasses` | `[]` | GatewayClass names whose Gateways do not count as exposure outside the cluster. |
 | `exposure.internalGateways` | `[]` | Gateways, as `namespace/name`, that do not count as exposure outside the cluster. |
@@ -71,7 +71,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `openReports.maxResults` | `100` | Most results in one report. |
 | `openReports.wgPolicy` | `false` | Also write `wgpolicyk8s.io` PolicyReports. The chart grants the extra RBAC only when this is true. |
 | `exceptions.maxDuration` | `8760h` | Longest an Exception may run, from now to its `expires`. At most `8760h` (one year). |
-| `retention.resolved` | `2160h` | How long resolved findings, their history and the alert delivery log are kept. Images that no workload runs and no upgrade suggestion holds are removed separately, a week after they fall out of use. |
+| `retention.resolved` | `2160h` | How long resolved findings, their history and the alert delivery log are kept. The history of findings that stay is pruned to the same window, keeping each finding's latest 20 transitions. Images that no workload runs and no upgrade suggestion holds are removed separately, a week after they fall out of use. |
 | `alertTargets.blockedCIDRs` | `[]` | Address ranges, as CIDRs, that alerts are not delivered to unless the AlertTarget sets `allowPrivate`. They add to the ranges the guard refuses already: private and carrier-grade NAT addresses and the nodes' pod CIDRs. Add the cluster's Service CIDR, and any other cluster range, when it is globally routable. See [Alerts](alerts.md#delivery). |
 | `upgrades.enabled` | `true` | Look for image upgrades that fix findings. |
 | `upgrades.maxCandidatesPerRepo` | `4` | Candidate tags scored per image repository and pass, from 1 to 4. |
@@ -112,7 +112,7 @@ These values configure the chart itself and are not part of `config.yaml`.
 | `catalog.resources` | requests `100m` CPU and `256Mi` memory, limit `2Gi` memory | Catalog container resources. The memory limit is a byte count or a quantity such as `2Gi` or `1.5Gi`; `GOMEMLIMIT` is set to 90% of it, and each catalog worker gets the limit less 128Mi for the catalog server, divided by `config.catalog.concurrency` (at least 64Mi each). |
 | `catalog.scratchSizeLimit` | `20Gi` | Size limit of the catalog container's scratch volume. |
 | `catalog.scratchLimit` | `19327352832` (18 GiB) | Scratch space the catalogue jobs may use together, as a byte count or a quantity such as `18Gi`. It must be greater than 0 and below `catalog.scratchSizeLimit`, so a job is refused before the kubelet evicts the pod; the chart refuses to render otherwise. |
-| `persistence.size` | `20Gi` | Size of the volume for the store and feed data. While a Grype DB update runs, the volume holds two builds (the November 2026 database is 2.7 GB before indexing), and diffing them takes about 2.5 GB more of SQLite temporary files. Keep at least 10Gi. |
+| `persistence.size` | `20Gi` | Size of the volume for the store and feed data. While a Grype DB update runs, the volume holds two builds (the November 2026 database is 2.7 GB before indexing and 3.3 GB after). When the update is diffed (from `feeds.grypedb.diffMinImages` catalogued SBOMs), it also holds a copy of the current build for the diff to read, and about 2.5 GB of SQLite temporary files. Keep at least 10Gi, or 15Gi when updates are diffed. |
 | `persistence.storageClass` | `""` | Storage class; empty uses the cluster default. |
 | `persistence.existingClaim` | `""` | Use an existing PersistentVolumeClaim instead of creating one. |
 | `podAnnotations` | `{}` | Extra pod annotations. |
@@ -165,7 +165,7 @@ web:
             app.kubernetes.io/name: oauth2-proxy
 ```
 
-Serve the web UI at the root of its host name, such as `https://ffs.example.com/`. It loads its files and the API from absolute paths (`/assets/…`, `/api/v1/…`), so a proxy that serves it under a path prefix, such as `https://example.com/ffs/`, is not supported in v0.0.1.
+Serve the web UI at the root of its host name, such as `https://ffs.example.com/`. It loads its files and the API from absolute paths (`/assets/…`, `/api/v1/…`), so a proxy that serves it under a path prefix, such as `https://example.com/ffs/`, is not supported.
 
 The web UI answers only requests addressed to `localhost`, an IP address, or a name in `config.allowedHosts`. The chart adds the Service's own names (`ffs-web`, `ffs-web.<namespace>`, `ffs-web.<namespace>.svc` and `ffs-web.<namespace>.svc.cluster.local`). If your proxy forwards the original host name, as oauth2-proxy does by default, list that name in `allowedHosts`.
 
