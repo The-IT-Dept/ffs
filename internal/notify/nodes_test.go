@@ -5,6 +5,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -245,4 +246,55 @@ func TestNotify_PausedTargetGetsNodeSummaryOnResume(t *testing.T) {
 	s := h.sink.sent[n]
 	assert.Equal(t, notify.KindBaseline, s.Kind)
 	assert.Equal(t, "Node inventory baseline: 1 finding on 1 node group (1 urgent, 0 high)", s.Title)
+}
+
+// nodeSummaries counts the node inventory baselines sent.
+func (h *harness) nodeSummaries() int {
+	n := 0
+	for _, m := range h.sink.ofKind(notify.KindBaseline) {
+		if strings.HasPrefix(m.Title, "Node inventory baseline: ") {
+			n++
+		}
+	}
+	return n
+}
+
+// The reconciler marks the node baseline ready after a pass reads its clock but before it reads
+// NodesState. The summary is recorded at the mark, not at the earlier clock, so a later pass with a
+// new transition (a new summary ID) does not summarise again.
+func TestNotify_NodesReadyAfterPassClockSummarisesOnce(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	h.process()
+	h.groups([3]string{grpA, labelA, "worker-1"})
+	h.batch(nodesFinding("CVE-2026-0100", urgent, grpA))
+	ready := h.now.Add(time.Second)
+	require.NoError(t, h.st.PutNodesState(ctx, store.NodesState{AgentEnabled: true, BaselineReadyAt: ready}))
+	h.process()
+	assert.Equal(t, 1, h.nodeSummaries())
+	assert.True(t, h.targetState("uid-ops").NodesBaselineAt.Equal(ready))
+	n := len(h.sink.sent)
+
+	h.open(dep("shop", "web"), "CVE-2026-0001", medium) // unrelated: below the immediate floor
+	h.process()
+	assert.Len(t, h.sink.sent, n)
+	assert.Equal(t, 1, h.nodeSummaries())
+}
+
+// The same race on a new target: its full baseline already covers the Nodes findings, so no node
+// summary follows it.
+func TestNotify_NewTargetReadyAfterPassClockSummarisesOnce(t *testing.T) {
+	h := newHarness(t)
+	h.groups([3]string{grpA, labelA, "worker-1"})
+	ready := h.now.Add(time.Second)
+	require.NoError(t, h.st.PutNodesState(ctx, store.NodesState{AgentEnabled: true, BaselineReadyAt: ready}))
+	h.batch(nodesFinding("CVE-2026-0100", urgent, grpA))
+	h.target("ops")
+	h.process()
+	assert.Equal(t, "ffs is watching 0 workloads: 1 urgent, 0 high", h.sink.only(t).Title)
+	assert.True(t, h.targetState("uid-ops").NodesBaselineAt.Equal(ready))
+
+	h.open(dep("shop", "web"), "CVE-2026-0001", medium) // unrelated: below the immediate floor
+	h.process()
+	h.sink.only(t)
 }

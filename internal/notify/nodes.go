@@ -24,14 +24,16 @@ func isNodes(o model.OwnerRef) bool { return o.ClusterLevel() && o.Kind == model
 // that follows classifies the held transitions against the new ledger, so nothing summarised is
 // sent again, and the message ID is stable, so a repeated pass queues nothing twice. A target
 // limited to some namespaces never covers cluster-level subjects: it only records the baseline.
-func (e *Engine) nodesBaseline(ctx context.Context, t *target, now time.Time) error {
+// readyAt is the BaselineReadyAt the pass observed; the baseline is recorded at no earlier time.
+func (e *Engine) nodesBaseline(ctx context.Context, t *target, readyAt, now time.Time) error {
 	uid := t.cfg.UID
+	at := nodesBaselineAt(now, readyAt)
 	maxID, err := e.st.MaxTransitionID(ctx)
 	if err != nil {
 		return err
 	}
 	if !t.cfg.allows("") {
-		return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, NodesBaselineAt: now})
+		return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, NodesBaselineAt: at})
 	}
 	all, err := e.st.ListFindings(ctx, store.FindingFilter{States: []model.FindingState{model.StateOpen}})
 	if err != nil {
@@ -68,7 +70,18 @@ func (e *Engine) nodesBaseline(ctx context.Context, t *target, now time.Time) er
 		return err
 	}
 	return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, Ledger: ledger, Deliveries: []store.Delivery{d},
-		NodesBaselineAt: now})
+		NodesBaselineAt: at})
+}
+
+// nodesBaselineAt is when a node inventory baseline sent at now is recorded: no earlier than the
+// BaselineReadyAt it summarised. The reconciler can mark the baseline ready after a pass reads its
+// clock but before it reads NodesState; recording now alone would leave the target held behind
+// that mark, and the next pass would send a second summary under a new ID (spec §9.9).
+func nodesBaselineAt(now, readyAt time.Time) time.Time {
+	if readyAt.After(now) {
+		return readyAt
+	}
+	return now
 }
 
 // groupLabels returns the labels of the agent node groups with members, keyed by their group

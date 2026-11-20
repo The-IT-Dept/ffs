@@ -360,7 +360,7 @@ func (e *Engine) processTarget(ctx context.Context, t *target) error {
 			Cursors: map[string]int64{immediateCursor(uid): last, digestCursor(uid): last}, LastDigestAt: now})
 	}
 	if holdNodes && !ns.BaselineReadyAt.IsZero() {
-		if err := e.nodesBaseline(ctx, t, now); err != nil {
+		if err := e.nodesBaseline(ctx, t, ns.BaselineReadyAt, now); err != nil {
 			return err
 		}
 		holdNodes = false
@@ -573,7 +573,7 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 		if b.nodeGroups, _, err = e.groupLabels(ctx); err != nil {
 			return err
 		}
-		c.NodesBaselineAt = now
+		c.NodesBaselineAt = nodesBaselineAt(now, ns.BaselineReadyAt)
 	}
 	m := e.message(t, KindBaseline, strconv.FormatInt(maxID, 10),
 		baselineTitle(n, counts[model.PriorityUrgent], counts[model.PriorityHigh]), now)
