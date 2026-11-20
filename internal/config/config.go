@@ -150,10 +150,13 @@ type TagOverride struct {
 }
 
 // DefaultDiffMinImages is the default feeds.grypedb.diffMinImages. Measured on one machine with the
-// 2026-11-18 and 2026-11-20 production builds, the diff took 223 CPU-seconds and a Grype re-match
-// 0.38 to 0.46 CPU-seconds per SBOM: the diff alone costs as much as re-matching about 500 SBOMs,
-// before the diff path re-matches the images whose packages changed, which was most of them.
-const DefaultDiffMinImages = 500
+// 2026-11-18 and 2026-11-20 production builds: the diff took 228 CPU-seconds, and a full re-match as
+// the engine runs it (every matcher, matches stored) 0.4 CPU-seconds per small image, 4 per large
+// image and 5 per Ubuntu node group. The diff selected every one of those SBOMs for re-matching, so
+// the diff path cost the diff plus a full re-match. It pays off only where a diff leaves enough
+// SBOMs untouched to save more than it costs: at 1000 SBOMs, over half of a cluster of small images,
+// or about 5% of one of large images.
+const DefaultDiffMinImages = 1000
 
 // Default returns the built-in configuration.
 func Default() Config {

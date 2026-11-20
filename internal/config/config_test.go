@@ -24,7 +24,7 @@ func TestDefault(t *testing.T) {
 		Catalog:  CatalogConfig{Socket: "/run/ffs/catalog.sock", Timeout: 10 * time.Minute, MaxImageBytes: 10 << 30, Concurrency: 2},
 		Registry: RegistryConfig{ReadPullSecrets: true},
 		Feeds: FeedsConfig{
-			GrypeDB:       GrypeDBConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h, 500},
+			GrypeDB:       GrypeDBConfig{true, "https://grype.anchore.io/databases/v6/latest.json", 1 * h, 48 * h, 1000},
 			OSV:           FeedConfig{true, "https://osv-vulnerabilities.storage.googleapis.com", 5 * time.Minute, 2 * h},
 			CVEList:       FeedConfig{true, "https://github.com/CVEProject/cvelistV5/releases/download", 1 * h, 6 * h},
 			KEV:           FeedConfig{true, "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json", 1 * h, 24 * h},

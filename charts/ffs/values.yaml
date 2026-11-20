@@ -261,7 +261,7 @@ config:
       # Age after which the feed is stale.
       staleAfter: 48h
       # Catalogued SBOMs from which a new database is diffed instead of re-matching every SBOM; 0 always diffs.
-      diffMinImages: 500
+      diffMinImages: 1000
     # OSV feed.
     osv:
       # Enable the OSV feed.
