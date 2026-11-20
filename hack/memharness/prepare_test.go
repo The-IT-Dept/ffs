@@ -183,10 +183,11 @@ func prepareAdvisories(t *testing.T, dir string) {
 }
 
 // prepareHosts writes the five group host SBOMs to <dir>/hosts/group-<n>.json, as the node agent's cataloguer
-// produces them: the dpkg database of ubuntu:26.04 with serverPackages installed (from docker), the running
-// kernel's package family, and the containerd and runc binaries, staged like the agent stages a host and
-// catalogued in process with the agent's host-dir cataloguer. Group n leaves out 5+2n packages, chosen
-// differently for each group, so the groups' fingerprints differ.
+// produces them: the dpkg database of ubuntu:26.04 with serverPackages installed (exportWithDocker, or
+// exportFromArchive without docker; see hostsSource), the running kernel's package family, and the containerd
+// and runc binaries, staged like the agent stages a host and catalogued in process with the agent's host-dir
+// cataloguer. Group n leaves out 5+2n packages, chosen differently for each group, so the groups' fingerprints
+// differ.
 func prepareHosts(t *testing.T, dir string) {
 	hostsDir := filepath.Join(dir, "hosts")
 	marker := filepath.Join(hostsDir, "hosts.ok")
@@ -199,21 +200,12 @@ func prepareHosts(t *testing.T, dir string) {
 	export := filepath.Join(hostsDir, "export")
 	require.NoError(t, os.MkdirAll(filepath.Join(export, "bin"), 0o750))
 
-	var copyBins []string
-	for _, b := range hostBinaries {
-		copyBins = append(copyBins, fmt.Sprintf("cp %s /out/bin/%s", b.Path, b.Name))
+	source := hostsSource(t, ctx)
+	if source == sourceDocker {
+		exportWithDocker(t, ctx, export)
+	} else {
+		exportFromArchive(t, ctx, export)
 	}
-	script := "set -e; apt-get update -qq >/dev/null; apt-get install -y -qq --no-install-recommends " +
-		strings.Join(serverPackages, " ") + " >/dev/null 2>&1; cp /var/lib/dpkg/status /out/status; " +
-		"cp /etc/os-release /out/os-release; " + strings.Join(copyBins, "; ")
-	start := time.Now()
-	//nolint:gosec // G204: docker with the harness's own script and export directory
-	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", "linux/amd64", "-e", "DEBIAN_FRONTEND=noninteractive",
-		"-v", export+":/out", ubuntuImage, "sh", "-c", script)
-	out, err := cmd.CombinedOutput()
-	require.NoError(t, err, "docker run %s: %s", ubuntuImage, out)
-	t.Logf("exported the dpkg database of %s with %d server packages in %s", ubuntuImage, len(serverPackages),
-		time.Since(start).Round(time.Second))
 
 	status, err := os.ReadFile(filepath.Join(export, "status")) //nolint:gosec // G304: the export directory
 	require.NoError(t, err)
@@ -249,7 +241,8 @@ func prepareHosts(t *testing.T, dir string) {
 		require.NoError(t, err)
 		writeFile(t, hostPath(dir, g), resp.SyftJSON)
 		require.NoError(t, os.RemoveAll(stage))
-		groups = append(groups, hostGroup{Group: g, LeftOut: left, Packages: len(kept), SyftJSONBytes: len(resp.SyftJSON)})
+		groups = append(groups, hostGroup{Group: g, Source: source, LeftOut: left, Packages: len(kept),
+			SyftJSONBytes: len(resp.SyftJSON)})
 		t.Logf("group %d: %d dpkg packages (left out %v), syft-json %d bytes", g, len(kept), left, len(resp.SyftJSON))
 	}
 	require.NoError(t, os.RemoveAll(export))
@@ -258,9 +251,56 @@ func prepareHosts(t *testing.T, dir string) {
 	require.NoError(t, os.WriteFile(marker, b, 0o600))
 }
 
+// The ways prepareHosts gets the hosts' dpkg database and binaries (FFS_MEMHARNESS_HOSTS).
+const (
+	sourceDocker  = "docker"
+	sourceArchive = "archive"
+)
+
+// hostsSource picks how prepareHosts gets the hosts' packages: FFS_MEMHARNESS_HOSTS when set, else docker
+// when its daemon answers, else the archive.
+func hostsSource(t *testing.T, ctx context.Context) string {
+	switch v := os.Getenv(envHosts); v {
+	case sourceDocker, sourceArchive:
+		return v
+	case "":
+	default:
+		t.Fatalf("%s=%q: want %s or %s", envHosts, v, sourceDocker, sourceArchive)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "docker", "info").Run(); err != nil {
+		t.Logf("docker is unavailable (%v): resolving the hosts' packages from the Ubuntu archive", err)
+		return sourceArchive
+	}
+	return sourceDocker
+}
+
+// exportWithDocker installs serverPackages in ubuntuImage with apt, and copies its dpkg status, os-release
+// and hostBinaries to export (status, os-release, bin/<name>).
+func exportWithDocker(t *testing.T, ctx context.Context, export string) {
+	t.Helper()
+	var copyBins []string
+	for _, b := range hostBinaries {
+		copyBins = append(copyBins, fmt.Sprintf("cp %s /out/bin/%s", b.Path, b.Name))
+	}
+	script := "set -e; apt-get update -qq >/dev/null; apt-get install -y -qq --no-install-recommends " +
+		strings.Join(serverPackages, " ") + " >/dev/null 2>&1; cp /var/lib/dpkg/status /out/status; " +
+		"cp /etc/os-release /out/os-release; " + strings.Join(copyBins, "; ")
+	start := time.Now()
+	//nolint:gosec // G204: docker with the harness's own script and export directory
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "--platform", "linux/"+debArch, "-e", "DEBIAN_FRONTEND=noninteractive",
+		"-v", export+":/out", ubuntuImage, "sh", "-c", script)
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, "docker run %s: %s", ubuntuImage, out)
+	t.Logf("exported the dpkg database of %s with %d server packages in %s", ubuntuImage, len(serverPackages),
+		time.Since(start).Round(time.Second))
+}
+
 // hostGroup describes one generated group host SBOM.
 type hostGroup struct {
 	Group         int      `json:"group"`
+	Source        string   `json:"source"`
 	LeftOut       []string `json:"leftOut"`
 	Packages      int      `json:"packages"`
 	SyftJSONBytes int      `json:"syftJSONBytes"`

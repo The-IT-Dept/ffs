@@ -50,6 +50,7 @@ const (
 	envLabel   = "FFS_MEMHARNESS_LABEL"
 	envCompare = "FFS_MEMHARNESS_COMPARE"
 	envWindow  = "FFS_MEMHARNESS_OSV_WINDOW"
+	envHosts   = "FFS_MEMHARNESS_HOSTS"
 
 	defaultDir    = "/tmp/ffs-memharness"
 	defaultWindow = 336 * time.Hour
