@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import { Fragment } from 'react'
 import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
@@ -19,7 +19,6 @@ import { copy, facetValueLabel } from '@/lib/copy'
 import { shortDigest } from '@/lib/format'
 import { type ImageSearch, parseImageSearch, revalidate } from '@/lib/query'
 import { formatScope } from '@/lib/scope'
-import { rootRoute } from './root'
 
 type View = NonNullable<ImageSearch['view']>
 const VIEWS: readonly View[] = ['findings', 'packages', 'upgrades', 'sbom']
@@ -60,9 +59,9 @@ function StatusLine({ d }: { d: S<'ImageDetail'> }) {
 }
 
 function ImagePage() {
-  const { digest } = imageRoute.useParams()
-  const search = revalidate(parseImageSearch, imageRoute.useSearch())
-  const navigate = imageRoute.useNavigate()
+  const { digest } = Route.useParams()
+  const search = revalidate(parseImageSearch, Route.useSearch())
+  const navigate = Route.useNavigate()
   const scopeObj = { kind: 'image' as const, value: digest }
   const scope = formatScope(scopeObj)
   const detail = useQuery(apiQuery('/images/{digest}', { path: { digest } }))
@@ -117,7 +116,7 @@ function ImagePage() {
               </Badge>
             ) : null}
             {d.counts.high > 0 ? (
-              <Badge variant="outline" className="text-(--high)">
+              <Badge variant="outline" className="text-(--high-text)">
                 {copy.workload.high(d.counts.high)}
               </Badge>
             ) : null}
@@ -160,9 +159,5 @@ function ImagePage() {
   )
 }
 
-export const imageRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/images/$digest',
-  validateSearch: parseImageSearch,
-  component: ImagePage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/images/$digest')({ component: ImagePage })

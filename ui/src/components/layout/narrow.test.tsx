@@ -37,7 +37,8 @@ test('from 1024 px the rail sits inline and there is no menu button', async () =
   const rail = await screen.findByRole('complementary', { name: 'Scope' })
   expect(await within(rail).findByText('Kubernetes 1.35.0 · 3 nodes · 4 namespaces')).toBeInTheDocument()
   expect(screen.queryByRole('button', { name: 'Open navigation' })).toBeNull()
-  expect(screen.getByRole('button', { name: /^Search/ })).toHaveTextContent('⌘K')
+  // jsdom reports no platform, so the hint is the one for every platform but Apple's.
+  expect(screen.getByRole('button', { name: /^Search/ })).toHaveTextContent('Ctrl K')
   expect(media.asked).toContain('(min-width: 1024px)')
 })
 
@@ -51,6 +52,7 @@ test('below 1024 px the rail is a drawer behind a menu button that names the sco
   expect(screen.queryByRole('complementary', { name: 'Scope' })).toBeNull()
   expect(screen.queryByText('Kubernetes 1.35.0 · 3 nodes · 4 namespaces')).toBeNull()
   const search = screen.getByRole('button', { name: 'Search' })
+  expect(search).not.toHaveTextContent('Ctrl K')
   expect(search).not.toHaveTextContent('⌘K')
 })
 

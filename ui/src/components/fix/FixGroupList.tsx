@@ -28,7 +28,9 @@ type Row = S<'FindingGroupRow'>
 export function groupFilter(group: FixGroupKind, row: Row): ExplorerSearch {
   if (group === 'fix') return { fixKey: row.key }
   if (group === 'advisory') return { advisory: row.key }
-  return { package: parsePackageKey(row.key).name }
+  // A package group is one ecosystem's package; the same name in another ecosystem is another.
+  const p = parsePackageKey(row.key)
+  return p.ecosystem ? { package: p.name, ecosystem: [p.ecosystem] } : { package: p.name }
 }
 
 function header(group: FixGroupKind, row: Row): string {

@@ -51,6 +51,7 @@ const relatedLabel: Record<RelatedSectionId, string> = {
 export const copy = {
   page: {
     home: 'Exposure',
+    notFound: 'Not found',
     vulnerabilities: 'Vulnerabilities',
     advisory: 'Advisory',
     workloads: 'Workloads',
@@ -247,6 +248,8 @@ export const copy = {
   },
   command: {
     open: 'Search',
+    shortcut: (apple: boolean) => (apple ? '⌘K' : 'Ctrl K'),
+    truncated: 'Refine the search to see more.',
     placeholder: 'Search workloads, images, advisories, packages and nodes',
     empty: 'No matches.',
     kind: {
@@ -358,6 +361,18 @@ export const copy = {
     containers: { container: 'Container', image: 'Image', status: 'Status', coverage: 'Coverage' },
     exposureCols: { entry: 'Entry', name: 'Name', listener: 'Listener', hostname: 'Hostname', route: 'Route', service: 'Service', internal: 'Internal' },
     history: { when: 'When', advisory: 'Advisory', change: 'Change', priority: 'Priority', trigger: 'Trigger' },
+    // The state a created finding comes from in the history's Change column.
+    created: 'new',
+    // Transition triggers (model.Trigger); an unknown one reads as sent.
+    trigger: {
+      NewAdvisory: 'New advisory',
+      InventoryChange: 'Inventory changed',
+      PriorityChange: 'Priority changed',
+      FixAvailable: 'Fix available',
+      ExceptionExpired: 'Exception expired',
+      Withdrawn: 'Advisory withdrawn',
+      UpgradeAvailable: 'Upgrade available',
+    } as Record<string, string | undefined>,
   },
   path: {
     internet: 'Internet',

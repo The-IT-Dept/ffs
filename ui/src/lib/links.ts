@@ -201,7 +201,8 @@ export function relatedHref(scope: Scope, id: RelatedSectionId, q?: string): str
     case 'controlplane':
       return '/controlplane'
     case 'usedBy':
-      return scope.kind === 'image' ? imagePath(scope.value) : undefined
+      // Used by is listed on the image's SBOM view.
+      return scope.kind === 'image' ? viewHref(scope, 'sbom') : undefined
     case 'members':
       return scope.kind === 'nodegroup' ? nodeGroupPath(scope.value) + stringifySearchParams({ view: 'members' }) : undefined
     case 'exceptions':

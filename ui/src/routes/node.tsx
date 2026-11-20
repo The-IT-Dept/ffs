@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import { AppLink } from '@/components/layout/AppLink'
@@ -13,7 +13,6 @@ import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { Skeleton } from '@/components/ui/skeleton'
 import { copy } from '@/lib/copy'
 import { nodeGroupPath } from '@/lib/links'
-import { rootRoute } from './root'
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -25,7 +24,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 }
 
 function NodePage() {
-  const { name } = nodeRoute.useParams()
+  const { name } = Route.useParams()
   const q = useQuery(apiQuery('/nodes/{name}', { path: { name } }))
   const d = q.data
   const n = d?.node
@@ -84,8 +83,5 @@ function NodePage() {
   )
 }
 
-export const nodeRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/nodes/$name',
-  component: NodePage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/nodes/$name')({ component: NodePage })

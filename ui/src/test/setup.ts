@@ -16,8 +16,10 @@ Element.prototype.hasPointerCapture ??= function hasPointerCapture() {
   return false
 }
 Element.prototype.releasePointerCapture ??= function releasePointerCapture() {}
-// The router restores scroll positions; jsdom reports window.scrollTo as not implemented.
+// The router restores scroll positions, and scrolls #main to the top of a new page; jsdom reports
+// window.scrollTo as not implemented and has no Element.scrollTo.
 window.scrollTo = function scrollTo() {} as typeof window.scrollTo
+Element.prototype.scrollTo ??= function scrollTo() {} as typeof Element.prototype.scrollTo
 
 // Width queries are answered against window.innerWidth, which jsdom sets to 1024, so pages render
 // their wide layout unless a test says otherwise; every other query (the colour scheme) is false.

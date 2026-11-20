@@ -56,13 +56,13 @@ test('the workloads explorer shows — for unknown pods and sorts on the server'
   await waitFor(() => expect(api.calls('/workloads').at(-1)!.searchParams.get('sort')).toBe('name'))
 })
 
-test('the packages explorer links a package to its findings', async () => {
+test('the packages explorer links a package to its findings in its own ecosystem', async () => {
   mockApi().on(
     '/packages',
     packagesPage({ total: 1, rows: [{ ecosystem: 'deb', name: 'openssl', version: '3.5.1-1', images: 2, workloads: 3, counts: counts({ high: 2 }), worst: 'high' }] }),
   )
   renderApp('/packages')
-  expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?package=openssl')
+  expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?package=openssl&ecosystem=deb')
 })
 
 test('a scoped packages explorer links a package to its findings in the same scope', async () => {
@@ -71,7 +71,7 @@ test('a scoped packages explorer links a package to its findings in the same sco
     packagesPage({ total: 1, rows: [{ ecosystem: 'deb', name: 'openssl', version: '3.5.1-1', images: 2, workloads: 3, counts: counts({ high: 2 }), worst: 'high' }] }),
   )
   renderApp('/packages?scope=namespace:shop')
-  expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?scope=namespace:shop&package=openssl')
+  expect(await screen.findByRole('link', { name: /openssl/ })).toHaveAttribute('href', '/vulnerabilities?scope=namespace:shop&package=openssl&ecosystem=deb')
 })
 
 test('explorers never send parameters their endpoint does not take', async () => {

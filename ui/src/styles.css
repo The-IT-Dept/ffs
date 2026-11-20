@@ -4,7 +4,8 @@
 @custom-variant dark (&:is(.dark *));
 
 /* shadcn zinc tokens (https://ui.shadcn.com/r/colors/zinc.json, cssVarsV4), plus the three priority
-   colours. Colour is spent only on urgent (red), high (orange) and medium (amber, dots only). */
+   colours. Colour is spent only on urgent (red), high (orange) and medium (amber, dots only). High
+   text takes a darker orange than high fills, so small text keeps AA contrast on the light ground. */
 :root {
   --radius: 0.625rem;
   --background: oklch(1 0 0);
@@ -40,10 +41,12 @@
   --sidebar-ring: oklch(0.705 0.015 286.067);
   --urgent: #dc2626;
   --high: #ea580c;
+  --high-text: #c2410c;
   --medium: #f59e0b;
 }
 
 .dark {
+  color-scheme: dark;
   --background: oklch(0.141 0.005 285.823);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.21 0.006 285.885);
@@ -77,6 +80,7 @@
   --sidebar-ring: oklch(0.552 0.016 285.938);
   --urgent: #f87171;
   --high: #fb923c;
+  --high-text: #fb923c;
   --medium: #f59e0b;
 }
 

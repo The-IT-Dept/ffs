@@ -1,4 +1,4 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { SlidersHorizontal } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef } from 'react'
@@ -33,7 +33,7 @@ import { FilterChips } from './FilterChips'
 import { GroupSwitch } from './GroupSwitch'
 import { GroupTable } from './GroupTable'
 import { Pager, useCursorPages } from './Pager'
-import { type ExplorerRow, explorerQuery, PAGE_LIMIT } from './params'
+import { type ExplorerRow, explorerQuery, keepWhileGroup, PAGE_LIMIT } from './params'
 
 const groupNoun: Record<string, CountNoun> = {
   advisory: 'advisories',
@@ -112,7 +112,7 @@ export function ExplorerPage<K extends ExplorerKind>({
   // Only what this explorer's endpoint takes; every update below is built from it, so a stray key
   // in a shared URL never reaches the server and is dropped from the URL on the next change.
   const search = useMemo(() => revalidate(explorerSearchFor(kind), routeSearch), [kind, routeSearch])
-  const q = useQuery({ ...explorerQuery(kind, search), placeholderData: keepPreviousData })
+  const q = useQuery({ ...explorerQuery(kind, search), placeholderData: keepWhileGroup(search.group) })
   const settings = useQuery(apiQuery('/settings', {}))
   const epssBump = settings.data?.priority.epssBump ?? 0.1
   const scope = scopeOf(search)

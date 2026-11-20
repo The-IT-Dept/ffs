@@ -2,7 +2,19 @@ import { createMemoryHistory } from '@tanstack/react-router'
 import { expect, test } from 'vitest'
 import { createQueryClient } from '@/api/client'
 import { createAppRouter } from '@/router'
-import { advisoryPath, coverageHref, explorerHref, hitPath, imagePath, nodeGroupLinkIds, ownerHref, ownerLabel, scopePath, workloadPath } from './links'
+import {
+  advisoryPath,
+  coverageHref,
+  explorerHref,
+  hitPath,
+  imagePath,
+  nodeGroupLinkIds,
+  ownerHref,
+  ownerLabel,
+  relatedHref,
+  scopePath,
+  workloadPath,
+} from './links'
 import { CLUSTER, parseScope } from './scope'
 
 // Review Focus 2
@@ -70,4 +82,9 @@ test('the coverage page of a scope keeps the scopes it covers', () => {
   expect(coverageHref(parseScope('namespace:shop'))).toBe('/coverage?scope=namespace:shop')
   expect(coverageHref(parseScope('workload:Deployment/shop/web'))).toBe('/coverage?scope=workload:Deployment/shop/web')
   expect(coverageHref(parseScope('image:sha256:abc'))).toBe('/coverage')
+})
+
+test('the rail used-by "+ N more" opens the SBOM view, where Used by is listed', () => {
+  expect(relatedHref(parseScope('image:sha256:abc'), 'usedBy')).toBe('/images/sha256%3Aabc?view=sbom')
+  expect(relatedHref(CLUSTER, 'usedBy')).toBeUndefined()
 })

@@ -29,7 +29,7 @@ function columnsFor(scope: string | undefined): Column<Row>[] {
       sort: 'name',
       cell: (r) => (
         <span className="inline-flex items-center gap-1.5">
-          <AppLink href={explorerHref('findings', { scope, package: r.name })} className="hover:underline">
+          <AppLink href={explorerHref('findings', { scope, package: r.name, ecosystem: [r.ecosystem] })} className="hover:underline">
             {r.name}
           </AppLink>
           {r.classifier ? <span className="rounded border px-1 text-[10px] leading-4 text-muted-foreground">{r.classifier}</span> : null}

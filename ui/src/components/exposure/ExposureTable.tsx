@@ -47,8 +47,9 @@ function Detail({ text }: { text?: string }) {
   return text ? <span className="ml-2 font-normal text-muted-foreground">{text}</span> : null
 }
 
+// Hostname is "hostname → workloads". The workloads behind a hostname can sit in several
+// namespaces, so the row names none.
 function Hostname({ row }: { row: Row }) {
-  const first = row.workloads[0]
   return (
     <span className="inline-flex min-w-0 items-center gap-1">
       <span>{row.label}</span>
@@ -62,7 +63,6 @@ function Hostname({ row }: { row: Row }) {
         </Fragment>
       ))}
       {row.moreWorkloads > 0 ? <span className="text-muted-foreground">+{formatCount(row.moreWorkloads)}</span> : null}
-      {first?.namespace ? <span className="text-muted-foreground">· {first.namespace}</span> : null}
     </span>
   )
 }

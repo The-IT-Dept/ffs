@@ -30,7 +30,7 @@ export function AppShell({ children }: { children: ReactNode }) {
             <Rail />
           </aside>
         ) : null}
-        <main className="min-w-0 flex-1 px-4 py-4 sm:px-6 lg:overflow-y-auto">
+        <main id="main" className="min-w-0 flex-1 px-4 py-4 sm:px-6 lg:overflow-y-auto">
           <GoneNotice />
           {children}
         </main>

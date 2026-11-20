@@ -43,12 +43,14 @@ function groupCell(group: string, row: Row, search: ExplorerSearch) {
           <Mono>{row.label}</Mono>
         </AppLink>
       )
-    case 'package':
+    case 'package': {
+      const p = parsePackageKey(row.key)
       return (
-        <AppLink href={narrowed(search, { package: parsePackageKey(row.key).name })} className="hover:underline">
+        <AppLink href={narrowed(search, { package: p.name, ...(p.ecosystem ? { ecosystem: [p.ecosystem] } : {}) })} className="hover:underline">
           <Mono>{row.label}</Mono>
         </AppLink>
       )
+    }
     case 'namespace':
       return row.key === '' ? (
         <span className="text-muted-foreground">{copy.clusterLevel}</span>

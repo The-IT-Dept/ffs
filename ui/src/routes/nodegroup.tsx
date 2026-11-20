@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query'
-import { createRoute } from '@tanstack/react-router'
+import { createLazyRoute } from '@tanstack/react-router'
 import { type ReactNode, useEffect, useState } from 'react'
 import { ApiProblem, apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
@@ -23,7 +23,6 @@ import { formatCount } from '@/lib/format'
 import { nodeGroupPath, nodePath } from '@/lib/links'
 import { type NodeGroupSearch, parseNodeGroupSearch, revalidate, stringifySearchParams } from '@/lib/query'
 import { cn } from '@/lib/utils'
-import { rootRoute } from './root'
 
 type View = NonNullable<NodeGroupSearch['view']>
 type Detail = S<'NodeGroupDetail'>
@@ -294,9 +293,9 @@ function MembersView({ d, id }: { d: Detail; id: string }) {
 
 function NodeGroupPage() {
   // id is the group's stable name, as the app links groups, or its ID; the API resolves both.
-  const { id } = nodeGroupRoute.useParams()
-  const search = revalidate(parseNodeGroupSearch, nodeGroupRoute.useSearch())
-  const navigate = nodeGroupRoute.useNavigate()
+  const { id } = Route.useParams()
+  const search = revalidate(parseNodeGroupSearch, Route.useSearch())
+  const navigate = Route.useNavigate()
   const q = useQuery({
     ...apiQuery('/nodegroups/{id}', { path: { id }, query: search.compare ? { compare: search.compare } : {} }),
     // Keep the page while compare changes, but never show another group's data.
@@ -387,9 +386,5 @@ function NodeGroupPage() {
   )
 }
 
-export const nodeGroupRoute = createRoute({
-  getParentRoute: () => rootRoute,
-  path: '/nodegroups/$id',
-  validateSearch: parseNodeGroupSearch,
-  component: NodeGroupPage,
-})
+// The page's code loads with its first visit; lazy.ts defines the route.
+export const Route = createLazyRoute('/nodegroups/$id')({ component: NodeGroupPage })

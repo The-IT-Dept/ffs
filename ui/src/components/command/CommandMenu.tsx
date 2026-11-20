@@ -13,6 +13,13 @@ import { hitPath } from '@/lib/links'
 
 export const SEARCH_DEBOUNCE_MS = 150
 
+// isApple reports whether the browser runs on macOS or iOS, where the shortcut is ⌘K; elsewhere
+// it is Ctrl K. Both work everywhere.
+export function isApple(): boolean {
+  const nav = navigator as Navigator & { userAgentData?: { platform?: string } }
+  return /mac|iphone|ipad|ipod/i.test(nav.userAgentData?.platform || nav.platform || '')
+}
+
 // CommandMenu is ⌘K / Ctrl-K: a jump to any object, searched on the server. It composes Dialog and
 // Command itself because shadcn's CommandDialog cannot turn off cmdk's client-side filtering. On a
 // narrow screen (compact) it opens from a search icon instead, and below sm the dialog fills the
@@ -52,7 +59,7 @@ export function CommandMenu({ compact = false }: { compact?: boolean }) {
         <Button variant="outline" size="sm" className="h-7 gap-2 px-2 text-[12px] font-normal text-muted-foreground" onClick={() => setOpen(true)}>
           <SearchIcon aria-hidden="true" />
           <span>{copy.command.open}</span>
-          <kbd className="rounded border bg-muted px-1 font-sans text-[10px]">⌘K</kbd>
+          <kbd className="rounded border bg-muted px-1 font-sans text-[10px]">{copy.command.shortcut(isApple())}</kbd>
         </Button>
       )}
       <Dialog open={open} onOpenChange={setOpenAndReset}>
@@ -87,6 +94,7 @@ export function CommandMenu({ compact = false }: { compact?: boolean }) {
                   {hit.worst ? <PriorityDot priority={hit.worst} /> : null}
                 </CommandItem>
               ))}
+              {term.length > 0 && search.data?.truncated ? <p className="px-3 py-2 text-[11px] text-muted-foreground">{copy.command.truncated}</p> : null}
             </CommandList>
           </Command>
           <DialogClose asChild>

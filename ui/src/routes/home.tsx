@@ -1,8 +1,9 @@
-import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { createRoute } from '@tanstack/react-router'
 import type { ReactNode } from 'react'
 import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
+import { keepWhileGroup } from '@/components/explorer/params'
 import { ExposureTable } from '@/components/exposure/ExposureTable'
 import { Footnote } from '@/components/exposure/Footnote'
 import { RegroupSwitch } from '@/components/exposure/RegroupSwitch'
@@ -51,7 +52,8 @@ function HomePage() {
     ...apiQuery('/exposure', {
       query: { ...(group !== 'entry' ? { group } : {}), ...(search.expand ? { expand: search.expand.split(',') } : {}) },
     }),
-    placeholderData: keepPreviousData,
+    // Folding keeps the table on screen; a regroup does not.
+    placeholderData: keepWhileGroup(group !== 'entry' ? group : undefined),
   })
 
   let table
@@ -75,7 +77,8 @@ function HomePage() {
   return (
     <div>
       {summary.data ? <Headline s={summary.data} /> : summary.error ? null : <Skeleton className="mb-3 h-12 max-w-4xl" />}
-      <CoverageFirstLine coverage={summary.data?.coverage} className="mb-3 text-[12px] text-muted-foreground" />
+      {/* An empty table leads with the coverage line itself, so it is said once. */}
+      {exposure.data?.rows.length === 0 ? null : <CoverageFirstLine coverage={summary.data?.coverage} className="mb-3 text-[12px] text-muted-foreground" />}
       <PageHeader
         title={copy.page.home}
         actions={<RegroupSwitch value={group} onChange={(g) => void navigate({ to: '.', search: { group: g === 'entry' ? undefined : g } })} />}
