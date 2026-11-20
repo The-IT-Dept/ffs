@@ -551,3 +551,57 @@ func TestAcquirer_StopAnswersQueuedWaiters(t *testing.T) {
 	_, err := a.AcquireNow(ctx, acqReq())
 	require.ErrorIs(t, err, ErrStopped)
 }
+
+// TestAcquirer_ScratchFull (F81): an image that fills the cataloguer's scratch space on its own is
+// quarantined at once, not downloaded again; one that filled it while another job ran is retried
+// alone first, since either job may have filled the shared space.
+func TestAcquirer_ScratchFull(t *testing.T) {
+	full := (&CatalogSource{}).statusError(acqReq(), http.StatusInsufficientStorage,
+		CatalogError{Kind: KindScratchFull, Error: "image unpacked beyond the scratch limit"})
+
+	t.Run("alone", func(t *testing.T) {
+		st, clock := acqStore(t), acqClock()
+		src := &fakeSource{name: "registry", err: full}
+		a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Concurrency: 1, Now: clock.Now,
+			RetryAfter: 10 * time.Millisecond})
+		startAcq(t, a)
+		_, err := a.AcquireNow(ctx, acqReq())
+		require.Error(t, err)
+		img := getImg(t, st, acqDigest)
+		require.Equal(t, model.ImageCatalogFailed, img.Status)
+		require.Equal(t, reasonScratchFull, img.StatusReason)
+		require.True(t, img.QuarantinedUntil.Equal(clock.Now().Add(defaultQuarantineFor)))
+		time.Sleep(50 * time.Millisecond)
+		require.Equal(t, int32(1), src.calls.Load(), "not downloaded again")
+	})
+
+	t.Run("overlapping", func(t *testing.T) {
+		st, clock := acqStore(t), acqClock()
+		const big, small = "sha256:big", "sha256:small"
+		var bigCalls atomic.Int32
+		smallIn := make(chan struct{})
+		src := &fakeSource{name: "registry"}
+		src.script = func(_ context.Context, _ int, r Request) (*Result, error) {
+			if r.Digest == big {
+				if bigCalls.Add(1) == 1 {
+					<-smallIn // both jobs are in flight
+				}
+				return nil, full
+			}
+			close(smallIn)
+			time.Sleep(30 * time.Millisecond)
+			return &Result{SyftJSON: syftBytes(t, ""), Source: "registry"}, nil
+		}
+		a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Concurrency: 2, Now: clock.Now,
+			RetryAfter: 10 * time.Millisecond})
+		startAcq(t, a)
+		a.Enqueue(Request{Repo: "docker.io/library/big", Digest: big, Platform: "linux/amd64"})
+		a.Enqueue(Request{Repo: "docker.io/library/small", Digest: small, Platform: "linux/amd64"})
+
+		require.Eventually(t, func() bool {
+			return getImgOrZero(st, big).Status == model.ImageCatalogFailed && getImgOrZero(st, small).Status == model.ImageCatalogued
+		}, 10*time.Second, 5*time.Millisecond)
+		require.Equal(t, int32(2), bigCalls.Load(), "retried once, alone")
+		require.Equal(t, reasonScratchFull, getImg(t, st, big).StatusReason)
+	})
+}

@@ -23,8 +23,6 @@ const (
 	catalogURL     = "http://catalog/v1/catalog"
 	// catalogSlack is how long past the job timeout the client waits before giving up on the cataloguer.
 	catalogSlack = 30 * time.Second
-	// maxCatalogResponse bounds a successful response: the syft-json document plus its envelope.
-	maxCatalogResponse = MaxSBOMBytes + 1<<20
 	// maxCatalogError bounds an error response body.
 	maxCatalogError = 64 << 10
 	// catalogReservation covers the manifest GETs one job makes: the cataloguer's size pre-check and
@@ -74,12 +72,10 @@ func NewCatalogSource(reg *registry.Client, cfg config.CatalogConfig) *CatalogSo
 func (s *CatalogSource) Name() string { return registrySource }
 
 // Acquire has the cataloguer pull and catalogue r's platform manifest. Packages are left for the
-// caller to normalise from SyftJSON.
+// caller to normalise from SyftJSON. The registry budget for the cataloguer's pulls is reserved just
+// before the request is sent, so an attempt that fails before it (credentials that cannot be
+// resolved) spends none.
 func (s *CatalogSource) Acquire(ctx context.Context, r Request) (*Result, error) {
-	if err := s.reg.Reserve(ctx, r.Repo, catalogReservation); err != nil {
-		// A low budget means slower cataloguing, never a failure.
-		return nil, &AcquireError{Kind: FailTransient, Reason: "waiting for the registry's rate budget", Err: err}
-	}
 	a, err := s.reg.Auth(ctx, r.Repo, r.Creds)
 	if err != nil {
 		return nil, &AcquireError{Kind: FailTransient, Reason: "resolving pull credentials", Err: err}
@@ -105,6 +101,10 @@ func (s *CatalogSource) Acquire(ctx context.Context, r Request) (*Result, error)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
+	if err := s.reg.Reserve(ctx, r.Repo, catalogReservation); err != nil {
+		// A low budget means slower cataloguing, never a failure.
+		return nil, &AcquireError{Kind: FailTransient, Reason: "waiting for the registry's rate budget", Err: err}
+	}
 	resp, err := s.http.Do(req)
 	if err != nil {
 		return nil, s.transportError(ctx, err)
@@ -113,7 +113,7 @@ func (s *CatalogSource) Acquire(ctx context.Context, r Request) (*Result, error)
 
 	if resp.StatusCode == http.StatusOK {
 		var cr CatalogResponse
-		body := &io.LimitedReader{R: resp.Body, N: maxCatalogResponse + 1}
+		body := &io.LimitedReader{R: resp.Body, N: MaxCatalogResponseBytes + 1}
 		if err := json.NewDecoder(body).Decode(&cr); err != nil {
 			if body.N <= 0 {
 				return nil, &AcquireError{Kind: FailQuarantine,
@@ -159,6 +159,13 @@ func cataloguerStopped(err error) bool {
 	return errors.As(err, &ae) && ae.Reason == reasonStopped
 }
 
+// scratchFull reports a job the cataloguer stopped for unpacking beyond its scratch limit. The limit
+// is shared by the jobs running together, so with another job in flight either may have filled it.
+func scratchFull(err error) bool {
+	var ae *AcquireError
+	return errors.As(err, &ae) && ae.Reason == reasonScratchFull
+}
+
 // statusError classifies a cataloguer error response.
 func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) error {
 	switch status {
@@ -177,7 +184,9 @@ func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) erro
 	case http.StatusGatewayTimeout:
 		return &AcquireError{Kind: FailCounted, Reason: "cataloguer timed out after " + s.cfg.Timeout.String()}
 	case http.StatusInsufficientStorage:
-		return &AcquireError{Kind: FailCounted, Reason: reasonScratchFull}
+		// Deterministic for an image that ran alone; the acquirer retries one that overlapped another
+		// job alone first (scratchFull).
+		return &AcquireError{Kind: FailQuarantine, Reason: reasonScratchFull}
 	case http.StatusBadRequest:
 		// The request can never succeed as it is (a reference or platform the cataloguer cannot use):
 		// unresolvable, retried after UnresolvableRetry, never a strike toward quarantine.

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -22,11 +23,20 @@ import (
 	"github.com/the-it-dept/ffs/internal/registry"
 )
 
-// countingRegistry records Reserve calls on top of a real registry client.
+// countingRegistry records Reserve calls on top of a real registry client, and fails Auth with
+// authErr when it is set.
 type countingRegistry struct {
 	*registry.Client
 	reserves atomic.Int32
 	lastN    atomic.Int32
+	authErr  error
+}
+
+func (c *countingRegistry) Auth(actx context.Context, repo string, cs registry.CredSet) (authn.AuthConfig, error) {
+	if c.authErr != nil {
+		return authn.AuthConfig{}, c.authErr
+	}
+	return c.Client.Auth(actx, repo, cs)
 }
 
 func (c *countingRegistry) Reserve(rctx context.Context, repo string, n int) error {
@@ -155,7 +165,7 @@ func TestCatalogSource_MapsErrors(t *testing.T) {
 			reason: "registry not reachable from the cataloguer"},
 		{name: "socket missing", socket: filepath.Join(filepath.Dir(fake.socket), "missing.sock"), kind: FailTransient},
 		{name: "504", status: 504, body: errBody(KindTimeout, "late"), kind: FailCounted, reason: "cataloguer timed out after 10m0s"},
-		{name: "507", status: 507, body: errBody(KindScratchFull, "full"), kind: FailCounted,
+		{name: "507", status: 507, body: errBody(KindScratchFull, "full"), kind: FailQuarantine,
 			reason: "image unpacked beyond the cataloguer scratch limit"},
 		{name: "500", status: 500, body: errBody(KindFailed, "syft exploded"), kind: FailCounted, reason: "cataloguer failed: syft exploded"},
 		{name: "400", status: 400, body: errBody(KindBadRequest, "ref is not pinned by a sha256 digest"), kind: FailUnresolvable,
@@ -200,4 +210,29 @@ func TestCatalogSource_OversizedSBOMQuarantined(t *testing.T) {
 	_, err := src.Acquire(ctx, Request{Repo: "docker.io/library/big", Digest: "sha256:" + strings.Repeat("3", 64), Platform: "linux/amd64"})
 	require.Error(t, err)
 	require.Equal(t, FailQuarantine, KindOf(err), err.Error())
+}
+
+// TestCatalogSource_ReserveOnlyBeforeThePost (F80): the registry budget is reserved just before the
+// request goes to the cataloguer: credentials that cannot be resolved spend none.
+func TestCatalogSource_ReserveOnlyBeforeThePost(t *testing.T) {
+	reg := &countingRegistry{Client: registry.New(registry.Options{}), authErr: errors.New("secrets are forbidden")}
+	fake := startFakeCatalog(t, reg)
+	cfg := config.Default().Catalog
+	cfg.Socket = fake.socket
+	src := NewCatalogSource(reg.Client, cfg)
+	src.reg = reg
+	req := Request{Repo: "docker.io/library/nginx", Digest: "sha256:" + strings.Repeat("2", 64), Platform: "linux/amd64"}
+
+	_, err := src.Acquire(ctx, req)
+	require.Equal(t, FailTransient, KindOf(err), err.Error())
+	require.Zero(t, reg.reserves.Load(), "no budget spent before the cataloguer is asked")
+	fake.mu.Lock()
+	require.Empty(t, fake.got)
+	fake.mu.Unlock()
+
+	reg.authErr = nil
+	fake.set(http.StatusOK, CatalogResponse{SyftJSON: json.RawMessage(`{"artifacts":[]}`)}, false)
+	_, err = src.Acquire(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), reg.reserves.Load())
 }

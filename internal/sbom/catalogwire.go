@@ -34,10 +34,17 @@ type CatalogAuth struct {
 	IdentityToken string `json:"identityToken,omitempty"`
 }
 
+// MaxCatalogResponseBytes bounds a cataloguer's successful response, read or written: the syft-json
+// document (at most MaxSBOMBytes) plus its envelope.
+const MaxCatalogResponseBytes = MaxSBOMBytes + 1<<20
+
 // CatalogResponse is a successful job: the syft-json document and its coverage.
 type CatalogResponse struct {
 	SyftJSON json.RawMessage `json:"syftJSON"`
 	Coverage model.Coverage  `json:"coverage"`
+	// Encoded, when set, is the whole response already encoded (a worker's output), sent as it is in
+	// place of SyftJSON and Coverage, so a large SBOM is not decoded and encoded again on its way.
+	Encoded []byte `json:"-"`
 }
 
 // CatalogError is a failed job. Kind is one of the Kind* constants.

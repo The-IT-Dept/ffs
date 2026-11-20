@@ -669,10 +669,13 @@ func (a *Acquirer) fail(ctx context.Context, j *job, prev model.Image, r Request
 	if errors.As(err, &ae) && ae.Reason != "" {
 		reason = ae.Reason
 	}
-	if kind == FailCounted && cataloguerStopped(err) && a.overlapped(j) {
-		// The cataloguer went down with more than one job in flight, so any of them may have taken it
-		// down (an out-of-memory kill ends the whole catalog container). Run this image again on its
-		// own before counting anything against it.
+	interrupted := kind == FailCounted && cataloguerStopped(err)
+	filled := kind == FailQuarantine && scratchFull(err)
+	if (interrupted || filled) && a.overlapped(j) {
+		// The cataloguer went down, or its shared scratch space filled up, with more than one job in
+		// flight, so any of them may be the cause (an out-of-memory kill ends the whole catalog
+		// container). Run this image again on its own before counting anything against it. A
+		// scratch-full image that ran alone is quarantined at once rather than downloaded again.
 		a.mu.Lock()
 		a.solo[r.Digest] = true
 		a.mu.Unlock()
