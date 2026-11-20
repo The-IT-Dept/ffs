@@ -44,9 +44,10 @@ type BuildInput struct {
 	GrypeDBBuilds []time.Time       // build times of every Grype DB ffs has applied
 	ImageUsers    map[string]string // digest → Image.ConfigUser, catalogued images only (absent = unknown)
 	// Carry holds the owner's stored open or excepted findings on image repositories that run a
-	// digest not yet catalogued (pending, unresolvable or catalogFailed): what that digest holds is
-	// unknown, so a finding the matches do not build stands instead of resolving (spec §6.2: never
-	// clean when not catalogued). Its advisory must be in Advisories.
+	// digest not yet catalogued (pending, unresolvable or catalogFailed), or catalogued but not yet
+	// matched (store.UnmatchedDigests): what that digest holds is unknown, so a finding the matches
+	// do not build stands instead of resolving (spec §6.2: never clean when not catalogued). Its
+	// advisory must be in Advisories.
 	Carry          []model.Finding
 	Now            time.Time
 	PriorityConfig config.PriorityConfig
@@ -302,9 +303,9 @@ func (b builder) finding(repo, advisoryID string, vs []verdict) model.Finding {
 }
 
 // carried returns the stored finding c, which the matches did not build because its repository
-// runs a digest not yet catalogued, as it stands now: its packages, digests and fix state are kept,
-// and its priority and exception are re-evaluated with the current advisory and owner context, so a
-// KEV listing or an expired exception still applies to it.
+// runs a digest not yet catalogued or not yet matched, as it stands now: its packages, digests and
+// fix state are kept, and its priority and exception are re-evaluated with the current advisory and
+// owner context, so a KEV listing or an expired exception still applies to it.
 func (b builder) carried(c model.Finding) model.Finding {
 	adv := b.in.Advisories[c.AdvisoryID]
 	f := c

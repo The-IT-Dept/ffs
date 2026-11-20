@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -46,6 +47,25 @@ var (
 type spyStore struct {
 	*store.Store
 	replaced []store.MatchScope
+	// afterMatches, when set, runs after each MatchesForDigests read; beforeMarkMatched before each
+	// MarkMatched write.
+	afterMatches      func(digests []string)
+	beforeMarkMatched func(digest string)
+}
+
+func (s *spyStore) MatchesForDigests(ctx context.Context, digests []string) ([]model.Match, error) {
+	ms, err := s.Store.MatchesForDigests(ctx, digests)
+	if s.afterMatches != nil {
+		s.afterMatches(digests)
+	}
+	return ms, err
+}
+
+func (s *spyStore) MarkMatched(ctx context.Context, digest string) error {
+	if s.beforeMarkMatched != nil {
+		s.beforeMarkMatched(digest)
+	}
+	return s.Store.MarkMatched(ctx, digest)
 }
 
 func (s *spyStore) ReplaceMatches(ctx context.Context, scope store.MatchScope, ms []model.Match) ([]string, error) {
@@ -851,6 +871,75 @@ func TestEngine_CataloguedButUnmatchedDigestKeepsFindings(t *testing.T) {
 	ts := h.transitions()
 	require.Len(t, ts, n+1)
 	require.Equal(t, model.TriggerInventoryChange, ts[n].Trigger)
+}
+
+// TestEngine_RecomputeReadsMarkBeforeMatches (R5): the acquirer and the engine write a newly
+// catalogued digest as MarkUnmatched, UpsertImage(catalogued), ReplaceMatches, MarkMatched. A
+// recompute reads in the reverse order, so a match that completes between its reads either is
+// seen whole or leaves the digest carried; it never builds against matches read before the match
+// completed with a mark read after, which resolved the finding and reopened it next time.
+func TestEngine_RecomputeReadsMarkBeforeMatches(t *testing.T) {
+	h := newHarness(t)
+	h.catalogueAPI()
+	n := len(h.transitions())
+
+	const d3 = "sha256:d3"
+	h.clock.now = t0.Add(time.Hour)
+	same := h.libssl3 // the new digest still holds the vulnerable package
+	same.ImageDigest = d3
+	same.ID = model.PackageID(d3, same)
+	require.NoError(t, h.st.PutSBOM(ctx, d3, []byte(`{"artifacts":[]}`), []model.Package{same}))
+	require.NoError(t, h.st.MarkUnmatched(ctx, d3, h.clock.now))
+	require.NoError(t, h.st.UpsertImage(ctx, model.Image{Digest: d3, Repo: apiRepo, Platform: "linux/amd64",
+		Status: model.ImageCatalogued, ConfigUser: "app", CataloguedAt: h.clock.now}))
+	o, _, err := h.st.GetOwner(ctx, apiKey)
+	require.NoError(t, err)
+	o.Containers[0].Digest = d3
+	require.NoError(t, h.st.UpsertOwner(ctx, o))
+
+	// The match of d3 completes right after the recompute has read d3's matches.
+	h.st.afterMatches = func(digests []string) {
+		if !slices.Contains(digests, d3) {
+			return
+		}
+		h.st.afterMatches = nil
+		for src, m := range map[model.MatchSource]model.Match{
+			model.SourceOSV: newMatch(same, cve, model.SourceOSV, "3.0.15-1"), model.SourceGrype: h.grypeOn(same),
+		} {
+			_, err := h.st.Store.ReplaceMatches(ctx, store.MatchScope{Source: src, Digests: []string{d3}}, []model.Match{m})
+			require.NoError(t, err)
+		}
+		require.NoError(t, h.st.Store.MarkMatched(ctx, d3))
+	}
+	require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+	require.NoError(t, h.e.Drain(ctx))
+	require.Nil(t, h.st.afterMatches, "the match completed during the recompute")
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	require.Len(t, h.transitions(), n, "no resolution of a finding the new digest still holds")
+
+	require.NoError(t, h.e.OnOwnersChanged(ctx, []string{apiKey}))
+	require.NoError(t, h.e.Drain(ctx))
+	require.Equal(t, model.StateOpen, h.finding(apiKey, cve).State)
+	require.Len(t, h.transitions(), n)
+}
+
+// TestEngine_MarkMatchedBeforeOwnersQueued (R5): OnImageCatalogued clears the digest's unmatched
+// mark before it queues the digest's owners. Queued first, the worker could recompute them while
+// the mark is still set and carry their findings, and nothing would queue them again.
+func TestEngine_MarkMatchedBeforeOwnersQueued(t *testing.T) {
+	h := newHarness(t)
+	require.True(t, h.e.Idle())
+	require.NoError(t, h.st.MarkUnmatched(ctx, d1, t0))
+	var calls int
+	h.st.beforeMarkMatched = func(digest string) {
+		calls++
+		require.Equal(t, d1, digest)
+		require.True(t, h.e.Idle(), "no owner of the digest is queued yet")
+	}
+	require.NoError(t, h.e.OnImageCatalogued(ctx, d1))
+	require.Equal(t, 1, calls)
+	require.False(t, h.e.Idle(), "the owners are queued afterwards")
+	require.NoError(t, h.e.Drain(ctx))
 }
 
 // TestEngine_ProvisionalResolutionTrigger is the F29 regression: a provisional finding resolves as

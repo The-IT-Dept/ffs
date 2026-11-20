@@ -173,6 +173,12 @@ func (p *pass) canonical(ctx context.Context, st Store, id string) (string, erro
 // (store.UnmatchedDigests), or with no digest are carried, since that digest's matches are unknown;
 // resolving them would report every rollout as fixed and reopen everything once the new digest is
 // matched.
+//
+// It reads in the reverse of the order a new digest is written in (MarkUnmatched, then
+// UpsertImage(catalogued), then each matcher's ReplaceMatches, then MarkMatched): the statuses,
+// then the marks, then the matches. A digest seen catalogued and then unmarked was matched before
+// the marks were read, so the matches read after them are complete; reading the matches first
+// could pair matches from before a match completed with a mark cleared after it.
 func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Finding) ([]model.Finding, findings.Withdrawals, error) {
 	var w findings.Withdrawals
 	o, ok, err := e.o.Store.GetOwner(ctx, key)
@@ -183,15 +189,41 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		return nil, w, nil
 	}
 	var digests []string
-	uncatalogued := map[string]bool{} // image repositories running a digest that is not catalogued
+	unknown := map[string]bool{} // image repositories running a digest whose matches are not known
+	carryRepos := func(d string) {
+		for _, c := range o.Containers {
+			if c.Digest == d {
+				unknown[c.Repo] = true
+			}
+		}
+	}
 	for _, c := range o.Containers {
 		if c.Digest == "" {
-			uncatalogued[c.Repo] = true
+			unknown[c.Repo] = true
 		} else if !slices.Contains(digests, c.Digest) {
 			digests = append(digests, c.Digest)
 		}
 	}
 	w.Digests = digests
+	users := map[string]string{}
+	for _, d := range digests {
+		img, ok, err := e.o.Store.GetImage(ctx, d)
+		if err != nil {
+			return nil, w, fmt.Errorf("image %s: %w", d, err)
+		}
+		if ok && img.Status == model.ImageCatalogued {
+			users[d] = img.ConfigUser
+		} else {
+			carryRepos(d)
+		}
+	}
+	unmatched, err := e.o.Store.UnmatchedDigests(ctx, digests)
+	if err != nil {
+		return nil, w, fmt.Errorf("unmatched digests: %w", err)
+	}
+	for _, d := range unmatched {
+		carryRepos(d)
+	}
 	ms, err := e.o.Store.MatchesForDigests(ctx, digests)
 	if err != nil {
 		return nil, w, fmt.Errorf("matches: %w", err)
@@ -209,27 +241,8 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 		matched[m.ImageDigest] = true
 		addID(m.AdvisoryID)
 	}
-	unmatched, err := e.o.Store.UnmatchedDigests(ctx, digests)
-	if err != nil {
-		return nil, w, fmt.Errorf("unmatched digests: %w", err)
-	}
 	pkgs := map[string]model.Package{}
-	users := map[string]string{}
 	for _, d := range digests {
-		img, ok, err := e.o.Store.GetImage(ctx, d)
-		if err != nil {
-			return nil, w, fmt.Errorf("image %s: %w", d, err)
-		}
-		if ok && img.Status == model.ImageCatalogued {
-			users[d] = img.ConfigUser
-		}
-		if !ok || img.Status != model.ImageCatalogued || slices.Contains(unmatched, d) {
-			for _, c := range o.Containers {
-				if c.Digest == d {
-					uncatalogued[c.Repo] = true
-				}
-			}
-		}
 		if !matched[d] {
 			continue // Build reads the packages of matches only
 		}
@@ -243,7 +256,7 @@ func (e *Engine) build(ctx context.Context, p *pass, key string, old []model.Fin
 	}
 	var carry []model.Finding
 	for _, f := range old {
-		if f.State != model.StateResolved && uncatalogued[f.ImageRepo] {
+		if f.State != model.StateResolved && unknown[f.ImageRepo] {
 			carry = append(carry, f)
 			addID(f.AdvisoryID)
 		}
