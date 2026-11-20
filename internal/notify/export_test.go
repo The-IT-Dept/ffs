@@ -13,3 +13,6 @@ func (r *TargetReconciler) NamespaceMatch(at *ffsv1alpha1.AlertTarget) func(stri
 
 // StartDrains exposes startDrains: it starts the drains of the sendable targets without waiting.
 func (e *Engine) StartDrains(ctx context.Context) (func() error, error) { return e.startDrains(ctx) }
+
+// StartupRetain exposes the startup cleanup the reconciler adds to the manager.
+func (r *TargetReconciler) StartupRetain(ctx context.Context) error { return r.startupRetain(ctx) }

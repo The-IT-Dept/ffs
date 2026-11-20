@@ -93,6 +93,7 @@ func digestCursor(uid string) string    { return "notify-digest:" + uid }
 
 // Register adds or updates a target and its sink. The digest schedule and quiet hours must parse.
 // Re-registering with the same ConfigHash keeps a disabled target disabled; a new one re-enables it.
+// A sink that s replaces has its idle connections closed.
 func (e *Engine) Register(ctx context.Context, t TargetConfig, s Sink) error {
 	if t.UID == "" || t.Name == "" {
 		return errors.New("notify: a target needs a UID and a name")
@@ -132,12 +133,36 @@ func (e *Engine) Register(ctx context.Context, t TargetConfig, s Sink) error {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if prev := e.targets[t.UID]; prev != nil && prev.cfg.Name != t.Name {
-		delete(e.uids, prev.cfg.Name)
+	if prev := e.targets[t.UID]; prev != nil {
+		if prev.cfg.Name != t.Name {
+			delete(e.uids, prev.cfg.Name)
+		}
+		if prev.sink != s {
+			closeIdle(prev.sink)
+		}
 	}
 	e.targets[t.UID] = &target{cfg: t, sink: s, sched: sched}
 	e.uids[t.Name] = t.UID
 	return nil
+}
+
+// sinkFor returns the sink registered for the target uid while its ConfigHash is configHash, so
+// a resync that changed nothing keeps the sink and its connections.
+func (e *Engine) sinkFor(uid, configHash string) (Sink, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if t := e.targets[uid]; t != nil && t.cfg.ConfigHash == configHash {
+		return t.sink, true
+	}
+	return nil, false
+}
+
+// closeIdle closes the idle connections of a sink that is replaced or dropped, when it keeps any.
+// A send under way on it finishes.
+func closeIdle(s Sink) {
+	if c, ok := s.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
 }
 
 // Unregister forgets the target called name and deletes its stored state, including state left
@@ -209,10 +234,12 @@ func (e *Engine) forget(ctx context.Context, uid string) error {
 	return e.st.DeleteNotifyTarget(ctx, uid)
 }
 
-// dropLocked removes uid from memory; e.mu must be held.
+// dropLocked removes uid from memory and closes the idle connections of its sink; e.mu must be
+// held.
 func (e *Engine) dropLocked(uid string) {
 	delete(e.backoff, uid)
 	if t := e.targets[uid]; t != nil {
+		closeIdle(t.sink)
 		if e.uids[t.cfg.Name] == uid {
 			delete(e.uids, t.cfg.Name)
 		}
@@ -635,12 +662,40 @@ func (e *Engine) message(t *target, kind Kind, key, title string, now time.Time)
 		Title: title, DashboardURL: e.o.DashboardURL, At: now}
 }
 
-// delivery wraps m as a pending delivery to its target, not sent before notBefore.
+// delivery wraps m as a pending delivery to its target, not sent before notBefore. The outbox
+// sends by creation time, then ID, and the messages of one pass share its time, m.At; the
+// delivery is created sendRank(m) nanoseconds after it, so a pass's messages go out by priority.
 func delivery(m Message, notBefore time.Time) (store.Delivery, error) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return store.Delivery{}, fmt.Errorf("encode message: %w", err)
 	}
 	return store.Delivery{ID: m.ID, Kind: string(m.Kind), Payload: payload, State: store.DeliveryPending,
-		NotBefore: notBefore, CreatedAt: m.At}, nil
+		NotBefore: notBefore, CreatedAt: m.At.Add(time.Duration(sendRank(m)))}, nil
+}
+
+// Send ranks of messages that have no priority of their own.
+const (
+	rankNoPriority = 4 // after low: feed-stale alerts, and a baseline with nothing open
+	rankResolved   = 5 // last: messages that only report resolutions
+)
+
+// sendRank orders the messages of one pass: by the highest priority among their items that are not
+// resolutions (urgent 0, high 1, medium 2, low 3), then those without one, then those that only
+// report resolutions.
+func sendRank(m Message) int {
+	top, resolvedOnly := model.PriorityNone, len(m.Items) > 0
+	for _, it := range m.Items {
+		if it.Event != EventResolved {
+			resolvedOnly = false
+			top = max(top, it.Priority)
+		}
+	}
+	switch {
+	case resolvedOnly:
+		return rankResolved
+	case top == model.PriorityNone:
+		return rankNoPriority
+	}
+	return int(model.PriorityUrgent - top)
 }

@@ -19,8 +19,9 @@ import (
 )
 
 const (
-	postTimeout  = 15 * time.Second
-	maxBodyShown = 200 // bytes of a response body kept in an error
+	postTimeout     = 15 * time.Second
+	idleConnTimeout = 90 * time.Second // how long a kept-alive connection to an endpoint may sit idle
+	maxBodyShown    = 200              // bytes of a response body kept in an error
 )
 
 // Poster posts alert bodies to an endpoint. Its direct client refuses to dial addresses the SSRF
@@ -51,14 +52,23 @@ func NewPoster(allowPrivate bool) *Poster {
 	redirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	return &Poster{
 		direct: &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
-			Transport: &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 10 * time.Second}},
+			Transport: &http.Transport{DialContext: dialer.DialContext, TLSHandshakeTimeout: 10 * time.Second,
+				IdleConnTimeout: idleConnTimeout}},
 		proxied: &http.Client{Timeout: postTimeout, CheckRedirect: redirect,
-			Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, TLSHandshakeTimeout: 10 * time.Second}},
+			Transport: &http.Transport{Proxy: http.ProxyFromEnvironment, TLSHandshakeTimeout: 10 * time.Second,
+				IdleConnTimeout: idleConnTimeout}},
 		allowPrivate: allowPrivate,
 		lookup: func(ctx context.Context, host string) ([]netip.Addr, error) {
 			return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
 		},
 	}
+}
+
+// CloseIdleConnections closes the Poster's idle kept-alive connections; a send under way finishes.
+// The engine calls it, through the sink, when it replaces or drops the sink.
+func (p *Poster) CloseIdleConnections() {
+	p.direct.CloseIdleConnections()
+	p.proxied.CloseIdleConnections()
 }
 
 // Post sends body to rawURL. It returns nil on a 2xx response and otherwise a *notify.DeliveryError

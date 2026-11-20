@@ -127,7 +127,8 @@ Any Standard Webhooks library does all of this for you.
 ## Delivery
 
 - Each request times out after 15 seconds. Redirects are not followed.
-- Failed deliveries are retried with exponential backoff and jitter: 5 seconds doubling to at most 15 minutes, for up to 12 attempts. A longer `Retry-After` from the endpoint (on 429, 408 and 5xx responses) is honoured, up to 1 hour. Messages to one target are sent in order, and while a target is backing off nothing else is sent to it.
+- Failed deliveries are retried with exponential backoff and jitter: 5 seconds doubling to at most 15 minutes. A delivery is given up when a send fails 24 hours or more after its first attempt, so an endpoint that is down for less than a day still gets every alert. A longer `Retry-After` from the endpoint (on 429, 408 and 5xx responses) is honoured, up to 1 hour. Messages to one target are sent in order, and while a target is backing off nothing else is sent to it.
+- Messages queued together go out by priority: `urgent`, `high`, `medium` and `low` (a message counts at its highest priority), then feed-stale alerts, then resolutions.
 - Other 4xx and 3xx responses fail the delivery without retrying.
 - HTTP 410 Gone disables the target; its `Ready` condition shows `EndpointGone`. Changing the AlertTarget or its Secret enables it again.
 - Every delivery and its outcome is kept in a delivery log for `retention.resolved`. Delivery is at least once, so a receiver can see the same `webhook-id` twice.

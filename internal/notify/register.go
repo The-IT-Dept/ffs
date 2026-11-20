@@ -17,6 +17,6 @@ func Register(m manager.Manager, d deps.Deps, newSink SinkFactory) error {
 		return err
 	}
 	r := &TargetReconciler{Client: m.GetClient(), Secrets: m.GetAPIReader(), Engine: e,
-		Namespace: d.Namespace, Cluster: d.Config.ClusterName, NewSink: newSink}
+		Namespace: d.Namespace, Cluster: d.Config.ClusterName, NewSink: newSink, Log: d.Log.WithName("notify")}
 	return r.SetupWithManager(m)
 }

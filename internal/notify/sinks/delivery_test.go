@@ -3,6 +3,7 @@ package sinks
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -133,4 +134,48 @@ func TestPoster_DialGuardRefusesLoopback(t *testing.T) {
 	p.lookup = nil // skip the resolver check: the dial guard alone must refuse
 	require.Error(t, p.Post(context.Background(), srv.URL, "application/json", nil, nil))
 	assert.Zero(t, hits.Load())
+}
+
+// TestPoster_IdleConnections pins F90: both transports drop connections idle for 90s, and
+// CloseIdleConnections, which the engine calls on a sink it replaces, closes a kept-alive
+// connection at once.
+func TestPoster_IdleConnections(t *testing.T) {
+	p := NewPoster(false)
+	for _, c := range []*http.Client{p.direct, p.proxied} {
+		tr, ok := c.Transport.(*http.Transport)
+		require.True(t, ok)
+		assert.Equal(t, 90*time.Second, tr.IdleConnTimeout)
+	}
+
+	idle, closed := make(chan struct{}, 1), make(chan struct{}, 1)
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	signal := func(c chan struct{}) {
+		select {
+		case c <- struct{}{}:
+		default:
+		}
+	}
+	srv.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		switch s {
+		case http.StateIdle:
+			signal(idle)
+		case http.StateClosed:
+			signal(closed)
+		}
+	}
+	srv.Start()
+	defer srv.Close()
+	tp := testPoster(srv)
+	require.NoError(t, tp.Post(context.Background(), srv.URL, "text/plain", nil, nil))
+	select {
+	case <-idle:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the connection was not kept alive")
+	}
+	tp.CloseIdleConnections()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		require.Fail(t, "the idle connection is still open")
+	}
 }

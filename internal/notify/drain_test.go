@@ -11,6 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/notify"
 	"github.com/the-it-dept/ffs/internal/store"
 )
@@ -50,7 +51,7 @@ func TestDrain_RetryAfterHonoured(t *testing.T) {
 	start := h.now
 	require.NoError(t, h.eng.DrainOnce(ctx))
 	assert.Empty(t, h.sink.ofKind(notify.KindImmediate))
-	d := h.deliveries()[0]
+	d := h.immediateDelivery()
 	assert.Equal(t, store.DeliveryPending, d.State)
 	assert.Equal(t, 429, d.HTTPStatus)
 	assert.Equal(t, 1, d.Attempts)
@@ -67,33 +68,106 @@ func TestDrain_RetryAfterHonoured(t *testing.T) {
 	assert.Equal(t, h.now, st.LastDeliveryAt)
 }
 
-func TestDrain_GiveUpAfterMaxAttempts(t *testing.T) {
+// immediateDelivery returns the target's only immediate delivery.
+func (h *harness) immediateDelivery() store.Delivery {
+	h.t.Helper()
+	var out []store.Delivery
+	for _, d := range h.deliveries() {
+		if d.Kind == string(notify.KindImmediate) {
+			out = append(out, d)
+		}
+	}
+	require.Len(h.t, out, 1)
+	return out[0]
+}
+
+// TestDrain_GiveUpAfter24Hours pins F58: a delivery that keeps failing transiently is retried,
+// with the backoff capped at 15m, until its first failed send 24h or more after its first attempt,
+// rather than after 12 attempts (about 66 minutes).
+func TestDrain_GiveUpAfter24Hours(t *testing.T) {
 	h := pendingHarness(t)
 	failure := &notify.DeliveryError{Status: 503, Msg: "hooks.example returned HTTP 503"}
-	h.sink.failNext(notify.MaxAttempts+1, failure)
-	for range notify.MaxAttempts {
+	h.sink.failNext(1<<20, failure)
+	h.now = h.now.Add(time.Minute) // the first attempt comes after the delivery was due
+	first := h.now
+	var lastPending time.Time
+	for i := 0; ; i++ {
+		require.Less(t, i, 1000, "never given up")
 		require.NoError(t, h.eng.DrainOnce(ctx))
-		h.now = h.now.Add(time.Hour)
+		d := h.immediateDelivery()
+		require.Equal(t, i+1, d.Attempts, "one send per due drain")
+		if d.State != store.DeliveryPending {
+			assert.Equal(t, store.DeliveryFailed, d.State)
+			break
+		}
+		assert.True(t, d.NotBefore.Equal(first), "the first attempt's time is kept")
+		assert.LessOrEqual(t, d.NextAttempt.Sub(h.now), 15*time.Minute, "the backoff stays capped at 15m")
+		lastPending = h.now
+		h.now = d.NextAttempt
 	}
-	d := h.deliveries()[0]
-	assert.Equal(t, store.DeliveryFailed, d.State)
-	assert.Equal(t, notify.MaxAttempts, d.Attempts)
+	d := h.immediateDelivery()
+	assert.Less(t, lastPending.Sub(first), notify.GiveUpAfter, "retried until 24h after the first attempt")
+	assert.GreaterOrEqual(t, h.now.Sub(first), notify.GiveUpAfter, "given up by the first failure after it")
+	assert.Greater(t, d.Attempts, 12)
 	st, _, err := h.eng.Status(ctx, "uid-ops")
 	require.NoError(t, err)
-	assert.Equal(t, 12, st.ConsecutiveFailures)
+	assert.Equal(t, d.Attempts, st.ConsecutiveFailures)
 	assert.Equal(t, failure.Msg, st.LastError)
 	assert.False(t, st.Disabled)
 
 	calls := h.sink.calls
+	h.now = h.now.Add(time.Hour)
 	require.NoError(t, h.eng.DrainOnce(ctx))
 	assert.Equal(t, calls, h.sink.calls) // given up: not sent again
+}
+
+// TestDrain_PassSendsByPriority pins F89: the messages one pass queues go out urgent first, then
+// high, medium and low, then those without a priority (a feed-stale alert), then resolutions, and
+// by message ID within a rank, rather than in the hash order of their IDs.
+func TestDrain_PassSendsByPriority(t *testing.T) {
+	h := newHarness(t, func(o *notify.Options) { o.FeedStaleAfter = map[string]time.Duration{"osv": time.Hour} })
+	h.target("ops", func(c *notify.TargetConfig) { c.ImmediateMin = low; c.NotifyOnFeedStale = true })
+	h.process() // baseline
+	old := h.open(dep("a", "r"), "CVE-2026-0900", low)
+	h.process()
+	require.Len(t, h.sink.ofKind(notify.KindImmediate), 1)
+
+	h.now = h.now.Add(2 * time.Hour) // osv, never synced, is now stale
+	before := len(h.sink.sent)
+	h.move(old, model.StateResolved, low, model.TriggerInventoryChange)
+	var fs []model.Finding
+	for i, p := range []model.Priority{low, urgent, medium, high, urgent, low, high, medium} {
+		fs = append(fs, finding(dep("a", fmt.Sprintf("w%d", i)), fmt.Sprintf("CVE-2026-%04d", i+1), p))
+	}
+	h.batch(fs...)
+	h.process()
+
+	sent := h.sink.sent[before:]
+	require.Len(t, sent, 10)
+	rank := func(m notify.Message) int {
+		switch {
+		case m.Kind == notify.KindFeedStale:
+			return 4
+		case m.Items[0].Event == notify.EventResolved:
+			return 5
+		}
+		return int(urgent - m.Items[0].Priority)
+	}
+	var ranks []int
+	for i, m := range sent {
+		ranks = append(ranks, rank(m))
+		if i > 0 && rank(sent[i-1]) == rank(m) {
+			assert.Less(t, sent[i-1].ID, m.ID, "by ID within a rank")
+		}
+	}
+	assert.Equal(t, []int{0, 0, 1, 1, 2, 2, 3, 3, 4, 5}, ranks)
 }
 
 func TestDrain_PermanentFailsAtOnce(t *testing.T) {
 	h := pendingHarness(t)
 	h.sink.failNext(1, &notify.DeliveryError{Status: 404, Permanent: true, Msg: "hooks.example returned HTTP 404"})
 	require.NoError(t, h.eng.DrainOnce(ctx))
-	d := h.deliveries()[0]
+	d := h.immediateDelivery()
 	assert.Equal(t, store.DeliveryFailed, d.State)
 	assert.Equal(t, 1, d.Attempts)
 }

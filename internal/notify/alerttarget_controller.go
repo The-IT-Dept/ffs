@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -172,6 +173,7 @@ type TargetReconciler struct {
 	Namespace string
 	Cluster   string
 	NewSink   SinkFactory
+	Log       logr.Logger
 }
 
 // Reconcile registers the AlertTarget req names, or forgets it when it is gone. A target that
@@ -230,9 +232,12 @@ func (r *TargetReconciler) register(ctx context.Context, at *ffsv1alpha1.AlertTa
 		return notReady("InvalidSpec", err.Error())
 	}
 	sc.Cluster = r.Cluster
-	sink, err := r.NewSink(at.Spec.Type, sc)
-	if err != nil {
-		return notReady("SecretInvalid", err.Error())
+	// A resync with nothing changed keeps the registered sink, and with it its idle connections.
+	sink, ok := r.Engine.sinkFor(cfg.UID, cfg.ConfigHash)
+	if !ok {
+		if sink, err = r.NewSink(at.Spec.Type, sc); err != nil {
+			return notReady("SecretInvalid", err.Error())
+		}
 	}
 	if err := r.Engine.Register(ctx, cfg, sink); err != nil {
 		return notReady("InvalidSpec", err.Error())
@@ -333,16 +338,31 @@ func (r *TargetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 	return mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 		if !mgr.GetCache().WaitForCacheSync(ctx) {
-			return ctx.Err()
+			return nil // shutting down
 		}
-		var list ffsv1alpha1.AlertTargetList
-		if err := r.Client.List(ctx, &list); err != nil {
-			return fmt.Errorf("listing AlertTargets: %w", err)
-		}
-		uids := make([]string, len(list.Items))
-		for i := range list.Items {
-			uids[i] = string(list.Items[i].UID)
-		}
-		return r.Engine.Retain(ctx, uids)
+		return r.startupRetain(ctx)
 	}))
+}
+
+// startupRetain deletes the stored state of AlertTargets that no longer exist, once at start. A
+// failure is logged, not returned: the state is left until the next start, which is not worth
+// stopping the manager for.
+func (r *TargetReconciler) startupRetain(ctx context.Context) error {
+	if err := r.retainLive(ctx); err != nil && ctx.Err() == nil {
+		r.Log.Error(err, "deleting the notification state of deleted AlertTargets failed")
+	}
+	return nil
+}
+
+// retainLive deletes the stored state of every target that is not a current AlertTarget.
+func (r *TargetReconciler) retainLive(ctx context.Context) error {
+	var list ffsv1alpha1.AlertTargetList
+	if err := r.Client.List(ctx, &list); err != nil {
+		return fmt.Errorf("listing AlertTargets: %w", err)
+	}
+	uids := make([]string, len(list.Items))
+	for i := range list.Items {
+		uids[i] = string(list.Items[i].UID)
+	}
+	return r.Engine.Retain(ctx, uids)
 }

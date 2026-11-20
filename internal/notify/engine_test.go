@@ -30,16 +30,29 @@ var ctx = context.Background()
 // fakeSink records the messages it sends. failNext makes the next n sends fail; cancelOnCall
 // cancels a context on the n-th send from now, as a process dying mid-send would.
 type fakeSink struct {
-	mu        sync.Mutex
-	sent      []notify.Message
-	calls     int
-	fails     int
-	failErr   error
-	cancelAt  int
-	cancelCtx context.CancelFunc
+	mu         sync.Mutex
+	sent       []notify.Message
+	calls      int
+	fails      int
+	failErr    error
+	cancelAt   int
+	cancelCtx  context.CancelFunc
+	idleClosed int // CloseIdleConnections calls
 }
 
 func (s *fakeSink) Type() string { return "slack" }
+
+func (s *fakeSink) CloseIdleConnections() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.idleClosed++
+}
+
+func (s *fakeSink) closedIdle() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.idleClosed
+}
 
 func (s *fakeSink) Send(ctx context.Context, m notify.Message) error {
 	s.mu.Lock()

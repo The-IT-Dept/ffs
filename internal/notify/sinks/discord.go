@@ -49,6 +49,9 @@ type discord struct {
 
 func (d *discord) Type() string { return "discord" }
 
+// CloseIdleConnections closes the idle connections of the sink's Poster.
+func (d *discord) CloseIdleConnections() { d.poster.CloseIdleConnections() }
+
 func (d *discord) Send(ctx context.Context, m notify.Message) error {
 	body, err := json.Marshal(discordPayload(m))
 	if err != nil {

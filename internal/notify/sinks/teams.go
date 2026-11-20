@@ -19,6 +19,9 @@ type teams struct {
 
 func (t *teams) Type() string { return "teams" }
 
+// CloseIdleConnections closes the idle connections of the sink's Poster.
+func (t *teams) CloseIdleConnections() { t.poster.CloseIdleConnections() }
+
 func (t *teams) Send(ctx context.Context, m notify.Message) error {
 	body, err := json.Marshal(teamsPayload(m))
 	if err != nil {

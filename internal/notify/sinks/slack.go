@@ -48,6 +48,9 @@ type slack struct {
 
 func (s *slack) Type() string { return "slack" }
 
+// CloseIdleConnections closes the idle connections of the sink's Poster.
+func (s *slack) CloseIdleConnections() { s.poster.CloseIdleConnections() }
+
 func (s *slack) Send(ctx context.Context, m notify.Message) error {
 	body, err := json.Marshal(slackPayload(m))
 	if err != nil {

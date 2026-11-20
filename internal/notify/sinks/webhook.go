@@ -60,6 +60,9 @@ type webhook struct {
 
 func (w *webhook) Type() string { return "webhook" }
 
+// CloseIdleConnections closes the idle connections of the sink's Poster.
+func (w *webhook) CloseIdleConnections() { w.poster.CloseIdleConnections() }
+
 type cloudEvent struct {
 	SpecVersion     string    `json:"specversion"`
 	ID              string    `json:"id"`
