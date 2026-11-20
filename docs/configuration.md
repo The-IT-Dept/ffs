@@ -81,7 +81,7 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `nodeAgent.certDir` | `/etc/ffs/agent-tls` | Holds `tls.crt` and `tls.key` for the agent API. The chart mounts its certificate here; it is not a Helm value. |
 | `nodeAgent.namespace` | `<release namespace>-agent` | The agent namespace. Tokens from any other namespace are refused. |
 | `nodeAgent.serviceAccount` | `<chart full name>-agent` (`ffs-agent` for a release named `ffs`) | The agent ServiceAccount; the chart sets it. |
-| `nodeAgent.maxReportBytes` | `33554432` (32 MiB) | Largest agent report accepted, 1 MiB to 256 MiB; Helm also takes a quantity. A full report over it is sent without its host SBOM. |
+| `nodeAgent.maxReportBytes` | `33554432` (32 MiB) | Largest agent report accepted, 1 MiB to 192 MiB (the most the controller reads of reports at once); Helm also takes a quantity. A full report over it is sent without its host SBOM. |
 | `nodeAgent.reportInterval` | `6h` | Time between full host reports per node, with jitter. |
 | `nodeAgent.imageListInterval` | `5m` | Time between cached-image checks. Each check is also the heartbeat. Must be shorter than `reportInterval`. |
 | `nodeAgent.staleAfter` | `30m` | After this long without a report, a node shows "node agent not reporting". At least twice `imageListInterval`. |

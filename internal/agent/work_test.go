@@ -306,6 +306,34 @@ func TestWork_ResultNotResentWhenItCannotBeTaken(t *testing.T) {
 	e.ctl.noSBOM(t)
 }
 
+// TestWork_StopDuringResendWaitAnswersSkipped: an agent that starts stopping while it waits to send a result
+// again answers the request skipped, once, so the request does not expire unanswered and count against its
+// image.
+func TestWork_StopDuringResendWaitAnswersSkipped(t *testing.T) {
+	e := newEnv(t)
+	e.startCataloguer(t)
+	a := newTestAgent(t, e)
+	e.ctl.failSBOMs(http.StatusServiceUnavailable) // the first send fails; the default first resend waits seconds
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		a.runJob(ctx, wire.WorkRequest{ID: "w1", Digest: e.manifest, Platform: "linux/" + runtime.GOARCH,
+			Deadline: time.Now().Add(5 * time.Minute)}, time.Now())
+	}()
+	require.Eventually(t, func() bool { events, _ := e.ctl.log(); return len(events) == 1 }, waitFor, 5*time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(waitFor):
+		t.Fatal("runJob did not return after cancel")
+	}
+	requireSkipped(t, e.ctl.nextSBOM(t), "w1", e.manifest)
+	e.ctl.noSBOM(t)
+	events, _ := e.ctl.log()
+	require.Equal(t, []string{"sbom:w1", "sbom:w1"}, events, "the failed send, then one skipped answer")
+}
+
 // requireSkipped checks a skipped result: the agent did not attempt the request, and says so with nothing else.
 func requireSkipped(t *testing.T, res wire.SBOMResult, id, digest string) {
 	t.Helper()

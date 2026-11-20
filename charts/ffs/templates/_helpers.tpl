@@ -40,9 +40,13 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 {{- $_ = set $c "allowedHosts" (concat (get $c "allowedHosts" | default list) $names | uniq) -}}
 {{- end -}}
 {{- $na := .Values.nodeAgent -}}
+{{- $maxReport := include "ffs.bytes" (list "nodeAgent.maxReportBytes" $na.maxReportBytes) | int64 -}}
+{{- if or (lt $maxReport 1048576) (gt $maxReport 201326592) -}}
+{{- fail (printf "nodeAgent.maxReportBytes (%d bytes) must be between 1 MiB and 192 MiB, the most the controller reads of reports at once" $maxReport) -}}
+{{- end -}}
 {{- $_ = set $c "nodeAgent" (dict "enabled" $na.enabled "listen" (printf ":%d" (int $na.port)) "certDir" "/etc/ffs/agent-tls"
   "namespace" (include "ffs.agentNamespace" .) "serviceAccount" (include "ffs.agentServiceAccount" .)
-  "maxReportBytes" (include "ffs.bytes" (list "nodeAgent.maxReportBytes" $na.maxReportBytes) | int64)
+  "maxReportBytes" $maxReport
   "reportInterval" $na.reportInterval "imageListInterval" $na.imageListInterval "staleAfter" $na.staleAfter
   "runtimeGrace" $na.runtimeGrace "workPerReport" (int $na.workPerReport) "workTimeout" $na.workTimeout
   "exposedNodes" $na.exposedNodes "architectures" $na.architectures "nodeSelector" $na.nodeSelector) -}}

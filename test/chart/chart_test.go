@@ -495,6 +495,10 @@ func TestChart_HTTPPortFollowsListen(t *testing.T) {
 	require.ErrorContains(t, err, "nodeAgent.port must not be one of the controller's other ports (9444, 8081, 8443)")
 	_, err = renderErr(t, "config.listen=0.0.0.0")
 	require.ErrorContains(t, err, `config.listen must be an address with a port number, such as 0.0.0.0:8080, not "0.0.0.0"`)
+	for _, v := range []string{"193Mi", "512Ki"} {
+		_, err = renderErr(t, "nodeAgent.maxReportBytes="+v)
+		require.ErrorContains(t, err, "must be between 1 MiB and 192 MiB", v)
+	}
 	for _, port := range []string{"8081", "8443"} {
 		_, err = renderErr(t, "config.listen=0.0.0.0:"+port)
 		require.ErrorContains(t, err, "config.listen must not use port "+port+": the controller serves health on 8081 and metrics on 8443")

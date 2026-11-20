@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -85,36 +86,48 @@ func (a *agent) runJob(ctx context.Context, w wire.WorkRequest, received time.Ti
 		a.skip(ctx, w)
 		return
 	}
-	a.post(ctx, w, res, doc)
+	a.post(ctx, w, res, doc, true)
 }
 
 // skip answers each of ws skipped. While the agent is stopping (ctx has ended), they are sent detached from
-// ctx, for at most stopSkipTimeout in all.
+// ctx, once each, for at most stopSkipTimeout in all: a resend wait would use up the budget the rest need.
 func (a *agent) skip(ctx context.Context, ws ...wire.WorkRequest) {
+	resend := true
 	if ctx.Err() != nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), stopSkipTimeout)
 		defer cancel()
+		resend = false
 	}
 	for _, w := range ws {
 		a.post(ctx, w, wire.SBOMResult{ID: w.ID, Node: a.o.NodeName, AgentVersion: version.Version, Digest: w.Digest,
-			Unavailable: wire.UnavailableSkipped}, nil)
+			Unavailable: wire.UnavailableSkipped}, nil, resend)
 	}
 }
 
 // post sends res, the result of w. A result the controller did not take (no answer, 429 or 5xx) would leave
-// w unanswered, and an unanswered request counts against its image, so it is sent again after each of
-// resultResends in turn, or the controller's Retry-After when longer, while the controller still takes a
-// result for w: until wire.ResultGrace after its deadline. Any other answer is final.
-func (a *agent) post(ctx context.Context, w wire.WorkRequest, res wire.SBOMResult, doc *sbomFile) {
+// w unanswered, and an unanswered request counts against its image, so with resend it is sent again after
+// each of resultResends in turn, or the controller's Retry-After when longer, while the controller still
+// takes a result for w: until wire.ResultGrace after its deadline. Any other answer is final. When the agent
+// starts stopping during a resend wait, w is answered skipped once, detached, so it does not count either.
+func (a *agent) post(ctx context.Context, w wire.WorkRequest, res wire.SBOMResult, doc *sbomFile, resend bool) {
 	until := w.Deadline.Add(wire.ResultGrace)
 	for i := 0; ; i++ {
 		err := a.client.SBOM(ctx, res, doc)
 		if err == nil || ctx.Err() != nil {
 			return
 		}
-		wait := jittered(resultResends[min(i, len(resultResends)-1)], backoffJitterPercent, a.o.Jitter)
 		var se *StatusError
+		if i > 0 && errors.As(err, &se) && se.Code == http.StatusForbidden {
+			// A resend after a lost answer: the controller already stored the result and released w.
+			a.o.Log.Info("the controller no longer takes this SBOM result; an earlier send was stored", "id", res.ID, "digest", res.Digest)
+			return
+		}
+		if !resend {
+			a.logFailure(err, "sending an SBOM result", "id", res.ID, "digest", res.Digest)
+			return
+		}
+		wait := jittered(resultResends[min(i, len(resultResends)-1)], backoffJitterPercent, a.o.Jitter)
 		if errors.As(err, &se) && se.RetryAfter > wait {
 			wait = se.RetryAfter
 		}
@@ -126,6 +139,7 @@ func (a *agent) post(ctx context.Context, w wire.WorkRequest, res wire.SBOMResul
 			"retryIn", wait, "reason", err.Error())
 		a.lease(wait + clientTimeout)
 		if !a.sleepUntil(ctx, a.o.Now().Add(wait)) {
+			a.skip(ctx, w)
 			return
 		}
 	}
