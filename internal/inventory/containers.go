@@ -3,6 +3,7 @@ package inventory
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -78,9 +79,34 @@ func initKind(c *corev1.Container) model.ContainerKind {
 	return model.ContainerInit
 }
 
+// placeholder is the use of a container whose image could not be resolved yet: it keeps the
+// container in the owner, with no digest, until a retry resolves it.
+func placeholder(name string, kind model.ContainerKind, ref string, platform NodePlatform, cs registry.CredSet, root bool) use {
+	repo, _, _, _ := SplitRef(ref)
+	return newUse(name, kind, ref, model.Image{Repo: repo, Platform: platform.Key()}, cs, root)
+}
+
+// partial collects the containers whose image failed to resolve, so the owner is still stored
+// with every other container and retried for these.
+type partial struct{ errs []error }
+
+// add records err for one container; it reports false when err must abort the whole owner
+// (shutdown).
+func (p *partial) add(ctx context.Context, what string, err error) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	p.errs = append(p.errs, fmt.Errorf("%s: %w", what, err))
+	return true
+}
+
+func (p *partial) err() error { return errors.Join(p.errs...) }
+
 // containerUses reads a running pod's container statuses (regular, init and native sidecars,
-// ephemeral) and its image volumes. Containers that have not reported an image ID are omitted.
-func (inv *Inventory) containerUses(ctx context.Context, pod *corev1.Pod, node NodePlatform) ([]use, error) {
+// ephemeral) and its image volumes. Containers that have not reported an image ID are omitted. A
+// container whose image fails to resolve becomes a placeholder use, and the returned error lists
+// those failures; the other uses are still returned.
+func (inv *Inventory) containerUses(ctx context.Context, pod *corev1.Pod, node NodePlatform, prev prevUses) ([]use, error) {
 	cs := credsFor(pod.Namespace, &pod.Spec)
 	// Container names are unique across regular, init and ephemeral containers.
 	type spec struct {
@@ -100,7 +126,10 @@ func (inv *Inventory) containerUses(ctx context.Context, pod *corev1.Pod, node N
 		specs[c.Name] = spec{c.Image, c.SecurityContext, model.ContainerEphemeral}
 	}
 
-	var out []use
+	var (
+		out   []use
+		fails partial
+	)
 	for _, group := range []struct {
 		statuses []corev1.ContainerStatus
 		kind     model.ContainerKind
@@ -121,11 +150,16 @@ func (inv *Inventory) containerUses(ctx context.Context, pod *corev1.Pod, node N
 			if ref == "" {
 				ref = s.image
 			}
+			root := rootUnlessImageUser(pod.Spec.SecurityContext, s.sc)
 			img, err := inv.o.Normalizer.Normalize(ctx, ContainerImage{Image: ref, ImageID: st.ImageID, Node: node, Creds: cs})
 			if err != nil {
-				return nil, fmt.Errorf("container %s: %w", st.Name, err)
+				if !fails.add(ctx, "container "+st.Name, err) {
+					return nil, err
+				}
+				out = append(out, placeholder(st.Name, s.kind, ref, node, cs, root))
+				continue
 			}
-			out = append(out, newUse(st.Name, s.kind, ref, img, cs, rootUnlessImageUser(pod.Spec.SecurityContext, s.sc)))
+			out = append(out, newUse(st.Name, s.kind, ref, img, cs, root))
 		}
 	}
 
@@ -140,14 +174,18 @@ func (inv *Inventory) containerUses(ctx context.Context, pod *corev1.Pod, node N
 		if id := volumeImageRef(pod, v.Name); id != "" {
 			img, err = inv.o.Normalizer.Normalize(ctx, ContainerImage{Image: v.Image.Reference, ImageID: id, Node: node, Creds: cs})
 		} else {
-			img, err = inv.resolveRef(ctx, v.Image.Reference, node, cs)
+			img, err = inv.resolveRef(ctx, v.Image.Reference, node, cs, prev.of(v.Name, model.ContainerImageVolume, v.Image.Reference))
 		}
 		if err != nil {
-			return nil, fmt.Errorf("image volume %s: %w", v.Name, err)
+			if !fails.add(ctx, "image volume "+v.Name, err) {
+				return nil, err
+			}
+			out = append(out, placeholder(v.Name, model.ContainerImageVolume, v.Image.Reference, node, cs, false))
+			continue
 		}
 		out = append(out, newUse(v.Name, model.ContainerImageVolume, v.Image.Reference, img, cs, false))
 	}
-	return out, nil
+	return out, fails.err()
 }
 
 // volumeImageRef returns the kubelet-reported image ref of an image volume, or "".
@@ -166,15 +204,24 @@ func volumeImageRef(pod *corev1.Pod, volume string) string {
 }
 
 // templateUses resolves a workload template's images (init containers, native sidecars,
-// containers and image volumes) at the given platform.
-func (inv *Inventory) templateUses(ctx context.Context, tmpl *corev1.PodTemplateSpec, namespace string, platform NodePlatform) ([]use, error) {
+// containers and image volumes) at the given platform. Like containerUses, an image that fails to
+// resolve becomes a placeholder use and its failure is returned with the other uses.
+func (inv *Inventory) templateUses(ctx context.Context, tmpl *corev1.PodTemplateSpec, namespace string, platform NodePlatform,
+	prev prevUses) ([]use, error) {
 	cs := credsFor(namespace, &tmpl.Spec)
 	psc := tmpl.Spec.SecurityContext
-	var out []use
+	var (
+		out   []use
+		fails partial
+	)
 	add := func(name string, kind model.ContainerKind, ref string, root bool) error {
-		img, err := inv.resolveRef(ctx, ref, platform, cs)
+		img, err := inv.resolveRef(ctx, ref, platform, cs, prev.of(name, kind, ref))
 		if err != nil {
-			return fmt.Errorf("%s %s: %w", kind, name, err)
+			if !fails.add(ctx, fmt.Sprintf("%s %s", kind, name), err) {
+				return err
+			}
+			out = append(out, placeholder(name, kind, ref, platform, cs, root))
+			return nil
 		}
 		out = append(out, newUse(name, kind, ref, img, cs, root))
 		return nil
@@ -197,46 +244,110 @@ func (inv *Inventory) templateUses(ctx context.Context, tmpl *corev1.PodTemplate
 			}
 		}
 	}
-	return out, nil
+	return out, fails.err()
 }
 
-// resolveRef resolves an image reference that has no kubelet-reported image ID. A tag goes
-// through the recorded tag digest while it is younger than TagTTL, else a registry HEAD; a
-// reference pinned by digest skips tag resolution. When a fresh lookup fails, the last recorded
-// digest is used; with none, a permanent failure yields an unresolvable placeholder image.
-func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodePlatform, cs registry.CredSet) (model.Image, error) {
+// prevUses are the container uses an owner was stored with, by container name, kind and image
+// reference.
+type prevUses map[prevKey]model.ContainerUse
+
+type prevKey struct {
+	name string
+	kind model.ContainerKind
+	ref  string
+}
+
+func prevUsesOf(o model.Owner) prevUses {
+	out := prevUses{}
+	for _, c := range o.Containers {
+		if c.Digest != "" {
+			out[prevKey{c.Name, c.Kind, c.ImageRef}] = c
+		}
+	}
+	return out
+}
+
+// of returns the stored use of the container, or nil.
+func (p prevUses) of(name string, kind model.ContainerKind, ref string) *model.ContainerUse {
+	if c, ok := p[prevKey{name, kind, ref}]; ok {
+		return &c
+	}
+	return nil
+}
+
+// resolveRef resolves an image reference that has no kubelet-reported image ID: a workload
+// template, or an image volume the kubelet has not reported. Nothing has pulled it for this
+// workload, so a digest is used only once the registry has confirmed that cs may pull it (a HEAD,
+// which costs no manifest budget). Otherwise a reference to another namespace's private image would
+// attach that image's packages and CVEs to this workload. A confirmation holds for TagTTL per
+// credentials, repository and digest.
+//
+// A tag goes through the recorded tag digest while the record is younger than TagTTL and confirmed
+// for cs, else a registry HEAD under cs; a reference pinned by digest is confirmed with a HEAD. A
+// refusal yields an unresolvable placeholder, never a digest recorded for someone else. When a
+// lookup fails for any other reason, the image prev (this container's stored use) had is kept.
+func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodePlatform, cs registry.CredSet,
+	prev *model.ContainerUse) (model.Image, error) {
 	repo, tag, digest, err := SplitRef(ref)
 	if err != nil {
 		return inv.o.Normalizer.unresolvable("unknown:"+ref, "", platform.Key(), fmt.Sprintf(ReasonBadReference, ref, err)), nil
 	}
+	now := inv.now()
+	lookup := ref // what a registry error is reported against
 	if digest == "" {
-		now := inv.now()
+		lookup = repo + ":" + tag
 		recorded, at, ok, err := inv.o.Store.TagDigest(ctx, repo, tag)
 		if err != nil {
 			return model.Image{}, err
 		}
-		digest = recorded
-		if !ok || now.Sub(at) >= inv.o.TagTTL {
-			d, err := inv.o.Resolver.ResolveTag(ctx, repo, tag, cs)
-			switch {
-			case err == nil:
-				if err := inv.o.Store.PutTagDigest(ctx, repo, tag, d, now); err != nil {
-					return model.Image{}, err
-				}
-				digest = d
-			case !ok:
-				tagRef := repo + ":" + tag
-				return inv.o.Normalizer.fail(err, "unknown:"+tagRef, repo, tagRef, "", platform.Key())
+		if ok && now.Sub(at) < inv.o.TagTTL && inv.access.confirmed(cs, repo, recorded, now) {
+			digest = recorded
+		} else if d, err := inv.o.Resolver.ResolveTag(ctx, repo, tag, cs); err != nil {
+			return inv.unconfirmed(ctx, err, lookup, repo, platform, prev)
+		} else {
+			if err := inv.o.Store.PutTagDigest(ctx, repo, tag, d, now); err != nil {
+				return model.Image{}, err
 			}
+			inv.access.confirm(cs, repo, d, now)
+			digest = d
 		}
+	} else if !inv.access.confirmed(cs, repo, digest, now) {
+		if _, err := inv.o.Resolver.Head(ctx, repo+"@"+digest, cs); err != nil {
+			return inv.unconfirmed(ctx, err, lookup, repo, platform, prev)
+		}
+		inv.access.confirm(cs, repo, digest, now)
 	}
 	return inv.o.Normalizer.Normalize(ctx, ContainerImage{Image: ref, ImageID: repo + "@" + digest, Node: platform, Creds: cs})
 }
 
+// unconfirmed handles a registry lookup that did not confirm access: a refusal is an unresolvable
+// placeholder for the reference; another failure keeps prev's image when there is one, and is
+// otherwise returned (or, after repeated failures, unresolvable as not reachable).
+func (inv *Inventory) unconfirmed(ctx context.Context, err error, lookup, repo string, platform NodePlatform,
+	prev *model.ContainerUse) (model.Image, error) {
+	refused := errors.Is(err, registry.ErrUnauthorized) || errors.Is(err, registry.ErrNotFound)
+	if !refused && prev != nil && ctx.Err() == nil {
+		img, ok, serr := inv.o.Store.GetImage(ctx, prev.Digest)
+		if serr != nil {
+			return model.Image{}, serr
+		}
+		if ok {
+			img.Repo = repo
+			return img, nil
+		}
+	}
+	return inv.o.Normalizer.fail(ctx, err, "unknown:"+lookup, repo, lookup, "", platform.Key())
+}
+
 // recordImage stores a new image row (or a refreshed unresolvable one) and collects an SBOM request
-// for a pending image this process has not yet handed to the acquirer.
+// for an image this process has not yet handed to the acquirer: a pending one, or one whose
+// catalogFailed quarantine has ended (the retry spec §6.3 promises, which must survive a restart).
+
 func (inv *Inventory) recordImage(ctx context.Context, f *flushState, u use) error {
 	img := u.Image
+	if img.Digest == "" {
+		return nil // a placeholder: nothing resolved yet
+	}
 	stored, ok, err := inv.o.Store.GetImage(ctx, img.Digest)
 	if err != nil {
 		return err
@@ -248,7 +359,8 @@ func (inv *Inventory) recordImage(ctx context.Context, f *flushState, u use) err
 			return err
 		}
 	}
-	if img.Status != model.ImagePending {
+	due := img.Status == model.ImageCatalogFailed && !f.now.Before(img.QuarantinedUntil)
+	if img.Status != model.ImagePending && !due {
 		delete(inv.enqueued, img.Digest)
 		return nil
 	}

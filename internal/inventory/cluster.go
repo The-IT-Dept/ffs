@@ -25,8 +25,8 @@ const (
 	// NoteVendorVersion is added for managed-distribution versions; %s is the raw version.
 	NoteVendorVersion = "version normalised from %s; vendor builds may include backported fixes"
 
-	kindCluster     = "Cluster"
-	kindRuntime     = "ContainerRuntime"
+	kindCluster     = model.OwnerKindCluster
+	kindRuntime     = model.OwnerKindContainerRuntime
 	sourceInventory = "inventory"
 )
 

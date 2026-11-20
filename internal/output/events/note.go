@@ -40,10 +40,10 @@ func classify(t model.Transition) (reason string, p model.Priority, ok bool) {
 // regarding returns the object an owner's events are recorded against and the note prefix. ok is
 // false when the owner has no Kubernetes object to attach to.
 func regarding(o model.OwnerRef, self *corev1.ObjectReference) (ref *corev1.ObjectReference, prefix string, ok bool) {
-	switch o.Kind {
-	case "Cluster":
+	switch {
+	case o.ClusterLevel() && o.Kind == model.OwnerKindCluster:
 		return self, "Kubernetes: ", self != nil
-	case "ContainerRuntime":
+	case o.ClusterLevel():
 		return self, "Container runtime " + o.Name + ": ", self != nil
 	}
 	api, known := model.APIVersionForKind(o.Kind)

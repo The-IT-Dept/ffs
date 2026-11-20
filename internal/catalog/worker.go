@@ -9,13 +9,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
 	"strings"
+	"syscall"
 
 	"github.com/anchore/stereoscope/pkg/image"
 	"github.com/anchore/syft/syft"
 	"github.com/anchore/syft/syft/cataloging"
 	_ "github.com/glebarez/go-sqlite" // the "sqlite" driver Syft's RPM cataloger needs; without it every image fails (see internal/store for why not modernc.org/sqlite)
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
@@ -90,23 +94,71 @@ func RunWorker(ctx context.Context, in io.Reader, out io.Writer) error {
 	return json.NewEncoder(out).Encode(resp)
 }
 
-// workError classifies err: a WorkError keeps its kind, registry refusals map to their kinds, and
-// anything else is a failure.
+// workError classifies err: a WorkError keeps its kind, registry refusals map to their kinds, a
+// registry that cannot be reached or answers with a server error is unavailable, and anything else
+// is a failure. Only failures count toward quarantine, so the classification also reads errors that
+// stereoscope flattened to text (it wraps registry errors with %+v, which drops their type).
 func workError(err error) *WorkError {
 	var we *WorkError
 	if errors.As(err, &we) {
 		return we
 	}
 	err = registry.Classify(err)
+	var kind string
 	switch {
 	case errors.Is(err, registry.ErrUnauthorized):
-		return &WorkError{Kind: sbom.KindUnauthorized, Msg: err.Error()}
+		kind = sbom.KindUnauthorized
 	case errors.Is(err, registry.ErrNotFound):
-		return &WorkError{Kind: sbom.KindNotFound, Msg: err.Error()}
+		kind = sbom.KindNotFound
 	case errors.Is(err, registry.ErrRateLimited):
-		return &WorkError{Kind: sbom.KindRateLimited, Msg: err.Error()}
+		kind = sbom.KindRateLimited
+	case unavailable(err):
+		kind = sbom.KindUnavailable
+	default:
+		kind = kindFromText(err.Error())
 	}
-	return &WorkError{Kind: sbom.KindFailed, Msg: err.Error()}
+	return &WorkError{Kind: kind, Msg: err.Error()}
+}
+
+// unavailable reports a typed network failure (DNS, refused or reset connection, timeout) or a
+// registry server error (5xx).
+func unavailable(err error) bool {
+	var te *transport.Error
+	if errors.As(err, &te) {
+		return te.StatusCode >= http.StatusInternalServerError
+	}
+	var (
+		dnsErr *net.DNSError
+		opErr  *net.OpError
+		netErr net.Error
+	)
+	return errors.As(err, &dnsErr) || errors.As(err, &opErr) || (errors.As(err, &netErr) && netErr.Timeout()) ||
+		errors.Is(err, syscall.ECONNREFUSED) || errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ENETUNREACH) ||
+		errors.Is(err, syscall.EHOSTUNREACH)
+}
+
+// textKinds maps the text of a flattened registry or network error to its kind. Registry error codes
+// come from the distribution spec; status lines are go-containerregistry's "unexpected status code".
+var textKinds = []struct {
+	kind    string
+	markers []string
+}{
+	{sbom.KindRateLimited, []string{"TOOMANYREQUESTS", "unexpected status code 429"}},
+	{sbom.KindUnauthorized, []string{"UNAUTHORIZED", "DENIED", "unexpected status code 401", "unexpected status code 403"}},
+	{sbom.KindNotFound, []string{"MANIFEST_UNKNOWN", "NAME_UNKNOWN", "unexpected status code 404"}},
+	{sbom.KindUnavailable, []string{"unexpected status code 5", "no such host", "server misbehaving", "connection refused",
+		"connection reset by peer", "network is unreachable", "no route to host", "i/o timeout", "TLS handshake timeout"}},
+}
+
+func kindFromText(msg string) string {
+	for _, tk := range textKinds {
+		for _, m := range tk.markers {
+			if strings.Contains(msg, m) {
+				return tk.kind
+			}
+		}
+	}
+	return sbom.KindFailed
 }
 
 // staticKeychain resolves every registry to the job's credentials, or to anonymous when it has none,

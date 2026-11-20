@@ -23,8 +23,8 @@ const (
 	catalogURL     = "http://catalog/v1/catalog"
 	// catalogSlack is how long past the job timeout the client waits before giving up on the cataloguer.
 	catalogSlack = 30 * time.Second
-	// maxCatalogResponse bounds a successful response (the syft-json document).
-	maxCatalogResponse = 1 << 30
+	// maxCatalogResponse bounds a successful response: the syft-json document plus its envelope.
+	maxCatalogResponse = MaxSBOMBytes + 1<<20
 	// maxCatalogError bounds an error response body.
 	maxCatalogError = 64 << 10
 	// catalogReservation covers the manifest GETs one job makes: the cataloguer's size pre-check and
@@ -32,6 +32,7 @@ const (
 	catalogReservation = 2
 
 	reasonStopped     = "cataloguer stopped while processing the image"
+	reasonUnavailable = "registry not reachable from the cataloguer"
 	reasonScratchFull = "image unpacked beyond the cataloguer scratch limit"
 )
 
@@ -72,7 +73,8 @@ func (s *CatalogSource) Name() string { return registrySource }
 // caller to normalise from SyftJSON.
 func (s *CatalogSource) Acquire(ctx context.Context, r Request) (*Result, error) {
 	if err := s.reg.Reserve(ctx, r.Repo, catalogReservation); err != nil {
-		return nil, err
+		// A low budget means slower cataloguing, never a failure.
+		return nil, &AcquireError{Kind: FailTransient, Reason: "waiting for the registry's rate budget", Err: err}
 	}
 	a, err := s.reg.Auth(ctx, r.Repo, r.Creds)
 	if err != nil {
@@ -107,8 +109,17 @@ func (s *CatalogSource) Acquire(ctx context.Context, r Request) (*Result, error)
 
 	if resp.StatusCode == http.StatusOK {
 		var cr CatalogResponse
-		if err := json.NewDecoder(io.LimitReader(resp.Body, maxCatalogResponse)).Decode(&cr); err != nil {
+		body := &io.LimitedReader{R: resp.Body, N: maxCatalogResponse + 1}
+		if err := json.NewDecoder(body).Decode(&cr); err != nil {
+			if body.N <= 0 {
+				return nil, &AcquireError{Kind: FailQuarantine,
+					Reason: fmt.Sprintf("SBOM is larger than the %d byte limit", MaxSBOMBytes)}
+			}
 			return nil, &AcquireError{Kind: FailCounted, Reason: "cataloguer returned an unreadable response", Err: err}
+		}
+		if len(cr.SyftJSON) > MaxSBOMBytes {
+			return nil, &AcquireError{Kind: FailQuarantine,
+				Reason: fmt.Sprintf(reasonSBOMTooLarge, len(cr.SyftJSON), MaxSBOMBytes)}
 		}
 		if len(cr.SyftJSON) == 0 || string(cr.SyftJSON) == "null" {
 			return nil, &AcquireError{Kind: FailCounted, Reason: "cataloguer returned no SBOM"}
@@ -137,6 +148,13 @@ func (s *CatalogSource) transportError(ctx context.Context, err error) error {
 	return &AcquireError{Kind: FailCounted, Reason: reasonStopped, Err: err}
 }
 
+// cataloguerStopped reports a job that lost its connection to the cataloguer mid-request: the
+// catalog container went down while processing it.
+func cataloguerStopped(err error) bool {
+	var ae *AcquireError
+	return errors.As(err, &ae) && ae.Reason == reasonStopped
+}
+
 // statusError classifies a cataloguer error response.
 func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) error {
 	switch status {
@@ -148,6 +166,8 @@ func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) erro
 		return &AcquireError{Kind: FailQuarantine, Reason: ce.Error}
 	case http.StatusTooManyRequests:
 		return &AcquireError{Kind: FailTransient, Reason: "registry rate limited the cataloguer's pull"}
+	case http.StatusBadGateway:
+		return &AcquireError{Kind: FailTransient, Reason: reasonUnavailable, Err: errors.New(ce.Error)}
 	case http.StatusServiceUnavailable:
 		return &AcquireError{Kind: FailTransient, Reason: "cataloguer busy"}
 	case http.StatusGatewayTimeout:

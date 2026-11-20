@@ -40,6 +40,10 @@ import (
 // socketPoll is how often the acquirer re-dials the cataloguer socket before it starts.
 const socketPoll = 2 * time.Second
 
+// acquireSlack is how much longer than the cataloguer's own job timeout one acquisition may take: the
+// registry budget wait, credential resolution and the response.
+const acquireSlack = 5 * time.Minute
+
 // wire builds the Phase 1 components, adds the leader-only ones to m and returns d with Registry,
 // Engine, Acquirer, Feeds, EOL and Ready filled in. d must carry Config, Namespace, Store, Hooks and Log.
 func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) (deps.Deps, error) {
@@ -62,11 +66,14 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 		Log:      log.WithName("engine"),
 	})
 
+	sources, fallback := sbom.DefaultSources(reg, cfg.Catalog)
 	acq := sbom.NewAcquirer(sbom.AcquirerOptions{
 		Store:        st,
-		Sources:      []sbom.Source{sbom.NewAttestationSource(reg), sbom.NewCatalogSource(reg, cfg.Catalog)},
+		Sources:      sources,
+		Fallback:     fallback,
 		Concurrency:  cfg.Catalog.Concurrency,
 		OnCatalogued: eng.OnImageCatalogued,
+		JobTimeout:   cfg.Catalog.Timeout + acquireSlack,
 		Log:          log.WithName("sbom"),
 	})
 

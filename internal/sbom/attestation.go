@@ -28,9 +28,12 @@ const (
 	attestationManifestType   = "attestation-manifest"
 )
 
-// AttestationSource takes an SBOM from a build attestation attached to the image. It is used as
-// the primary input only when the SBOM's creator is Syft (BuildKit's scanner and syft-generated
-// cosign attestations); anything else is ErrNotFound so the cataloguer runs.
+// AttestationSource takes an SBOM from a build attestation attached to the image. ffs wires it as the
+// acquirer's fallback, used only for images the cataloguer refuses as too large: SPDX and CycloneDX
+// lose what Syft's binary classifiers found (php, node or python built from source come back with no
+// classifier), so the upstream-runtime fast path would never see those runtimes in an attested
+// image. It accepts only an SBOM whose creator is Syft (BuildKit's scanner and syft-generated cosign
+// attestations) and that holds an OS package inventory; anything else is ErrNotFound.
 type AttestationSource struct {
 	reg *registry.Client
 }
@@ -91,7 +94,12 @@ func (s *AttestationSource) Acquire(ctx context.Context, r Request) (*Result, er
 			return out, nil
 		},
 		func() ([]string, error) {
-			d, err := s.reg.Get(ctx, r.Repo+":sha256-"+hex, r.Creds)
+			ref := r.Repo + ":sha256-" + hex
+			// HEAD first: most images have no such tag, and a HEAD costs no manifest budget.
+			if _, err := s.reg.Head(ctx, ref, r.Creds); err != nil {
+				return nil, err
+			}
+			d, err := s.reg.Get(ctx, ref, r.Creds)
 			if err != nil {
 				return nil, err
 			}
@@ -125,7 +133,14 @@ func (s *AttestationSource) Acquire(ctx context.Context, r Request) (*Result, er
 		}
 	}
 
-	img, err := s.image(ctx, r, r.Repo+":sha256-"+hex+".att")
+	att := r.Repo + ":sha256-" + hex + ".att"
+	if _, err := s.reg.Head(ctx, att, r.Creds); err != nil {
+		if err := soften(ctx, err); err != nil {
+			return nil, err
+		}
+		return nil, ErrNotFound
+	}
+	img, err := s.image(ctx, r, att)
 	if err := soften(ctx, err); err != nil {
 		return nil, err
 	}
@@ -203,7 +218,9 @@ func (s *AttestationSource) fromImage(ctx context.Context, r Request, img v1.Ima
 	return nil, nil
 }
 
-// accept decodes predicate and returns it when it covers r.Digest, was made by Syft and lists packages.
+// accept decodes predicate and returns it when it covers r.Digest, was made by Syft, lists packages
+// and holds an OS package inventory (spec §6.3). The last rules out an SBOM of a source directory
+// attested to the image, which would otherwise stand in for the image's whole inventory.
 func (s *AttestationSource) accept(r Request, predicate []byte, subjects []string) *syftsbom.SBOM {
 	if len(subjects) > 0 {
 		hex := strings.TrimPrefix(r.Digest, "sha256:")
@@ -219,7 +236,7 @@ func (s *AttestationSource) accept(r Request, predicate []byte, subjects []strin
 		return nil
 	}
 	sb, _, _, err := format.Decode(bytes.NewReader(predicate))
-	if err != nil || sb == nil || sb.Artifacts.Packages.PackageCount() == 0 {
+	if err != nil || sb == nil || sb.Artifacts.Packages.PackageCount() == 0 || sb.Artifacts.LinuxDistribution == nil {
 		return nil
 	}
 	return sb

@@ -202,3 +202,16 @@ func TestEvents_FeedStale(t *testing.T) {
 	require.Equal(t, "Feed osv has not synced since 2026-11-19T09:00:00Z (stale after 2h0m0s). Findings may be out of date.", ev[0].Note)
 	require.Equal(t, "Feed kev has never synced (stale after 24h0m0s). Findings may be out of date.", ev[1].Note)
 }
+
+// TestEvents_NamespacedClusterKindIsNotKubernetes (F17): a CloudNativePG owner has kind Cluster but a
+// namespace; its findings are not cluster-level, so they never go on the ffs Deployment as
+// "Kubernetes: ...".
+func TestEvents_NamespacedClusterKindIsNotKubernetes(t *testing.T) {
+	h := newHarness(t, self)
+	h.seed(t, create(model.OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg"}, "CVE-2026-1111", model.PriorityHigh), nil)
+	require.NoError(t, h.em.Drain(context.Background()))
+	for _, e := range h.rec.Snapshot() {
+		require.NotEqual(t, self, e.Regarding)
+		require.False(t, strings.HasPrefix(e.Note, "Kubernetes: "), e.Note)
+	}
+}

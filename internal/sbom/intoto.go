@@ -10,7 +10,7 @@ import (
 )
 
 // maxLayerBytes bounds how much of an attestation layer is read.
-const maxLayerBytes = 64 << 20
+const maxLayerBytes = MaxSBOMBytes
 
 const (
 	mtInToto    = "application/vnd.in-toto+json"

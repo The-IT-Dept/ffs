@@ -32,7 +32,7 @@ func (r *Resolver) resolveClusterLevel(ctx context.Context, o model.Owner, fs []
 		}
 		return nil
 	}
-	if o.Ref.Kind == "Cluster" {
+	if o.Ref.Kind == model.OwnerKindCluster {
 		return r.AdviseCluster(ctx, o)
 	}
 	return r.AdviseRuntime(ctx, o)

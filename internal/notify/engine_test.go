@@ -643,3 +643,19 @@ func TestNotify_UnregisterAndRetainDeleteState(t *testing.T) {
 	h.process()
 	assert.Len(t, h.sink.sent, 2) // the two baselines; nothing after the targets went
 }
+
+// TestNotify_BaselineCountsNamespacedClusterKind (F17): a CloudNativePG owner (kind Cluster, in a
+// namespace) is a workload in the baseline; only the synthetic cluster-level owners are left out.
+func TestNotify_BaselineCountsNamespacedClusterKind(t *testing.T) {
+	h := newHarness(t)
+	h.open(dep("db", "web"), "CVE-2026-0001", urgent)
+	h.open(model.OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg"}, "CVE-2026-0002", high)
+	require.NoError(t, h.st.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "Cluster", Name: "test"}}))
+	require.NoError(t, h.st.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "ContainerRuntime", Name: "containerd"}}))
+	h.target("ops")
+	h.process()
+
+	m := h.sink.only(t)
+	assert.Equal(t, notify.KindBaseline, m.Kind)
+	assert.Equal(t, "ffs is watching 2 workloads: 1 urgent, 1 high", m.Title)
+}

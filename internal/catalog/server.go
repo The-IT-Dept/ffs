@@ -36,6 +36,9 @@ const (
 	workerWaitDelay      = 5 * time.Second
 	shutdownGrace        = 10 * time.Second
 	readHeaderTimeout    = 10 * time.Second
+	// jobDirPrefix starts the name of every per-job scratch directory, so the server can tell its own
+	// leftovers from anything else under ScratchDir.
+	jobDirPrefix = "job-"
 )
 
 var (
@@ -50,6 +53,7 @@ var kindStatus = map[string]int{
 	sbom.KindNotFound:     http.StatusNotFound,
 	sbom.KindTooLarge:     http.StatusRequestEntityTooLarge,
 	sbom.KindRateLimited:  http.StatusTooManyRequests,
+	sbom.KindUnavailable:  http.StatusBadGateway,
 	sbom.KindFailed:       http.StatusInternalServerError,
 	sbom.KindBusy:         http.StatusServiceUnavailable,
 	sbom.KindTimeout:      http.StatusGatewayTimeout,
@@ -112,11 +116,14 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-// ListenAndServe serves on the unix socket until ctx is done. A stale socket file is replaced. Jobs
-// still running at shutdown are killed.
+// ListenAndServe serves on the unix socket until ctx is done. A stale socket file is replaced, and job
+// directories left in ScratchDir by a previous run are removed. Jobs still running at shutdown are killed.
 func (s *Server) ListenAndServe(ctx context.Context, socket string) error {
 	if err := os.Remove(socket); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("removing stale socket: %w", err)
+	}
+	if err := s.removeStaleJobs(); err != nil {
+		return err
 	}
 	var lc net.ListenConfig
 	ln, err := lc.Listen(ctx, "unix", socket)
@@ -148,6 +155,37 @@ func (s *Server) ListenAndServe(ctx context.Context, socket string) error {
 		return nil
 	}
 	return err
+}
+
+// removeStaleJobs deletes the job directories a previous run left in ScratchDir. The scratch volume
+// outlives the container, so the partial extractions of a cataloguer that was killed (an out-of-memory
+// kill takes the whole container) would otherwise stay on disk, unseen by the scratch watchdog, until
+// the volume's size limit evicts the pod.
+func (s *Server) removeStaleJobs() error {
+	if s.ScratchDir == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(s.ScratchDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("reading scratch directory: %w", err)
+	}
+	removed := 0
+	for _, e := range entries {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), jobDirPrefix) {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(s.ScratchDir, e.Name())); err != nil {
+			return fmt.Errorf("removing stale job directory: %w", err)
+		}
+		removed++
+	}
+	if removed > 0 {
+		s.Log.Info("removed job directories left by a previous run", "count", removed)
+	}
+	return nil
 }
 
 func (s *Server) serveCatalog(w http.ResponseWriter, r *http.Request) {
@@ -213,7 +251,7 @@ func (s *Server) runJob(parent context.Context, req sbom.CatalogRequest) (*sbom.
 
 	id := make([]byte, 8)
 	_, _ = rand.Read(id)
-	dir := filepath.Join(s.ScratchDir, hex.EncodeToString(id))
+	dir := filepath.Join(s.ScratchDir, jobDirPrefix+hex.EncodeToString(id))
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, &WorkError{Kind: sbom.KindFailed, Msg: "creating job directory: " + err.Error()}
 	}
@@ -399,8 +437,14 @@ func ExecRunner(self string) Runner {
 			return nil, &WorkError{Kind: ce.Kind, Msg: ce.Error}
 		}
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
-			return nil, &WorkError{Kind: sbom.KindFailed, Msg: fmt.Sprintf("cataloguer killed by %s", ws.Signal())}
+			return nil, &WorkError{Kind: sbom.KindFailed, Msg: signalMessage(ws.Signal())}
 		}
 		return nil, &WorkError{Kind: sbom.KindFailed, Msg: fmt.Sprintf("cataloguer exited with status %d", ee.ExitCode())}
 	}
+}
+
+// signalMessage describes a worker that a signal ended, naming the signal once: "cataloguer worker
+// ended by signal 9 (killed)".
+func signalMessage(sig syscall.Signal) string {
+	return fmt.Sprintf("cataloguer worker ended by signal %d (%s)", int(sig), sig)
 }

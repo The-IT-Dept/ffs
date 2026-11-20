@@ -19,6 +19,8 @@ const maxReferrersBytes = 4 << 20
 // sha256-<hex> tag schema is left to the caller. A registry without the API (404, 400, 405, 406, or a
 // body that is not an index) yields nil, nil.
 func (c *Client) Referrers(ctx context.Context, repo, digest string, cs CredSet) ([]v1.Descriptor, error) {
+	ctx, cancel := c.call(ctx)
+	defer cancel()
 	descs, err := c.referrers(ctx, repo, digest, cs)
 	return descs, Classify(err)
 }

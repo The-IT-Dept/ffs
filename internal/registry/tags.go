@@ -23,7 +23,8 @@ const (
 
 // ListTags lists repo's tags through tags/list paging: it follows a same-host Link rel="next" header,
 // falls back to last=<last tag> after a full page without one, and stops on a short page, a page with
-// no new tags, 100 pages or 50,000 tags. tags/list does not consume the manifest budget.
+// no new tags, 100 pages or 50,000 tags. tags/list does not consume the manifest budget. Credential
+// resolution and each page are bounded by CallTimeout.
 func (c *Client) ListTags(ctx context.Context, repo string, cs CredSet) ([]string, error) {
 	tags, err := c.listTags(ctx, repo, cs)
 	return tags, Classify(err)
@@ -34,7 +35,9 @@ func (c *Client) listTags(ctx context.Context, repo string, cs CredSet) ([]strin
 	if err != nil {
 		return nil, err
 	}
-	rt, err := c.rawTransport(ctx, r, cs)
+	actx, cancel := c.call(ctx)
+	defer cancel()
+	rt, err := c.rawTransport(actx, r, cs)
 	if err != nil {
 		return nil, err
 	}
@@ -54,7 +57,9 @@ func (c *Client) listTags(ctx context.Context, repo string, cs CredSet) ([]strin
 	var tags []string
 	next := pageURL("")
 	for page := 0; page < maxTagPages && next != nil; page++ {
-		got, link, err := tagsPage(ctx, client, next)
+		pctx, cancel := c.call(ctx)
+		got, link, err := tagsPage(pctx, client, next)
+		cancel()
 		if err != nil {
 			return nil, err
 		}

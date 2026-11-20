@@ -16,7 +16,7 @@ Rust binaries built without cargo-auditable, bundled or minified JavaScript, cop
 
 Images whose credentials only the kubelet holds, through a credential-provider plugin or KEP-4412 service-account tokens; images pulled through a node-level registry mirror that the mirror map does not cover; and side-loaded images (`ctr import`, `kind load`, k3s airgap tarballs), whose image ID is a node-local config digest.
 
-**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
+**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. A registry that ffs itself cannot reach (DNS, refused or timed-out connections, blocked egress) gives `registry not reachable from ffs for <repository>: <problem>` after about five minutes of failures, and is retried hourly. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
 - `registry.operatorSecret` supplies registry credentials that otherwise only the nodes hold;
 - `registry.mirrors` is a registry mirror rewrite map, so pulls go where the nodes pull from.
 
@@ -60,12 +60,16 @@ Most of the time between a vulnerability becoming known and a finding appearing 
 
 ## SBOM sources
 
-For each image, ffs first looks for an SBOM attestation published with the image, without pulling its layers. It tries, in order, the OCI referrers API, BuildKit attestation manifests in the image index, the `sha256-<digest>` referrers tag, and cosign `.att` tags.
+ffs catalogues every image itself: the cataloguer pulls the image and runs Syft on it. SBOM attestations published with an image are not used in its place, because SPDX and CycloneDX do not carry what Syft's binary classifiers find. A runtime built from source, such as php in the official `php` images, would lose the identification that its minutes-latency matching depends on.
 
-- SPDX or CycloneDX attestations created by Syft are used as the primary input. They must cover the image's platform digest and list packages.
-- Attestations from other tools fall through to the cataloguer, which pulls the image and catalogues it.
+Attestations are used only for an image the cataloguer refuses as too large (`catalog.maxImageBytes`):
+
+- ffs tries, in order, the OCI referrers API, BuildKit attestation manifests in the image index, the `sha256-<digest>` referrers tag, and cosign `.att` tags.
+- Only SPDX or CycloneDX attestations created by Syft are used. They must cover the image's platform digest, list packages and include the image's OS packages; an SBOM of a source directory is not taken as the image's inventory.
 - Attestation signatures are not verified. The image publisher already controls the image itself, so a signature adds no trust about its contents.
-- For attested images, executables not attributed to a package are not measured. These images carry the note `inventory from a build attestation; executables not attributed to a package were not measured`.
+- These images carry the note `inventory from a build attestation; executables not attributed to a package were not measured`.
+
+An image whose SBOM is larger than 64 MiB is shown as `catalogFailed` with the reason, rather than decoded in the controller.
 
 ## Environments
 

@@ -21,3 +21,15 @@ func TestAPIVersionForKind(t *testing.T) {
 		require.Empty(t, got, kind)
 	}
 }
+
+func TestClusterLevel(t *testing.T) {
+	require.True(t, OwnerRef{Kind: "Cluster", Name: "dev"}.ClusterLevel())
+	require.True(t, OwnerRef{Kind: "ContainerRuntime", Name: "containerd"}.ClusterLevel())
+	// A CloudNativePG Cluster is a namespaced workload owner, not the synthetic one.
+	require.False(t, OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg"}.ClusterLevel())
+	require.False(t, OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web"}.ClusterLevel())
+	require.True(t, ClusterLevelKey("Cluster//dev"))
+	require.True(t, ClusterLevelKey("ContainerRuntime//containerd"))
+	require.False(t, ClusterLevelKey("Cluster/db/pg"))
+	require.False(t, ClusterLevelKey("cluster"))
+}
