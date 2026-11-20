@@ -204,3 +204,84 @@ export function coverageBody(p?: Partial<S<'Coverage'>>): S<'Coverage'> {
     ...p,
   }
 }
+
+export function exposureEdge(p?: Partial<S<'ExposureEdge'>>): S<'ExposureEdge'> {
+  return { entry: 'gateway', entryName: 'gateway/public', listener: '', hostname: '', route: '', service: '', internal: false, ...p }
+}
+
+export function suggestion(p?: Partial<S<'Suggestion'>>): S<'Suggestion'> {
+  return {
+    repo: 'ghcr.io/example/web',
+    fromTag: '1.4.2',
+    toTag: '1.4.3',
+    tier: 'patch',
+    target: 'ghcr.io/example/web:1.4.3',
+    netChange: 'fixes 2 urgent; introduces none',
+    fixes: counts({ urgent: 2 }),
+    remaining: counts(),
+    introduces: counts(),
+    fixedIds: ['CVE-2026-0001'],
+    notes: [],
+    alternatives: [],
+    ...p,
+  }
+}
+
+export function workloadDetail(p?: Partial<S<'WorkloadDetail'>>): S<'WorkloadDetail'> {
+  return {
+    ...ENV,
+    workload: workloadRef('Deployment', 'shop', 'web'),
+    serviceAccount: 'default',
+    notRunning: false,
+    pods: 2,
+    exposed: false,
+    exposure: [],
+    privileged: false,
+    privilegeReasons: [],
+    saPower: false,
+    saReasons: [],
+    containers: [],
+    counts: counts(),
+    open: 0,
+    fixable: 0,
+    exploited: 0,
+    excepted: 0,
+    coverage: coverageFigure(),
+    coverageNotes: [],
+    upgrades: [],
+    ...p,
+  }
+}
+
+export function imageDetail(p?: Partial<S<'ImageDetail'>>): S<'ImageDetail'> {
+  return {
+    ...ENV,
+    digest: 'sha256:' + 'a'.repeat(64),
+    indexDigest: '',
+    repo: 'ghcr.io/example/web',
+    platform: 'linux/amd64',
+    tags: ['1.4.2'],
+    versionAnnotation: '',
+    status: 'catalogued',
+    statusReason: '',
+    source: 'registry',
+    sbom: { source: 'registry', tool: 'syft', toolVersion: '1.57.0' },
+    ecosystems: [],
+    counts: counts(),
+    fixable: 0,
+    usedBy: [],
+    upgrades: [],
+    coverage: { class: 'full', unattributedExecutables: 0, rustWithoutAuditable: 0, notes: [], cpeOnly: [], gaps: [] },
+    eol: [],
+    notable: [],
+    ...p,
+  }
+}
+
+export function imagePackagesPage(p?: Partial<S<'ImagePackagesPage'>>): S<'ImagePackagesPage'> {
+  return { ...ENV, total: 0, rows: [], next: null, facets: {}, ...p }
+}
+
+export function transitionsPage(p?: Partial<S<'TransitionsPage'>>): S<'TransitionsPage'> {
+  return { ...ENV, rows: [], next: null, ...p }
+}

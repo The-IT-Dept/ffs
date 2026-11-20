@@ -234,6 +234,7 @@ export const copy = {
     groupBy: 'Group by',
     page: (n: number, m: number) => `Page ${formatCount(n)} of ${formatCount(m)}`,
     pages: (m: number) => plural(m, 'page', 'pages'),
+    pageAlone: (n: number) => `Page ${formatCount(n)}`,
     previous: 'Previous',
     next: 'Next',
     first: 'First page',
@@ -294,6 +295,78 @@ export const copy = {
     return parts.length ? parts.join(' · ') : '—'
   },
   moreGaps: (shown: number, total: number) => `Showing ${formatCount(shown)} of ${formatCount(total)} gaps`,
+  // Contract: managed by.
+  managedBy: (m: S<'ManagedBy'>) => {
+    switch (m.tool) {
+      case 'helm':
+        return `Helm ${m.name}`
+      case 'flux-helmrelease':
+      case 'flux-kustomization':
+        return `Flux ${m.name}`
+      case 'argocd':
+        return `Argo CD ${m.name}`
+    }
+    return `${m.tool} ${m.name}`
+  },
+  workload: {
+    managedBy: (label: string) => `Managed by ${label}`,
+    urgent: (n: number) => `${formatCount(n)} urgent`,
+    high: (n: number) => `${formatCount(n)} high`,
+    fixable: (n: number) => `${formatCount(n)} fixable`,
+    exposed: 'exposed',
+    notExposed: 'not exposed',
+    privileged: 'privileged',
+    notPrivileged: 'not privileged',
+    coverage: (label: string) => `coverage ${label}`,
+    serviceAccount: 'Service account',
+    saPower: 'SA power',
+    privilegedTitle: 'Privileged',
+    yes: 'yes',
+    no: 'no',
+    containers: { container: 'Container', image: 'Image', status: 'Status', coverage: 'Coverage' },
+    exposureCols: { entry: 'Entry', name: 'Name', listener: 'Listener', hostname: 'Hostname', route: 'Route', service: 'Service', internal: 'Internal' },
+    history: { when: 'When', advisory: 'Advisory', change: 'Change', priority: 'Priority', trigger: 'Trigger' },
+  },
+  path: {
+    internet: 'Internet',
+    pods: (n: number) => plural(n, 'pod', 'pods'),
+    notExposed: 'Not exposed',
+    internal: 'Internal entry points',
+    more: (n: number) => `+ ${formatCount(n)} more paths`,
+    noClass: 'Ingress (no class)',
+  },
+  fixList: {
+    more: (n: number) => `+ ${formatCount(n)} more`,
+    cols: { advisory: 'Advisory', workload: 'Workload', priority: 'Priority', package: 'Package', installed: 'Installed', why: 'Why', seen: 'Seen' },
+  },
+  upgrades: {
+    none: 'No upgrade candidates.',
+    cols: {
+      image: 'Image',
+      change: 'Change',
+      tier: 'Tier',
+      fixes: 'Fixes',
+      remaining: 'Remaining',
+      introduces: 'Introduces',
+      net: 'Net change',
+      eol: 'End of life',
+      checked: 'Checked',
+    },
+    nothing: 'none',
+  },
+  image: {
+    // "SBOM from attestation · syft 1.57.0"; without a tool, "SBOM from attestation".
+    sbom: (source: string, tool?: string, version?: string) =>
+      tool ? `SBOM from ${source} · ${tool}${version ? ` ${version}` : ''}` : `SBOM from ${source}`,
+    agent: (node: string, version: string) => `From the node agent on ${node} (${version})`,
+    unattributed: (n: number) => `${plural(n, 'executable', 'executables')} without package metadata`,
+    rust: (n: number) => `${plural(n, 'Rust binary', 'Rust binaries')} without cargo-auditable`,
+    searchPackages: 'Search packages',
+    usedBy: 'Used by',
+    ecosystems: 'Ecosystems',
+    lifecycle: 'Lifecycle',
+    packageCols: { package: 'Package', version: 'Version', ecosystem: 'Ecosystem', foundBy: 'Found by', path: 'Path', findings: 'Findings', worst: 'Worst' },
+  },
 }
 
 export type CountNoun = 'advisories' | 'workloads' | 'images' | 'packages' | 'namespaces' | 'fixes'

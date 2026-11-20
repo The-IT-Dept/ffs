@@ -43,17 +43,22 @@ export function Pager({
   onFirst,
 }: {
   info: PageInfo
-  total: number
+  total: number | undefined // undefined for a list whose size the server does not report
   limit: number
   hasNext: boolean
   onNext: () => void
   onPrev: () => void
   onFirst: () => void
 }) {
-  const pages = Math.max(1, Math.ceil(total / limit))
+  let label: string | null
+  if (total === undefined) label = info.page === null ? null : copy.explorer.pageAlone(info.page)
+  else {
+    const pages = Math.max(1, Math.ceil(total / limit))
+    label = info.page === null ? copy.explorer.pages(pages) : copy.explorer.page(info.page, pages)
+  }
   return (
     <nav aria-label="Pages" className="mt-3 flex items-center gap-2 text-[12px] text-muted-foreground">
-      <span className="tabular-nums">{info.page === null ? copy.explorer.pages(pages) : copy.explorer.page(info.page, pages)}</span>
+      {label ? <span className="tabular-nums">{label}</span> : null}
       <span className="ml-auto flex items-center gap-1.5">
         {info.page === null ? (
           <Button variant="outline" size="xs" onClick={onFirst}>
