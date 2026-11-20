@@ -212,21 +212,24 @@ func nodeGroupRow(ctx context.Context, q querier, id string) (model.NodeGroup, b
 	return g, err == nil, err
 }
 
-const nodeGroupCols = `id, data, first_seen, last_seen`
+const nodeGroupCols = `id, kind, label, digest, data, first_seen, last_seen`
 
+// scanNodeGroup reads one node_groups row without Members. The id, kind, label, digest and time
+// columns override the decoded data.
 func scanNodeGroup(r scanner) (model.NodeGroup, error) {
 	var (
-		id, data    string
-		first, last sql.NullInt64
+		id, kind, label, digest, data string
+		first, last                   sql.NullInt64
 	)
-	if err := r.Scan(&id, &data, &first, &last); err != nil {
+	if err := r.Scan(&id, &kind, &label, &digest, &data, &first, &last); err != nil {
 		return model.NodeGroup{}, err
 	}
 	var g model.NodeGroup
 	if err := json.Unmarshal([]byte(data), &g); err != nil {
 		return model.NodeGroup{}, fmt.Errorf("node group %s: %w", id, err)
 	}
-	g.ID, g.FirstSeen, g.LastSeen = id, fromNanos(first), fromNanos(last)
+	g.ID, g.Kind, g.Label, g.Digest = id, model.NodeGroupKind(kind), label, digest
+	g.Members, g.FirstSeen, g.LastSeen = nil, fromNanos(first), fromNanos(last)
 	return g, nil
 }
 
