@@ -70,3 +70,52 @@ func TestCatalogCmd_NiceRange(t *testing.T) {
 		require.NoFileExists(t, sock, "rejected before listening")
 	}
 }
+
+func TestAgentCmd_Flags(t *testing.T) {
+	t.Setenv("NODE_NAME", "worker-1")
+	cmd := newAgentCmd()
+	for flag, def := range map[string]string{ //nolint:gosec // G101: flag defaults; the token path is not a credential
+		"controller":      "",
+		"ca-file":         "/etc/ffs-agent/ca/ca.crt",
+		"token-file":      "/var/run/secrets/ffs-agent/token",
+		"node-name":       "worker-1",
+		"host-root":       "/host",
+		"distribution":    "containerd",
+		"content-store":   "",
+		"scratch":         "/scratch/stage",
+		"catalog-socket":  "/run/ffs/catalog.sock",
+		"max-image-bytes": "1073741824",
+		"heartbeat":       "/scratch/heartbeat",
+		"extra-bin-dir":   "[]",
+	} {
+		f := cmd.Flags().Lookup(flag)
+		require.NotNil(t, f, flag)
+		require.Equal(t, def, f.DefValue, flag)
+	}
+	require.Equal(t, "stringArray", cmd.Flags().Lookup("extra-bin-dir").Value.Type(), "repeatable")
+
+	check, _, err := cmd.Find([]string{"check"})
+	require.NoError(t, err)
+	require.Equal(t, "check", check.Name())
+	require.True(t, check.Hidden)
+	for flag, def := range map[string]string{"heartbeat": "/scratch/heartbeat", "max-age": "15m0s"} {
+		f := check.Flags().Lookup(flag)
+		require.NotNil(t, f, flag)
+		require.Equal(t, def, f.DefValue, flag)
+	}
+
+	agentCmd, _, err := newRootCmd().Find([]string{"agent"})
+	require.NoError(t, err)
+	require.Equal(t, "agent", agentCmd.Name())
+}
+
+func TestAgentCmd_CheckExitsWithItsMessage(t *testing.T) {
+	cmd := newRootCmd()
+	p := filepath.Join(t.TempDir(), "heartbeat")
+	cmd.SetArgs([]string{"agent", "check", "--heartbeat=" + p, "--max-age=15m"})
+	require.EqualError(t, cmd.ExecuteContext(context.Background()), "no agent heartbeat at "+p)
+
+	cmd = newRootCmd()
+	cmd.SetArgs([]string{"agent", "--distribution=auto"})
+	require.EqualError(t, cmd.ExecuteContext(context.Background()), `unknown distribution "auto": want containerd, k3s, rke2 or crio`)
+}
