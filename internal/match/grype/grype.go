@@ -88,13 +88,8 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 	if err != nil {
 		return nil, err
 	}
-	for _, a := range r.advisoryList() {
-		if a, err = m.fillOnly(ctx, a); err != nil {
-			return nil, err
-		}
-		if err := m.st.UpsertAdvisory(ctx, a); err != nil {
-			return nil, fmt.Errorf("grype: store advisory %s: %w", a.ID, err)
-		}
+	if err := m.storeAdvisories(ctx, r.advisoryList()); err != nil {
+		return nil, err
 	}
 	if err := m.st.PutGrypeKeys(ctx, in.Digest, keys.pkgNames, keys.cpeProducts); err != nil {
 		return nil, fmt.Errorf("grype: store search keys of %s: %w", in.Digest, err)
@@ -102,22 +97,55 @@ func (m *Matcher) MatchImage(ctx context.Context, in match.ImageInput) ([]model.
 	return r.list(), nil
 }
 
-// fillOnly drops a's Title and Published where the stored advisory already has one: grype's
-// description and record date only fill in an advisory no other source has described, and never
-// replace an OSV summary or a CNA title (UpsertAdvisory overwrites with any non-zero field).
+// storeAdvisories stores the advisories an image matched, grype's titles and dates filling gaps only
+// (see fillOnly).
+func (m *Matcher) storeAdvisories(ctx context.Context, advs []model.Advisory) error {
+	for _, a := range advs {
+		a, err := m.fillOnly(ctx, a)
+		if err != nil {
+			return err
+		}
+		if err := m.st.UpsertAdvisory(ctx, a); err != nil {
+			return fmt.Errorf("grype: store advisory %s: %w", a.ID, err)
+		}
+	}
+	return nil
+}
+
+// fillOnly keeps a's Title and Published, taken from grype's record a.ID, only where they fill a gap
+// in the advisory a is stored as: grype's description and record date title an advisory no other
+// source has described (a RHEL or Amazon Linux one), and never replace an OSV summary or a CNA
+// title, nor describe another advisory.
+//
+// UpsertAdvisory merges a into the stored advisories of a.ID and of every alias, under their
+// canonical id, and overwrites with any non-zero field. So both are dropped when a canonicalises to
+// another id (an ALAS that by-CVE normalisation left alone, aliased to its one CVE, would title the
+// CVE with the vendor update's text and date) or merges with an advisory stored under another id,
+// and each is dropped when any advisory a resolves to already has it.
 func (m *Matcher) fillOnly(ctx context.Context, a model.Advisory) (model.Advisory, error) {
 	if a.Title == "" && a.Published.IsZero() {
 		return a, nil
 	}
-	stored, ok, err := m.st.GetAdvisory(ctx, a.ID)
+	ids := append([]string{a.ID}, a.Aliases...)
+	if model.CanonicalID(ids...) != a.ID {
+		a.Title, a.Published = "", time.Time{}
+		return a, nil
+	}
+	stored, err := m.st.Advisories(ctx, ids)
 	if err != nil {
 		return a, fmt.Errorf("grype: advisory %s: %w", a.ID, err)
 	}
-	if ok && stored.Title != "" {
-		a.Title = ""
-	}
-	if ok && !stored.Published.IsZero() {
-		a.Published = time.Time{}
+	for id, s := range stored {
+		if id != a.ID {
+			a.Title, a.Published = "", time.Time{}
+			return a, nil
+		}
+		if s.Title != "" {
+			a.Title = ""
+		}
+		if !s.Published.IsZero() {
+			a.Published = time.Time{}
+		}
 	}
 	return a, nil
 }

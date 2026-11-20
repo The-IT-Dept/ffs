@@ -383,3 +383,66 @@ func TestGrypeMatcher_TitleOnlyFillsIn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "Race condition in Firefox graphics", a.Title)
 }
+
+// A vendor record by-CVE normalisation left alone (its CVE was not yet in grype's NVD data) keeps
+// its own id and metadata. Aliased to its one CVE, it is stored under the CVE: its text and date
+// must not title the CVE, whether or not a CNA record already did.
+func TestGrypeMatcher_VendorTextNeverTitlesItsCVE(t *testing.T) {
+	st := newStore(t)
+	m := New(st)
+	cnaPublished := time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)
+	vendorPublished := time.Date(2026, 10, 2, 8, 0, 0, 0, time.UTC)
+	require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-1001", Title: "CNA title", Published: cnaPublished}))
+	require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: "ELSA-2026-0004"}))
+
+	gp := grypepkg.Package{ID: "syft-curl", Name: "curl", Version: "8.3.0-1.amzn2023", Type: syftpkg.RpmPkg}
+	p := model.Package{ID: "pkg-curl", SyftID: string(gp.ID), Ecosystem: "rpm", Name: "curl", Version: "8.3.0-1.amzn2023"}
+	vendor := func(id string, rel ...string) grypematch.Match {
+		ns := "amazon:distro:amazonlinux:2023"
+		refs := make([]vulnerability.Reference, len(rel))
+		for i, r := range rel {
+			refs[i] = vulnerability.Reference{ID: r, Namespace: "nvd:cpe"}
+		}
+		return grypematch.Match{Package: gp, Vulnerability: vulnerability.Vulnerability{
+			Reference: vulnerability.Reference{ID: id, Namespace: ns,
+				Internal: &v6.VulnerabilityHandle{Name: id, PublishedDate: &vendorPublished}},
+			Fix:                    vulnerability.Fix{State: vulnerability.FixStateFixed, Versions: []string{"8.5.0-1.amzn2023"}},
+			RelatedVulnerabilities: refs,
+			Metadata:               &vulnerability.Metadata{ID: id, Namespace: ns, Description: id + " description. More."},
+		}}
+	}
+	r := toModel(d1, []model.Package{p}, built, []grypematch.Match{
+		vendor("ALAS-2026-0001", "CVE-2026-1101", "CVE-2026-1102", "CVE-2026-1103"), // several CVEs: no CVE alias
+		vendor("ALAS-2026-0002", "CVE-2026-1001"),                                   // its CVE has a CNA title
+		vendor("ALAS-2026-0003", "CVE-2026-3001"),                                   // its CVE is not stored yet
+		vendor("ALAS-2026-0004", "ELSA-2026-0004"),                                  // merges into another id
+	}, nil)
+	require.NoError(t, m.storeAdvisories(ctx, r.advisoryList()))
+
+	get := func(id string) model.Advisory {
+		t.Helper()
+		a, ok, err := st.GetAdvisory(ctx, id)
+		require.NoError(t, err)
+		require.True(t, ok, id)
+		return a
+	}
+	a := get("ALAS-2026-0002")
+	require.Equal(t, "CVE-2026-1001", a.ID)
+	require.Equal(t, "CNA title", a.Title, "the CNA title stays")
+	require.Equal(t, cnaPublished, a.Published, "the CNA date stays")
+
+	a = get("ALAS-2026-0003")
+	require.Equal(t, "CVE-2026-3001", a.ID)
+	require.Empty(t, a.Title, "the vendor text does not title the CVE")
+	require.True(t, a.Published.IsZero(), "nor date it")
+
+	a = get("ALAS-2026-0004")
+	require.Equal(t, "ELSA-2026-0004", a.ID)
+	require.Empty(t, a.Title, "one vendor's text does not title another's advisory")
+	require.True(t, a.Published.IsZero())
+
+	a = get("ALAS-2026-0001")
+	require.Equal(t, "ALAS-2026-0001", a.ID)
+	require.Equal(t, "ALAS-2026-0001 description", a.Title, "an advisory only grype knows is titled from its own record")
+	require.Equal(t, vendorPublished, a.Published)
+}
