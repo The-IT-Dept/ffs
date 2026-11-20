@@ -797,6 +797,41 @@ func TestOSVSync_BacklogResumesAfterFailedChunk(t *testing.T) {
 	require.Equal(t, reads, []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")})
 }
 
+// TestOSVSync_TimeoutKeepsProgress is the sync timeout cutting a hand-off short: the handler's context
+// ends part-way, and the chunks it took are still recorded as no longer pending.
+func TestOSVSync_TimeoutKeepsProgress(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-3*time.Hour), now.Add(-time.Minute)
+	const n = 1200
+	records := make(map[string][]byte, n)
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("GHSA-2026-%05d", i)
+		records[id] = pypi(id, "2.0.0", t1)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	calls := 0
+	f := e.feed(func(o *osv.Options) {
+		o.Handler = func(hctx context.Context, recs []osv.Changed) error {
+			if calls++; calls == 3 { // the deadline passes during the third chunk
+				cancel()
+				return hctx.Err()
+			}
+			return nil
+		}
+	})
+	require.ErrorIs(t, f.Sync(sctx), context.Canceled)
+	pending := strings.Split(e.meta(t)["pending"], "\n")
+	require.Len(t, pending, n-1000, "the two chunks taken before the deadline are not pending")
+	require.Equal(t, "PyPI/GHSA-2026-01000", pending[0])
+}
+
 // bigPyPI is a PyPI record padded with details to about size bytes, the way Ubuntu kernel records
 // run to hundreds of KB.
 func bigPyPI(id string, modified time.Time, size int) []byte {

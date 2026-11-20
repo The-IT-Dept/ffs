@@ -59,6 +59,11 @@ const (
 	metaSetDiff     = "setdiff"
 )
 
+// pendingSaveEvery is how often a hand-off records the chunks the handler has taken: often enough
+// that a crash costs little, rarely enough that a backlog of 200,000 records does not rewrite its
+// pending list after each of 450 chunks.
+const pendingSaveEvery = 30 * time.Second
+
 // handlerBytes bounds the uncompressed records of one handler call and of one read of cached records
 // for it: the record matchers parse every record of a call, and an Ubuntu record averages over
 // 400 KB, so 500 of them took gigabytes.
@@ -863,13 +868,20 @@ func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) 
 }
 
 // deliverKeys hands the cached records of keys, which st holds as pending, to the handler in chunks
-// (see keyChunks), skipping records no longer cached. Once the handler has taken a chunk, pending is cut to
-// the keys after it and saved, so a failure part-way loses none of the progress before it. With
-// refreshNames it first rewrites each record's index names. A GIT record that references no
-// GitRepos repository is a drop (see put): once the handler has taken it, it is deleted from the
-// cache. Deciding this from the cached raw lets a redelivery finish a drop.
-func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recKey, refreshNames bool) error {
-	done := 0
+// (see keyChunks), skipping records no longer cached. Pending is cut to the keys after the chunks the
+// handler has taken and saved every pendingSaveEvery, and when a chunk fails, even once ctx is done,
+// so a hand-off cut short by the sync timeout loses none of its progress. With refreshNames it first
+// rewrites each record's index names. A GIT record that references no GitRepos repository is a drop
+// (see put): once the handler has taken it, it is deleted from the cache. Deciding this from the
+// cached raw lets a redelivery finish a drop.
+func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recKey, refreshNames bool) (err error) {
+	done, saved := 0, time.Now()
+	defer func() {
+		if err != nil && done > 0 {
+			setPending(st, keys[done:])
+			err = errors.Join(err, f.save(context.WithoutCancel(ctx), st))
+		}
+	}()
 	for chunk := range keyChunks(*st, keys) {
 		ids := make([]string, len(chunk))
 		for i, k := range chunk {
@@ -918,9 +930,12 @@ func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recK
 			}
 		}
 		done += len(chunk)
-		setPending(st, keys[done:])
-		if err := f.save(ctx, st); err != nil {
-			return err
+		if time.Since(saved) >= pendingSaveEvery {
+			setPending(st, keys[done:])
+			if err := f.save(ctx, st); err != nil {
+				return err
+			}
+			saved = time.Now()
 		}
 	}
 	return nil
