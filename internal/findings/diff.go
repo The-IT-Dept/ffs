@@ -55,6 +55,11 @@ func (c Causes) Top() model.Trigger {
 // appeared labels a finding n that is created or reopens from resolved: the cause that produced its
 // match, a feed before an inventory change, or else the exception change that queued the owner (the
 // exception trigger, ExceptionExpired, for an open finding) or the enrichment.
+//
+// A finding that appears already excepted in an exception change's recompute is PriorityChange,
+// the label of an exception being applied (see excepted): the trigger enum's only exception value,
+// ExceptionExpired, says an exception lapsed, which is the opposite of what happened. A dedicated
+// value would be an additive enum and API change, which this release does not make.
 func (c Causes) appeared(n model.Finding) model.Trigger {
 	switch {
 	case c.has(CauseNewAdvisory):
