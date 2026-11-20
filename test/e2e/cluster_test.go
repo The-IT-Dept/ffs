@@ -251,15 +251,21 @@ func fetch(t *testing.T, url string) (int, http.Header, []byte) {
 	return resp.StatusCode, resp.Header, body
 }
 
-// apiObjects GETs an ffs API path and returns every JSON object in the response, at any depth.
-func apiObjects(t *testing.T, base, path string) []map[string]any {
-	t.Helper()
+// apiObjects GETs an ffs API path and returns every JSON object in the response, at any depth. It returns errors
+// rather than failing the test, so a poll retries a transient failure, such as a dropped port-forward.
+func apiObjects(ctx context.Context, base, path string) ([]map[string]any, error) {
 	var body bytes.Buffer
-	code, err := get(t.Context(), base+path, &body)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, code, "GET %s: %s", path, body.String())
+	code, err := get(ctx, base+path, &body)
+	if err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
+	if code != http.StatusOK {
+		return nil, fmt.Errorf("GET %s: %d %s", path, code, body.String())
+	}
 	var doc any
-	require.NoError(t, json.Unmarshal(body.Bytes(), &doc), "GET %s", path)
+	if err := json.Unmarshal(body.Bytes(), &doc); err != nil {
+		return nil, fmt.Errorf("GET %s: %w", path, err)
+	}
 	var out []map[string]any
 	var walk func(any)
 	walk = func(v any) {
@@ -276,7 +282,7 @@ func apiObjects(t *testing.T, base, path string) []map[string]any {
 		}
 	}
 	walk(doc)
-	return out
+	return out, nil
 }
 
 // eventually polls cond every 2s until it holds, failing with its last message after timeout.

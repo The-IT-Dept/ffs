@@ -30,9 +30,12 @@ const maxBody = 16 << 20
 type Delivery struct {
 	ID, Type  string    // webhook-id header; the CloudEvents type of the body
 	Timestamp time.Time // webhook-timestamp header; zero when absent or malformed
-	Body      []byte
-	Verified  bool // the signature verified against the receiver's secret
+	Body      []byte    // what was read of the body
+	Verified  bool      // the signature verified against the receiver's secret
 	Received  time.Time
+	// ReadErr is why the body could not be read in full (too large, or the connection failed), "" when it was. Such
+	// a delivery is recorded unverified and answered 400.
+	ReadErr string
 }
 
 // Verify checks a Standard Webhooks v1 signature: sigHeader holds space-separated "v1,<base64>"
@@ -84,20 +87,21 @@ func New(secret string) *Receiver {
 	return &Receiver{secret: secret, changed: make(chan struct{})}
 }
 
-// ServeHTTP records the delivery and answers 204 when its signature verifies, 401 otherwise.
+// ServeHTTP records the delivery and answers 204 when its signature verifies, 401 otherwise, and 400 when its body
+// cannot be read, which is recorded too, so a failed delivery shows in the record rather than vanishing.
 func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, req.Body, maxBody))
-	if err != nil {
-		http.Error(w, "unreadable body", http.StatusBadRequest)
-		return
-	}
+	body, readErr := io.ReadAll(http.MaxBytesReader(w, req.Body, maxBody))
 	now := time.Now()
 	d := Delivery{ID: req.Header.Get("webhook-id"), Type: eventType(body), Body: body, Received: now}
 	ts := req.Header.Get("webhook-timestamp")
 	if sec, err := strconv.ParseInt(ts, 10, 64); err == nil {
 		d.Timestamp = time.Unix(sec, 0)
 	}
-	d.Verified = Verify(r.secret, d.ID, ts, body, req.Header.Get("webhook-signature"), now) == nil
+	if readErr != nil {
+		d.ReadErr = readErr.Error()
+	} else {
+		d.Verified = Verify(r.secret, d.ID, ts, body, req.Header.Get("webhook-signature"), now) == nil
+	}
 
 	r.mu.Lock()
 	r.got = append(r.got, d)
@@ -108,11 +112,14 @@ func (r *Receiver) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 		r.OnDelivery(d)
 	}
 
-	if d.Verified {
+	switch {
+	case d.ReadErr != "":
+		http.Error(w, "unreadable body", http.StatusBadRequest)
+	case d.Verified:
 		w.WriteHeader(http.StatusNoContent)
-		return
+	default:
+		w.WriteHeader(http.StatusUnauthorized)
 	}
-	w.WriteHeader(http.StatusUnauthorized)
 }
 
 // Deliveries returns every delivery so far, oldest first.

@@ -113,7 +113,15 @@ func TestAlertTargetDefaults(t *testing.T) {
 
 	bad := &v1alpha1.AlertTarget{ObjectMeta: metav1.ObjectMeta{Name: "email"},
 		Spec: v1alpha1.AlertTargetSpec{Type: "email", SecretRef: v1alpha1.SecretReference{Name: "x"}}}
-	require.True(t, apierrors.IsInvalid(c.Create(ctx, bad)))
+	requireInvalid(t, c.Create(ctx, bad), "type", `spec.type: Unsupported value: "email": supported values: "slack", "discord", "teams", "webhook"`)
+}
+
+// requireInvalid checks err is the API server's Invalid error naming the expected field error, not just any
+// rejection (F55).
+func requireInvalid(t *testing.T, err error, name, want string) {
+	t.Helper()
+	require.True(t, apierrors.IsInvalid(err), "%s: %v", name, err)
+	require.ErrorContains(t, err, want, name)
 }
 
 func TestExceptionValidation(t *testing.T) {
@@ -127,15 +135,21 @@ func TestExceptionValidation(t *testing.T) {
 				Expires: metav1.NewTime(time.Now().Add(30 * 24 * time.Hour))}}
 	}
 	require.NoError(t, c.Create(ctx, valid()))
-	for name, mut := range map[string]func(*v1alpha1.Exception){
-		"empty reason":      func(e *v1alpha1.Exception) { e.Spec.Reason = "" },
-		"missing expires":   func(e *v1alpha1.Exception) { e.Spec.Expires = metav1.Time{} },
-		"no selector":       func(e *v1alpha1.Exception) { e.Spec.Advisories = nil },
-		"bad vexStatus":     func(e *v1alpha1.Exception) { e.Spec.VEXStatus = "maybe" },
-		"bad justification": func(e *v1alpha1.Exception) { e.Spec.Justification = "trust me" },
+	for name, tc := range map[string]struct {
+		mut  func(*v1alpha1.Exception)
+		want string
+	}{
+		"empty reason":    {func(e *v1alpha1.Exception) { e.Spec.Reason = "" }, "spec.reason: Invalid value: \"\": spec.reason in body should be at least 1 chars long"},
+		"missing expires": {func(e *v1alpha1.Exception) { e.Spec.Expires = metav1.Time{} }, "spec.expires: Required value"},
+		"no selector": {func(e *v1alpha1.Exception) { e.Spec.Advisories = nil },
+			"spec: Invalid value: at least one of advisories, packages, imageRepositories or owners is required"},
+		"bad vexStatus": {func(e *v1alpha1.Exception) { e.Spec.VEXStatus = "maybe" },
+			`spec.vexStatus: Unsupported value: "maybe": supported values: "not_affected", "affected", "fixed", "under_investigation"`},
+		"bad justification": {func(e *v1alpha1.Exception) { e.Spec.Justification = "trust me" },
+			`spec.justification: Unsupported value: "trust me": supported values: "component_not_present"`},
 	} {
 		e := valid()
-		mut(e)
-		require.True(t, apierrors.IsInvalid(c.Create(ctx, e)), name)
+		tc.mut(e)
+		requireInvalid(t, c.Create(ctx, e), name, tc.want)
 	}
 }

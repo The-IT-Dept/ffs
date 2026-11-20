@@ -126,6 +126,9 @@ func TestChart_DeploymentShape(t *testing.T) {
 	require.EqualValues(t, 8081, ctl.ReadinessProbe.HTTPGet.Port.IntVal)
 
 	require.Contains(t, d.Spec.Template.Annotations, "checksum/config")
+	// Longer than the manager's 30-second graceful shutdown, so the lease is released and the store closed (F117).
+	require.NotNil(t, ps.TerminationGracePeriodSeconds)
+	require.EqualValues(t, 45, *ps.TerminationGracePeriodSeconds)
 	require.NotNil(t, ps.EnableServiceLinks)
 	require.False(t, *ps.EnableServiceLinks)
 	for _, c := range ps.Containers {
@@ -216,7 +219,8 @@ func TestChart_ConfigRoundTrips(t *testing.T) {
 	path := writeTemp(t, renderedConfig(t, render(t)))
 	got, err := config.Load(path)
 	require.NoError(t, err)
-	require.Empty(t, cmp.Diff(config.Default(), got, cmpopts.EquateEmpty()))
+	want := config.Default()
+	require.Empty(t, cmp.Diff(want, got, cmpopts.EquateEmpty()))
 }
 
 func hasPath(m map[string]any, path string) bool {
@@ -262,6 +266,39 @@ func clusterRole(t *testing.T, o objs, name string) rbacv1.ClusterRole {
 	return as[rbacv1.ClusterRole](t, o.get(t, "ClusterRole", name))
 }
 
+// controllerRules is the controller ClusterRole, rule by rule; wgPolicy adds the PolicyReport rule.
+func controllerRules(wgPolicy bool) map[rule]bool {
+	read := []string{"get", "list", "watch"}
+	manage := []string{"get", "list", "watch", "create", "update", "patch", "delete"}
+	want := map[rule]bool{}
+	add := func(group string, resources []string, verbs ...string) {
+		for _, res := range resources {
+			for _, v := range verbs {
+				want[rule{group, res, v}] = true
+			}
+		}
+	}
+	add("", []string{"pods", "nodes", "namespaces", "services", "serviceaccounts"}, read...)
+	add("discovery.k8s.io", []string{"endpointslices"}, read...)
+	add("apps", []string{"deployments", "statefulsets", "daemonsets", "replicasets"}, read...)
+	add("batch", []string{"jobs", "cronjobs"}, read...)
+	add("networking.k8s.io", []string{"ingresses", "ingressclasses"}, read...)
+	// ReferenceGrants decide which routes in other namespaces count towards a Service's exposure (spec call 11).
+	add("gateway.networking.k8s.io", []string{"gateways", "gatewayclasses", "httproutes", "grpcroutes", "tlsroutes", "tcproutes",
+		"udproutes", "referencegrants"}, read...)
+	add("rbac.authorization.k8s.io", []string{"roles", "clusterroles", "rolebindings", "clusterrolebindings"}, read...)
+	add("ffs.theitdept.au", []string{"findings", "vulnerabilities", "alerttargets", "exceptions"}, read...)
+	add("ffs.theitdept.au", []string{"findings", "vulnerabilities"}, "create", "update", "patch", "delete")
+	add("ffs.theitdept.au", []string{"findings/status", "vulnerabilities/status", "alerttargets/status", "exceptions/status"},
+		"get", "update", "patch")
+	add("events.k8s.io", []string{"events"}, "create", "patch")
+	add("openreports.io", []string{"reports"}, manage...)
+	if wgPolicy {
+		add("wgpolicyk8s.io", []string{"policyreports"}, manage...)
+	}
+	return want
+}
+
 func TestChart_ControllerRBACIsReadMostly(t *testing.T) {
 	o := render(t, "config.openReports.wgPolicy=true")
 	cr := clusterRole(t, o, "ffs")
@@ -276,7 +313,6 @@ func TestChart_ControllerRBACIsReadMostly(t *testing.T) {
 		"wgpolicyk8s.io":      {"policyreports": true},
 		"coordination.k8s.io": {"leases": true},
 	}
-	reads := map[string][]string{}
 	for _, pr := range []struct {
 		name  string
 		rules []rbacv1.PolicyRule
@@ -291,47 +327,22 @@ func TestChart_ControllerRBACIsReadMostly(t *testing.T) {
 			}
 			if !read[r.verb] {
 				require.True(t, writable[r.group][r.resource], "%s may not %s %s/%s", pr.name, r.verb, r.group, r.resource)
-				continue
-			}
-			if pr.name == "ClusterRole" && r.verb == "get" && r.group != "wgpolicyk8s.io" && !strings.Contains(r.resource, "/") {
-				reads[r.group] = append(reads[r.group], r.resource)
 			}
 		}
 	}
-	// alerttargets and exceptions are read-only; only /status is writable.
-	for r := range ruleSet(cr.Rules) {
-		if r.group == "ffs.theitdept.au" && (r.resource == "alerttargets" || r.resource == "exceptions") {
-			require.True(t, read[r.verb], r)
-		}
-	}
-	for _, v := range reads {
-		slices.Sort(v)
-	}
-	want := map[string][]string{
-		"":                            {"pods", "nodes", "namespaces", "services", "serviceaccounts"},
-		"discovery.k8s.io":            {"endpointslices"},
-		"apps":                        {"deployments", "statefulsets", "daemonsets", "replicasets"},
-		"batch":                       {"jobs", "cronjobs"},
-		"networking.k8s.io":           {"ingresses", "ingressclasses"},
-		"gateway.networking.k8s.io":   {"gateways", "gatewayclasses", "httproutes", "grpcroutes", "tlsroutes", "tcproutes", "udproutes"},
-		"rbac.authorization.k8s.io":   {"roles", "clusterroles", "rolebindings", "clusterrolebindings"},
-		"helm.toolkit.fluxcd.io":      {"helmreleases"},
-		"kustomize.toolkit.fluxcd.io": {"kustomizations"},
-		"argoproj.io":                 {"applications"},
-		"ffs.theitdept.au":            {"findings", "vulnerabilities", "alerttargets", "exceptions"},
-		"openreports.io":              {"reports"},
-	}
-	for _, v := range want {
-		slices.Sort(v)
-	}
-	require.Equal(t, want, reads)
-
-	// wgpolicyk8s.io only when enabled.
-	for _, s := range []string{"false"} {
-		cr := clusterRole(t, render(t, "config.openReports.wgPolicy="+s), "ffs")
+	// The whole ClusterRole is pinned: F115 dropped the Flux HelmRelease, Flux Kustomization and Argo CD Application
+	// reads (owners come from workload labels and annotations, and those objects can carry inline credentials), and
+	// v0.0.2 adds only the ReferenceGrant read, in the Gateway API group already read.
+	require.Equal(t, controllerRules(true), ruleSet(cr.Rules))
+	for _, group := range []string{"helm.toolkit.fluxcd.io", "kustomize.toolkit.fluxcd.io", "argoproj.io"} {
 		for r := range ruleSet(cr.Rules) {
-			require.NotEqual(t, "wgpolicyk8s.io", r.group)
+			require.NotEqual(t, group, r.group)
 		}
+	}
+
+	// wgpolicyk8s.io only when enabled: not by default, nor when set false.
+	for _, sets := range [][]string{nil, {"config.openReports.wgPolicy=false"}} {
+		require.Equal(t, controllerRules(false), ruleSet(clusterRole(t, render(t, sets...), "ffs").Rules), sets)
 	}
 	// The Role: leases and secrets get only.
 	rs := ruleSet(role.Rules)
@@ -569,6 +580,32 @@ func TestChart_ServiceMonitorHonorsLabels(t *testing.T) {
 	require.Equal(t, true, eps[0].(map[string]any)["honorLabels"])
 }
 
+// TestChart_ServiceMonitorSelectsOnlyTheMetricsService: the web UI and agent API Services carry the pod selector
+// labels too, so the ServiceMonitor selects by labels of the metrics Service's own (F55).
+func TestChart_ServiceMonitorSelectsOnlyTheMetricsService(t *testing.T) {
+	o := render(t, "metrics.serviceMonitor.enabled=true", "web.service.enabled=true", "config.listen=0.0.0.0:8080", webPeer)
+	sel, ok, err := unstructured.NestedStringMap(o.get(t, "ServiceMonitor", "ffs").Object, "spec", "selector", "matchLabels")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs",
+		"app.kubernetes.io/component": "metrics"}, sel)
+	matches := func(svc string) bool {
+		labels := o.get(t, "Service", svc).GetLabels()
+		for k, v := range sel {
+			if labels[k] != v {
+				return false
+			}
+		}
+		return true
+	}
+	require.True(t, matches("ffs-metrics"))
+	require.False(t, matches("ffs-web"))
+	require.False(t, matches("ffs-agent-api"))
+	// The metrics Service still selects the ffs pod by its selector labels alone.
+	svc := as[corev1.Service](t, o.get(t, "Service", "ffs-metrics"))
+	require.Equal(t, map[string]string{"app.kubernetes.io/name": "ffs", "app.kubernetes.io/instance": "ffs"}, svc.Spec.Selector)
+}
+
 // TestChart_ScratchLimitQuantities is the regression test for F16: a quantity such as 18Gi used to
 // render --scratch-limit=0, which the cataloguer reads as unlimited.
 // TestChart_ControllerGoMemLimit checks the controller's GOMEMLIMIT is 90% of its memory limit, so
@@ -662,14 +699,14 @@ func TestChart_NodeAgentConfig(t *testing.T) {
 	require.Equal(t, config.NodeAgentConfig{Enabled: false, Listen: ":9444", CertDir: "/etc/ffs/agent-tls",
 		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
 		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
-		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64"},
+		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64", "arm64"},
 		NodeSelector: map[string]string{"kubernetes.io/os": "linux"}, Tolerations: []config.Toleration{{Operator: "Exists"}}},
 		c.NodeAgent)
 
-	o = render(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.nodeSelector.pool=general")
+	o = render(t, "nodeAgent.architectures={arm64}", "nodeAgent.nodeSelector.pool=general")
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
 	require.NoError(t, err)
-	require.Equal(t, []string{"amd64", "arm64"}, c.NodeAgent.Architectures)
+	require.Equal(t, []string{"arm64"}, c.NodeAgent.Architectures)
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", "pool": "general"}, c.NodeAgent.NodeSelector)
 
 	// The agent's tolerations reach the controller, which shows nodes they exclude as not scheduled (#11).

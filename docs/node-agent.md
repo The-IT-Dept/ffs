@@ -115,7 +115,7 @@ In a cluster with mixed distributions, `auto` uses the most common one, and the 
 
 - **GKE Autopilot** does not allow `hostPath` volumes. Install with `--set nodeAgent.enabled=false`.
 - **Managed nodes** that run no DaemonSets, such as EKS Fargate and virtual nodes, are not covered. They show the `node_agent_missing` gap.
-- **Other architectures.** Published images are amd64, so `nodeAgent.architectures` is `[amd64]` and other nodes are not scheduled. Nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector` (Windows nodes, for example), and nodes with a `NoSchedule` or `NoExecute` taint that `nodeAgent.tolerations` does not tolerate, show `not scheduled by the node agent: <reason>` (`node_agent_unsupported`), and do not hold back the switch from node status to the agent.
+- **Other architectures.** Published images are amd64 and arm64, so `nodeAgent.architectures` is `[amd64, arm64]` and nodes of other architectures are not scheduled. Nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector` (Windows nodes, for example), and nodes with a `NoSchedule` or `NoExecute` taint that `nodeAgent.tolerations` does not tolerate, show `not scheduled by the node agent: <reason>` (`node_agent_unsupported`), and do not hold back the switch from node status to the agent.
 - **SELinux.** On SELinux-enforcing nodes the agent shows `node agent cannot read <path>: permission denied` until `nodeAgent.seLinuxType: spc_t` is set, which runs the collector, and only the collector, with that SELinux type.
 - **OpenShift** needs `nodeAgent.openshift.scc: true`, which creates a SecurityContextConstraints for the agent and lets its ServiceAccount use it, and `nodeAgent.seLinuxType: spc_t`: Red Hat CoreOS enforces SELinux, so without it every node shows `node agent cannot read <path>: permission denied`.
 - **Image-based OSes** (Talos, Flatcar, Container-Optimized OS, Bottlerocket) have no package database. Their nodes show `no package database (image-based OS)`, never a clean empty package list. Set `nodeAgent.packageDatabases: []` when every node runs one. A node of any other OS whose package database the agent cannot find shows `package database not mounted; set nodeAgent.packageDatabases`.
@@ -136,7 +136,7 @@ On Fedora, RHEL 10 and SUSE, `/var/lib/rpm` is a link to `/usr/lib/sysimage/rpm`
 - **Node groups.** Nodes share a group, and with it one stored host SBOM, only when every package field ffs matches on is the same: names, versions and architectures, the distribution, source packages, package URLs and CPEs. A host inventory that differs in any of them gets a group of its own.
 - **Residual risk.** A compromised node can under-report the packages of its own host, and of an image the controller asks it to catalogue, because it controls those bytes. Its kubelet can also claim that a pod on it runs any image, so it can be the node asked. It cannot replace an image SBOM that another node or a registry supplied, or change the host inventory of nodes that report their own.
 
-The NetworkPolicy `ffs` (`nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
+The NetworkPolicy `ffs` (`networkPolicy.enabled`, formerly `nodeAgent.networkPolicy.enabled`) selects the ffs pod, with or without the node agent, and allows:
 
 - the agent API port, only from the agent pods, while `nodeAgent.enabled` is true;
 - the metrics and health ports, from anywhere: metrics answers only requests that pass Kubernetes authentication and authorisation, and health serves only the kubelet's probes;
@@ -176,7 +176,7 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.packageDatabases` | `auto` | Package databases to mount: `auto`, or a list of `dpkg`, `rpm` and `apk`. An empty list means an image-based OS. |
 | `nodeAgent.hostPaths.extraBinDirs` | `[]` | Extra host directories searched for the known binaries, each under `/usr` or `/opt`, listed once, and not `/usr/bin`, `/usr/sbin` or `/usr/local/bin`, which are searched already. |
 | `nodeAgent.hostPaths.containerdRoot` | `""` | containerd's root directory, for k0s, MicroK8s or a custom root, such as `/var/lib/k0s/containerd`; the content store under it replaces the distribution's. Empty uses the distribution's. See [Distributions](#distributions). |
-| `nodeAgent.architectures` | `[amd64]` | Node architectures the DaemonSet schedules on; at least one. |
+| `nodeAgent.architectures` | `[amd64, arm64]` | Node architectures the DaemonSet schedules on; at least one. Published images are amd64 and arm64. |
 | `nodeAgent.nodeSelector` | `{kubernetes.io/os: linux}` | Node selector of the agent pods. |
 | `nodeAgent.tolerations` | `[{operator: Exists}]` | Tolerations of the agent pods; the default runs on every node. Nodes with a taint they do not tolerate show as not scheduled by the node agent. |
 | `nodeAgent.priorityClassName` | `""` | Priority class of the agent pods. |
@@ -199,4 +199,4 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |
 | `nodeAgent.seLinuxType` | `""` | SELinux type of the collector container, for example `spc_t`. |
 | `nodeAgent.openshift.scc` | `false` | Create a SecurityContextConstraints for the agent and bind its ServiceAccount to it. |
-| `nodeAgent.networkPolicy.enabled` | `true` | Create the NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while `nodeAgent.enabled` is true, metrics and health from anywhere, and the web UI only from `web.networkPolicy.from`. While false, the chart refuses a non-empty `web.networkPolicy.from`. See [Trust](#trust). |
+| `nodeAgent.networkPolicy.enabled` | unset | Deprecated: use the top-level `networkPolicy.enabled` ([configuration.md](configuration.md#helm-only-values)). When set, v0.0.2 still uses it in place of `networkPolicy.enabled` and the install notes say it is deprecated; v0.0.3 removes it. See [Trust](#trust). |

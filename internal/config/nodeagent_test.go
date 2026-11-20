@@ -12,7 +12,7 @@ func TestNodeAgent_DefaultsAndLoad(t *testing.T) {
 	require.Equal(t, NodeAgentConfig{Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent",
 		ServiceAccount: "ffs-agent", MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
 		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
-		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Architectures: []string{"amd64", "arm64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
 		Tolerations: []Toleration{{Operator: "Exists"}}}, Default().NodeAgent)
 	c, err := Load(writeFile(t, "nodeAgent:\n  staleAfter: 1h\n  exposedNodes: node-role.example.com/edge\n"))
 	require.NoError(t, err)
@@ -21,14 +21,17 @@ func TestNodeAgent_DefaultsAndLoad(t *testing.T) {
 	require.Equal(t, 5*time.Minute, c.NodeAgent.ImageListInterval) // siblings keep defaults
 }
 
-// TestNodeAgent_SchedulingDefaultsMatchTheChart: the defaults are the chart's ([amd64], kubernetes.io/os:
+// TestNodeAgent_SchedulingDefaultsMatchTheChart: the defaults are the chart's ([amd64, arm64], kubernetes.io/os:
 // linux); a value in the file replaces them rather than merging, and an explicitly empty or null value
 // means every node.
 func TestNodeAgent_SchedulingDefaultsMatchTheChart(t *testing.T) {
 	arm := map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "arm64"}
+	riscv := map[string]string{"kubernetes.io/os": "linux", "kubernetes.io/arch": "riscv64"}
 	windows := map[string]string{"kubernetes.io/os": "windows", "kubernetes.io/arch": "amd64"}
 	ok, _ := Default().NodeAgent.ScheduledOn(arm, "arm64")
-	require.False(t, ok, "the default schedules on amd64 only")
+	require.True(t, ok, "the default schedules on arm64 too (#17)")
+	ok, _ = Default().NodeAgent.ScheduledOn(riscv, "riscv64")
+	require.False(t, ok, "the default schedules on amd64 and arm64 only")
 	ok, _ = Default().NodeAgent.ScheduledOn(windows, "amd64")
 	require.False(t, ok, "the default schedules on Linux only")
 
@@ -37,7 +40,7 @@ func TestNodeAgent_SchedulingDefaultsMatchTheChart(t *testing.T) {
 		arch     []string
 		selector map[string]string
 	}{
-		"absent keeps the defaults": {"nodeAgent:\n  staleAfter: 1h\n", []string{"amd64"}, map[string]string{"kubernetes.io/os": "linux"}},
+		"absent keeps the defaults": {"nodeAgent:\n  staleAfter: 1h\n", []string{"amd64", "arm64"}, map[string]string{"kubernetes.io/os": "linux"}},
 		"explicitly empty":          {"nodeAgent:\n  architectures: []\n  nodeSelector: {}\n", []string{}, map[string]string{}},
 		"null":                      {"nodeAgent:\n  architectures: null\n  nodeSelector:\n", nil, nil},
 		"set replaces, not merges": {"nodeAgent:\n  architectures: [arm64]\n  nodeSelector:\n    pool: general\n",

@@ -25,7 +25,7 @@ controller:
     requests:
       # CPU request.
       cpu: 200m
-      # Memory limit.
+      # Memory request.
       memory: 512Mi
     # Resource ceilings.
     limits:
@@ -44,7 +44,7 @@ catalog:
     requests:
       # CPU request.
       cpu: 100m
-      # Memory limit.
+      # Memory request.
       memory: 256Mi
     # Resource ceilings.
     limits:
@@ -77,6 +77,11 @@ affinity: {}
 # Pod priority class.
 priorityClassName: ""
 
+# The ffs pod's NetworkPolicy.
+networkPolicy:
+  # Create a NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while nodeAgent.enabled, metrics and health from anywhere, the web UI only from web.networkPolicy.from. It replaces nodeAgent.networkPolicy.enabled, which this release still honours when set.
+  enabled: true
+
 # Web UI exposure.
 web:
   # Service settings.
@@ -85,9 +90,9 @@ web:
     enabled: false
     # Service port for the web UI.
     port: 8080
-  # Who may reach the web UI port through the ffs pod's NetworkPolicy, which nodeAgent.networkPolicy.enabled creates, with or without the node agent.
+  # Who may reach the web UI port through the ffs pod's NetworkPolicy, which networkPolicy.enabled creates.
   networkPolicy:
-    # NetworkPolicyPeers (podSelector, namespaceSelector or ipBlock) admitted to the web UI port, such as your authenticating proxy's pods. Empty admits none. Required with web.service.enabled while nodeAgent.networkPolicy.enabled is true, and refused while it is false, which leaves the port to a NetworkPolicy of your own.
+    # NetworkPolicyPeers (podSelector, namespaceSelector or ipBlock) admitted to the web UI port, such as your authenticating proxy's pods. Empty admits none. Required with web.service.enabled while networkPolicy.enabled is true, and refused while it is false, which leaves the port to a NetworkPolicy of your own.
     from: []
 
 # Authenticated metrics endpoint.
@@ -145,8 +150,8 @@ nodeAgent:
     extraBinDirs: []
     # containerd root directory (absolute), such as /var/lib/k0s/containerd for k0s; empty uses the distribution's.
     containerdRoot: ""
-  # Node architectures to schedule on, at least one; published images are amd64 only, so other architectures are skipped.
-  architectures: [amd64]
+  # Node architectures to schedule on, at least one; published images are amd64 and arm64.
+  architectures: [amd64, arm64]
   # Node selector of the agent pods.
   nodeSelector:
     kubernetes.io/os: linux
@@ -213,10 +218,6 @@ nodeAgent:
   openshift:
     # Create an SCC for the agent and bind its ServiceAccount to it.
     scc: false
-  # NetworkPolicy settings.
-  networkPolicy:
-    # Create a NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while nodeAgent.enabled, metrics and health from anywhere, the web UI only from web.networkPolicy.from.
-    enabled: true
 
 # ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.
 config:

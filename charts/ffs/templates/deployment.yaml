@@ -33,6 +33,9 @@ spec:
     spec:
       serviceAccountName: {{ $name }}
       automountServiceAccountToken: false
+      # The controller allows its runnables 30 seconds to stop, then releases its leader lease and closes the
+      # store; the default 30-second grace period would kill it before that.
+      terminationGracePeriodSeconds: 45
       enableServiceLinks: false
       hostNetwork: false
       hostPID: false

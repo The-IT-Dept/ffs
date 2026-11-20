@@ -282,8 +282,8 @@ func TestCutover_UnsupportedNodesDoNotBlockCutover(t *testing.T) {
 	require.False(t, x.state(t).RuntimeRetired, "every Ready node counts while the config says the agent runs everywhere")
 	require.Nil(t, x.state(t).Unsupported)
 
-	x.setConfig(func(c *config.Config) { // the chart's defaults: amd64, Linux
-		c.NodeAgent.Architectures, c.NodeAgent.NodeSelector = config.Default().NodeAgent.Architectures, config.Default().NodeAgent.NodeSelector
+	x.setConfig(func(c *config.Config) { // amd64 only, on Linux
+		c.NodeAgent.Architectures, c.NodeAgent.NodeSelector = []string{"amd64"}, config.Default().NodeAgent.NodeSelector
 	})
 	x.pass(t)
 	x.requireForward(t)

@@ -1,5 +1,8 @@
 # Applies to findings in its own namespace. Only Exceptions in the ffs namespace apply
-# cluster-wide and can except urgent findings.
+# cluster-wide and can except urgent findings. expires can be at most one year away: set
+# ${EXPIRES} as you apply it, for example 90 days out:
+#   EXPIRES=$(date -u -d '+90 days' +%Y-%m-%dT%H:%M:%SZ)   # macOS: date -u -v+90d +%Y-%m-%dT%H:%M:%SZ
+#   sed "s/\${EXPIRES}/$EXPIRES/" exception.yaml | kubectl apply -f -
 apiVersion: ffs.theitdept.au/v1alpha1
 kind: Exception
 metadata:
@@ -11,6 +14,6 @@ spec:
   imageRepositories:
     - docker.io/library/php
   reason: The affected extension is not built into this image. Reviewed by the platform team.
-  expires: "2027-05-31T00:00:00Z"
+  expires: "${EXPIRES}"
   vexStatus: not_affected
   justification: vulnerable_code_not_present

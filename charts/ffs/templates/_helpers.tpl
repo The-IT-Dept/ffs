@@ -196,6 +196,56 @@ true
 {{- end -}}
 
 {{- /*
+ffs.legacyNetworkPolicy is "true" when the deprecated nodeAgent.networkPolicy.enabled is set, and "" otherwise.
+It has no default, so it is set only when the user sets it, and it must then be true or false.
+*/ -}}
+{{- define "ffs.legacyNetworkPolicy" -}}
+{{- $np := dig "networkPolicy" (dict) (.Values.nodeAgent | default dict) -}}
+{{- if not (kindIs "map" $np) -}}
+{{- fail "nodeAgent.networkPolicy must be a map with an enabled key; it is deprecated, so set networkPolicy.enabled instead" -}}
+{{- end -}}
+{{- if hasKey $np "enabled" -}}
+{{- if not (kindIs "bool" $np.enabled) -}}
+{{- fail (printf "nodeAgent.networkPolicy.enabled must be true or false, not %q; it is deprecated, so set networkPolicy.enabled instead" (toString $np.enabled)) -}}
+{{- end -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /*
+ffs.networkPolicy is "true" when the chart creates the ffs pod's NetworkPolicy, and "" otherwise: networkPolicy.enabled,
+unless the deprecated nodeAgent.networkPolicy.enabled is set, which wins until it is removed in v0.0.3. networkPolicy.enabled
+is true by default, so a false there was set on purpose, and the render fails if the deprecated key says true.
+*/ -}}
+{{- define "ffs.networkPolicy" -}}
+{{- /* values without a top-level networkPolicy (helm upgrade --reuse-values from v0.0.1) default to true */ -}}
+{{- $np := .Values.networkPolicy | default dict -}}
+{{- $enabled := true -}}
+{{- if hasKey $np "enabled" -}}
+{{- $enabled = $np.enabled -}}
+{{- end -}}
+{{- if include "ffs.legacyNetworkPolicy" . -}}
+{{- $legacy := dig "networkPolicy" "enabled" false .Values.nodeAgent -}}
+{{- if and $legacy (not $enabled) -}}
+{{- fail "networkPolicy.enabled is false but the deprecated nodeAgent.networkPolicy.enabled is true: unset nodeAgent.networkPolicy.enabled and set networkPolicy.enabled only" -}}
+{{- end -}}
+{{- $enabled = $legacy -}}
+{{- end -}}
+{{- if $enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /*
+ffs.metricsSelectorLabels are the labels of the metrics Service, which the ServiceMonitor selects: the other Services of
+the release carry ffs.selectorLabels too.
+*/ -}}
+{{- define "ffs.metricsSelectorLabels" -}}
+{{ include "ffs.selectorLabels" . }}
+app.kubernetes.io/component: metrics
+{{- end -}}
+
+{{- /*
 ffs.agentPort is nodeAgent.port, which must differ from the controller's other ports.
 */ -}}
 {{- define "ffs.agentPort" -}}

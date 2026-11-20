@@ -8,8 +8,19 @@ on:
 permissions: {}
 
 jobs:
+  # The kind suite on each published architecture, on its own native runner.
   e2e:
-    runs-on: ubuntu-24.04
+    name: e2e (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -22,8 +33,16 @@ jobs:
       - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
         with:
           version: v3.22.1
-      - uses: helm/kind-action@ea822c7bf1874f08e5a491df991c228edffc3376 # v1.15.2
-        with:
-          install_only: true
-          version: v0.33.0
+      # make e2e installs kind itself, at the version the Makefile pins. kubectl is not on the arm64 runner image,
+      # so both runners install the version of the kind node image.
+      - name: Install kubectl
+        env:
+          KUBECTL_VERSION: v1.37.0
+        run: |
+          set -euo pipefail
+          base="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/$(dpkg --print-architecture)"
+          curl -fsSLo kubectl "${base}/kubectl"
+          echo "$(curl -fsSL "${base}/kubectl.sha256")  kubectl" | sha256sum -c -
+          sudo install -m 0755 kubectl /usr/local/bin/kubectl
+          rm kubectl
       - run: make e2e

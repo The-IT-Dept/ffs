@@ -1,4 +1,8 @@
 version: "2"
+run:
+  # The end-to-end suite (test/e2e) builds only with the e2e tag; lint it with everything else.
+  build-tags:
+    - e2e
 linters:
   default: standard
   enable:

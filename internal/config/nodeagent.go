@@ -57,7 +57,7 @@ func defaultNodeAgent() NodeAgentConfig {
 		Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent", ServiceAccount: "ffs-agent",
 		MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
 		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
-		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Architectures: []string{"amd64", "arm64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
 		Tolerations: []Toleration{{Operator: "Exists"}},
 	}
 }
