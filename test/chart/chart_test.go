@@ -551,6 +551,8 @@ func TestChart_ControllerGoMemLimit(t *testing.T) {
 	require.Equal(t, "1800000000", env("controller.resources.limits.memory=2G").Value)
 	e := env("controller.resources.limits=null")
 	require.Empty(t, e.Value)
+	e = env("controller.resources=null")
+	require.Empty(t, e.Value)
 	require.Equal(t, "limits.memory", e.ValueFrom.ResourceFieldRef.Resource)
 	require.Equal(t, "controller", e.ValueFrom.ResourceFieldRef.ContainerName)
 

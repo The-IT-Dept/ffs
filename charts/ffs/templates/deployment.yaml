@@ -61,7 +61,7 @@ spec:
             - --config=/etc/ffs/config.yaml
           env:
             - name: GOMEMLIMIT
-              {{- with (.Values.controller.resources.limits | default dict).memory }}
+              {{- with (dig "resources" "limits" "memory" "" .Values.controller) }}
               value: {{ include "ffs.goMemLimit" . | quote }}
               {{- else }}
               valueFrom:
