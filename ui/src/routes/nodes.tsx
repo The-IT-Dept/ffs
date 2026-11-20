@@ -28,7 +28,9 @@ function Count({ n }: { n: number }) {
 // gappedGroups is the set of node groups ffs cannot fully see into: groups with no host inventory
 // (nodeinfo), groups with members whose agent is not reporting, and groups the cluster rail marks
 // with a gap (an agent that cannot read the host, an image-based OS). The rail is asked anyway on
-// this page, so its marks cost no request; it lists groups by ID or by stable name.
+// this page, so its marks cost no request; it lists groups by ID or by stable name. It lists only
+// its worst few groups, so a host gap in a group beyond them goes unmarked until NodeGroupRow
+// carries its own gaps.
 function gappedGroups(groups: Group[], rail?: S<'ScopeCard'>): Set<string> {
   const marked = new Set((rail?.related.find((r) => r.id === 'nodegroups')?.items ?? []).filter((i) => i.gap && i.scope).map((i) => i.scope))
   return new Set(
