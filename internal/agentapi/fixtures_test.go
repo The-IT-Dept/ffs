@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -165,3 +166,36 @@ func reviewer(t *testing.T, answer func(spec authenticationv1.TokenReviewSpec) (
 	}).Build()
 	return c, &specs
 }
+
+// fakePods is a PodIndex: node → the digests its pods run.
+type fakePods struct {
+	mu    sync.Mutex
+	nodes map[string]map[string]bool
+}
+
+func newFakePods() *fakePods { return &fakePods{nodes: map[string]map[string]bool{}} }
+
+// run records that a pod on node runs each digest.
+func (f *fakePods) run(node string, digests ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.nodes[node] == nil {
+		f.nodes[node] = map[string]bool{}
+	}
+	for _, d := range digests {
+		f.nodes[node][d] = true
+	}
+}
+
+func (f *fakePods) DigestsOnNode(_ context.Context, node string) (map[string]bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]bool{}
+	for d := range f.nodes[node] {
+		out[d] = true
+	}
+	return out, nil
+}
+
+// hexDigest is a sha256 digest whose hex is c repeated.
+func hexDigest(c string) string { return "sha256:" + strings.Repeat(c, 64) }
