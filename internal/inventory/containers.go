@@ -283,9 +283,14 @@ func (p prevUses) of(name string, kind model.ContainerKind, ref string) *model.C
 // credentials, repository and digest.
 //
 // A tag goes through the recorded tag digest while the record is younger than TagTTL and confirmed
-// for cs, else a registry HEAD under cs; a reference pinned by digest is confirmed with a HEAD. A
-// refusal yields an unresolvable placeholder, never a digest recorded for someone else. When a
-// lookup fails for any other reason, the image prev (this container's stored use) had is kept.
+// for cs (unless a TagTTL refresh is forcing tags, see refreshTemplates), else a registry HEAD under
+// cs; a reference pinned by digest is confirmed with a HEAD. A refusal yields an unresolvable
+// placeholder, never a digest recorded for someone else. When a lookup fails for any other reason,
+// the image prev (this container's stored use) had is kept.
+//
+// A lookup that ended in an unresolvable placeholder is not repeated for the same credentials and
+// platform while its miss holds (missTTL, doubling up to maxMissTTL), so a tag that never resolves
+// does not cost a registry call on every flush of its owners.
 func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodePlatform, cs registry.CredSet,
 	prev *model.ContainerUse) (model.Image, error) {
 	repo, tag, digest, err := SplitRef(ref)
@@ -300,11 +305,18 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 		if err != nil {
 			return model.Image{}, err
 		}
-		if ok && now.Sub(at) < inv.o.TagTTL && inv.access.confirmed(cs, repo, recorded, now) {
+		if ok && !inv.forceTags && now.Sub(at) < inv.o.TagTTL && inv.access.confirmed(cs, repo, recorded, now) {
 			digest = recorded
-		} else if d, err := inv.o.Resolver.ResolveTag(ctx, repo, tag, cs); err != nil {
-			return inv.unconfirmed(ctx, err, lookup, repo, platform, prev)
 		} else {
+			mk := missKeyOf(cs, lookup, platform)
+			if img, ok := inv.misses.get(mk, now); ok {
+				return img, nil
+			}
+			d, err := inv.o.Resolver.ResolveTag(ctx, repo, tag, cs)
+			if err != nil {
+				return inv.unconfirmed(ctx, err, mk, lookup, repo, platform, prev)
+			}
+			inv.misses.clear(mk)
 			if err := inv.o.Store.PutTagDigest(ctx, repo, tag, d, now); err != nil {
 				return model.Image{}, err
 			}
@@ -312,9 +324,14 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 			digest = d
 		}
 	} else if !inv.access.confirmed(cs, repo, digest, now) {
-		if _, err := inv.o.Resolver.Head(ctx, repo+"@"+digest, cs); err != nil {
-			return inv.unconfirmed(ctx, err, lookup, repo, platform, prev)
+		mk := missKeyOf(cs, lookup, platform)
+		if img, ok := inv.misses.get(mk, now); ok {
+			return img, nil
 		}
+		if _, err := inv.o.Resolver.Head(ctx, repo+"@"+digest, cs); err != nil {
+			return inv.unconfirmed(ctx, err, mk, lookup, repo, platform, prev)
+		}
+		inv.misses.clear(mk)
 		inv.access.confirm(cs, repo, digest, now)
 	}
 	return inv.o.Normalizer.Normalize(ctx, ContainerImage{Image: ref, ImageID: repo + "@" + digest, Node: platform, Creds: cs})
@@ -322,8 +339,9 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 
 // unconfirmed handles a registry lookup that did not confirm access: a refusal is an unresolvable
 // placeholder for the reference; another failure keeps prev's image when there is one, and is
-// otherwise returned (or, after repeated failures, unresolvable as not reachable).
-func (inv *Inventory) unconfirmed(ctx context.Context, err error, lookup, repo string, platform NodePlatform,
+// otherwise returned (or, after repeated failures, unresolvable as not reachable). A placeholder is
+// recorded as a miss under mk.
+func (inv *Inventory) unconfirmed(ctx context.Context, err error, mk missKey, lookup, repo string, platform NodePlatform,
 	prev *model.ContainerUse) (model.Image, error) {
 	refused := errors.Is(err, registry.ErrUnauthorized) || errors.Is(err, registry.ErrNotFound)
 	if !refused && prev != nil && ctx.Err() == nil {
@@ -336,7 +354,12 @@ func (inv *Inventory) unconfirmed(ctx context.Context, err error, lookup, repo s
 			return img, nil
 		}
 	}
-	return inv.o.Normalizer.fail(ctx, err, "unknown:"+lookup, repo, lookup, "", platform.Key())
+	placeholder := "unknown:" + lookup
+	img, ferr := inv.o.Normalizer.fail(ctx, err, placeholder, repo, lookup, "", platform.Key())
+	if ferr == nil && img.Digest == placeholder {
+		img = inv.misses.add(mk, img, inv.now())
+	}
+	return img, ferr
 }
 
 // recordImage stores a new image row (or a refreshed unresolvable one) and collects an SBOM request

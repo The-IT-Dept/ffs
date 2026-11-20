@@ -42,7 +42,7 @@ Rust binaries built without cargo-auditable, bundled or minified JavaScript, cop
 
 Images whose credentials only the kubelet holds, through a credential-provider plugin or KEP-4412 service-account tokens; images pulled through a node-level registry mirror that the mirror map does not cover; and side-loaded images (`ctr import`, `kind load`, k3s airgap tarballs), whose image ID is a node-local config digest.
 
-**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. A registry that ffs itself cannot reach (DNS, refused or timed-out connections, blocked egress) gives `registry not reachable from ffs for <repository>: <problem>` after about five minutes of failures, and is retried hourly. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
+**What ffs shows:** the image is `unresolvable`, with the reason, for example `image ID is a node-local config digest and the container image has no tag to look up in a registry`. A registry that ffs itself cannot reach (DNS, refused or timed-out connections, blocked egress) gives `registry not reachable from ffs for <repository>: <problem>` after about five minutes of failures, and is retried hourly. An image named only by a workload that is not running is looked up again after one hour, then after two, four and at most six hours while it stays unresolvable. It is never shown as clean, and it is retried periodically. Two settings narrow the gap:
 - `registry.operatorSecret` supplies registry credentials that otherwise only the nodes hold;
 - `registry.mirrors` is a registry mirror rewrite map, so pulls go where the nodes pull from.
 
@@ -103,7 +103,7 @@ Private images on EKS, GKE or AKS that the nodes pull with cloud workload identi
 
 ### Whether a LoadBalancer or Ingress is internet-facing
 
-ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account.
+ffs cannot tell whether a LoadBalancer, NodePort, Ingress or Gateway is reachable from the internet. It assumes it is. NetworkPolicy is not taken into account. A Gateway API route in another namespace than its backend Service counts only when a ReferenceGrant in the Service's namespace allows it, as for the Gateway itself; ffs needs to list ReferenceGrants for this, and while it may not, such routes are not counted.
 
 **What ffs shows:** the reason names the path, for example `exposed via HTTPRoute shop/web on Gateway edge/external`. Internal paths can be excluded with `exposure.internalIngressClasses`, `exposure.internalGatewayClasses`, `exposure.internalGateways` and `exposure.internalLBAnnotations`.
 

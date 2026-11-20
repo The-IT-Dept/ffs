@@ -158,6 +158,8 @@ func TestCatalogSource_MapsErrors(t *testing.T) {
 		{name: "507", status: 507, body: errBody(KindScratchFull, "full"), kind: FailCounted,
 			reason: "image unpacked beyond the cataloguer scratch limit"},
 		{name: "500", status: 500, body: errBody(KindFailed, "syft exploded"), kind: FailCounted, reason: "cataloguer failed: syft exploded"},
+		{name: "400", status: 400, body: errBody(KindBadRequest, "ref is not pinned by a sha256 digest"), kind: FailUnresolvable,
+			reason: "cataloguer rejected the request: ref is not pinned by a sha256 digest"},
 		{name: "hangup", hangup: true, kind: FailCounted, reason: "cataloguer stopped while processing the image"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

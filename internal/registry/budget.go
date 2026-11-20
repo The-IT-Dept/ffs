@@ -31,6 +31,9 @@ const (
 	unknownHold = time.Minute
 	// minWait stops float rounding from turning the wait loop into a spin.
 	minWait = 10 * time.Millisecond
+	// reserveHold is how long tokens taken by Reserve count as spent by GETs the registry may not have
+	// seen yet: the cataloguer's pulls start within moments of the reservation.
+	reserveHold = 2 * time.Minute
 )
 
 var manifestPath = regexp.MustCompile(`^/v2/.+/manifests/[^/]+$`)
@@ -78,12 +81,18 @@ func ParseRateLimit(v string) (n int, window time.Duration, ok bool) {
 // budgetTransport holds a token bucket per registry host, driven by the registry's own rate-limit
 // headers. Only manifest GETs wait and consume; HEAD, tags/list, blobs, referrers and token-endpoint
 // requests pass straight through. A registry that never sends the headers is unlimited.
+//
+// A response's RateLimit-Remaining sets the bucket, except while other tokens taken locally may not be
+// counted by the registry yet (manifest GETs still in flight, and Reserve's tokens for reserveHold):
+// the header is then no newer than the bucket, so it may only lower it, never give those tokens back.
 type budgetTransport struct {
 	base http.RoundTripper
 	now  func() time.Time
 
-	mu      sync.Mutex
-	buckets map[string]*bucket
+	mu       sync.Mutex
+	buckets  map[string]*bucket
+	inFlight map[string]int       // manifest GETs that took a token and are not answered yet, per host
+	reserved map[string]time.Time // per host, until when tokens Reserve took may be unseen by the registry
 }
 
 type bucket struct {
@@ -95,12 +104,15 @@ type bucket struct {
 }
 
 func newBudgetTransport(base http.RoundTripper, now func() time.Time) *budgetTransport {
-	return &budgetTransport{base: base, now: now, buckets: map[string]*bucket{}}
+	return &budgetTransport{base: base, now: now, buckets: map[string]*bucket{}, inFlight: map[string]int{},
+		reserved: map[string]time.Time{}}
 }
 
 func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.Method == http.MethodGet && manifestPath.MatchString(req.URL.Path) {
-		if err := t.take(req.Context(), req.URL.Host, 1); err != nil {
+	host := req.URL.Host
+	counted := req.Method == http.MethodGet && manifestPath.MatchString(req.URL.Path)
+	if counted {
+		if err := t.take(req.Context(), host, 1, func(time.Time) { t.inFlight[host]++ }); err != nil {
 			if req.Body != nil {
 				_ = req.Body.Close()
 			}
@@ -108,20 +120,52 @@ func (t *budgetTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 	}
 	resp, err := t.base.RoundTrip(req)
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if counted {
+		if t.inFlight[host]--; t.inFlight[host] <= 0 {
+			delete(t.inFlight, host)
+		}
+	}
 	if err == nil {
-		t.observe(req.URL.Host, resp)
+		t.observe(host, resp)
 	}
 	return resp, err
 }
 
-// take blocks until n tokens are available for host, then consumes them. It fails only with ctx.Err().
-func (t *budgetTransport) take(ctx context.Context, host string, n float64) error {
+// reserveFor takes n tokens for requests made outside this transport and counts them as unseen by
+// the registry for reserveHold. It fails only with ctx.Err().
+func (t *budgetTransport) reserveFor(ctx context.Context, host string, n float64) error {
+	return t.take(ctx, host, n, func(now time.Time) { t.reserved[host] = now.Add(reserveHold) })
+}
+
+// unseen reports whether host has tokens taken locally that the registry may not have counted yet;
+// t.mu is held.
+func (t *budgetTransport) unseen(host string, now time.Time) bool {
+	if t.inFlight[host] > 0 {
+		return true
+	}
+	until, ok := t.reserved[host]
+	if ok && !now.Before(until) {
+		delete(t.reserved, host)
+		return false
+	}
+	return ok
+}
+
+// take blocks until n tokens are available for host, then consumes them and calls taken, both under
+// t.mu, so no response is observed in between. It fails only with ctx.Err().
+func (t *budgetTransport) take(ctx context.Context, host string, n float64, taken func(now time.Time)) error {
 	low := IsLowPriority(ctx)
 	for {
 		t.mu.Lock()
+		now := t.now()
 		var wait time.Duration
 		if b := t.buckets[host]; b != nil {
-			wait = b.reserve(t.now(), n, low)
+			wait = b.reserve(now, n, low)
+		}
+		if wait <= 0 {
+			taken(now)
 		}
 		t.mu.Unlock()
 		if wait <= 0 {
@@ -137,7 +181,7 @@ func (t *budgetTransport) take(ctx context.Context, host string, n float64) erro
 	}
 }
 
-// observe updates host's bucket from the response's rate-limit headers and from a 429.
+// observe updates host's bucket from the response's rate-limit headers and from a 429; t.mu is held.
 func (t *budgetTransport) observe(host string, resp *http.Response) {
 	limit, window, okLimit := ParseRateLimit(resp.Header.Get("RateLimit-Limit"))
 	okLimit = okLimit && limit > 0
@@ -147,8 +191,6 @@ func (t *budgetTransport) observe(host string, resp *http.Response) {
 		return
 	}
 	now := t.now()
-	t.mu.Lock()
-	defer t.mu.Unlock()
 	b := t.buckets[host]
 	if b == nil {
 		if !okLimit && !limited {
@@ -165,7 +207,12 @@ func (t *budgetTransport) observe(host string, resp *http.Response) {
 		b.refill(now)
 	}
 	if okRemaining && b.known {
-		b.tokens, b.last = math.Min(float64(remaining), b.limit), now
+		r := math.Min(float64(remaining), b.limit)
+		if t.unseen(host, now) {
+			b.refill(now)
+			r = math.Min(r, b.tokens)
+		}
+		b.tokens, b.last = r, now
 	}
 	if limited {
 		b.tokens, b.last = 0, now

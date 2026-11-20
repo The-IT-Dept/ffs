@@ -16,8 +16,9 @@ import (
 const maxReferrersBytes = 4 << 20
 
 // Referrers lists the manifests whose subject is repo@digest through the OCI referrers API only; the
-// sha256-<hex> tag schema is left to the caller. A registry without the API (404, 400, 405, 406, or a
-// body that is not an index) yields nil, nil.
+// sha256-<hex> tag schema is left to the caller. A registry without the API (404, 400, 405, 406)
+// yields nil, nil. A 200 whose body is not an image index, or is larger than 4 MiB, is an error: the
+// registry answered, so its referrers are unknown rather than none.
 func (c *Client) Referrers(ctx context.Context, repo, digest string, cs CredSet) ([]v1.Descriptor, error) {
 	ctx, cancel := c.call(ctx)
 	defer cancel()
@@ -54,8 +55,12 @@ func (c *Client) referrers(ctx context.Context, repo, digest string, cs CredSet)
 		return nil, err
 	}
 	var idx v1.IndexManifest
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReferrersBytes)).Decode(&idx); err != nil {
-		return nil, nil //nolint:nilerr // a 200 that is not an index means the API is not really there
+	body := &io.LimitedReader{R: resp.Body, N: maxReferrersBytes + 1}
+	if err := json.NewDecoder(body).Decode(&idx); err != nil {
+		if body.N <= 0 {
+			return nil, fmt.Errorf("registry: referrers of %s are larger than %d bytes", d, maxReferrersBytes)
+		}
+		return nil, fmt.Errorf("registry: referrers of %s are not an image index: %w", d, err)
 	}
 	return idx.Manifests, nil
 }

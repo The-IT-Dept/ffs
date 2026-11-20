@@ -36,6 +36,10 @@ const (
 	reasonScratchFull = "image unpacked beyond the cataloguer scratch limit"
 )
 
+// errCatalogRefused marks a request the cataloguer refused as invalid (400): another owner's
+// credentials would not change the answer.
+var errCatalogRefused = errors.New("sbom: the cataloguer refused the request")
+
 // catalogRegistry is the part of the registry client the catalog source uses.
 type catalogRegistry interface {
 	PullRepo(repo string) string
@@ -175,7 +179,9 @@ func (s *CatalogSource) statusError(r Request, status int, ce CatalogError) erro
 	case http.StatusInsufficientStorage:
 		return &AcquireError{Kind: FailCounted, Reason: reasonScratchFull}
 	case http.StatusBadRequest:
-		return &AcquireError{Kind: FailCounted, Reason: "cataloguer rejected the request: " + ce.Error}
+		// The request can never succeed as it is (a reference or platform the cataloguer cannot use):
+		// unresolvable, retried after UnresolvableRetry, never a strike toward quarantine.
+		return &AcquireError{Kind: FailUnresolvable, Reason: "cataloguer rejected the request: " + ce.Error, Err: errCatalogRefused}
 	default:
 		msg := ce.Error
 		if msg == "" {

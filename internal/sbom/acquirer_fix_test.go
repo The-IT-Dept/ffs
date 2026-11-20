@@ -489,3 +489,65 @@ func TestAttestation_TagLookupsHeadFirst(t *testing.T) {
 	require.Zero(t, s.Count(http.MethodGet, tagRe))
 	require.Equal(t, 2, s.Count(http.MethodHead, tagRe))
 }
+
+// TestAcquirer_RefusedRequestUnresolvable (F53): a request the cataloguer refuses as invalid can never
+// succeed as it is: the image is unresolvable (retried after UnresolvableRetry) at once, no strike is
+// counted, and other owners' credentials are not tried, since they would not change the answer.
+func TestAcquirer_RefusedRequestUnresolvable(t *testing.T) {
+	st, clock := acqStore(t), acqClock()
+	r := acqReq()
+	require.NoError(t, st.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "prod", Name: "web"},
+		ServiceAccount: "web", Containers: []model.ContainerUse{{Name: "app", Digest: r.Digest}}}))
+	src := &fakeSource{name: "registry", err: (&CatalogSource{}).statusError(r, http.StatusBadRequest,
+		CatalogError{Kind: KindBadRequest, Error: "unknown platform"})}
+	a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Concurrency: 1, Now: clock.Now})
+	startAcq(t, a)
+	_, err := a.AcquireNow(ctx, r)
+	require.Error(t, err)
+	require.Equal(t, int32(1), src.calls.Load(), "no other credentials tried")
+	img := getImg(t, st, r.Digest)
+	require.Equal(t, model.ImageUnresolvable, img.Status)
+	require.Equal(t, "cataloguer rejected the request: unknown platform", img.StatusReason)
+	require.Zero(t, img.Attempts)
+	require.True(t, img.QuarantinedUntil.Equal(clock.Now().Add(defaultUnresolvableRetry)), img.QuarantinedUntil)
+}
+
+// TestAcquirer_StopAnswersQueuedWaiters (F53): AcquireNow callers whose job is still queued when the
+// acquirer stops get ErrStopped rather than waiting until their own context ends, and a request after
+// the stop is answered at once.
+func TestAcquirer_StopAnswersQueuedWaiters(t *testing.T) {
+	st, clock := acqStore(t), acqClock()
+	started, release := make(chan struct{}), make(chan struct{})
+	src := &fakeSource{name: "registry"}
+	src.script = func(context.Context, int, Request) (*Result, error) {
+		close(started)
+		<-release
+		return &Result{SyftJSON: syftBytes(t, ""), Source: "registry"}, nil
+	}
+	a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Concurrency: 1, Now: clock.Now})
+	sctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { _ = a.Start(sctx); close(done) }()
+
+	a.Enqueue(Request{Repo: "docker.io/library/x", Digest: "sha256:running", Platform: "linux/amd64"})
+	<-started
+	queued := make(chan error, 1)
+	go func() {
+		_, err := a.AcquireNow(ctx, Request{Repo: "docker.io/library/y", Digest: "sha256:queued", Platform: "linux/amd64"})
+		queued <- err
+	}()
+	require.Eventually(t, func() bool { return a.Stats().Queued == 1 }, 5*time.Second, time.Millisecond)
+
+	cancel()
+	select {
+	case err := <-queued:
+		require.ErrorIs(t, err, ErrStopped)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a queued AcquireNow was not answered when the acquirer stopped")
+	}
+	close(release)
+	<-done
+	require.Zero(t, a.Stats().Queued)
+	_, err := a.AcquireNow(ctx, acqReq())
+	require.ErrorIs(t, err, ErrStopped)
+}

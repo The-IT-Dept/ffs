@@ -9,7 +9,6 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -26,8 +25,7 @@ func ingressRule(host string, b networkingv1.IngressServiceBackend) networkingv1
 
 func contextOf(t *testing.T, cfg config.ExposureConfig, objs []client.Object, w *inventory.Workload) model.WorkloadContext {
 	t.Helper()
-	c := fake.NewClientBuilder().WithScheme(testScheme(t, true)).WithObjects(objs...).Build()
-	got, err := New(c, cfg).Context(context.Background(), w)
+	got, err := New(newClient(t, testScheme(t, true), objs...), cfg).Context(context.Background(), w)
 	require.NoError(t, err)
 	return got
 }

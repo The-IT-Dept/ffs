@@ -90,6 +90,7 @@ type Inventory struct {
 	retry  *retrier    // backs off keys whose flush failed
 	cache  cache.Cache // set by Register
 	access *accessCache
+	misses *missCache // template references whose registry lookup ended unresolvable
 	synced atomic.Bool
 	// podCounts is the live pod count per owner key as of the last Flush; nil before the first.
 	podCounts atomic.Pointer[map[string]int]
@@ -102,6 +103,9 @@ type Inventory struct {
 	catalogRetry map[string]bool                // synthetic digests whose OnImageCatalogued failed
 	unreported   map[string]bool                // owner keys whose OnOwnersChanged failed
 	superseded   map[string]time.Time           // agent-catalogued digests → last Supersede request
+	// forceTags makes resolveRef look recorded tags up again however young the record: set for the
+	// flush of a TagTTL refresh, so no tag is used for longer than TagTTL.
+	forceTags bool
 
 	mu             sync.Mutex
 	known          map[string]bool // stored workload owner keys
@@ -126,7 +130,8 @@ func New(o Options) *Inventory {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
+	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), misses: newMissCache(),
+		podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
 		enqueued: map[string]time.Time{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
 		superseded: map[string]time.Time{}, known: map[string]bool{}, templateBacked: map[string]bool{}}
 	inv.batch = newBatcher(o.Debounce, func(ctx context.Context, keys []string) {
@@ -213,10 +218,11 @@ func (inv *Inventory) nodeHandler() toolscache.ResourceEventHandler {
 func (inv *Inventory) NeedLeaderElection() bool { return true }
 
 // Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
-// then flushes batches. Every TagTTL it re-resolves template-backed owners; every VersionPoll it
-// re-reads the control-plane version; every RetryPoll it flushes the owners of images whose
-// quarantine has ended, which hands those images back to the acquirer or the normaliser, and the
-// owners of images catalogued from a node agent's SBOM, which asks the registry to supersede them.
+// then flushes batches. Every TagTTL it re-resolves the tags of template-backed owners
+// (refreshTemplates); every VersionPoll it re-reads the control-plane version; every RetryPoll it
+// flushes the owners of images whose quarantine has ended, which hands those images back to the
+// acquirer or the normaliser, and the owners of images catalogued from a node agent's SBOM, which
+// asks the registry to supersede them.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -265,15 +271,27 @@ func (inv *Inventory) Start(ctx context.Context) error {
 			}
 			inv.batch.Add(append(keys, agent...)...)
 		case <-tags.C:
-			inv.mu.Lock()
-			keys := sortedKeys(inv.templateBacked)
-			inv.mu.Unlock()
-			inv.batch.Add(keys...)
+			if err := inv.refreshTemplates(ctx); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "refreshing the tags of owners that are not running failed")
+			}
 		case <-versions.C:
 			inv.refreshVersion(ctx)
 			inv.batch.Add(clusterKey)
 		}
 	}
+}
+
+// refreshTemplates flushes the template-backed owners now, looking every recorded tag up again however
+// young its record. A record written just after one refresh is therefore replaced at the next, so a tag
+// is used for at most TagTTL (one refresh period), not up to twice that.
+func (inv *Inventory) refreshTemplates(ctx context.Context) error {
+	inv.mu.Lock()
+	keys := sortedKeys(inv.templateBacked)
+	inv.mu.Unlock()
+	if len(keys) == 0 {
+		return nil
+	}
+	return inv.flush(ctx, keys, true)
 }
 
 // MarkCluster queues "cluster", which rebuilds the synthetic Cluster and ContainerRuntime owners (the
@@ -359,8 +377,15 @@ type flushState struct {
 // Flush returns an error only when the batch as a whole could not be applied or reported; what it
 // could not report is reported by a later Flush.
 func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
+	return inv.flush(ctx, keys, false)
+}
+
+// flush is Flush; forceTags looks recorded tags up again (refreshTemplates).
+func (inv *Inventory) flush(ctx context.Context, keys []string, forceTags bool) error {
 	inv.flushMu.Lock()
 	defer inv.flushMu.Unlock()
+	inv.forceTags = forceTags
+	defer func() { inv.forceTags = false }()
 	f, err := inv.newFlush(ctx)
 	if err != nil {
 		inv.batch.Add(keys...)

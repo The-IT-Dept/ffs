@@ -9,6 +9,7 @@ import (
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -32,6 +33,31 @@ func testScheme(t *testing.T, gateway bool) *runtime.Scheme {
 		}
 	}
 	return s
+}
+
+// newClient is a fake reader over objs with RouteBackendIndex on every route kind s knows, as the
+// manager's cache has after Register.
+func newClient(t *testing.T, s *runtime.Scheme, objs ...client.Object) client.Client {
+	t.Helper()
+	b := fake.NewClientBuilder().WithScheme(s).WithObjects(objs...)
+	for _, versions := range routeKinds {
+		for _, k := range versions {
+			if obj := k.newObj(); s.Recognizes(gvkOf(t, s, obj)) {
+				b = b.WithIndex(obj, RouteBackendIndex, k.index)
+			}
+		}
+	}
+	return b.Build()
+}
+
+// gvkOf is obj's kind in s, or the zero kind when s does not know it.
+func gvkOf(t *testing.T, s *runtime.Scheme, obj client.Object) schema.GroupVersionKind {
+	t.Helper()
+	gvks, _, err := s.ObjectKinds(obj)
+	if err != nil || len(gvks) == 0 {
+		return schema.GroupVersionKind{}
+	}
+	return gvks[0]
 }
 
 func objMeta(ns, name string) metav1.ObjectMeta { return metav1.ObjectMeta{Namespace: ns, Name: name} }
@@ -85,6 +111,29 @@ func common(p gatewayv1.ParentReference) gatewayv1.CommonRouteSpec {
 func httpRoute(p gatewayv1.ParentReference) *gatewayv1.HTTPRoute {
 	return &gatewayv1.HTTPRoute{ObjectMeta: objMeta("netbox", "netbox"), Spec: gatewayv1.HTTPRouteSpec{CommonRouteSpec: common(p),
 		Rules: []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: backend("netbox")}}}}}}
+}
+
+// crossRoute is an HTTPRoute in namespace edge sending traffic to the Service netbox/netbox.
+func crossRoute(p gatewayv1.ParentReference) *gatewayv1.HTTPRoute {
+	r := httpRoute(p)
+	r.Namespace = "edge"
+	ns := gatewayv1.Namespace("netbox")
+	r.Spec.Rules[0].BackendRefs[0].Namespace = &ns
+	return r
+}
+
+// grant is a ReferenceGrant in namespace netbox letting kind routes in namespace from reference the
+// Service named svc ("" = every Service).
+func grant(kind, from, svc string) *gatewayv1.ReferenceGrant {
+	to := gatewayv1.ReferenceGrantTo{Group: "", Kind: "Service"}
+	if svc != "" {
+		n := gatewayv1.ObjectName(svc)
+		to.Name = &n
+	}
+	return &gatewayv1.ReferenceGrant{ObjectMeta: objMeta("netbox", "allow-"+from), Spec: gatewayv1.ReferenceGrantSpec{
+		From: []gatewayv1.ReferenceGrantFrom{{Group: gatewayGroup, Kind: gatewayv1.Kind(kind), Namespace: gatewayv1.Namespace(from)}},
+		To:   []gatewayv1.ReferenceGrantTo{to},
+	}}
 }
 
 func allRoutes(p gatewayv1.ParentReference) []client.Object {
@@ -172,6 +221,23 @@ func TestExposure(t *testing.T) {
 			config.ExposureConfig{InternalGatewayClasses: []string{"cilium"}}, false, nil},
 		{"grpc/tls/tcp/udp routes", append([]client.Object{svc(cip, appNetbox), gw("public", "edge", "cilium")}, allRoutes(pub)...), nil, cfg0, true, routeNames},
 		{"route parentRef to Service (mesh)", []client.Object{svc(cip, appNetbox), meshRoute()}, nil, cfg0, false, nil},
+		{"route from another namespace without a ReferenceGrant", []client.Object{svc(cip, appNetbox), crossRoute(pub)}, nil, cfg0,
+			false, nil},
+		{"route from another namespace with a ReferenceGrant", []client.Object{svc(cip, appNetbox), crossRoute(pub),
+			grant("HTTPRoute", "edge", "")}, nil, cfg0, true, []string{"HTTPRoute edge/netbox on Gateway public/edge"}},
+		{"ReferenceGrant naming the Service", []client.Object{svc(cip, appNetbox), crossRoute(pub),
+			grant("HTTPRoute", "edge", "netbox")}, nil, cfg0, true, []string{"HTTPRoute edge/netbox on Gateway public/edge"}},
+		{"ReferenceGrant for another Service", []client.Object{svc(cip, appNetbox), crossRoute(pub),
+			grant("HTTPRoute", "edge", "other")}, nil, cfg0, false, nil},
+		{"ReferenceGrant for another namespace", []client.Object{svc(cip, appNetbox), crossRoute(pub),
+			grant("HTTPRoute", "elsewhere", "")}, nil, cfg0, false, nil},
+		{"ReferenceGrant for another route kind", []client.Object{svc(cip, appNetbox), crossRoute(pub),
+			grant("GRPCRoute", "edge", "")}, nil, cfg0, false, nil},
+		{"ReferenceGrant in the route's namespace", []client.Object{svc(cip, appNetbox), crossRoute(pub), func() client.Object {
+			g := grant("HTTPRoute", "edge", "")
+			g.Namespace = "edge"
+			return g
+		}()}, nil, cfg0, false, nil},
 		{"hostNetwork", nil, []*corev1.Pod{netboxPod(func(p *corev1.Pod) { p.Spec.HostNetwork = true })}, cfg0, true, []string{"hostNetwork"}},
 		{"hostPort", nil, []*corev1.Pod{netboxPod(func(p *corev1.Pod) {
 			p.Spec.Containers[0].Ports = []corev1.ContainerPort{{ContainerPort: 80, HostPort: 8080, Protocol: corev1.ProtocolTCP}}
@@ -183,7 +249,7 @@ func TestExposure(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			c := fake.NewClientBuilder().WithScheme(testScheme(t, true)).WithObjects(tc.objs...).Build()
+			c := newClient(t, testScheme(t, true), tc.objs...)
 			w := workload(tc.pods...)
 			if len(tc.pods) == 0 {
 				w.Template = &corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{Labels: appNetbox}}
@@ -200,7 +266,7 @@ func TestExposure(t *testing.T) {
 }
 
 func TestExposure_GatewayCRDsAbsent(t *testing.T) {
-	c := fake.NewClientBuilder().WithScheme(testScheme(t, false)).WithObjects(svc(corev1.ServiceTypeLoadBalancer, appNetbox)).Build()
+	c := newClient(t, testScheme(t, false), svc(corev1.ServiceTypeLoadBalancer, appNetbox))
 	w := workload(netboxPod())
 	got, err := New(c, config.ExposureConfig{InternalGatewayClasses: []string{"cilium"}}).Context(context.Background(), w)
 	if err != nil {
@@ -211,7 +277,7 @@ func TestExposure_GatewayCRDsAbsent(t *testing.T) {
 	}
 }
 
-func TestRoutesIn_AlphaFallback(t *testing.T) {
+func TestRoutesTo_AlphaFallback(t *testing.T) {
 	s := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(s); err != nil {
 		t.Fatal(err)
@@ -221,12 +287,12 @@ func TestRoutesIn_AlphaFallback(t *testing.T) {
 	}
 	p := parent("gws", "edge")
 	b := gatewayv1alpha2.BackendRef{BackendObjectReference: gatewayv1alpha2.BackendObjectReference{Name: "netbox"}}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(
+	c := newClient(t, s,
 		&gatewayv1alpha2.TLSRoute{ObjectMeta: objMeta("netbox", "t"), Spec: gatewayv1alpha2.TLSRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.TLSRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
 		&gatewayv1alpha2.TCPRoute{ObjectMeta: objMeta("netbox", "c"), Spec: gatewayv1alpha2.TCPRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.TCPRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
 		&gatewayv1alpha2.UDPRoute{ObjectMeta: objMeta("netbox", "u"), Spec: gatewayv1alpha2.UDPRouteSpec{CommonRouteSpec: common(p), Rules: []gatewayv1alpha2.UDPRouteRule{{BackendRefs: []gatewayv1alpha2.BackendRef{b}}}}},
-	).Build()
-	rs, err := routesIn(context.Background(), c, "netbox")
+	)
+	rs, err := routesTo(context.Background(), c, "netbox", routeKinds)
 	if err != nil {
 		t.Fatal(err)
 	}

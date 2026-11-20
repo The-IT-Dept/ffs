@@ -53,9 +53,11 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 			}},
 		},
 		Status: corev1.PodStatus{
-			Phase: corev1.PodRunning,
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
 			ContainerStatuses: []corev1.ContainerStatus{{
 				Name: "app", Image: "docker.io/library/nginx:1.27", ImageID: "docker.io/library/nginx@" + idx,
+				Ready: true, RestartCount: 3, Started: ptr.To(true),
 				VolumeMounts: []corev1.VolumeMountStatus{{Name: "models", MountPath: "/models", VolumeStatus: volStatus}},
 			}},
 		},
@@ -91,10 +93,11 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 	require.Equal(t, int32(8080), c.Ports[0].HostPort)
 	require.Equal(t, containerSC, c.SecurityContext)
 
-	st := p.Status.ContainerStatuses[0]
-	require.Equal(t, "docker.io/library/nginx@"+idx, st.ImageID)
-	require.Equal(t, volStatus, st.VolumeMounts[0].VolumeStatus)
-	require.Equal(t, corev1.PodRunning, p.Status.Phase)
+	// Only what is read is kept: no phase, conditions, readiness or restarts.
+	require.Equal(t, corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+		Name: "app", Image: "docker.io/library/nginx:1.27", ImageID: "docker.io/library/nginx@" + idx,
+		VolumeMounts: []corev1.VolumeMountStatus{{Name: "models", MountPath: "/models", VolumeStatus: volStatus}},
+	}}}, p.Status)
 
 	t.Run("workload", func(t *testing.T) {
 		d := &appsv1.Deployment{

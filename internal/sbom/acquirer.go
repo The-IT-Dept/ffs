@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"golang.org/x/sync/semaphore"
-	"golang.org/x/sync/singleflight"
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/output/metrics"
@@ -21,6 +20,9 @@ import (
 
 // ErrQuarantined means the digest is quarantined and was not attempted.
 var ErrQuarantined = errors.New("sbom: digest quarantined")
+
+// ErrStopped is AcquireNow's answer when the acquirer stops before the digest is attempted.
+var ErrStopped = errors.New("sbom: acquirer stopped")
 
 const (
 	defaultRetryAfter        = time.Minute
@@ -92,7 +94,8 @@ type job struct {
 	overlapped bool
 }
 
-// Acquirer orders, deduplicates and bounds SBOM acquisition and applies the quarantine policy.
+// Acquirer orders, deduplicates and bounds SBOM acquisition and applies the quarantine policy. A
+// digest has at most one job, queued or running, which every request for it joins.
 //
 // Every acquisition runs under registry.LowPriority, so cataloguing never takes the last of a
 // registry's budget from inventory resolution. Images whose quarantine has ended are handed back by
@@ -102,7 +105,6 @@ type job struct {
 // again at the next start.
 type Acquirer struct {
 	o      AcquirerOptions
-	sf     singleflight.Group
 	decode *semaphore.Weighted // bounds the SBOM bytes decoded at once
 
 	mu        sync.Mutex
@@ -175,10 +177,15 @@ func (a *Acquirer) enqueue(r Request) {
 }
 
 // AcquireNow acquires r's SBOM and waits for the result. It queues behind inventory work and joins an
-// acquisition already queued or running for the same digest.
+// acquisition already queued or running for the same digest. Once the acquirer has stopped, a request
+// that was not attempted is answered ErrStopped.
 func (a *Acquirer) AcquireNow(ctx context.Context, r Request) (*Result, error) {
 	ch := make(chan outcome, 1)
 	a.mu.Lock()
+	if a.stopped {
+		a.mu.Unlock()
+		return nil, ErrStopped
+	}
 	j, ok := a.jobs[r.Digest]
 	if !ok {
 		j = &job{req: r, solo: a.solo[r.Digest]}
@@ -240,14 +247,32 @@ func (a *Acquirer) Start(ctx context.Context) error {
 	}()
 	go func() {
 		<-ctx.Done()
-		a.mu.Lock()
-		a.stopped = true
-		a.cond.Broadcast()
-		a.mu.Unlock()
+		a.stop()
 	}()
 	<-ctx.Done()
 	wg.Wait()
 	return nil
+}
+
+// stop stops the workers and answers the AcquireNow callers of every queued job ErrStopped: no worker
+// will take those jobs. Running jobs answer their callers when they end.
+func (a *Acquirer) stop() {
+	a.mu.Lock()
+	a.stopped = true
+	var waiters []chan outcome
+	for _, q := range []*[]*job{&a.high, &a.low} {
+		for _, j := range *q {
+			waiters = append(waiters, j.waiters...)
+			delete(a.jobs, j.req.Digest)
+		}
+		*q = nil
+	}
+	metrics.CatalogQueueDepth.Set(0)
+	a.cond.Broadcast()
+	a.mu.Unlock()
+	for _, w := range waiters {
+		w <- outcome{err: ErrStopped}
+	}
 }
 
 // next waits for a job that may start and marks it running: inventory work first; a solo job only
@@ -299,12 +324,9 @@ func (a *Acquirer) worker(ctx context.Context) {
 		if j == nil {
 			return
 		}
-		v, _, _ := a.sf.Do(j.req.Digest, func() (any, error) {
-			res, retry, err := a.process(ctx, j)
-			return processed{res, retry, err}, nil
-		})
-		p := v.(processed)
-		retry := p.retry > 0 && ctx.Err() == nil
+		// The job is the digest's only one (jobs holds it until here), so attempts never overlap.
+		res, delay, err := a.process(ctx, j)
+		retry := delay > 0 && ctx.Err() == nil
 		a.mu.Lock()
 		a.inFlight--
 		if retry {
@@ -320,11 +342,11 @@ func (a *Acquirer) worker(ctx context.Context) {
 		a.cond.Broadcast()
 		a.mu.Unlock()
 		for _, w := range waiters {
-			w <- outcome{p.res, p.err}
+			w <- outcome{res, err}
 		}
 		if retry {
 			req := j.req
-			time.AfterFunc(p.retry, func() {
+			time.AfterFunc(delay, func() {
 				a.mu.Lock()
 				defer a.mu.Unlock()
 				a.retrying--
@@ -334,12 +356,6 @@ func (a *Acquirer) worker(ctx context.Context) {
 			})
 		}
 	}
-}
-
-type processed struct {
-	res   *Result
-	retry time.Duration // > 0: enqueue the digest again after this long
-	err   error
 }
 
 // process runs one attempt for j. It returns the result on success, otherwise the error and how
@@ -413,7 +429,7 @@ func (a *Acquirer) process(ctx context.Context, j *job) (*Result, time.Duration,
 // of the other owners of the image, and after a quarantine it tries the fallback.
 func (a *Acquirer) acquire(ctx context.Context, r Request) (*Result, error) {
 	res, err := a.runSources(ctx, r)
-	if err != nil && KindOf(err) == FailUnresolvable {
+	if err != nil && KindOf(err) == FailUnresolvable && !errors.Is(err, errCatalogRefused) {
 		for _, cs := range a.altCreds(ctx, r) {
 			alt := r
 			alt.Creds = cs

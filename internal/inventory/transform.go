@@ -51,7 +51,6 @@ func transformPod(in any) (any, error) {
 		ObjectMeta: trimMeta(p.ObjectMeta),
 		Spec:       trimPodSpec(p.Spec),
 		Status: corev1.PodStatus{
-			Phase:                      p.Status.Phase,
 			ContainerStatuses:          trimStatuses(p.Status.ContainerStatuses),
 			InitContainerStatuses:      trimStatuses(p.Status.InitContainerStatuses),
 			EphemeralContainerStatuses: trimStatuses(p.Status.EphemeralContainerStatuses),
@@ -102,14 +101,16 @@ func trimContainers(cs []corev1.Container) []corev1.Container {
 	return out
 }
 
+// trimStatuses keeps what inventory and the node agent's pod index read of each container status:
+// its name, image and image ID, and the image refs of its image volume mounts. Phase, readiness and
+// restarts are not read: a pod counts as running once a container reports an image ID.
 func trimStatuses(ss []corev1.ContainerStatus) []corev1.ContainerStatus {
 	if ss == nil {
 		return nil
 	}
 	out := make([]corev1.ContainerStatus, len(ss))
 	for i, s := range ss {
-		out[i] = corev1.ContainerStatus{Name: s.Name, Image: s.Image, ImageID: s.ImageID, Ready: s.Ready,
-			RestartCount: s.RestartCount, Started: s.Started}
+		out[i] = corev1.ContainerStatus{Name: s.Name, Image: s.Image, ImageID: s.ImageID}
 		for _, m := range s.VolumeMounts {
 			if m.VolumeStatus != nil {
 				out[i].VolumeMounts = append(out[i].VolumeMounts,
