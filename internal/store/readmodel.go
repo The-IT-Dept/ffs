@@ -123,7 +123,7 @@ func (s *Store) ScopeStats(ctx context.Context, sc model.Scope) (OwnerStats, err
 		args  []any
 	)
 	switch sc.Kind {
-	case model.ScopeCluster:
+	case model.ScopeCluster, "": // the zero Scope is the cluster
 		query = `SELECT ` + ownerStatsSums + ` FROM owner_stats`
 	case model.ScopeNamespace:
 		query, args = `SELECT `+ownerStatsSums+` FROM owner_stats WHERE namespace = ?`, []any{sc.Value}
@@ -157,12 +157,12 @@ const controlPlaneOwners = `owner_kind IN ('Cluster', 'ContainerRuntime') AND na
 // scopeErr is ErrScope wrapped with the scope's kind.
 func scopeErr(sc model.Scope) error { return fmt.Errorf("%w: %s", ErrScope, sc.Kind) }
 
-// findingScopeWhere is the predicate that narrows findings to a scope. A node scope must be resolved
-// to its group first; it and unknown kinds return ErrScope.
+// findingScopeWhere is the predicate that narrows findings to a scope; the zero Scope is the
+// cluster. A node scope must be resolved to its group first; it and unknown kinds return ErrScope.
 func findingScopeWhere(sc model.Scope) (where, error) {
 	var w where
 	switch sc.Kind {
-	case model.ScopeCluster:
+	case model.ScopeCluster, "": // the zero Scope is the cluster
 	case model.ScopeNamespace:
 		w.add(`namespace = ?`, sc.Value)
 	case model.ScopeWorkload:

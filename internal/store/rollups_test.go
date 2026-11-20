@@ -9,10 +9,10 @@ import (
 	"github.com/the-it-dept/ffs/internal/model"
 )
 
-// queryPlan returns the EXPLAIN QUERY PLAN details of query, one per line.
-func queryPlan(t *testing.T, s *Store, query string) string {
+// queryPlan returns the EXPLAIN QUERY PLAN details of query, bound to args, one per line.
+func queryPlan(t *testing.T, s *Store, query string, args ...any) string {
 	t.Helper()
-	rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+query)
+	rows, err := s.rdb.QueryContext(ctx, `EXPLAIN QUERY PLAN `+query, args...)
 	require.NoError(t, err)
 	defer func() { _ = rows.Close() }()
 	var lines []string
