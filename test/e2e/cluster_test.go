@@ -214,11 +214,11 @@ func portForward(t *testing.T) (base string) {
 
 	base = "http://127.0.0.1:" + strconv.Itoa(port)
 	eventually(t, 30*time.Second, func() (bool, string) {
-		code, err := get(t.Context(), base+"/api/v1/cluster", io.Discard)
+		code, err := get(t.Context(), base+"/api/v1/feeds", io.Discard)
 		if err != nil {
 			return false, err.Error()
 		}
-		return code == http.StatusOK, fmt.Sprintf("GET /api/v1/cluster: %d", code)
+		return code == http.StatusOK, fmt.Sprintf("GET /api/v1/feeds: %d", code)
 	})
 	return base
 }
