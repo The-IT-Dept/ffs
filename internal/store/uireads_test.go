@@ -488,13 +488,14 @@ func TestCoverage_UnmatchedImagesAreNotSeenInto(t *testing.T) {
 	require.Equal(t, before, matched)
 }
 
-// An image's own coverage figure counts it in use only when an owner runs it.
+// An image's own coverage figure counts it only when an owner runs it: an unused image is no image in
+// use, so it is neither in use nor seen into (its page shows its own status).
 func TestCoverageOf_ImageInUseOnlyWhenRun(t *testing.T) {
 	s := newStore(t)
 	seedExplorer(t, s)
 	unused, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:unused"})
 	require.NoError(t, err)
-	require.Equal(t, CoverageFigure{SeenInto: 1, Full: 1}, unused, "catalogued, but no owner runs it")
+	require.Equal(t, CoverageFigure{}, unused, "catalogued, but no owner runs it")
 	none, err := s.CoverageOf(ctx, model.Scope{Kind: model.ScopeImage, Value: "sha256:nowhere"})
 	require.NoError(t, err)
 	require.Equal(t, CoverageFigure{}, none)
