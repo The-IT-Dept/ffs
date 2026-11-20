@@ -147,7 +147,7 @@ If your cluster also uses another policy engine, allow the agent namespace to re
 **Upgrading from 0.0.1-rc.8 or earlier.**
 
 - Release candidates rc.5 to rc.8 admitted the web UI port from every source in this NetworkPolicy, then named `ffs-agent-api` and created only with the node agent, and earlier ones created no NetworkPolicy for the ffs pod. It is now `ffs`, and the chart creates it with `nodeAgent.enabled: false` too. If you serve the web UI beyond `kubectl port-forward`, set `web.networkPolicy.from` to your proxy's pods before you upgrade: with `web.service.enabled` the chart refuses to render without it, and with a Service of your own the web UI stops answering other pods.
-- In rc.5 to rc.8, cert-manager wrote the agent API certificate to the Secret `ffs-agent-tls`. After the upgrade it issues `ffs-agent-cert-manager-tls` instead. Delete the old `ffs-agent-tls` Secret before you set `nodeAgent.tls.certManager.enabled: false`, because Helm does not take over a Secret it did not create.
+- In rc.5 to rc.8, cert-manager wrote the agent API certificate to the Secret `ffs-agent-tls`. After the upgrade it issues `ffs-agent-cert-manager-tls` instead, and agents cannot connect until it has (the certificate volume stays empty until then), so expect a short gap in agent reports. Once the new Secret exists, the old `ffs-agent-tls` is unused and can be deleted. Delete the old `ffs-agent-tls` Secret before you set `nodeAgent.tls.certManager.enabled: false`, because Helm does not take over a Secret it did not create.
 
 ## Monitoring
 

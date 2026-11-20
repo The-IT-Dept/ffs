@@ -59,24 +59,27 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
 
 {{- /*
 ffs.bytes renders a byte count from a number or a Kubernetes quantity, whole or with a decimal fraction of
-up to six digits ("18Gi", "15G", "1.5Gi", "0.5Gi"). A fraction of a byte is rounded up, as Kubernetes rounds
-a memory quantity. It is called with (list "<value path>" <value>) and fails the render on anything else.
+up to six digits ("18Gi", "15G", "1.5Gi", "0.5Gi", ".5Gi", "1.Gi", "01Gi"). A fraction of a byte is rounded
+up, as Kubernetes rounds a memory quantity, for a quantity string and for a number in a values file alike. It is called with (list "<value path>" <value>) and fails the render on anything else.
 The digits are read with atoi, which is decimal, because int64 reads a leading 0 as octal ("1.05Gi").
 */ -}}
 {{- define "ffs.bytes" -}}
 {{- $name := index . 0 -}}
 {{- $v := index . 1 -}}
-{{- if or (kindIs "float64" $v) (kindIs "int64" $v) (kindIs "int" $v) -}}
+{{- if kindIs "float64" $v -}}
+{{- $whole := int64 $v -}}
+{{- if gt $v (float64 $whole) }}{{ add1 $whole }}{{ else }}{{ $whole }}{{ end -}}
+{{- else if or (kindIs "int64" $v) (kindIs "int" $v) -}}
 {{- int64 $v -}}
 {{- else -}}
 {{- $s := toString $v | trim -}}
-{{- $re := "^(0|[1-9][0-9]*)(?:\\.([0-9]{1,6}))?(k|M|G|T|Ki|Mi|Gi|Ti)?$" -}}
-{{- if not (regexMatch $re $s) -}}
+{{- $re := "^([0-9]*)(?:\\.([0-9]{0,6}))?(k|M|G|T|P|E|Ki|Mi|Gi|Ti|Pi|Ei)?$" -}}
+{{- if or (not (regexMatch $re $s)) (not (regexMatch "[0-9]" (regexReplaceAll $re $s "${1}${2}"))) -}}
 {{- fail (printf "%s must be a byte count or a quantity such as 18Gi, not %q" $name $s) -}}
 {{- end -}}
-{{- $units := dict "" 1 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 -}}
+{{- $units := dict "" 1 "k" 1000 "M" 1000000 "G" 1000000000 "T" 1000000000000 "P" 1000000000000000 "E" 1000000000000000000 "Ki" 1024 "Mi" 1048576 "Gi" 1073741824 "Ti" 1099511627776 "Pi" 1125899906842624 "Ei" 1152921504606846976 -}}
 {{- $unit := get $units (regexReplaceAll $re $s "${3}") | int64 -}}
-{{- $bytes := mul (regexReplaceAll $re $s "${1}" | atoi) $unit -}}
+{{- $bytes := mul (regexReplaceAll $re $s "${1}" | default "0" | atoi) $unit -}}
 {{- with regexReplaceAll $re $s "${2}" -}}
 {{- $scale := printf "1%s" (repeat (len .) "0") | atoi -}}
 {{- $bytes = add $bytes (div (add (mul (atoi .) $unit) (sub $scale 1)) $scale) -}}
@@ -170,6 +173,9 @@ ffs.httpPort is the port of config.listen, where the web UI and API listen.
 {{- $port := regexFind "[0-9]+$" (regexFind ":[0-9]+$" $listen) -}}
 {{- if not $port -}}
 {{- fail (printf "config.listen must be an address with a port number, such as 0.0.0.0:8080, not %q" $listen) -}}
+{{- end -}}
+{{- if has ($port | int) (list 8081 8443) -}}
+{{- fail (printf "config.listen must not use port %s: the controller serves health on 8081 and metrics on 8443" $port) -}}
 {{- end -}}
 {{- $port -}}
 {{- end -}}

@@ -113,7 +113,11 @@ func TestShipping_DependabotLeavesNodeToHand(t *testing.T) {
 var makeCall = regexp.MustCompile(`(?m)(?:^|[;&|(]\s*|\s)make((?:[ \t]+[^\s;&|()\\]+)+)`)
 
 // makeTarget matches a rule's targets in a Makefile, but not a variable assignment (:=, ::=).
-var makeTarget = regexp.MustCompile(`(?m)^([A-Za-z0-9_./-]+(?:[ \t]+[A-Za-z0-9_./-]+)*)[ \t]*::?(?:[^=]|$)`)
+var makeTarget = regexp.MustCompile(`(?m)^([A-Za-z0-9_./-]+(?:[ \t]+[A-Za-z0-9_./-]+)*)[ \t]*::?(?:[^:=]|$)`)
+
+// makeArgFlags are the make flags that take the next word as their argument (a directory, file, job count or
+// file to treat as old), so that word is not a target.
+var makeArgFlags = map[string]bool{"-C": true, "-f": true, "-j": true, "-o": true, "-I": true, "-W": true}
 
 // TestShipping_WorkflowMakeTargetsExist: every make target a workflow runs is a rule in the Makefile, so a renamed
 // or missing target fails here rather than in CI.
@@ -134,7 +138,16 @@ func TestShipping_WorkflowMakeTargetsExist(t *testing.T) {
 	for _, path := range files {
 		for name, j := range readWorkflow(t, path) {
 			for _, m := range makeCall.FindAllStringSubmatch(runs(j), -1) {
+				skip := false
 				for _, arg := range strings.Fields(m[1]) {
+					if skip {
+						skip = false
+						continue // the argument of the flag before
+					}
+					if makeArgFlags[arg] {
+						skip = true
+						continue
+					}
 					if strings.HasPrefix(arg, "-") || strings.Contains(arg, "=") {
 						continue // a flag or a variable
 					}

@@ -653,3 +653,12 @@ func (f *Fixture) seedNodeAgent(ctx context.Context) error {
 	return f.Store.ReplaceNodeImages(ctx, "worker-1", []model.NodeImage{{Digest: DigestWeb, Names: []string{repoNginx + ":1.30.6"},
 		Kind: "manifest", Complete: true, InUse: true, Source: "both"}})
 }
+
+// seedConfig sets what Small and Scale serve alike: the default configuration for cluster "test", and
+// the eol, kev and osv feeds with their default stale-after times.
+func (f *Fixture) seedConfig() {
+	f.Config = config.Default()
+	f.Config.ClusterName = ClusterName
+	f.Feeds = []apiserver.FeedInfo{{Name: "eol", StaleAfter: 72 * time.Hour}, {Name: "kev", StaleAfter: 24 * time.Hour},
+		{Name: "osv", StaleAfter: 2 * time.Hour}}
+}

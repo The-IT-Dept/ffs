@@ -711,6 +711,12 @@ data:
 		{"128974848", "128974848"},
 		{128974848, "128974848"},
 		{"1.000001Ti", "1099512727288"},
+		{".5Gi", "536870912"},
+		{"1.Gi", "1073741824"},
+		{"01Gi", "1073741824"},
+		{"1Pi", "1125899906842624"},
+		{"1E", "1000000000000000000"},
+		{1.5, "2"}, // a number in a values file rounds up like the string "1.5"
 	}
 	values := make([]any, len(cases))
 	for i, c := range cases {
@@ -726,7 +732,7 @@ data:
 		}
 	}
 
-	for _, bad := range []string{"1.5GB", ".5Gi", "1.Gi", "1.1234567Gi", "01Gi", "1.5.0Gi", "1e9", "-1Gi"} {
+	for _, bad := range []string{"1.5GB", ".Gi", "Gi", ".", "1.1234567Gi", "1.5.0Gi", "1e9", "-1Gi"} {
 		_, err := renderErr(t, "controller.resources.limits.memory="+bad)
 		require.ErrorContains(t, err, fmt.Sprintf("controller.resources.limits.memory must be a byte count or a quantity such as 18Gi, not %q", bad), bad)
 	}

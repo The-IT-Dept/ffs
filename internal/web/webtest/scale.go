@@ -12,11 +12,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/the-it-dept/ffs/internal/config"
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/store"
-	"github.com/the-it-dept/ffs/internal/web/apiserver"
 )
 
 // ScaleSize is the shape of a Scale fixture. OpenFindings counts every open finding, the
@@ -121,15 +119,6 @@ type scaler struct {
 	advisories []model.Advisory // by index
 	findings   []model.Finding
 	ts         map[int]model.Transition // creation transitions, by index in findings
-}
-
-// seedConfig sets what Small and Scale serve alike: the default configuration for cluster "test", and
-// the eol, kev and osv feeds with their default stale-after times.
-func (f *Fixture) seedConfig() {
-	f.Config = config.Default()
-	f.Config.ClusterName = ClusterName
-	f.Feeds = []apiserver.FeedInfo{{Name: "eol", StaleAfter: 72 * time.Hour}, {Name: "kev", StaleAfter: 24 * time.Hour},
-		{Name: "osv", StaleAfter: 2 * time.Hour}}
 }
 
 func (s *scaler) seed(ctx context.Context) error {
