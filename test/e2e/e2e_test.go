@@ -256,7 +256,7 @@ func (s *suite) catalogued(t *testing.T) {
 	base := portForward(t)
 	eventually(t, 5*time.Minute, func() (bool, string) {
 		var app, self string
-		for _, o := range apiObjects(t, base, "/api/v1/images") {
+		for _, o := range apiObjects(t, base, "/api/v1/images?limit=200") {
 			switch o["repo"] {
 			case s.appRepo:
 				if o["status"] == "catalogued" && o["platform"] == platform {

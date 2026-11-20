@@ -73,6 +73,21 @@ func enumParam[T interface {
 	return slices.Compact(out), nil
 }
 
+// enumValue validates a single enum parameter: "" when absent or empty; an unknown value is 400
+// invalid_parameter naming the parameter and the value.
+func enumValue[T interface {
+	~string
+	Valid() bool
+}](name string, p *T) (T, error) {
+	if p == nil || *p == "" {
+		return "", nil
+	}
+	if !(*p).Valid() {
+		return "", badParam(name, fmt.Sprintf("%q is not a valid value", string(*p)))
+	}
+	return *p, nil
+}
+
 // stringsParam is an array parameter of free values: nil when absent, empty values dropped,
 // de-duplicated and sorted.
 func stringsParam(p *[]string) []string {

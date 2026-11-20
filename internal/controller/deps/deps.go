@@ -17,6 +17,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/engine"
 	"github.com/the-it-dept/ffs/internal/eol"
 	"github.com/the-it-dept/ffs/internal/feeds"
+	"github.com/the-it-dept/ffs/internal/inventory"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
 	"github.com/the-it-dept/ffs/internal/store"
@@ -61,6 +62,7 @@ type Deps struct {
 	Acquirer  *sbom.Acquirer
 	Feeds     *feeds.Runner
 	EOL       *eol.Evaluator
+	Inventory *inventory.Inventory // the leader's inventory: the web UI reads pod counts; the node-agent reconciler marks the cluster
 	Recorder  events.EventRecorder
 	Hooks     *Hooks
 	Log       logr.Logger

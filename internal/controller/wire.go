@@ -126,7 +126,7 @@ func wire(ctx context.Context, m manager.Manager, rc *rest.Config, d deps.Deps) 
 		}
 	}
 
-	d.Registry, d.Engine, d.Acquirer, d.Feeds, d.EOL = reg, eng, acq, runner, ev
+	d.Registry, d.Engine, d.Acquirer, d.Feeds, d.EOL, d.Inventory = reg, eng, acq, runner, ev, inv
 	d.Ready = newReady(readyOptions{Synced: inv.Synced, Stats: acq.Stats, Idle: eng.Idle,
 		GrypeOK: grypeReady(cfg.Feeds.GrypeDB.Enabled, st, log), Wait: readyWait,
 		Stall: max(readyStall, cfg.Catalog.Timeout+acquireSlack), Log: log.WithName("ready")})

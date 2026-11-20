@@ -29,36 +29,6 @@ func (s *Server) GetExposure(context.Context, apigen.GetExposureRequestObject) (
 	return nil, notImplemented()
 }
 
-// ListWorkloads is not implemented yet.
-func (s *Server) ListWorkloads(context.Context, apigen.ListWorkloadsRequestObject) (apigen.ListWorkloadsResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// GetWorkload is not implemented yet.
-func (s *Server) GetWorkload(context.Context, apigen.GetWorkloadRequestObject) (apigen.GetWorkloadResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// ListImages is not implemented yet.
-func (s *Server) ListImages(context.Context, apigen.ListImagesRequestObject) (apigen.ListImagesResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// GetImage is not implemented yet.
-func (s *Server) GetImage(context.Context, apigen.GetImageRequestObject) (apigen.GetImageResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// ListImagePackages is not implemented yet.
-func (s *Server) ListImagePackages(context.Context, apigen.ListImagePackagesRequestObject) (apigen.ListImagePackagesResponseObject, error) {
-	return nil, notImplemented()
-}
-
-// ListPackages is not implemented yet.
-func (s *Server) ListPackages(context.Context, apigen.ListPackagesRequestObject) (apigen.ListPackagesResponseObject, error) {
-	return nil, notImplemented()
-}
-
 // ListNodeGroups is not implemented yet.
 func (s *Server) ListNodeGroups(context.Context, apigen.ListNodeGroupsRequestObject) (apigen.ListNodeGroupsResponseObject, error) {
 	return nil, notImplemented()

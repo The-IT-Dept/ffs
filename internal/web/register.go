@@ -17,7 +17,7 @@ import (
 func Register(m manager.Manager, d deps.Deps) error {
 	srv := apiserver.New(apiserver.Options{
 		Store: d.Store, Config: d.Config, Feeds: feedInfos(d.Feeds.StaleAfter()), EOL: d.EOL,
-		Kube: m.GetClient(), Now: time.Now, Log: d.Log.WithName("api"),
+		Kube: m.GetClient(), Pods: d.Inventory, Now: time.Now, Log: d.Log.WithName("api"),
 	})
 	if err := m.Add(NewServer(d.Config, Handlers{API: srv.Handler(), UI: ui.Handler(ui.Dist())}, nil)); err != nil {
 		return fmt.Errorf("add web server: %w", err)

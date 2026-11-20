@@ -91,6 +91,8 @@ type Inventory struct {
 	cache  cache.Cache // set by Register
 	access *accessCache
 	synced atomic.Bool
+	// podCounts is the live pod count per owner key as of the last Flush; nil before the first.
+	podCounts atomic.Pointer[map[string]int]
 
 	// Only Flush, which holds flushMu, touches these.
 	flushMu      sync.Mutex
@@ -415,6 +417,7 @@ func (inv *Inventory) Flush(ctx context.Context, keys []string) error {
 		}
 	}
 	inv.batch.Add(sortedKeys(pending)...)
+	inv.snapshotPodCounts()
 	return inv.report(ctx, f)
 }
 

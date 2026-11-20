@@ -2,7 +2,6 @@ package apiserver
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"strings"
 	"time"
@@ -56,17 +55,14 @@ func (s *Server) findingQuery(ctx context.Context, p apigen.ListFindingsParams) 
 	if err != nil {
 		return store.FindingQuery{}, err
 	}
-	sort := store.SortPriority
-	if p.Sort != nil && *p.Sort != "" {
-		if !p.Sort.Valid() {
-			return store.FindingQuery{}, badParam("sort", fmt.Sprintf("%q is not a valid value", string(*p.Sort)))
-		}
-		sort = store.FindingSort(*p.Sort)
+	sort, err := enumValue("sort", p.Sort)
+	if err != nil {
+		return store.FindingQuery{}, err
 	}
 	q := store.FindingQuery{
 		Scope: sc, States: []model.FindingState{model.StateOpen}, ResolvedSince: s.o.Now().Add(-resolvedWindow),
 		Ecosystems: stringsParam(p.Ecosystem), Namespaces: stringsParam(p.Namespace), Kinds: stringsParam(p.Kind),
-		Sort: sort, Limit: limit,
+		Sort: store.FindingSort(sort), Limit: limit,
 	}
 	if len(states) > 0 {
 		q.States = make([]model.FindingState, len(states))
@@ -110,13 +106,11 @@ func (s *Server) ListFindings(ctx context.Context, req apigen.ListFindingsReques
 	if err != nil {
 		return nil, err
 	}
-	var group store.FindingGroup
-	if p.Group != nil && *p.Group != "" {
-		if !p.Group.Valid() {
-			return nil, badParam("group", fmt.Sprintf("%q is not a valid value", string(*p.Group)))
-		}
-		group = store.FindingGroup(*p.Group)
+	groupName, err := enumValue("group", p.Group)
+	if err != nil {
+		return nil, err
 	}
+	group := store.FindingGroup(groupName)
 	names, err := enumParam("facets", p.Facets)
 	if err != nil {
 		return nil, err
