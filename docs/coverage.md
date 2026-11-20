@@ -27,7 +27,7 @@ The Coverage page and the API (`/api/v1/coverage`) report each gap with a code a
 | `no_package_database` | no package database (image-based OS) | `informational` | Image-based operating systems have no package database. On any other OS, set `nodeAgent.packageDatabases`. |
 | `content_store_unreadable` | no containerd content store | `informational` | Side-loaded images on this node cannot be catalogued from it. |
 | `host_not_inventoried` | agent reporting, host not inventoried | `check_node_agent` | Check the node agent's logs on these nodes; the last error is shown. |
-| `node_agent_unsupported` | not scheduled by the node agent | `informational` | Its architecture or node selector excludes this node from the node agent. To cover it, add it to `nodeAgent.architectures` or `nodeAgent.nodeSelector`. |
+| `node_agent_unsupported` | not scheduled by the node agent | `informational` | Its architecture, the node selector or a taint the agent does not tolerate excludes this node from the node agent. To cover it, add it to `nodeAgent.architectures`, `nodeAgent.nodeSelector` or `nodeAgent.tolerations`. |
 | `feed_stale` | feed out of date | `check_feed_access` | Check that ffs can reach the feed; the last error is shown. |
 
 ## Blind spots
@@ -69,7 +69,7 @@ Kernel packages that are installed but not running, components bundled into k3s 
 - `node agent cannot read <path>: permission denied`, for example under SELinux;
 - `no containerd content store on this node; side-loaded images cannot be catalogued from it`;
 - `host_not_inventoried`: the agent reports but the node's host inventory is not stored or not current, with the reason;
-- `not scheduled by the node agent: <reason>` (`node_agent_unsupported`) on nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector`.
+- `not scheduled by the node agent: <reason>` (`node_agent_unsupported`) on nodes outside `nodeAgent.architectures` or `nodeAgent.nodeSelector`, or with a `NoSchedule` or `NoExecute` taint that `nodeAgent.tolerations` does not tolerate.
 
 A node group is seen into in full only while none of its members has a host coverage gap.
 

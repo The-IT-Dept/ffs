@@ -663,13 +663,26 @@ func TestChart_NodeAgentConfig(t *testing.T) {
 		Namespace: "node-agents", ServiceAccount: "ffs-agent", MaxReportBytes: 64 << 20, ReportInterval: 6 * time.Hour,
 		ImageListInterval: 5 * time.Minute, StaleAfter: time.Hour, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3,
 		WorkTimeout: 20 * time.Minute, ExposedNodes: "node-role.example.com/edge", Architectures: []string{"amd64"},
-		NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}, c.NodeAgent)
+		NodeSelector: map[string]string{"kubernetes.io/os": "linux"}, Tolerations: []config.Toleration{{Operator: "Exists"}}},
+		c.NodeAgent)
 
 	o = render(t, "nodeAgent.architectures={amd64,arm64}", "nodeAgent.nodeSelector.pool=general")
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
 	require.NoError(t, err)
 	require.Equal(t, []string{"amd64", "arm64"}, c.NodeAgent.Architectures)
 	require.Equal(t, map[string]string{"kubernetes.io/os": "linux", "pool": "general"}, c.NodeAgent.NodeSelector)
+
+	// The agent's tolerations reach the controller, which shows nodes they exclude as not scheduled (#11).
+	o = render(t, "nodeAgent.tolerations[0].key=dedicated", "nodeAgent.tolerations[0].operator=Equal",
+		"nodeAgent.tolerations[0].value=gpu", "nodeAgent.tolerations[0].effect=NoSchedule")
+	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
+	require.NoError(t, err)
+	require.Equal(t, []config.Toleration{{Key: "dedicated", Operator: "Equal", Value: "gpu", Effect: "NoSchedule"}},
+		c.NodeAgent.Tolerations)
+	o = render(t, "nodeAgent.tolerations=null")
+	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))
+	require.NoError(t, err)
+	require.Empty(t, c.NodeAgent.Tolerations)
 
 	o = render(t, "config.nodeAgent.listen=:1") // the top-level nodeAgent values win
 	c, err = config.Load(writeTemp(t, renderedConfig(t, o)))

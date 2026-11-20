@@ -12,7 +12,8 @@ func TestNodeAgent_DefaultsAndLoad(t *testing.T) {
 	require.Equal(t, NodeAgentConfig{Enabled: true, Listen: ":8444", CertDir: "/etc/ffs/agent-tls", Namespace: "ffs-agent",
 		ServiceAccount: "ffs-agent", MaxReportBytes: 32 << 20, ReportInterval: 6 * time.Hour, ImageListInterval: 5 * time.Minute,
 		StaleAfter: 30 * time.Minute, RuntimeGrace: 2 * time.Hour, WorkPerReport: 3, WorkTimeout: 20 * time.Minute,
-		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"}}, Default().NodeAgent)
+		Architectures: []string{"amd64"}, NodeSelector: map[string]string{"kubernetes.io/os": "linux"},
+		Tolerations: []Toleration{{Operator: "Exists"}}}, Default().NodeAgent)
 	c, err := Load(writeFile(t, "nodeAgent:\n  staleAfter: 1h\n  exposedNodes: node-role.example.com/edge\n"))
 	require.NoError(t, err)
 	require.Equal(t, time.Hour, c.NodeAgent.StaleAfter)
@@ -130,4 +131,27 @@ func TestNodeAgent_ScheduledOn(t *testing.T) {
 	ok, why = n.ScheduledOn(map[string]string{"kubernetes.io/os": "windows", "kubernetes.io/arch": "amd64"}, "amd64")
 	require.False(t, ok)
 	require.Equal(t, "node labels do not match nodeAgent.nodeSelector", why)
+}
+
+// TestNodeAgent_Tolerations (#11): the default is the chart's, tolerate everything; a value in the file
+// replaces it, an explicitly empty or null one means none, and every field of a toleration is read.
+func TestNodeAgent_Tolerations(t *testing.T) {
+	require.Equal(t, []Toleration{{Operator: "Exists"}}, Default().NodeAgent.Tolerations)
+	secs := int64(300)
+	for name, tc := range map[string]struct {
+		yaml string
+		want []Toleration
+	}{
+		"absent keeps the default": {"nodeAgent:\n  staleAfter: 1h\n", []Toleration{{Operator: "Exists"}}},
+		"empty":                    {"nodeAgent:\n  tolerations: []\n", []Toleration{}},
+		"null":                     {"nodeAgent:\n  tolerations:\n", nil},
+		"set replaces": {"nodeAgent:\n  tolerations:\n    - key: dedicated\n      operator: Equal\n      value: gpu\n" +
+			"      effect: NoExecute\n      tolerationSeconds: 300\n",
+			[]Toleration{{Key: "dedicated", Operator: "Equal", Value: "gpu", Effect: "NoExecute", TolerationSeconds: &secs}}},
+	} {
+		c, err := Load(writeFile(t, tc.yaml))
+		require.NoError(t, err, name)
+		require.Equal(t, tc.want, c.NodeAgent.Tolerations, name)
+	}
+	require.Equal(t, []Toleration{{Operator: "Exists"}}, Default().NodeAgent.Tolerations, "loading never changes the default")
 }

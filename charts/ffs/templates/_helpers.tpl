@@ -49,7 +49,7 @@ helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | 
   "maxReportBytes" $maxReport
   "reportInterval" $na.reportInterval "imageListInterval" $na.imageListInterval "staleAfter" $na.staleAfter
   "runtimeGrace" $na.runtimeGrace "workPerReport" (int $na.workPerReport) "workTimeout" $na.workTimeout
-  "exposedNodes" $na.exposedNodes "architectures" $na.architectures "nodeSelector" $na.nodeSelector) -}}
+  "exposedNodes" $na.exposedNodes "architectures" $na.architectures "nodeSelector" $na.nodeSelector "tolerations" $na.tolerations) -}}
 {{- toYaml $c -}}
 {{- end -}}
 

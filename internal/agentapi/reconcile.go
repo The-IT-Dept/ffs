@@ -508,11 +508,29 @@ func (r *Reconciler) fresh(p *pass, nodes []corev1.Node, agents map[string]store
 }
 
 // unsupportedNodes returns the nodes the agent DaemonSet does not schedule on, as far as the configuration
-// tells (NodeAgentConfig.ScheduledOn), each with why; nil when there are none.
+// tells, each with why; nil when there are none: nodes outside its architectures or node selector
+// (NodeAgentConfig.ScheduledOn), and nodes with a NoSchedule or NoExecute taint that neither its tolerations
+// nor those the DaemonSet controller adds to every daemon pod tolerate.
 func unsupportedNodes(na config.NodeAgentConfig, nodes []corev1.Node) map[string]string {
+	tolerations := slices.Clone(daemonPodTolerations)
+	for _, t := range na.Tolerations {
+		tolerations = append(tolerations, corev1.Toleration{Key: t.Key, Operator: corev1.TolerationOperator(t.Operator),
+			Value: t.Value, Effect: corev1.TaintEffect(t.Effect), TolerationSeconds: t.TolerationSeconds})
+	}
+	// A PreferNoSchedule taint never keeps a daemon pod off a node.
+	tolerated := func(taint *corev1.Taint) bool {
+		return taint.Effect == corev1.TaintEffectPreferNoSchedule || slices.ContainsFunc(tolerations,
+			func(t corev1.Toleration) bool { return t.ToleratesTaint(logr.Discard(), taint, true) })
+	}
 	var out map[string]string
 	for i := range nodes {
-		if ok, why := na.ScheduledOn(nodes[i].Labels, nodes[i].Status.NodeInfo.Architecture); !ok {
+		ok, why := na.ScheduledOn(nodes[i].Labels, nodes[i].Status.NodeInfo.Architecture)
+		for j := range nodes[i].Spec.Taints {
+			if taint := &nodes[i].Spec.Taints[j]; ok && !tolerated(taint) {
+				ok, why = false, "taint "+taint.ToString()+" is not tolerated by nodeAgent.tolerations"
+			}
+		}
+		if !ok {
 			if out == nil {
 				out = map[string]string{}
 			}
@@ -520,6 +538,18 @@ func unsupportedNodes(na config.NodeAgentConfig, nodes []corev1.Node) map[string
 		}
 	}
 	return out
+}
+
+// daemonPodTolerations are the tolerations the DaemonSet controller adds to every daemon pod of a
+// DaemonSet without host networking, whatever its spec says: the agent runs on not-ready, unreachable,
+// cordoned and pressured nodes.
+var daemonPodTolerations = []corev1.Toleration{
+	{Key: corev1.TaintNodeNotReady, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
+	{Key: corev1.TaintNodeUnreachable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
+	{Key: corev1.TaintNodeDiskPressure, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+	{Key: corev1.TaintNodeMemoryPressure, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+	{Key: corev1.TaintNodePIDPressure, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
+	{Key: corev1.TaintNodeUnschedulable, Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoSchedule},
 }
 
 // fullReportOverdue is how old a reporting node's last full report may be before its host inventory counts

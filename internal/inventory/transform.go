@@ -208,8 +208,9 @@ func transformWorkload(in any) (any, error) {
 	return in, nil
 }
 
-// transformNode keeps name, labels, status.nodeInfo, the Ready condition's status and
-// status.images (names and sizes), which the node agent's report merges with the cached images.
+// transformNode keeps name, labels, spec.taints (of the spec, only those: the node agent's tolerations
+// decide where it runs), status.nodeInfo, the Ready condition's status and status.images (names and
+// sizes), which the node agent's report merges with the cached images.
 func transformNode(in any) (any, error) {
 	n, ok := in.(*corev1.Node)
 	if !ok {
@@ -219,6 +220,7 @@ func transformNode(in any) (any, error) {
 		TypeMeta: n.TypeMeta,
 		ObjectMeta: metav1.ObjectMeta{Name: n.Name, UID: n.UID, ResourceVersion: n.ResourceVersion,
 			Labels: n.Labels},
+		Spec:   corev1.NodeSpec{Taints: n.Spec.Taints},
 		Status: corev1.NodeStatus{NodeInfo: n.Status.NodeInfo},
 	}
 	if n.Status.Images != nil {
