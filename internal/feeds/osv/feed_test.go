@@ -797,6 +797,63 @@ func TestOSVSync_BacklogResumesAfterFailedChunk(t *testing.T) {
 	require.Equal(t, reads, []int{e.srv.recordGETs("PyPI"), e.srv.count("PyPI/all.zip")})
 }
 
+// bigPyPI is a PyPI record padded with details to about size bytes, the way Ubuntu kernel records
+// run to hundreds of KB.
+func bigPyPI(id string, modified time.Time, size int) []byte {
+	return fmt.Appendf(nil, `{"id":%q,"modified":%q,"details":%q,"affected":[{"package":{"ecosystem":"PyPI","name":"r"},`+
+		`"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"2.0"}]}]}]}`,
+		id, modified.UTC().Format(time.RFC3339Nano), strings.Repeat("x", size))
+}
+
+// requireBoundedCalls checks that every handler call holds at most 16 MiB of records, or a single
+// record: the record matchers parse all of a call at once.
+func requireBoundedCalls(t *testing.T, calls [][]osv.Changed) {
+	t.Helper()
+	for _, c := range calls {
+		size := 0
+		for _, r := range c {
+			size += len(r.Raw)
+		}
+		require.True(t, len(c) == 1 || size <= 16<<20, "a handler call of %d records holds %d bytes", len(c), size)
+	}
+}
+
+// TestOSVSync_LargeRecordsDeliveredInBoundedChunks guards the memory of a hand-off of large records:
+// handler calls are cut by size as well as by count, both for a poll and for a redelivery whose
+// bucket has no measured record size yet.
+func TestOSVSync_LargeRecordsDeliveredInBoundedChunks(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-time.Minute)
+	const n = 40
+	records := map[string][]byte{}
+	var rows []row
+	for i := range n {
+		id := fmt.Sprintf("PYSEC-2026-%03d", i)
+		records[id] = bigPyPI(id, t1, 1<<20)
+		rows = append(rows, row{t1, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n)
+	require.Greater(t, len(e.sink.calls), 1)
+	requireBoundedCalls(t, e.sink.calls)
+
+	// a redelivery of the same records with no measured size: cut by the records' real size
+	pending := e.sink.keys()
+	e.sink.calls = nil
+	st, err := e.st.FeedState(ctx, feeds.NameOSV)
+	require.NoError(t, err)
+	delete(st.Meta, "size.PyPI")
+	feeds.SetPending(&st, pending)
+	require.NoError(t, e.st.PutFeedState(ctx, st))
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Len(t, e.sink.all(), n)
+	requireBoundedCalls(t, e.sink.calls)
+}
+
 func TestOSVSetDiff_VanishedMarkedWithdrawn(t *testing.T) {
 	e := newEnv(t)
 	npm := store.EcosystemKey{Ecosystem: "npm"}

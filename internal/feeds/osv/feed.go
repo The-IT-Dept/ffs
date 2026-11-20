@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"iter"
 	"maps"
 	"net/http"
 	"os"
@@ -58,6 +59,11 @@ const (
 	metaSetDiff     = "setdiff"
 )
 
+// handlerBytes bounds the uncompressed records of one handler call and of one read of cached records
+// for it: the record matchers parse every record of a call, and an Ubuntu record averages over
+// 400 KB, so 500 of them took gigabytes.
+const handlerBytes = 16 << 20
+
 // zipBehindWait is how long polls of a bucket wait for its all.zip to catch up with its
 // modified_id.csv. The OSV exporter uploads all.zip seconds after the listing; a zip still behind
 // after this (a mirror that refreshes it less often) is read anyway, and what it lacks is read one
@@ -79,8 +85,8 @@ type Changed struct {
 	Raw           []byte
 }
 
-// Handler consumes changed records, at most 500 per call. Until it returns nil the records stay
-// pending and the next Sync offers them again.
+// Handler consumes changed records, at most 500 and about 16 MiB of them per call. Until it returns
+// nil the records stay pending and the next Sync offers them again.
 type Handler func(ctx context.Context, recs []Changed) error
 
 // Options configures a Feed.
@@ -857,14 +863,14 @@ func (f *Feed) handOff(ctx context.Context, st *store.FeedState, keys []recKey) 
 }
 
 // deliverKeys hands the cached records of keys, which st holds as pending, to the handler in chunks
-// of 500, skipping records no longer cached. Once the handler has taken a chunk, pending is cut to
+// (see keyChunks), skipping records no longer cached. Once the handler has taken a chunk, pending is cut to
 // the keys after it and saved, so a failure part-way loses none of the progress before it. With
 // refreshNames it first rewrites each record's index names. A GIT record that references no
 // GitRepos repository is a drop (see put): once the handler has taken it, it is deleted from the
 // cache. Deciding this from the cached raw lets a redelivery finish a drop.
 func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recKey, refreshNames bool) error {
 	done := 0
-	for chunk := range slices.Chunk(keys, handlerChunk) {
+	for chunk := range keyChunks(*st, keys) {
 		ids := make([]string, len(chunk))
 		for i, k := range chunk {
 			ids[i] = k.id
@@ -920,14 +926,48 @@ func (f *Feed) deliverKeys(ctx context.Context, st *store.FeedState, keys []recK
 	return nil
 }
 
-// deliver calls the handler with recs in chunks of 500.
+// deliver calls the handler with recs in chunks of at most 500 records and handlerBytes, except
+// that a single larger record is a chunk of its own.
 func (f *Feed) deliver(ctx context.Context, recs []Changed) error {
-	for chunk := range slices.Chunk(recs, handlerChunk) {
-		if err := f.o.Handler(ctx, chunk); err != nil {
+	for len(recs) > 0 {
+		n, size := 0, 0
+		for n < len(recs) && n < handlerChunk && (n == 0 || size+len(recs[n].Raw) <= handlerBytes) {
+			size += len(recs[n].Raw)
+			n++
+		}
+		if err := f.o.Handler(ctx, recs[:n]); err != nil {
 			return fmt.Errorf("osv: handler: %w", err)
 		}
+		recs = recs[n:]
 	}
 	return nil
+}
+
+// keyChunks splits keys into consecutive chunks of at most 500 keys whose records are estimated, at
+// their bucket's measured average size (see recordBytesOf), to total at most handlerBytes; a chunk
+// always holds at least one key.
+func keyChunks(st store.FeedState, keys []recKey) iter.Seq[[]recKey] {
+	return func(yield func([]recKey) bool) {
+		avg := map[string]int64{}
+		for len(keys) > 0 {
+			n, size := 0, int64(0)
+			for n < len(keys) && n < handlerChunk {
+				b := keys[n].bucket
+				if _, ok := avg[b]; !ok {
+					avg[b] = recordBytesOf(st, b)
+				}
+				if n > 0 && size+avg[b] > handlerBytes {
+					break
+				}
+				size += avg[b]
+				n++
+			}
+			if !yield(keys[:n:n]) {
+				return
+			}
+			keys = keys[n:]
+		}
+	}
 }
 
 // setDiff runs weekly. It reads each polled bucket's whole modified_id.csv and withdraws the cached
