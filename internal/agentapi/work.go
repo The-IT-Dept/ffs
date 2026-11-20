@@ -74,6 +74,12 @@ type WorkOptions struct {
 // unanswered offer made while an earlier unanswered offer to the same process was still before its deadline
 // was never attempted, and is not counted. Of the requests a process held when it died, only the one it died
 // on counts. A restarted agent (a new Instance) starts a new queue.
+//
+// Agents older than 0.0.1-rc.7 send no Instance, so all of a node's processes share one queue: until a rollout
+// has replaced them, their requests are accounted per node rather than per process. After such an agent
+// restarts, a request made to it while an unanswered request of its previous process was still before its
+// deadline is taken as queued behind that one, and is not counted if the agent dies on it; inFlight, too,
+// takes the processes for one.
 type WorkQueue struct {
 	o WorkOptions
 
@@ -121,6 +127,8 @@ func NewWorkQueue(o WorkOptions) *WorkQueue {
 
 func declineKey(node, digest string) string { return node + "\x00" + digest }
 
+// agentKey identifies an agent process: its node and Instance. An agent older than 0.0.1-rc.7 sends no
+// Instance, so its key is its node's, and its processes share one queue (see WorkQueue).
 func agentKey(node, instance string) string { return node + "\x00" + instance }
 
 // Offer picks images for node's agent to catalogue, oldest first, up to PerReport less the node's offers

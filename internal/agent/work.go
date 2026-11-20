@@ -75,11 +75,13 @@ func (a *agent) runJob(ctx context.Context, w wire.WorkRequest, received time.Ti
 	defer cancel()
 
 	res := wire.SBOMResult{ID: w.ID, Node: a.o.NodeName, AgentVersion: version.Version, Digest: w.Digest}
-	doc := a.job(ctx, jctx, w, &res)
+	doc := a.job(jctx, w, &res)
 	if doc != nil {
 		defer func() { _ = os.Remove(doc.path) }()
 	}
-	if ctx.Err() != nil { // the agent is stopping: whatever the job got to, the image is offered again
+	// The stopping rule lives here alone: whatever the job got to, a stopping agent answers skipped, and the
+	// image is offered again.
+	if ctx.Err() != nil {
 		a.skip(ctx, w)
 		return
 	}
@@ -129,22 +131,23 @@ func (a *agent) post(ctx context.Context, w wire.WorkRequest, res wire.SBOMResul
 	}
 }
 
-// job fills res for w. doc is the spooled SBOM, when the cataloguer made one.
-func (a *agent) job(ctx, jctx context.Context, w wire.WorkRequest, res *wire.SBOMResult) (doc *sbomFile) {
+// job fills res for w, within jctx. doc is the spooled SBOM, when the cataloguer made one. When the agent
+// stops during the job, runJob answers skipped, whatever res says.
+func (a *agent) job(jctx context.Context, w wire.WorkRequest, res *wire.SBOMResult) (doc *sbomFile) {
 	if a.store == nil {
 		res.Unavailable = wire.UnavailableNotFound
 		return nil
 	}
 	t, err := a.store.Resolve(jctx, w.Digest, w.Platform)
 	if err != nil {
-		a.stagingFailed(ctx, w, err, res)
+		a.stagingFailed(w, err, res)
 		return nil
 	}
 	dir := a.workDir(w.ID)
 	defer func() { _ = os.RemoveAll(dir) }()
 	maxImage := a.maxImageBytes()
 	if err := a.store.Stage(jctx, t, dir, maxImage); err != nil {
-		a.stagingFailed(ctx, w, err, res)
+		a.stagingFailed(w, err, res)
 		return nil
 	}
 	timeout := int(w.Deadline.Sub(a.o.Now()) / time.Second)
@@ -154,8 +157,6 @@ func (a *agent) job(ctx, jctx context.Context, w wire.WorkRequest, res *wire.SBO
 		var se *catalog.ScratchError
 		kind, msg := workErrorOf(err)
 		switch {
-		case ctx.Err() != nil: // the agent is stopping: not the image's fault
-			res.Unavailable = wire.UnavailableSkipped
 		case errors.As(err, &se):
 			a.o.Log.Error(err, "spooling an SBOM to scratch; the controller will offer the work again", "id", w.ID,
 				"digest", w.Digest)
@@ -180,10 +181,8 @@ func (a *agent) spoolPath(dir string) string {
 }
 
 // stagingFailed maps a Resolve or Stage error onto res.
-func (a *agent) stagingFailed(ctx context.Context, w wire.WorkRequest, err error, res *wire.SBOMResult) {
+func (a *agent) stagingFailed(w wire.WorkRequest, err error, res *wire.SBOMResult) {
 	switch {
-	case ctx.Err() != nil: // the agent is stopping
-		res.Unavailable = wire.UnavailableSkipped
 	case errors.Is(err, contentstore.ErrScratch):
 		a.o.Log.Error(err, "staging an image in scratch; the controller will offer the work again", "id", w.ID,
 			"digest", w.Digest)
