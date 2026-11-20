@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 )
 
 var (
@@ -72,6 +74,9 @@ type Response struct {
 	ETag       string
 	Generation string // x-goog-generation
 	Location   string
+	// Total is the size of the whole resource: from Content-Range for a 206, else Content-Length;
+	// -1 when the server did not say.
+	Total int64
 }
 
 // Fetch performs r. A 2xx body is read whole, up to MaxBytes. 304, 416 and (with NoRedirect) 3xx
@@ -107,6 +112,10 @@ func Fetch(ctx context.Context, c *http.Client, r Request) (Response, error) {
 		ETag:       resp.Header.Get("ETag"),
 		Generation: resp.Header.Get("x-goog-generation"),
 		Location:   resp.Header.Get("Location"),
+		Total:      resp.ContentLength,
+	}
+	if resp.StatusCode == http.StatusPartialContent {
+		out.Total = rangeTotal(resp.Header.Get("Content-Range"))
 	}
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
@@ -127,6 +136,19 @@ func Fetch(ctx context.Context, c *http.Client, r Request) (Response, error) {
 	default:
 		return out, fmt.Errorf("feeds: GET %s: %s", r.URL, resp.Status)
 	}
+}
+
+// rangeTotal returns the complete length of a "bytes first-last/complete" Content-Range, or -1.
+func rangeTotal(v string) int64 {
+	_, total, ok := strings.Cut(v, "/")
+	if !ok || !strings.HasPrefix(v, "bytes ") {
+		return -1
+	}
+	n, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // Download streams url into dst, writing dst+".part" first (hashed into h when h is non-nil) and

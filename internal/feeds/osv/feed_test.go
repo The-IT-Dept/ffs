@@ -36,24 +36,42 @@ type fakeBucket struct {
 	csv     []byte
 	gen     string            // x-goog-generation; "" sends none
 	records map[string][]byte // served as <id>.json and inside all.zip
+	noRange bool              // all.zip ignores Range headers
+	zip     []byte            // all.zip, built on first request
 }
 
 // bucketServer serves <bucket>/modified_id.csv (with Range support), <bucket>/<id>.json and
-// <bucket>/all.zip. A bucket it does not know has an empty listing and an empty all.zip.
+// <bucket>/all.zip (with Range support unless noRange). A bucket it does not know has an empty
+// listing and an empty all.zip.
 type bucketServer struct {
 	*httptest.Server
-	mu      sync.Mutex
-	buckets map[string]*fakeBucket
-	gets    map[string]int      // "<bucket>/<file>" → GETs
-	ranges  map[string][]string // bucket → Range headers sent for modified_id.csv
+	mu       sync.Mutex
+	buckets  map[string]*fakeBucket
+	gets     map[string]int      // "<bucket>/<file>" → GETs
+	ranges   map[string][]string // bucket → Range headers sent for modified_id.csv
+	zipWhole map[string]int      // bucket → all.zip GETs without a Range header
+	zipBytes map[string]int64    // bucket → all.zip body bytes sent
 }
 
 func newBucketServer(t *testing.T) *bucketServer {
 	t.Helper()
-	s := &bucketServer{buckets: map[string]*fakeBucket{}, gets: map[string]int{}, ranges: map[string][]string{}}
+	s := &bucketServer{buckets: map[string]*fakeBucket{}, gets: map[string]int{}, ranges: map[string][]string{},
+		zipWhole: map[string]int{}, zipBytes: map[string]int64{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(s.Close)
 	return s
+}
+
+// countingWriter counts the body bytes written.
+type countingWriter struct {
+	http.ResponseWriter
+	n int64
+}
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	n, err := c.ResponseWriter.Write(p)
+	c.n += int64(n)
+	return n, err
 }
 
 func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
@@ -70,6 +88,17 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 	if rg := r.Header.Get("Range"); rg != "" && file == "modified_id.csv" {
 		s.ranges[b] = append(s.ranges[b], rg)
 	}
+	var zipped []byte
+	if file == "all.zip" {
+		if fb.zip == nil {
+			fb.zip = zipOf(records)
+		}
+		zipped = fb.zip
+		if r.Header.Get("Range") == "" || fb.noRange {
+			s.zipWhole[b]++
+		}
+	}
+	noRange := fb.noRange
 	s.mu.Unlock()
 
 	if gen != "" {
@@ -79,7 +108,16 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 	case "modified_id.csv":
 		http.ServeContent(w, r, file, time.Time{}, bytes.NewReader(csv)) // 416 for a Range read of an empty file
 	case "all.zip":
-		_, _ = w.Write(zipOf(records))
+		cw := &countingWriter{ResponseWriter: w}
+		if noRange {
+			w.Header().Set("Content-Length", fmt.Sprint(len(zipped)))
+			_, _ = cw.Write(zipped)
+		} else {
+			http.ServeContent(cw, r, file, time.Time{}, bytes.NewReader(zipped))
+		}
+		s.mu.Lock()
+		s.zipBytes[b] += cw.n
+		s.mu.Unlock()
 	default:
 		raw, ok := records[strings.TrimSuffix(file, ".json")]
 		if !ok {
@@ -100,6 +138,20 @@ func (s *bucketServer) count(path string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gets[path]
+}
+
+// wholeZips counts the downloads of all of b's all.zip.
+func (s *bucketServer) wholeZips(b string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zipWhole[b]
+}
+
+// zipSent returns the all.zip body bytes sent for b.
+func (s *bucketServer) zipSent(b string) int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.zipBytes[b]
 }
 
 // rangesOf returns the Range headers sent for b's modified_id.csv.
@@ -496,7 +548,7 @@ func TestOSVSync_BulkPathAboveThreshold(t *testing.T) {
 	e.putMeta(t, map[string]string{"setdiff": ts(now)})
 
 	require.NoError(t, e.feed().Sync(ctx))
-	require.Equal(t, 1, e.srv.count("PyPI/all.zip"))
+	require.Equal(t, 1, e.srv.wholeZips("PyPI"), "nearly every record changed: all of all.zip is cheapest")
 	require.Zero(t, e.srv.recordGETs("PyPI"))
 	require.Len(t, e.sink.all(), n)
 	for _, c := range e.sink.calls {
@@ -815,4 +867,76 @@ func TestAffectedHash_IgnoresTimestamps(t *testing.T) {
 		"affected":[{"package":{"ecosystem":"PyPI","name":"x"},"ranges":[{"type":"ECOSYSTEM","events":[{"introduced":"0"},{"fixed":"1.2.3"}]}]}]}`))
 	_, err := osv.AffectedHash([]byte(`not json`))
 	require.Error(t, err)
+}
+
+// TestOSVSync_RangedZipReadsOnlyChangedEntries: when one GET per record looks expensive (Ubuntu's
+// records average about 500 KB) and only part of the bucket changed, the changed records are read
+// with Range requests from their compressed entries in all.zip: no per-record GETs and no download
+// of the whole zip.
+func TestOSVSync_RangedZipReadsOnlyChangedEntries(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t0, t1 := now.Add(-48*time.Hour), now.Add(-time.Minute)
+	const total, changed = 2000, 100
+	records := make(map[string][]byte, total)
+	var rows []row
+	for i := range total {
+		id := fmt.Sprintf("PYSEC-2026-%05d", i)
+		if i < changed {
+			records[id] = pypi(id, "2.0.0", t1)
+			rows = append(rows, row{t1, id})
+		} else {
+			records[id] = pypi(id, "1.0.0", t0)
+		}
+	}
+	for i := changed; i < total; i++ {
+		id := fmt.Sprintf("PYSEC-2026-%05d", i)
+		rows = append(rows, row{t0, id})
+	}
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "mal.PyPI": ts(now)})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Zero(t, e.srv.recordGETs("PyPI"), "no per-record GETs")
+	require.Zero(t, e.srv.wholeZips("PyPI"), "no download of all of all.zip")
+	require.Less(t, e.srv.zipSent("PyPI"), int64(len(zipOf(records))/2), "only the directory and the changed entries")
+	require.Len(t, e.sink.all(), changed)
+	require.Len(t, e.ids(t, "PyPI"), changed)
+	require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+	require.Equal(t, fmt.Sprint(len(records["PYSEC-2026-00000"])), e.meta(t)["size.PyPI"], "the record size is measured")
+}
+
+// TestOSVSync_ZipOverCapDoesNotWedge: a burst of changes in a bucket whose all.zip is over the
+// download cap (Ubuntu's is at 80% of it) is read with Range requests, or one GET per record when the
+// server ignores Range, instead of failing every poll with the watermark stuck.
+func TestOSVSync_ZipOverCapDoesNotWedge(t *testing.T) {
+	for name, noRange := range map[string]bool{"ranged": false, "no Range support": true} {
+		t.Run(name, func(t *testing.T) {
+			e := newEnv(t)
+			e.inUse(t, python)
+			t1 := now.Add(-time.Minute)
+			const n = 5001
+			records := make(map[string][]byte, n)
+			var rows []row
+			for i := range n {
+				id := fmt.Sprintf("GHSA-2026-%05d", i)
+				records[id] = pypi(id, "2.0.0", t1)
+				rows = append(rows, row{t1, id})
+			}
+			e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records, noRange: noRange})
+			e.putMeta(t, map[string]string{"setdiff": ts(now), "mal.PyPI": ts(now)})
+			osv.SetMaxZipBytes(t, int64(len(zipOf(records))-1))
+
+			require.NoError(t, e.feed().Sync(ctx))
+			require.Zero(t, e.srv.wholeZips("PyPI")-map[bool]int{true: 1, false: 0}[noRange], "no download of the whole zip beyond the probe")
+			if noRange {
+				require.Equal(t, n, e.srv.recordGETs("PyPI"))
+			} else {
+				require.Zero(t, e.srv.recordGETs("PyPI"))
+			}
+			require.Len(t, e.ids(t, "PyPI"), n)
+			require.Len(t, e.sink.all(), n)
+			require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+		})
+	}
 }
