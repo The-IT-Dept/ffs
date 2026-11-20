@@ -32,8 +32,8 @@ type layoutIndex struct {
 // Stage writes t as an OCI image layout at dst: oci-layout, an index.json naming the manifest, and
 // blobs/sha256/<hex> for the manifest, the config and every layer (files 0644, dirs 0755). It returns an error
 // wrapping ErrTooLarge when the image is over maxBytes (nothing is written), ErrNotFound when the manifest or
-// config blob is missing, and ErrLayersDiscarded when a layer blob is missing. Every blob is checked against its
-// digest as it is copied. On any error dst is removed.
+// config blob is missing, ErrLayersDiscarded when a layer blob is missing, and ErrScratch when dst cannot be
+// written. Every blob is checked against its digest as it is copied. On any error dst is removed.
 func (s *Store) Stage(ctx context.Context, t Target, dst string, maxBytes int64) (err error) {
 	if t.Size > maxBytes {
 		return fmt.Errorf("%w: %s is %d bytes, the limit is %d", ErrTooLarge, t.Manifest, t.Size, maxBytes)
@@ -59,10 +59,10 @@ func (s *Store) Stage(ctx context.Context, t Target, dst string, maxBytes int64)
 	blobs := filepath.Join(dst, "blobs", "sha256")
 	for _, d := range []string{dst, filepath.Join(dst, "blobs"), blobs} {
 		if err := os.MkdirAll(d, 0o755); err != nil { //nolint:gosec // G301: the non-root cataloguer reads the staged layout
-			return err
+			return scratchErr(err)
 		}
 		if err := os.Chmod(d, 0o755); err != nil { //nolint:gosec // G302: the non-root cataloguer reads the staged layout
-			return err
+			return scratchErr(err)
 		}
 	}
 
@@ -126,15 +126,16 @@ func (s *Store) copyBlob(ctx context.Context, digest, blobs string, limit int64)
 	hex64 := strings.TrimPrefix(digest, "sha256:")
 	out, err := os.OpenFile(filepath.Join(blobs, hex64), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644) //nolint:gosec // G302/G304: the non-root cataloguer reads the staged layout
 	if err != nil {
-		return 0, err
+		return 0, scratchErr(err)
 	}
 	h := sha256.New()
-	n, err := io.Copy(out, io.TeeReader(&ctxReader{ctx: ctx, r: io.LimitReader(in, limit+1)}, h))
+	// Write errors come back wrapping ErrScratch; read errors, from the content store, as they are.
+	n, err := io.Copy(scratchWriter{out}, io.TeeReader(&ctxReader{ctx: ctx, r: io.LimitReader(in, limit+1)}, h))
 	if err == nil {
-		err = out.Chmod(0o644) //nolint:gosec // G302: the non-root cataloguer reads the staged layout
+		err = scratchErr(out.Chmod(0o644)) //nolint:gosec // G302: the non-root cataloguer reads the staged layout
 	}
 	if cerr := out.Close(); err == nil {
-		err = cerr
+		err = scratchErr(cerr)
 	}
 	switch {
 	case err != nil:
@@ -147,11 +148,28 @@ func (s *Store) copyBlob(ctx context.Context, digest, blobs string, limit int64)
 	return n, nil
 }
 
+// writeFile writes a small file of the staged layout; its error wraps ErrScratch.
 func writeFile(p string, b []byte) error {
 	if err := os.WriteFile(p, b, 0o644); err != nil { //nolint:gosec // G306: the non-root cataloguer reads the staged layout
-		return err
+		return scratchErr(err)
 	}
-	return os.Chmod(p, 0o644) //nolint:gosec // G302: the non-root cataloguer reads the staged layout
+	return scratchErr(os.Chmod(p, 0o644)) //nolint:gosec // G302: the non-root cataloguer reads the staged layout
+}
+
+// scratchErr wraps a failure to write the staged layout in ErrScratch; nil stays nil.
+func scratchErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%w: %w", ErrScratch, err)
+}
+
+// scratchWriter tells write errors (the staged layout) from read errors (the content store) in io.Copy.
+type scratchWriter struct{ w io.Writer }
+
+func (s scratchWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	return n, scratchErr(err)
 }
 
 // ctxReader stops a copy once its context is done.

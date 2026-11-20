@@ -33,6 +33,9 @@ var (
 	ErrNotFound        = errors.New("contentstore: digest not in the content store")
 	ErrLayersDiscarded = errors.New("contentstore: layers discarded")
 	ErrTooLarge        = errors.New("contentstore: image larger than the limit")
+	// ErrScratch is a failure to write the staged layout (ENOSPC, EACCES, EROFS…): the collector's scratch
+	// volume, not the image, is at fault.
+	ErrScratch = errors.New("contentstore: writing the staged layout")
 )
 
 type blobKind int

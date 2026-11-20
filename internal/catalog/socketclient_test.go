@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"os"
@@ -198,9 +199,11 @@ func TestSocketClient_UnreadableResponses(t *testing.T) {
 		sock := rawSocket(t, func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, `{"syftJSON":{}}`) })
 		_, err := catalog.NewSocketClient(sock, 10*time.Second).Catalog(ctx, sbom.CatalogRequest{},
 			filepath.Join(t.TempDir(), "missing", "s.json"))
+		var se *catalog.ScratchError
+		require.ErrorAs(t, err, &se, "a scratch failure is not the job's")
 		var we *catalog.WorkError
-		require.ErrorAs(t, err, &we)
-		require.Equal(t, sbom.KindFailed, we.Kind)
-		require.True(t, strings.HasPrefix(we.Msg, "writing the SBOM to scratch: "), we.Msg)
+		require.NotErrorAs(t, err, &we)
+		require.ErrorIs(t, err, fs.ErrNotExist)
+		require.True(t, strings.HasPrefix(err.Error(), "writing the SBOM to scratch: "), err.Error())
 	})
 }

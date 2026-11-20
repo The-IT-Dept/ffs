@@ -255,19 +255,19 @@ func (a *agent) loop(ctx context.Context) {
 		if !a.sleepUntil(ctx, due) {
 			return
 		}
-		var work []wire.WorkRequest
+		var work []queuedJob
 		if !a.o.Now().Before(s.nextFull) {
-			work = a.fullReport(ctx, s)
+			work = a.enqueue(nil, a.fullReport(ctx, s))
 		} else {
-			work = a.imagesReport(ctx, s)
+			work = a.enqueue(nil, a.imagesReport(ctx, s))
 		}
 		for len(work) > 0 && ctx.Err() == nil {
-			w := work[0]
+			j := work[0]
 			work = work[1:]
-			a.runJob(ctx, w)
+			a.runJob(ctx, j.w, j.received)
 			// A job can outlast the image-list interval: report between jobs, so the node does not look stale.
 			if ctx.Err() == nil && !a.o.Now().Before(s.nextImages) {
-				work = append(work, a.imagesReport(ctx, s)...)
+				work = a.enqueue(work, a.imagesReport(ctx, s))
 			}
 		}
 		if ctx.Err() != nil {
@@ -355,7 +355,9 @@ func (a *agent) fullReport(parent context.Context, s *schedule) []wire.WorkReque
 		// The host part was not collected, or not stored: resend it soon, with the inventory kept.
 		s.nextFull = now.Add(a.retryIn(nil, &s.fullBackoff))
 	} else {
-		// Stored; or, when the controller did not apply the report, not worth keeping past the report interval.
+		// Stored. Or not applied without HostRetry: a duplicate or out-of-order report, whose host part the
+		// controller does not want again. Kept, the inventory would serve only the next scheduled report, and
+		// only when its jitter lands it early, as a host nearly a report interval old.
 		a.dropHost()
 		s.fullBackoff = 0
 		s.nextFull = now.Add(jittered(a.reportInterval(), a.cfg.JitterPercent, a.o.Jitter))
@@ -490,6 +492,12 @@ func (a *agent) collectHost(ctx context.Context) (inv *hostInventory, problems [
 	doc, err := a.cat.Catalog(ctx, sbom.CatalogRequest{Source: sbom.CatalogSourceHostDir, Path: dir, MaxBytes: MaxHostBytes,
 		TimeoutSeconds: int(hostCatalogTimeout / time.Second)}, filepath.Join(a.o.Scratch, fmt.Sprintf("sbom-host-%d.json", n)))
 	_ = os.RemoveAll(dir)
+	var se *catalog.ScratchError
+	if errors.As(err, &se) {
+		a.o.Log.Error(err, "spooling the host SBOM to scratch")
+		return nil, append(in.Problems, wire.Problem{Code: wire.ProblemScratch, Detail: "host SBOM not spooled: " + se.Err.Error()}),
+			true
+	}
 	if err != nil {
 		kind, msg := workErrorOf(err)
 		a.o.Log.Error(err, "cataloguing host inputs", "kind", kind)

@@ -76,13 +76,13 @@ type SBOMFile struct {
 //   - the cataloguer's error response keeps its kind and message;
 //   - a response over the controller's SBOM limit is KindTooLarge;
 //   - a response that is not a catalog response is KindFailed;
-//   - a document that cannot be written to dst is KindFailed "writing the SBOM to scratch: <err>";
 //   - a socket that cannot be dialled is KindBusy "cataloguer unavailable: <err>" (the job was not
 //     attempted);
 //   - a connection lost after the request was sent is KindFailed;
 //   - no answer within the client timeout is KindTimeout.
 //
-// When ctx ends first, the error wraps ctx's error instead.
+// A document that cannot be written to dst is a *ScratchError instead: the scratch volume is full or not
+// writable, which says nothing about the job. When ctx ends first, the error wraps ctx's error instead.
 func (c *SocketClient) Catalog(ctx context.Context, req sbom.CatalogRequest, dst string) (out *SBOMFile, err error) {
 	defer func() {
 		if err != nil {
@@ -117,10 +117,10 @@ func (c *SocketClient) Catalog(ctx context.Context, req sbom.CatalogRequest, dst
 	if out, err = spool(bufio.NewReaderSize(lr, spoolBuffer), dst); err == nil {
 		return out, nil
 	}
-	var se *spoolError
+	var se *ScratchError
 	switch {
 	case errors.As(err, &se):
-		return nil, &WorkError{Kind: sbom.KindFailed, Msg: "writing the SBOM to scratch: " + se.err.Error()}
+		return nil, se
 	case lr.N <= 0:
 		return nil, &WorkError{Kind: sbom.KindTooLarge,
 			Msg: fmt.Sprintf("cataloguer response is larger than the %d byte limit", maxSocketResponse)}
@@ -130,10 +130,13 @@ func (c *SocketClient) Catalog(ctx context.Context, req sbom.CatalogRequest, dst
 	return nil, c.transportError(ctx, err)
 }
 
-// spoolError is a failure to write the document to its file.
-type spoolError struct{ err error }
+// ScratchError is a failure to create or write the caller's scratch file for the SBOM document (ENOSPC,
+// EACCES, EROFS…): the collector could not keep the result, which is no fault of the job.
+type ScratchError struct{ Err error }
 
-func (e *spoolError) Error() string { return "writing the SBOM: " + e.err.Error() }
+func (e *ScratchError) Error() string { return "writing the SBOM to scratch: " + e.Err.Error() }
+
+func (e *ScratchError) Unwrap() error { return e.Err }
 
 // spool reads a catalog response, {"syftJSON": <document>, "coverage": {...}}, from r, writing the document to
 // the file dst. Members other than the document are read into memory up to maxEnvelopeMember; unknown ones are
@@ -141,7 +144,7 @@ func (e *spoolError) Error() string { return "writing the SBOM: " + e.err.Error(
 func spool(r *bufio.Reader, dst string) (*SBOMFile, error) {
 	f, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: dst is the caller's scratch file
 	if err != nil {
-		return nil, &spoolError{err}
+		return nil, &ScratchError{err}
 	}
 	closed := false
 	defer func() {
@@ -179,7 +182,7 @@ func spool(r *bufio.Reader, dst string) (*SBOMFile, error) {
 			seen = true
 			if err := c.copyValue(doc); err != nil {
 				if c.werr != nil {
-					return nil, &spoolError{c.werr}
+					return nil, &ScratchError{c.werr}
 				}
 				return nil, err
 			}
@@ -213,15 +216,15 @@ func spool(r *bufio.Reader, dst string) (*SBOMFile, error) {
 		return nil, fmt.Errorf("%w: no syftJSON member", errJSONSyntax)
 	}
 	if err := doc.Flush(); err != nil {
-		return nil, &spoolError{err}
+		return nil, &ScratchError{err}
 	}
 	fi, err := f.Stat()
 	if err != nil {
-		return nil, &spoolError{err}
+		return nil, &ScratchError{err}
 	}
 	closed = true
 	if err := f.Close(); err != nil {
-		return nil, &spoolError{err}
+		return nil, &ScratchError{err}
 	}
 	out.Size = fi.Size()
 	return out, nil

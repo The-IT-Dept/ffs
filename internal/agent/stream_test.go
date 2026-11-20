@@ -212,7 +212,7 @@ func TestCollectorStreamsLargeSBOM(t *testing.T) {
 		a, err := newAgent(e.opts)
 		require.NoError(t, err)
 		w := wire.WorkRequest{ID: "w1", Digest: e.config, Platform: "linux/" + runtime.GOARCH, Deadline: time.Now().Add(5 * time.Minute)}
-		growth := peakHeapGrowth(t, func() { a.runJob(ctx, w) })
+		growth := peakHeapGrowth(t, func() { a.runJob(ctx, w, time.Now()) })
 		require.Less(t, growth, limit, "peak heap growth %d MiB for a %d MiB SBOM", growth>>20, largeSBOMBytes>>20)
 
 		body, err := os.ReadFile(saved(wire.PathSBOM))
