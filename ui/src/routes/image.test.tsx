@@ -1,5 +1,6 @@
 import { screen, waitFor } from '@testing-library/react'
 import { expect, test } from 'vitest'
+import { copy } from '@/lib/copy'
 import { imagePath } from '@/lib/links'
 import { mockApi } from '@/test/api'
 import { findingsPage, imageDetail, imagePackagesPage } from '@/test/fixtures'
@@ -15,6 +16,24 @@ test('a placeholder image page requests one encoded segment and shows why it can
   expect((await screen.findByText(/registry refused access/)).closest('.hatched')).not.toBeNull()
   expect(api.calls('/images/{digest}')[0].pathname).toBe('/api/v1/images/unknown%3Aghcr.io%2Fexample%2Fprivate%3A1.0')
   expect(api.calls('/findings')[0].searchParams.get('scope')).toBe(`image:${placeholder}`)
+})
+
+test.each(['unresolvable', 'pending', 'catalogFailed'] as const)('an image that is %s and has no findings leads with coverage, not "nothing needs attention"', async (status) => {
+  mockApi()
+    .on('/images/{digest}', imageDetail({ digest: placeholder, status, coverage: { class: 'none', unattributedExecutables: 0, rustWithoutAuditable: 0, notes: [], cpeOnly: [], gaps: [] } }))
+    .on('/findings', findingsPage())
+  renderApp(imagePath(placeholder))
+  expect(await screen.findByText(copy.coverageFirst(1, 1))).toBeInTheDocument()
+  expect(screen.queryByText(copy.empty)).toBeNull()
+})
+
+test('a catalogued image with no findings says nothing needs attention', async () => {
+  mockApi()
+    .on('/images/{digest}', imageDetail({ digest: 'sha256:' + 'd'.repeat(64) }))
+    .on('/findings', findingsPage())
+  renderApp(imagePath('sha256:' + 'd'.repeat(64)))
+  expect(await screen.findByText(copy.empty)).toBeInTheDocument()
+  expect(screen.queryByText(copy.coverageFirst(1, 1))).toBeNull()
 })
 
 test('package search is server-side and lives in the URL', async () => {

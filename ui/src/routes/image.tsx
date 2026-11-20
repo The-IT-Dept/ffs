@@ -2,8 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import { createRoute } from '@tanstack/react-router'
 import { Fragment } from 'react'
 import { apiQuery } from '@/api/client'
-import { findingsQuery } from '@/components/explorer/params'
-import { FixGroupList } from '@/components/fix/FixGroupList'
+import type { S } from '@/api/types'
+import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { EmptyState } from '@/components/layout/EmptyState'
 import { PageHeader } from '@/components/layout/PageHeader'
@@ -24,11 +24,10 @@ import { rootRoute } from './root'
 type View = NonNullable<ImageSearch['view']>
 const VIEWS: readonly View[] = ['findings', 'packages', 'upgrades', 'sbom']
 
-function FindingsView({ scope }: { scope: string }) {
-  const q = useQuery(findingsQuery({ scope, group: 'fix' }))
-  if (q.data) return q.data.groupRows.length === 0 ? <EmptyState /> : <FixGroupList key={scope} rows={q.data.groupRows} group="fix" base={{ scope }} />
-  if (q.error) return <ProblemNotice error={q.error} />
-  return <Skeleton className="h-24" />
+// imageCoverage is the image's own coverage figure, by the store's rule for an image scope: one
+// image in use, seen into when catalogued, in full detail when its coverage class is full.
+function imageCoverage(d: S<'ImageDetail'>): S<'CoverageFigure'> {
+  return { inUse: 1, seenInto: d.status === 'catalogued' ? 1 : 0, full: d.coverage.class === 'full' ? 1 : 0 }
 }
 
 function ImagePage() {
@@ -100,7 +99,7 @@ function ImagePage() {
               ))}
             </TabsList>
             <TabsContent value="findings">
-              <FindingsView scope={scope} />
+              <FixGroupFindings scope={scope} empty={<EmptyState coverage={imageCoverage(d)} />} />
             </TabsContent>
             <TabsContent value="packages">
               <PackageTable key={digest} digest={digest} q={search.q} onQ={(q) => void navigate({ to: '.', search: { ...search, q }, replace: true })} />

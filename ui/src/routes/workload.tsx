@@ -5,10 +5,11 @@ import { apiQuery } from '@/api/client'
 import type { S } from '@/api/types'
 import { type Column, ExplorerTable } from '@/components/explorer/ExplorerTable'
 import { GroupSwitch } from '@/components/explorer/GroupSwitch'
-import { PAGE_LIMIT, findingsQuery } from '@/components/explorer/params'
+import { PAGE_LIMIT } from '@/components/explorer/params'
 import { Pager, useCursorPages } from '@/components/explorer/Pager'
 import { ExposurePathLine } from '@/components/fix/ExposurePathLine'
-import { type FixGroupKind, FixGroupList } from '@/components/fix/FixGroupList'
+import { FixGroupFindings } from '@/components/fix/FixGroupFindings'
+import type { FixGroupKind } from '@/components/fix/FixGroupList'
 import { UpgradeTable } from '@/components/fix/UpgradeTable'
 import { AppLink } from '@/components/layout/AppLink'
 import { EmptyState } from '@/components/layout/EmptyState'
@@ -132,8 +133,6 @@ function Containers({ d, scope }: { d: Detail; scope: string }) {
 
 function FindingsView({ scope, group, coverage, onGroup }: { scope: string; group: FixGroupKind; coverage?: S<'CoverageFigure'>; onGroup: (g: FixGroupKind) => void }) {
   // The request always groups (by fix unless the URL says otherwise); the URL leaves the default out.
-  // No placeholder data: rows of another grouping would open groups with the wrong filter.
-  const q = useQuery(findingsQuery({ scope, group }))
   return (
     <div className="flex flex-col gap-2">
       <GroupSwitch
@@ -142,17 +141,7 @@ function FindingsView({ scope, group, coverage, onGroup }: { scope: string; grou
         options={GROUPS.map((g) => ({ value: g, label: copy.explorer.group[g] ?? g }))}
         onChange={(v) => onGroup(v as FixGroupKind)}
       />
-      {q.data ? (
-        q.data.groupRows.length === 0 ? (
-          <EmptyState coverage={coverage} />
-        ) : (
-          <FixGroupList key={`${scope}:${group}`} rows={q.data.groupRows} group={group} base={{ scope }} />
-        )
-      ) : q.error ? (
-        <ProblemNotice error={q.error} />
-      ) : (
-        <Skeleton className="h-24" />
-      )}
+      <FixGroupFindings scope={scope} group={group} empty={<EmptyState coverage={coverage} />} />
     </div>
   )
 }
