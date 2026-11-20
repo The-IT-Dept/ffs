@@ -33,11 +33,13 @@
 {{- if has "apk" $host.packageDatabases }}
 {{- $vols = append $vols (dict "name" "host-apk" "path" "/lib/apk/db" "type" "Directory") }}
 {{- end }}
-{{- if eq $dist "k3s" "rke2" }}
-{{- $vols = append $vols (dict "name" (printf "host-%s-data" $dist) "path" (printf "/var/lib/rancher/%s/data" $dist) "type" "Directory") }}
+{{- if eq $dist "k3s" }}
+{{- $vols = append $vols (dict "name" "host-k3s-data" "path" "/var/lib/rancher/k3s/data" "type" "Directory") }}
 {{- end }}
 {{- if eq $dist "rke2" }}
-{{- /* RKE2's link to the bin dir of its current data dir; the link is followed when the container starts. */}}
+{{- /* RKE2's link to the bin dir of its current data dir, followed when the container starts. RKE2 makes it before
+it starts the kubelet. The data dirs are not mounted: the agent searches them only when the link is missing, and
+without the link this mount, like the content store's, keeps the pod from starting. */}}
 {{- $vols = append $vols (dict "name" "host-rke2-bin" "path" "/var/lib/rancher/rke2/bin" "type" "Directory") }}
 {{- end }}
 {{- if $store }}

@@ -26,7 +26,6 @@ Every host path is mounted read-only, without mount propagation, into the collec
 | `/lib/apk/db` | Alpine nodes | The apk package database. |
 | `/var/lib/rancher/k3s/data` | k3s | The k3s binaries (`current/bin` and `current/bin/aux`). |
 | `/var/lib/rancher/rke2/bin` | RKE2 | The RKE2 binaries: RKE2's link to the `bin` directory of its current data directory. |
-| `/var/lib/rancher/rke2/data` | RKE2 | The RKE2 binaries of the newest data directory, used only when the `bin` link is missing. |
 | `/var/lib/containerd/io.containerd.content.v1.content` | containerd | Cached images. |
 | `/var/lib/rancher/k3s/agent/containerd/io.containerd.content.v1.content` | k3s | Cached images. |
 | `/var/lib/rancher/rke2/agent/containerd/io.containerd.content.v1.content` | RKE2 | Cached images. |
@@ -98,7 +97,7 @@ The first agent data on a cluster is a baseline: each AlertTarget gets one summa
 
 - **containerd**: `/var/lib/containerd`.
 - **k3s**: the binaries under `/var/lib/rancher/k3s/data` and the content store under `/var/lib/rancher/k3s/agent/containerd`.
-- **RKE2**: the binaries through `/var/lib/rancher/rke2/bin`, RKE2's link to its current data directory, and the content store under `/var/lib/rancher/rke2/agent/containerd`. The link is followed when the collector container starts, so after an RKE2 upgrade or rollback the node reports the binaries RKE2 now runs once the collector restarts (for example with `kubectl rollout restart daemonset/ffs-agent -n ffs-agent`).
+- **RKE2**: the binaries through `/var/lib/rancher/rke2/bin`, RKE2's link to its current data directory, and the content store under `/var/lib/rancher/rke2/agent/containerd`. RKE2 creates the link before it starts the kubelet; the agent pods do not start on a node without it. The link is followed when the collector container starts, so after an RKE2 upgrade or rollback the node reports the binaries RKE2 now runs once the collector restarts (for example with `kubectl rollout restart daemonset/ffs-agent -n ffs-agent`).
 - **CRI-O** (`crio`): nodes report host packages and binaries, but there is no containerd content store, so side-loaded images cannot be catalogued from them. Each node shows `no containerd content store on this node; side-loaded images cannot be catalogued from it`.
 - **Other containerd roots.** k0s, MicroK8s and custom installs keep containerd elsewhere. The content store mount must exist, or the agent pods never start, so set `nodeAgent.hostPaths.containerdRoot` to containerd's root directory (the agent reads `io.containerd.content.v1.content` under it):
   - k0s: `--set nodeAgent.hostPaths.containerdRoot=/var/lib/k0s/containerd`. k0s reports a `+k0s` kubelet version, which `auto` reads as containerd.
@@ -106,7 +105,7 @@ The first agent data on a cluster is a baseline: each AlertTarget gets one summa
 
   The path must be absolute, and the chart refuses system directories such as `/run` and `/var/lib/kubelet`. It applies to every node the DaemonSet runs on, and not to `crio`.
 
-In a cluster with mixed distributions, `auto` uses the most common one, and the content store and data directory mounts must exist on every node the DaemonSet runs on. Set `nodeAgent.distribution` and `nodeAgent.nodeSelector` to match one kind of node, or install one release per node pool.
+In a cluster with mixed distributions, `auto` uses the most common one, and the content store and binary directory mounts (the k3s data directory, the RKE2 `bin` link) must exist on every node the DaemonSet runs on. Set `nodeAgent.distribution` and `nodeAgent.nodeSelector` to match one kind of node, or install one release per node pool.
 
 ## Platforms
 

@@ -34,8 +34,8 @@ type HostPaths struct {
 var (
 	baseBinDirs = []string{"/usr/bin", "/usr/sbin", "/usr/local/bin"}
 	k3sBinDirs  = []string{"/var/lib/rancher/k3s/data/current/bin", "/var/lib/rancher/k3s/data/current/bin/aux"}
-	// rke2BinDir is RKE2's link to the bin dir of its current data dir. Only without it is the newest data dir
-	// searched, which is wrong after a rollback.
+	// rke2BinDir is RKE2's link to the bin dir of its current data dir. Only a host root without it has the newest
+	// data dir searched, which is wrong after a rollback; the chart mounts the link itself, and no data dir.
 	rke2BinDir      = "/var/lib/rancher/rke2/bin"
 	rke2DataBinDirs = "/var/lib/rancher/rke2/data/*/bin"
 )
