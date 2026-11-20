@@ -12,25 +12,27 @@ import (
 // PutOSVRecordNames replaces the index names of the cached record id in bucket. Empty names are
 // ignored; no names removes the record from the index.
 func (s *Store) PutOSVRecordNames(ctx context.Context, bucket, id string, names []string) error {
-	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM osv_record_names WHERE bucket = ? AND id = ?`, bucket, id); err != nil {
+	return s.inTx(ctx, func(tx *sql.Tx) error { return putOSVRecordNames(ctx, tx, bucket, id, names) })
+}
+
+func putOSVRecordNames(ctx context.Context, tx *sql.Tx, bucket, id string, names []string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM osv_record_names WHERE bucket = ? AND id = ?`, bucket, id); err != nil {
+		return err
+	}
+	ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO osv_record_names(bucket, id, name) VALUES(?, ?, ?)`)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ins.Close() }()
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		if _, err := ins.ExecContext(ctx, bucket, id, n); err != nil {
 			return err
 		}
-		ins, err := tx.PrepareContext(ctx, `INSERT OR IGNORE INTO osv_record_names(bucket, id, name) VALUES(?, ?, ?)`)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = ins.Close() }()
-		for _, n := range names {
-			if n == "" {
-				continue
-			}
-			if _, err := ins.ExecContext(ctx, bucket, id, n); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+	}
+	return nil
 }
 
 // OSVRecordIDsByName returns the sorted IDs of the records in bucket indexed under any of names.

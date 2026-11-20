@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -415,6 +416,42 @@ func TestOSVSync_ChangedAffectedDelivered(t *testing.T) {
 	require.Equal(t, "PyPI", got[0].Ecosystem)
 	require.Equal(t, "PYSEC-2026-2", got[0].ID)
 	require.JSONEq(t, string(records["PYSEC-2026-2"]), string(got[0].Raw))
+	ids, err := e.st.OSVRecordIDsByName(ctx, "PyPI", []string{"requests-pysec-2026-2"})
+	require.NoError(t, err)
+	require.Equal(t, []string{"PYSEC-2026-2"}, ids)
+}
+
+// A failed name-index write must not lose the record: the write is one transaction with the
+// record's, so the next poll sees the record as changed again, hands it off and indexes it.
+func TestOSVSync_IndexWriteFailureRetried(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	st, err := store.Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	e := &env{st: st, srv: newBucketServer(t), sink: &sink{}, dataDir: t.TempDir()}
+	e.inUse(t, python)
+	t0, t1 := now.Add(-time.Hour), now.Add(-10*time.Minute)
+	e.cache(t, "PyPI", "PYSEC-2026-2", t0, pypi("PYSEC-2026-2", "1.2.3", t0))
+	rec := pypi("PYSEC-2026-2", "1.2.4", t1)
+	e.srv.set("PyPI", &fakeBucket{csv: csvOf(row{t1, "PYSEC-2026-2"}), records: map[string][]byte{"PYSEC-2026-2": rec}})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now)})
+
+	inj, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, inj.Close()) })
+	_, err = inj.ExecContext(ctx, `CREATE TRIGGER fail_index BEFORE INSERT ON osv_record_names
+		BEGIN SELECT RAISE(ABORT, 'injected index failure'); END`)
+	require.NoError(t, err)
+
+	require.Error(t, e.feed().Sync(ctx))
+	require.Empty(t, e.sink.all())
+
+	_, err = inj.ExecContext(ctx, `DROP TRIGGER fail_index`)
+	require.NoError(t, err)
+	require.NoError(t, e.feed().Sync(ctx))
+	got := e.sink.all()
+	require.Len(t, got, 1)
+	require.Equal(t, "PYSEC-2026-2", got[0].ID)
 	ids, err := e.st.OSVRecordIDsByName(ctx, "PyPI", []string{"requests-pysec-2026-2"})
 	require.NoError(t, err)
 	require.Equal(t, []string{"PYSEC-2026-2"}, ids)

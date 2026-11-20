@@ -684,19 +684,19 @@ func (f *Feed) put(ctx context.Context, b, id string, raw []byte, gitCached map[
 		if !gitCached[id] {
 			return putSkipped, modified, nil
 		}
-		if _, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw); err != nil {
+		if _, err := f.o.Store.PutOSVRecordIndexed(ctx, b, id, modified, hash, raw, nil, true); err != nil {
 			return putSkipped, modified, err
 		}
-		return putDropped, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, nil)
+		return putDropped, modified, nil
 	}
-	changed, err := f.o.Store.PutOSVRecord(ctx, b, id, modified, hash, raw)
+	changed, err := f.o.Store.PutOSVRecordIndexed(ctx, b, id, modified, hash, raw, info.names(b), false)
 	switch {
 	case err != nil:
 		return putSkipped, modified, err
 	case !changed:
 		return putUnchanged, modified, nil
 	}
-	return putChanged, modified, f.o.Store.PutOSVRecordNames(ctx, b, id, info.names(b))
+	return putChanged, modified, nil
 }
 
 // tracked reports whether a GIT record references one of the GitRepos repositories.
