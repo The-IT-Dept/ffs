@@ -99,6 +99,7 @@ type Inventory struct {
 	enqueued     map[string]time.Time           // digests this process has handed to the acquirer → when
 	catalogRetry map[string]bool                // synthetic digests whose OnImageCatalogued failed
 	unreported   map[string]bool                // owner keys whose OnOwnersChanged failed
+	superseded   map[string]time.Time           // agent-catalogued digests → last Supersede request
 
 	mu             sync.Mutex
 	known          map[string]bool // stored workload owner keys
@@ -125,7 +126,7 @@ func New(o Options) *Inventory {
 	}
 	inv := &Inventory{o: o, access: newAccessCache(o.TagTTL), podOwner: map[string]model.OwnerRef{}, ownerPods: map[string]map[string]struct{}{},
 		enqueued: map[string]time.Time{}, catalogRetry: map[string]bool{}, unreported: map[string]bool{},
-		known: map[string]bool{}, templateBacked: map[string]bool{}}
+		superseded: map[string]time.Time{}, known: map[string]bool{}, templateBacked: map[string]bool{}}
 	inv.batch = newBatcher(o.Debounce, func(ctx context.Context, keys []string) {
 		if err := inv.Flush(ctx, keys); err != nil {
 			logf.FromContext(ctx).WithName("inventory").Error(err, "inventory flush failed")
@@ -212,7 +213,8 @@ func (inv *Inventory) NeedLeaderElection() bool { return true }
 // Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
 // then flushes batches. Every TagTTL it re-resolves template-backed owners; every VersionPoll it
 // re-reads the control-plane version; every RetryPoll it flushes the owners of images whose
-// quarantine has ended, which hands those images back to the acquirer or the normaliser.
+// quarantine has ended, which hands those images back to the acquirer or the normaliser, and the
+// owners of images catalogued from a node agent's SBOM, which asks the registry to supersede them.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -255,7 +257,11 @@ func (inv *Inventory) Start(ctx context.Context) error {
 				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images due a retry")
 				continue
 			}
-			inv.batch.Add(keys...)
+			agent, err := inv.o.Store.OwnersOfAgentImages(ctx)
+			if err != nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images catalogued by a node agent")
+			}
+			inv.batch.Add(append(keys, agent...)...)
 		case <-tags.C:
 			inv.mu.Lock()
 			keys := sortedKeys(inv.templateBacked)
@@ -267,6 +273,10 @@ func (inv *Inventory) Start(ctx context.Context) error {
 		}
 	}
 }
+
+// MarkCluster queues "cluster", which rebuilds the synthetic Cluster and ContainerRuntime owners (the
+// node-agent reconciler calls it after a runtime cutover).
+func (inv *Inventory) MarkCluster() { inv.batch.Add(clusterKey) }
 
 // Synced reports whether a SyncAll has completed. SyncAll sets it (so a direct SyncAll counts);
 // Start runs SyncAll before anything else, so after Start it means the first SyncAll completed.

@@ -66,7 +66,7 @@ func TestBuildClusterInventory_K3s(t *testing.T) {
 	nodes := []model.Node{{KubeletVersion: "v1.35.2+k3s1", ContainerRuntimeVersion: "containerd://2.1.4-k3s1"},
 		{KubeletVersion: "v1.35.2+k3s1", ContainerRuntimeVersion: "containerd://2.1.4-k3s1"},
 		{KubeletVersion: "v1.34.5+k3s1", ContainerRuntimeVersion: "containerd://1.7.27-k3s1"}}
-	syn := BuildClusterInventory("dev", ci, nodes, t0)
+	syn := BuildClusterInventory("dev", ci, nodes, t0, ClusterOptions{})
 	require.Len(t, syn, 2)
 
 	cl := syn[0]
@@ -109,25 +109,38 @@ func TestBuildClusterInventory_K3s(t *testing.T) {
 	}
 
 	ci.KubeProxyVersion = "1.35.2"
-	syn = BuildClusterInventory("dev", ci, nodes, t0)
+	syn = BuildClusterInventory("dev", ci, nodes, t0, ClusterOptions{})
 	require.Equal(t, "control plane; kubelet on 2 nodes; kube-proxy", syn[0].Packages["k8s:1.35.2"][0].Path)
 
 	syn = BuildClusterInventory("dev", ci, []model.Node{
 		{KubeletVersion: "v1.35.2+k3s1", ContainerRuntimeVersion: "cri-o://1.31.3"},
 		{KubeletVersion: "v1.35.2+k3s1", ContainerRuntimeVersion: "docker://27.3.1"},
-	}, t0)
+	}, t0, ClusterOptions{})
 	require.Len(t, syn, 2)
 	require.Equal(t, model.OwnerRef{Kind: "ContainerRuntime", Name: "cri-o"}, syn[1].Owner.Ref)
 	require.Equal(t, synthPackage("runtime:cri-o@1.31.3", "go-module", "github.com/cri-o/cri-o", "v1.31.3", "1 node"),
 		syn[1].Packages["runtime:cri-o@1.31.3"][0])
 
 	eks := model.ClusterInfo{GitVersion: "v1.30.4-eks-a737599", Version: "1.30.4", Distribution: "eks", LowConfidence: true}
-	syn = BuildClusterInventory("dev", eks, nil, t0)
+	syn = BuildClusterInventory("dev", eks, nil, t0, ClusterOptions{})
 	require.Len(t, syn, 1)
 	require.Equal(t, "control plane", syn[0].Packages["k8s:1.30.4"][0].Path)
 	require.Equal(t, []string{"kernel, runc and other bundled components (flannel) are not inventoried",
 		"version normalised from v1.30.4-eks-a737599; vendor builds may include backported fixes"}, syn[0].Images[0].Coverage.Notes)
 
 	require.Empty(t, BuildClusterInventory("dev", model.ClusterInfo{KubeProxyVersion: "1.35.2"},
-		[]model.Node{{ContainerRuntimeVersion: "docker://27.3.1"}}, t0))
+		[]model.Node{{ContainerRuntimeVersion: "docker://27.3.1"}}, t0, ClusterOptions{}))
+}
+
+func TestBuildClusterInventory_RuntimeRetired(t *testing.T) {
+	ci := model.ClusterInfo{GitVersion: "v1.35.2+k3s1", Version: "1.35.2", Distribution: "k3s"}
+	nodes := []model.Node{{KubeletVersion: "v1.35.2+k3s1", ContainerRuntimeVersion: "containerd://2.1.4-k3s1"}}
+	syn := BuildClusterInventory("dev", ci, nodes, t0, ClusterOptions{RuntimeRetired: true})
+	require.Len(t, syn, 1)
+	require.Equal(t, model.OwnerKindCluster, syn[0].Owner.Ref.Kind)
+	require.Empty(t, syn[0].Images[0].Coverage.Notes) // NoteBundled dropped
+	eks := model.ClusterInfo{GitVersion: "v1.30.4-eks-a737599", Version: "1.30.4", Distribution: "eks", LowConfidence: true}
+	syn = BuildClusterInventory("dev", eks, nil, t0, ClusterOptions{RuntimeRetired: true})
+	require.Equal(t, []string{"version normalised from v1.30.4-eks-a737599; vendor builds may include backported fixes"},
+		syn[0].Images[0].Coverage.Notes)
 }

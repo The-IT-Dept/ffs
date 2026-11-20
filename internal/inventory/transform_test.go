@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -128,7 +129,8 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 				ManagedFields: []metav1.ManagedFieldsEntry{{Manager: "kubelet"}}},
 			Status: corev1.NodeStatus{
 				NodeInfo: corev1.NodeSystemInfo{Architecture: "arm64", KubeletVersion: "v1.35.2+k3s1"},
-				Images:   []corev1.ContainerImage{{Names: []string{"nginx"}}},
+				Images: []corev1.ContainerImage{{Names: []string{"docker.io/library/nginx@sha256:" + strings.Repeat("e", 64),
+					"docker.io/library/nginx:1.27"}, SizeBytes: 1234}},
 				Conditions: []corev1.NodeCondition{{Type: corev1.NodeMemoryPressure, Status: corev1.ConditionFalse},
 					{Type: corev1.NodeReady, Status: corev1.ConditionTrue, Message: "kubelet is posting ready status"}},
 			},
@@ -137,7 +139,7 @@ func TestTransformPod_KeepsNeededFields(t *testing.T) {
 		require.NoError(t, err)
 		got := out.(*corev1.Node)
 		require.Nil(t, got.ManagedFields)
-		require.Nil(t, got.Status.Images)
+		require.Equal(t, n.Status.Images, got.Status.Images)
 		require.Equal(t, n.Status.NodeInfo, got.Status.NodeInfo)
 		require.Equal(t, []corev1.NodeCondition{{Type: corev1.NodeReady, Status: corev1.ConditionTrue}}, got.Status.Conditions)
 	})

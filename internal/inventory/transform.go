@@ -2,6 +2,7 @@ package inventory
 
 import (
 	"maps"
+	"slices"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -156,7 +157,8 @@ func transformWorkload(in any) (any, error) {
 	return in, nil
 }
 
-// transformNode keeps name, labels, status.nodeInfo and the Ready condition's status.
+// transformNode keeps name, labels, status.nodeInfo, the Ready condition's status and
+// status.images (names and sizes), which the node agent's report merges with the cached images.
 func transformNode(in any) (any, error) {
 	n, ok := in.(*corev1.Node)
 	if !ok {
@@ -167,6 +169,12 @@ func transformNode(in any) (any, error) {
 		ObjectMeta: metav1.ObjectMeta{Name: n.Name, UID: n.UID, ResourceVersion: n.ResourceVersion,
 			Labels: n.Labels},
 		Status: corev1.NodeStatus{NodeInfo: n.Status.NodeInfo},
+	}
+	if n.Status.Images != nil {
+		out.Status.Images = make([]corev1.ContainerImage, len(n.Status.Images))
+		for i, img := range n.Status.Images {
+			out.Status.Images[i] = corev1.ContainerImage{Names: slices.Clone(img.Names), SizeBytes: img.SizeBytes}
+		}
 	}
 	for _, c := range n.Status.Conditions {
 		if c.Type == corev1.NodeReady {
