@@ -91,11 +91,10 @@ type ServerOptions struct {
 // ResultWindow is implemented by an SBOMHandler that knows how long a node's result may still be accepted
 // (*WorkQueue does). The server then bounds a result's wait for the SBOM budget by it.
 type ResultWindow interface {
-	// ResultWait is how long a result from node may wait before it is read; zero or less when none is
-	// expected from node.
-	ResultWait(node string) time.Duration
-	// ResultUnread is called when a result from node waited that long without being read.
-	ResultUnread(node string)
+	// ResultWait is how long a result from node may wait before it is read, zero or less when none is
+	// expected from node, and unread, which the server calls when the result waited that long without being
+	// read.
+	ResultWait(node string) (wait time.Duration, unread func())
 }
 
 // Server serves /agent/v1 over TLS on the leader.
@@ -459,10 +458,10 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 }
 
 // serveSBOM takes the result's share of the SBOM budget before reading its body. The agent has no
-// back-pressure for results, so it waits for as long as the result could still be accepted: until the last
-// request open to the node stops taking a result (ResultWindow), or while the request lasts. A node with no
-// open request is answered 403 at once. A result that waited that long is answered 503, and its requests are
-// not counted against their images: the controller held them up.
+// back-pressure for results, so it waits for as long as the result could still be accepted: until the request
+// it answers stops taking a result (ResultWindow), or while the HTTP request lasts. A node with no request
+// taking a result is answered 403 at once. A result that waited that long is answered 503, and the request it
+// answers is not counted against its image: the controller held it up.
 func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
 	defer countAnswer(w)
@@ -471,9 +470,10 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var wait time.Duration // as long as the request lasts
+	var unread func()
 	window, bounded := s.o.SBOMs.(ResultWindow)
 	if bounded {
-		if wait = window.ResultWait(id.Node); wait <= 0 {
+		if wait, unread = window.ResultWait(id.Node); wait <= 0 {
 			writeError(w, http.StatusForbidden, "no request to "+id.Node+" takes a result")
 			return
 		}
@@ -481,7 +481,7 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	release, ok := acquire(r.Context(), s.sboms, bodyWeight(r, s.o.MaxSBOMBytes, s.o.SBOMBudget), wait)
 	if !ok {
 		if bounded && r.Context().Err() == nil {
-			window.ResultUnread(id.Node)
+			unread()
 			s.o.Log.Info("an SBOM result waited for the ingest budget until its request expired", "node", id.Node)
 			writeError(w, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
 		}

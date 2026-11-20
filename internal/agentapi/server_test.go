@@ -428,16 +428,14 @@ func (b *blockingSBOMs) unreadNodes() []string {
 // windowedSBOMs is blockingSBOMs as a ResultWindow.
 type windowedSBOMs struct{ *blockingSBOMs }
 
-func (w windowedSBOMs) ResultWait(string) time.Duration {
+func (w windowedSBOMs) ResultWait(node string) (time.Duration, func()) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.wait
-}
-
-func (w windowedSBOMs) ResultUnread(node string) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.unread = append(w.unread, node)
+	return w.wait, func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.unread = append(w.unread, node)
+	}
 }
 
 // sizedBody is a JSON body of exactly size bytes: prefix, padding and suffix.
@@ -491,10 +489,10 @@ func TestServer_ReportsDoNotWaitBehindSBOMResults(t *testing.T) {
 	require.Equal(t, held, inFlight())
 }
 
-// TestServer_SBOMWaitEndsWithItsRequests: a result waits for the SBOM budget no longer than its node's requests
-// take a result (ResultWindow). It is then answered 503 and the node's requests are marked answered; a node
+// TestServer_SBOMWaitEndsWithItsRequest: a result waits for the SBOM budget no longer than the request it
+// answers takes a result (ResultWindow). It is then answered 503 and that request is marked answered; a node
 // with no request taking a result is answered 403 before its body is read.
-func TestServer_SBOMWaitEndsWithItsRequests(t *testing.T) {
+func TestServer_SBOMWaitEndsWithItsRequest(t *testing.T) {
 	const size = 1 << 20
 	forbidden := func() float64 {
 		return testutil.ToFloat64(metrics.AgentReports.WithLabelValues(metrics.AgentReportRejected, metrics.AgentRejectForbidden))
@@ -520,7 +518,7 @@ func TestServer_SBOMWaitEndsWithItsRequests(t *testing.T) {
 	a = serve(t, h, http.MethodPost, wire.PathSBOM, "tok", strings.NewReader(result), int64(len(result)))
 	requireError(t, a, http.StatusServiceUnavailable, "the controller could not take the result before its request expired")
 	require.GreaterOrEqual(t, time.Since(start), 50*time.Millisecond)
-	require.Equal(t, []string{"worker-1"}, sboms.unreadNodes(), "its requests are answered")
+	require.Equal(t, []string{"worker-1"}, sboms.unreadNodes(), "its request is answered")
 	require.Equal(t, held+size, inFlight())
 
 	close(sboms.release)

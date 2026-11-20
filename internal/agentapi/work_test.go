@@ -719,26 +719,77 @@ func TestWork_OfferCountsEveryExpiry(t *testing.T) {
 	require.Equal(t, "worker-2", j.LastNode)
 }
 
-// TestWork_ResultWaitEndsWithTheNodesLastRequest: a node's result may wait for the ingest budget until the
-// grace of its last open request ends; a result that waited that long answers the node's requests, so their
-// expiry is not counted against the images.
-func TestWork_ResultWaitEndsWithTheNodesLastRequest(t *testing.T) {
-	f := newWorkFixture(t)
-	f.q.o.PerReport = 1
-	require.LessOrEqual(t, f.q.ResultWait("worker-1"), time.Duration(0), "no request open to worker-1")
-	require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
-	require.Equal(t, pastGrace, f.q.ResultWait("worker-1"))
-	require.LessOrEqual(t, f.q.ResultWait("worker-2"), time.Duration(0))
-	f.clk.Add(10 * time.Minute)
-	f.offered("worker-1", dig3) // a later request
-	require.Equal(t, pastGrace, f.q.ResultWait("worker-1"), "until the grace of the last request ends")
-
-	f.q.ResultUnread("worker-1")
-	f.clk.Add(pastGrace)
-	require.LessOrEqual(t, f.q.ResultWait("worker-1"), time.Duration(0))
-	f.offer(t, "worker-1")
-	for _, d := range []string{dig1, dig3} {
-		_, ok := f.job(t, d)
-		require.False(t, ok, "%s: the controller held up the result, not the image", d)
+// TestWork_ResultWaitEndsWithTheRequestInFlight: a node's result may wait for the ingest budget until the
+// request it answers stops taking a result: its newest agent process's earliest unanswered request, which the
+// agent, working in order, is on. A result that waited that long answers that request only, so its expiry is
+// not counted against the image, while the requests behind it still need answers of their own.
+func TestWork_ResultWaitEndsWithTheRequestInFlight(t *testing.T) {
+	ctx := context.Background()
+	attempts := func(t *testing.T, f *workFixture, digest string) int {
+		t.Helper()
+		j, _ := f.job(t, digest)
+		return j.Attempts
 	}
+
+	t.Run("the earliest request, not the latest", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		wait, _ := f.q.ResultWait("worker-1")
+		require.LessOrEqual(t, wait, time.Duration(0), "no request open to worker-1")
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		wait, _ = f.q.ResultWait("worker-1")
+		require.Equal(t, pastGrace, wait)
+		wait, _ = f.q.ResultWait("worker-2")
+		require.LessOrEqual(t, wait, time.Duration(0))
+
+		f.clk.Add(10 * time.Minute)
+		f.offered("worker-1", dig3) // a later request, queued behind dig1
+		wait, unread := f.q.ResultWait("worker-1")
+		require.Equal(t, pastGrace-10*time.Minute, wait, "until dig1's grace ends, not dig3's")
+		unread()
+		wait, _ = f.q.ResultWait("worker-1")
+		require.Equal(t, pastGrace, wait, "dig1 is answered: the next result answers dig3")
+		f.clk.Add(pastGrace - 10*time.Minute) // past dig1's grace
+		wait, _ = f.q.ResultWait("worker-1")
+		require.Equal(t, 10*time.Minute, wait, "dig3 still takes a result")
+
+		f.clk.Add(10 * time.Minute) // past dig3's grace, with no answer for it
+		wait, _ = f.q.ResultWait("worker-1")
+		require.LessOrEqual(t, wait, time.Duration(0))
+		f.offer(t, "worker-1")
+		require.Zero(t, attempts(t, f, dig1), "the controller held up dig1's result, not the image")
+		require.Equal(t, 1, attempts(t, f, dig3), "dig3 was never answered")
+	})
+
+	t.Run("the newest agent process's request", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 2
+		require.Equal(t, []string{dig1, dig2}, f.offer(t, "worker-1"))
+		require.NoError(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		f.clk.Add(5 * time.Minute) // dig2 kills the agent, which comes back as a new process
+		applied, err := f.st.AcceptAgentReport(ctx, store.AgentReport{Node: "worker-1", AgentVersion: "v0.0.1",
+			BootID: "boot-worker-1", Instance: "after-restart", StartedAt: f.clk.Now(), Seq: 1, At: f.clk.Now()})
+		require.NoError(t, err)
+		require.True(t, applied)
+		require.Equal(t, []string{dig3}, f.offer(t, "worker-1"))
+		wait, unread := f.q.ResultWait("worker-1")
+		require.Equal(t, pastGrace, wait, "the new process is on dig3, not on the dead one's dig2")
+		unread()
+
+		f.clk.Add(pastGrace)
+		f.offer(t, "worker-1")
+		require.Equal(t, 1, attempts(t, f, dig2), "the old process died on dig2")
+		require.Zero(t, attempts(t, f, dig3), "the controller held up dig3's result")
+	})
+
+	t.Run("an answered request when no other takes a result", func(t *testing.T) {
+		f := newWorkFixture(t)
+		f.q.o.PerReport = 1
+		require.Equal(t, []string{dig1}, f.offer(t, "worker-1"))
+		f.ingest.setErr(&sbom.AcquireError{Kind: sbom.FailTransient, Reason: "acquisition in progress"})
+		require.Error(t, f.q.SBOM(ctx, worker1, &wire.SBOMResult{Node: "worker-1", Digest: dig1, SyftJSON: sideloadDoc(t)}))
+		f.clk.Add(time.Minute)
+		wait, _ := f.q.ResultWait("worker-1")
+		require.Equal(t, pastGrace-time.Minute, wait, "dig1 still takes the agent's retry")
+	})
 }

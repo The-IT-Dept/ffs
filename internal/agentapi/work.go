@@ -361,12 +361,7 @@ func (q *WorkQueue) SBOM(ctx context.Context, id Identity, res *wire.SBOMResult)
 		}
 	}
 	if err != nil && !errors.Is(err, ErrForbidden) { // transient: the offer stays for the agent's retry
-		q.mu.Lock()
-		if cur, still := q.offers[res.Digest]; still && cur.id == o.id {
-			cur.answered = true
-			q.offers[res.Digest] = cur
-		}
-		q.mu.Unlock()
+		q.markAnswered(res.Digest, o.id)
 		return err
 	}
 	q.release(res.Digest, o.id)
@@ -382,34 +377,64 @@ func (q *WorkQueue) release(digest, id string) {
 	}
 }
 
-// ResultWait is how long a result from node may wait for the ingest budget before it is read: until the last
-// offer to node stops taking a result. It is zero or less when node holds no such offer. An agent sends its
-// results one at a time, so this bounds the wait of the one it is sending.
-func (q *WorkQueue) ResultWait(node string) time.Duration {
+// ResultWait is how long a result from node may wait for the ingest budget before it is read, and what to call
+// when it waited that long unread. An agent process answers its requests one at a time, in the order they were
+// offered, and the node's newest process (the one its latest offer went to) is the one working, so the result
+// in flight answers that process's earliest unanswered request that still takes a result: the wait ends when
+// that request stops taking one, and unread marks it answered, because the controller held it up, not the
+// image. The requests behind it get answers of their own. Failing such a request, the earliest of the node's
+// other requests that still take a result bounds the wait. wait is zero or less when none does.
+func (q *WorkQueue) ResultWait(node string) (wait time.Duration, unread func()) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	var last time.Time
+	now := q.o.Now()
+	var newest offer
 	for _, o := range q.offers {
-		if o.node == node && o.deadline.After(last) {
-			last = o.deadline
+		if o.node == node && o.seq > newest.seq {
+			newest = o
 		}
 	}
-	if last.IsZero() {
-		return 0
+	// inFlightFirst orders the requests a result from node most likely answers: the newest process's first,
+	// then unanswered ones, then in offer order.
+	inFlightFirst := func(a, b offer) int {
+		return cmp.Or(falseFirst(a.instance != newest.instance, b.instance != newest.instance),
+			falseFirst(a.answered, b.answered), cmp.Compare(a.seq, b.seq))
 	}
-	return last.Add(resultGrace).Sub(q.o.Now())
+	var digest string
+	var target offer
+	for d, o := range q.offers {
+		if o.node != node || !o.deadline.Add(resultGrace).After(now) {
+			continue
+		}
+		if digest == "" || inFlightFirst(o, target) < 0 {
+			digest, target = d, o
+		}
+	}
+	if digest == "" {
+		return 0, func() {}
+	}
+	return target.deadline.Add(resultGrace).Sub(now), func() { q.markAnswered(digest, target.id) }
 }
 
-// ResultUnread marks node's offers answered: a result from node waited for the ingest budget until none of
-// them took a result any more. The controller, not the image, held it up, so their expiry is not counted.
-func (q *WorkQueue) ResultUnread(node string) {
+// falseFirst orders false before true.
+func falseFirst(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case !a:
+		return -1
+	}
+	return 1
+}
+
+// markAnswered marks the offer id of digest answered, unless another offer has replaced it: a result for it
+// arrived but was not handled, so its expiry is not counted against the image.
+func (q *WorkQueue) markAnswered(digest, id string) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	for d, o := range q.offers {
-		if o.node == node {
-			o.answered = true
-			q.offers[d] = o
-		}
+	if cur, ok := q.offers[digest]; ok && cur.id == id {
+		cur.answered = true
+		q.offers[digest] = cur
 	}
 }
 
