@@ -2,6 +2,7 @@ package apiserver_test
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -89,7 +90,7 @@ func TestSearch_PrefixFirstKindsInterleavedAndTruncated(t *testing.T) {
 
 	res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q=kube"))
 	require.True(t, res.Truncated, "ten workloads match and eight are asked for")
-	require.Equal(t, []string{"workload:Cluster//test", "workload:Deployment/ops/kube-app-01", "namespace:kube-system", "node:kube-node-1",
+	require.Equal(t, []string{"controlplane:test", "workload:Deployment/ops/kube-app-01", "namespace:kube-system", "node:kube-node-1",
 		"workload:Deployment/ops/kube-app-02"}, hitIDs(res)[:5], "the control plane (Kubernetes), then each kind in turn")
 	require.LessOrEqual(t, len(res.Hits), 20)
 
@@ -116,17 +117,17 @@ func TestSearch_ClusterLevelHitsAndHostPackages(t *testing.T) {
 	}
 
 	res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q=control"))
-	cp := hitOf(t, res, apigen.SearchHitKindWorkload, "Cluster//test")
+	cp := hitOf(t, res, apigen.SearchHitKindControlplane, webtest.ClusterName)
 	require.Equal(t, "Control plane", cp.Label)
 	require.NotNil(t, cp.Scope)
 	require.Equal(t, "controlplane", *cp.Scope)
 	require.Equal(t, "Kubernetes 1.34.2", *cp.Detail)
 	require.Equal(t, apigen.PriorityHigh, *cp.Worst)
 	res = ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q=containerd"))
-	hitOf(t, res, apigen.SearchHitKindWorkload, "Cluster//test")
+	hitOf(t, res, apigen.SearchHitKindControlplane, webtest.ClusterName)
 
 	res = ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q=nodes"))
-	nodes := hitOf(t, res, apigen.SearchHitKindWorkload, "Nodes//test")
+	nodes := hitOf(t, res, apigen.SearchHitKindNodes, webtest.ClusterName)
 	require.Equal(t, "Nodes", nodes.Label)
 	require.Equal(t, "3 nodes", *nodes.Detail)
 	require.Nil(t, nodes.Scope)
@@ -144,5 +145,27 @@ func TestSearch_ClusterLevelHitsAndHostPackages(t *testing.T) {
 	hitOf(t, res, apigen.SearchHitKindPackage, "deb/openssl")
 	for _, hit := range res.Hits {
 		require.NotEqual(t, apigen.SearchHitKindNodegroup, hit.Kind, "openssl is also in container images")
+	}
+}
+
+// #8: the Control plane and Nodes pages are hits of their own kinds, never workload hits with
+// cluster-level owner keys.
+func TestSearch_PageHitsHaveTheirOwnKinds(t *testing.T) {
+	_, h := newAPI(t)
+	for q, want := range map[string]apigen.SearchHitKind{
+		"control": apigen.SearchHitKindControlplane, "kubernetes": apigen.SearchHitKindControlplane,
+		"containerd": apigen.SearchHitKindControlplane, "nodes": apigen.SearchHitKindNodes, "host packages": apigen.SearchHitKindNodes,
+	} {
+		res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q="+url.QueryEscape(q)))
+		hit := hitOf(t, res, want, webtest.ClusterName)
+		require.True(t, hit.Kind.Valid(), q)
+		for _, other := range res.Hits {
+			if other.Kind != apigen.SearchHitKindWorkload {
+				continue
+			}
+			for _, key := range []string{webtest.Cluster.Key(), webtest.Runtime.Key(), webtest.Nodes.Key()} {
+				require.NotEqual(t, key, other.Id, "%s: a cluster-level owner is not a workload hit", q)
+			}
+		}
 	}
 }

@@ -1380,8 +1380,11 @@ export interface components {
             truncated: boolean;
         };
         SearchHit: {
-            /** @enum {string} */
-            kind: "workload" | "namespace" | "image" | "advisory" | "package" | "nodegroup" | "node";
+            /**
+             * @description The kind of object. controlplane is the Control plane page and nodes the Nodes page; the id of either is the cluster name.
+             * @enum {string}
+             */
+            kind: "workload" | "namespace" | "image" | "advisory" | "package" | "nodegroup" | "node" | "controlplane" | "nodes";
             id: string;
             label: string;
             detail?: string;

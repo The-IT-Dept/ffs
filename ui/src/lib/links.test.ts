@@ -2,11 +2,11 @@ import { createMemoryHistory } from '@tanstack/react-router'
 import { expect, test } from 'vitest'
 import { createQueryClient } from '@/api/client'
 import { createAppRouter } from '@/router'
+import { copy } from './copy'
 import {
   advisoryPath,
   coverageHref,
   explorerHref,
-  hitKindLabel,
   hitPath,
   imagePath,
   nodeGroupPath,
@@ -62,7 +62,6 @@ test('cluster-level owners link to their own pages, never to a workload page', (
   // Scope pages and search hits go through the same mapping.
   expect(scopePath(parseScope('workload:Nodes//test'))).toBe('/nodes')
   expect(scopePath(parseScope('workload:ContainerRuntime//containerd'))).toBe('/controlplane')
-  expect(hitPath({ kind: 'workload', id: 'Cluster//test', label: 'test' })).toBe('/controlplane')
 })
 
 test('node group keys are used as they are: path-encoded in links, whole in scopes', async () => {
@@ -90,18 +89,21 @@ test('node group keys are used as they are: path-encoded in links, whole in scop
 })
 
 test('search hits for the control plane and Nodes open their pages and read by what they hold', () => {
-  // The Nodes hit has no scope; the control plane hit carries the controlplane scope.
-  const nodes = { kind: 'workload', id: 'Nodes//test', label: 'Nodes', detail: '3 nodes' } as const
-  const cp = { kind: 'workload', id: 'Cluster//test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' } as const
+  // The hits are of their own kinds, with the cluster name as id. The Nodes hit has no scope; the
+  // control plane hit carries the controlplane scope, and goes to its page without it too.
+  const nodes = { kind: 'nodes', id: 'test', label: 'Nodes', detail: '3 nodes' } as const
+  const cp = { kind: 'controlplane', id: 'test', label: 'Control plane', detail: 'Kubernetes 1.35.1', scope: 'controlplane' } as const
   expect(hitPath(nodes)).toBe('/nodes')
   expect(hitPath(cp)).toBe('/controlplane')
-  expect(hitKindLabel(nodes)).toBe('Nodes (host packages)')
-  expect(hitKindLabel(cp)).toBe('Control plane')
-  // A namespaced custom resource of kind Cluster is a workload.
+  expect(hitPath({ kind: 'controlplane', id: 'test', label: 'Control plane' })).toBe('/controlplane')
+  expect(copy.command.kind[nodes.kind]).toBe('Nodes (host packages)')
+  expect(copy.command.kind[cp.kind]).toBe('Control plane')
+  // A workload hit opens its workload page; a namespaced custom resource of kind Cluster is a workload.
   const db = { kind: 'workload', id: 'Cluster/payments/db', label: 'db', scope: 'workload:Cluster/payments/db' } as const
   expect(hitPath(db)).toBe('/workloads/Cluster/payments/db')
-  expect(hitKindLabel(db)).toBe('Workload')
-  expect(hitKindLabel({ kind: 'nodegroup', id: 'ubuntu-24.04-k6.8', label: 'ubuntu' })).toBe('Node group')
+  expect(hitPath({ kind: 'workload', id: 'Deployment/shop/web', label: 'web' })).toBe('/workloads/Deployment/shop/web')
+  expect(copy.command.kind[db.kind]).toBe('Workload')
+  expect(copy.command.kind.nodegroup).toBe('Node group')
 })
 
 test('the coverage page of a scope keeps the scopes it covers', () => {

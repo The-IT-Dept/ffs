@@ -137,7 +137,7 @@ Errors are RFC 9457 problem documents, `application/problem+json`, with `type`, 
 | `/api/v1/feeds` | Feed freshness, and the data sources with their licences and attribution. |
 | `/api/v1/exceptions` | Exceptions with what they match. |
 | `/api/v1/settings` | The effective settings that shape findings, without registry, listener or storage settings. |
-| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups (by name, or holding a matching host-only package), nodes, the control plane and Nodes, at most 20. Labels starting with `q` come first, the kinds taking turns, and `truncated` is set when more matched. |
+| `/api/v1/search` | Objects matching `q` (1 to 100 characters), for the web UI's search: workloads, namespaces, images, advisories, packages, node groups (by name, or holding a matching host-only package), nodes, and the Control plane and Nodes pages (hit kinds `controlplane` and `nodes`, whose `id` is the cluster name), at most 20. Labels starting with `q` come first, the kinds taking turns, and `truncated` is set when more matched. |
 | `/api/v1/stream` | Change notifications; see [Live updates](#live-updates). |
 
 Each row of `/api/v1/nodegroups` counts its members by node agent state in `agents`: `reporting` (the host inventory is stored), `reportingWithoutInventory` (the agent reports, but the host inventory is not stored or not current; the node shows the `host_not_inventoried` gap), `stale`, `never`, `disabled`, and `unsupported` (the node agent does not schedule on the node; it shows the `node_agent_unsupported` gap).

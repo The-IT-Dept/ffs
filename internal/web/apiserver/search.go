@@ -20,14 +20,14 @@ const (
 	nodesLabel = "Nodes"
 )
 
-// searchKinds orders the kinds a search interleaves: the control plane and Nodes pages, then the
-// store's kinds, then node groups (by name, or holding a host package that matches).
+// searchKinds orders the kinds a search interleaves: the control plane and Nodes pages (one turn,
+// "page"), then the store's kinds, then node groups (by name, or holding a host package that matches).
 var searchKinds = []string{"page", "workload", "namespace", "image", "advisory", "package", "nodegroup", "node"}
 
 // Search finds objects of every kind for the jump menu, at most 20. Hits whose label starts with
 // the query come first, the kinds taking turns, then the hits that contain it elsewhere, again by
 // turns; truncated says that more matched than are answered. A package only node groups hold opens
-// the node group, and the control plane and Nodes are hits of their own.
+// the node group, and the control plane and Nodes pages are hits of their own kinds.
 func (s *Server) Search(ctx context.Context, req apigen.SearchRequestObject) (apigen.SearchResponseObject, error) {
 	q := req.Params.Q
 	if n := utf8.RuneCountInString(q); n < 1 || n > searchMaxLen {
@@ -160,8 +160,9 @@ func (s *Server) groupHits(ctx context.Context, q string, hits []store.JumpHit) 
 }
 
 // pageHits are the control plane and the Nodes page when q names them: "Control plane" or
-// "Kubernetes" or a container runtime of the nodes, and "Nodes" or "host packages". Each is its
-// cluster-level owner, the control plane with its scope.
+// "Kubernetes" or a container runtime of the nodes, and "Nodes" or "host packages". They are hits
+// of kinds controlplane and nodes, each with the cluster name as its id, and take one turn between
+// them; the control plane carries its scope, and the Nodes page has none.
 func (s *Server) pageHits(ctx context.Context, q string) ([]searchHit, error) {
 	lq := strings.ToLower(q)
 	match := func(terms ...string) (found, prefix bool) {
@@ -192,7 +193,8 @@ func (s *Server) pageHits(ctx context.Context, q string) ([]searchHit, error) {
 		if err != nil {
 			return nil, err
 		}
-		h := hitOf(store.JumpHit{Kind: "workload", ID: keys[0], Label: controlPlaneLabel, Worst: st.Counts.Worst()})
+		h := hitOf(store.JumpHit{Kind: string(apigen.SearchHitKindControlplane), ID: s.o.Config.ClusterName, Label: controlPlaneLabel,
+			Worst: st.Counts.Worst()})
 		if ci.Version != "" {
 			h.hit.Detail = optString("Kubernetes " + ci.Version)
 		}
@@ -210,9 +212,8 @@ func (s *Server) pageHits(ctx context.Context, q string) ([]searchHit, error) {
 		if err != nil {
 			return nil, err
 		}
-		h := hitOf(store.JumpHit{Kind: "workload", ID: key, Label: nodesLabel, Detail: plural(len(nodes), "node"),
-			Worst: st[key].Counts.Worst()})
-		h.hit.Scope = nil // the Nodes page has no scope; the UI opens it for the Nodes owner
+		h := hitOf(store.JumpHit{Kind: string(apigen.SearchHitKindNodes), ID: s.o.Config.ClusterName, Label: nodesLabel,
+			Detail: plural(len(nodes), "node"), Worst: st[key].Counts.Worst()})
 		h.kind, h.prefix = "page", prefix
 		out = append(out, h)
 	}
