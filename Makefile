@@ -8,7 +8,7 @@ GOLANGCI_LINT  ?= go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@
 OAPI_CODEGEN   ?= go run github.com/oapi-codegen/oapi-codegen/v2/cmd/oapi-codegen@v2.8.2
 PKGS ?= ./...
 RUN  ?=
-.PHONY: build test generate lint e2e golden chart-lint image licenses ui ui-test
+.PHONY: build test generate lint e2e golden chart-lint image licenses ui ui-test bench-api
 build:    ; go build -trimpath -ldflags '$(LDFLAGS)' -o bin/ffs ./cmd/ffs
 SETUP_ENVTEST ?= go run sigs.k8s.io/controller-runtime/tools/setup-envtest@v0.25.3
 ENVTEST_K8S_VERSION ?= 1.37.0
@@ -23,6 +23,9 @@ golden:   ; hack/golden.sh fetch && FFS_GOLDEN_DB=$(CURDIR)/.cache/golden-db/6 g
 chart-lint: ; helm lint --strict --kube-version 1.37.0 charts/ffs
 ui:      ; cd ui && npm ci && npm run build
 ui-test: ; cd ui && npm ci && npm run typecheck && npm test
+# API latency gate (spec G8): p95 of every list, facet and aggregate operation on the 25,000-finding
+# webtest.Scale fixture, in process.
+bench-api: ; GOFLAGS=-p=4 go test -tags bench -run TestAPILatency_P95 -count=1 -v ./internal/web/apiserver/
 image:   ; docker buildx build --platform linux/$(shell go env GOARCH) --build-arg VERSION=dev --build-arg COMMIT=$$(git rev-parse --short=7 HEAD) -t ghcr.io/the-it-dept/ffs:dev --load .
 
 # Licence check of every package linked into the linux/amd64 and linux/arm64 binaries. It fails on
