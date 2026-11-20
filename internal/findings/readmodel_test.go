@@ -70,6 +70,11 @@ func TestBuild_SignalsFromRankedInput(t *testing.T) {
 
 func TestBuild_FixAction(t *testing.T) {
 	requestsAmd := newPkg(amd, model.Package{Ecosystem: "python", Name: "requests", Version: "2.9.0", Path: "/usr/lib/python3/dist-packages/requests"})
+	containerdAmd := newPkg(amd, model.Package{Ecosystem: "go-module", Name: "github.com/containerd/containerd", Version: "v1.7.17",
+		Path: "/usr/local/bin/tool"})
+	debTesting := &model.Distro{ID: "debian", Codename: "trixie"} // a testing release has no version ID
+	libssl3Testing := newPkg(amd, model.Package{Ecosystem: "deb", Distro: debTesting, Name: "libssl3", Version: "3.0.13-1", Arch: "amd64",
+		Path: "/var/lib/dpkg/status"})
 	const id = "CVE-2026-0001"
 	grype := func(p model.Package, opts ...matchOpt) model.Match { return match(model.SourceGrype, p, id, opts...) }
 	lodashTo := func(to string) *model.FixAction {
@@ -94,9 +99,15 @@ func TestBuild_FixAction(t *testing.T) {
 		{"binary falls back to semver", []model.Match{grype(phpAmd, fixedIn("8.3.100", "8.3.20"))},
 			&model.FixAction{Kind: model.FixKindPackage, Key: "package:binary:php:8.3.14:8.3.20", Label: "php 8.3.14 → 8.3.20",
 				Package: "php", Ecosystem: "binary", From: "8.3.14", To: "8.3.20"}},
-		{"Go toolchain version compares without its go", []model.Match{grype(stdlibAmd, fixedIn("1.21.11", "1.22.5"))},
-			&model.FixAction{Kind: model.FixKindPackage, Key: "package:go-module:stdlib:go1.22.3:1.22.5", Label: "stdlib go1.22.3 → 1.22.5",
-				Package: "stdlib", Ecosystem: "go-module", From: "go1.22.3", To: "1.22.5"}},
+		{"Go toolchain version compares without its go and moves to a go version", []model.Match{grype(stdlibAmd, fixedIn("1.21.11", "1.22.5"))},
+			&model.FixAction{Kind: model.FixKindPackage, Key: "package:go-module:stdlib:go1.22.3:go1.22.5", Label: "stdlib go1.22.3 → go1.22.5",
+				Package: "stdlib", Ecosystem: "go-module", From: "go1.22.3", To: "go1.22.5"}},
+		{"Go module version keeps the fixed version's spelling", []model.Match{grype(containerdAmd, fixedIn("1.7.18", "1.7.20"))},
+			&model.FixAction{Kind: model.FixKindPackage, Key: "package:go-module:github.com/containerd/containerd:v1.7.17:1.7.18",
+				Label: "github.com/containerd/containerd v1.7.17 → 1.7.18", Package: "github.com/containerd/containerd", Ecosystem: "go-module",
+				From: "v1.7.17", To: "1.7.18"}},
+		{"distro without a version → rebuild with a single space", []model.Match{grype(libssl3Testing, fixedIn("3.0.15-1"))},
+			&model.FixAction{Kind: model.FixKindRebuild, Key: "rebuild:debian:", Label: "debian rebuild", Distro: debTesting}},
 		{"nothing above installed → smallest", []model.Match{grype(lodashAmd, fixedIn("4.17.19", "4.17.10"))}, lodashTo("4.17.10")},
 		{"first package by name with a fixed version", []model.Match{grype(aesonAmd), grype(lodashAmd, fixedIn("4.17.21"))}, lodashTo("4.17.21")},
 		{"fixed state without versions", []model.Match{grype(lodashAmd, func(m *model.Match) { m.FixState = model.FixFixed })},
@@ -105,7 +116,9 @@ func TestBuild_FixAction(t *testing.T) {
 	}
 	for _, tc := range cases {
 		in := input(tc.ms)
-		in.Packages[requestsAmd.ID] = requestsAmd
+		for _, p := range []model.Package{requestsAmd, containerdAmd, libssl3Testing} {
+			in.Packages[p.ID] = p
+		}
 		require.Equal(t, tc.want, one(t, Build(in)).Fix, tc.name)
 	}
 }

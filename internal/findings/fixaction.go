@@ -109,7 +109,8 @@ func packageAction(ps []model.FindingPackage) *model.FixAction {
 }
 
 // minFixed returns the smallest fixed version greater than installed, else the smallest fixed
-// version; "" when fixed is empty.
+// version; "" when fixed is empty. A Go toolchain version is spelled as installed is, so the Go
+// standard library's go1.22.3 moves to go1.22.5, not to vulndb's 1.22.5.
 func minFixed(ecosystem, installed string, fixed []string) string {
 	var above, lowest string
 	for _, v := range fixed {
@@ -123,16 +124,25 @@ func minFixed(ecosystem, installed string, fixed []string) string {
 			above = v
 		}
 	}
-	return cmp.Or(above, lowest)
+	to := cmp.Or(above, lowest)
+	if ecosystem == goModule && to != "" && strings.HasPrefix(installed, goPrefix) && !strings.HasPrefix(to, goPrefix) {
+		to = goPrefix + to
+	}
+	return to
 }
+
+const (
+	goModule = "go-module" // the syft type of Go modules and the Go standard library
+	goPrefix = "go"        // starts a Go toolchain version, which syft reports for the standard library
+)
 
 // compareVersions orders two versions of a package type: by its OSV ecosystem's rules when it has
 // one and both parse, else as semver, else as strings. A Go toolchain version ("go1.22.3", the Go
 // standard library's) compares without its "go", as Go vulndb's fixed versions are written.
 func compareVersions(ecosystem, a, b string) int {
 	eco, ok := osvEcosystems[ecosystem]
-	if ecosystem == "go-module" {
-		a, b = strings.TrimPrefix(a, "go"), strings.TrimPrefix(b, "go")
+	if ecosystem == goModule {
+		a, b = strings.TrimPrefix(a, goPrefix), strings.TrimPrefix(b, goPrefix)
 	}
 	if ok {
 		va, errA := semantic.Parse(a, eco)
