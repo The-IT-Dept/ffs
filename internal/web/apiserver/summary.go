@@ -102,6 +102,9 @@ func (s *Server) GetSummary(ctx context.Context, req apigen.GetSummaryRequestObj
 	if err != nil {
 		return nil, err
 	}
+	if sc, err = s.canonicalScope(ctx, sc); err != nil {
+		return nil, err
+	}
 	label, err := s.scopeTitle(ctx, sc)
 	if err != nil {
 		return nil, err

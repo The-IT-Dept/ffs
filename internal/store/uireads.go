@@ -201,8 +201,9 @@ func (s *Store) BestFixes(ctx context.Context, keys []string) (map[string]FixSum
 
 // CoverageOf returns the coverage figure of a cluster, namespace or workload scope (its owners'
 // distinct in-use container digests; no images row counts as in use only), or of one image, whose
-// figure is its own: in use when an owner runs it. An image is seen into once it is catalogued and
-// its first match has run.
+// figure is its own: in use when an owner runs it, and seen into or in full detail only then, so the
+// figure of an image no owner runs is zero. An image is seen into once it is catalogued and its first
+// match has run.
 func (s *Store) CoverageOf(ctx context.Context, sc model.Scope) (CoverageFigure, error) {
 	var c CoverageFigure
 	if sc.Kind == model.ScopeImage {
@@ -212,6 +213,9 @@ func (s *Store) CoverageOf(ctx context.Context, sc model.Scope) (CoverageFigure,
 			sc.Value, sc.Value, sc.Value).Scan(&c.InUse, &c.SeenInto, &c.Full)
 		if err != nil {
 			return CoverageFigure{}, fmt.Errorf("store: coverage of %s: %w", sc, err)
+		}
+		if c.InUse == 0 {
+			return CoverageFigure{}, nil
 		}
 		return c, nil
 	}
@@ -418,32 +422,28 @@ func (s *Store) AdvisorySeverityUsed(ctx context.Context, id string) (string, er
 	return src, err
 }
 
-// JumpHit is one ⌘K result. Kind is workload (ID the owner key), namespace, image (ID the digest),
-// advisory (the canonical ID), package (ID "<ecosystem>/<name>"), node, or hostpackage: a package
-// held only by a node group's host packages (ID the group's "nodegroup:<id>" digest, Label the
-// package name, Detail its version), which the API turns into a node group hit. Prefix is set when
-// the label (for an advisory, its ID or an alias) starts with the query.
+// JumpHit is one ⌘K result. Kind is workload (ID the owner key), namespace (Count its workloads,
+// which the API words), image (ID the digest), advisory (the canonical ID), package (ID
+// "<ecosystem>/<name>"), node, or hostpackage: a package held only by a node group's host packages
+// (ID the group's "nodegroup:<id>" digest, Label the package name, Detail its version), which the
+// API turns into a node group hit. Prefix is set when the label (for an advisory, its ID or an
+// alias) starts with the query.
 type JumpHit struct {
 	Kind, ID, Label, Detail string
+	Count                   int
 	Worst                   model.Priority
 	Prefix                  bool
 }
 
 const defaultJumpLimit = 5
 
-// countNoun is "1 <one>" or "<n> <one>s".
-func countNoun(n int, one string) string {
-	if n == 1 {
-		return "1 " + one
-	}
-	return fmt.Sprintf("%d %ss", n, one)
-}
-
 // Jump finds workloads, namespaces, images, advisories, packages, host-only packages and nodes for
 // q, at most limit of each kind (5 when limit <= 0), in that order; more reports that some kind had
 // more. Within a kind, labels starting with q come first, then labels containing it, each by label
 // and ID: the rank is taken before the cut, so a prefix hit is never lost to an alphabetical one.
 // Images and packages are those of in-use container images; synthetic digests are never image hits.
+// Host-only packages give one hit per node group, its best-ranked package with the highest version
+// installed, so limit and more count node groups.
 func (s *Store) Jump(ctx context.Context, q string, limit int) (hits []JumpHit, more bool, err error) {
 	if limit <= 0 {
 		limit = defaultJumpLimit
@@ -470,9 +470,9 @@ func (s *Store) Jump(ctx context.Context, q string, limit int) (hits []JumpHit, 
 			ORDER BY pre DESC, o.name, o.key LIMIT ?`, []any{pre, pat, n}},
 		{"namespaces", func(r scanner) (JumpHit, error) {
 			h := JumpHit{Kind: "namespace"}
-			var count, worst int
-			err := r.Scan(&h.ID, &count, &worst, &h.Prefix)
-			h.Label, h.Detail, h.Worst = h.ID, countNoun(count, "workload"), model.Priority(worst)
+			var worst int
+			err := r.Scan(&h.ID, &h.Count, &worst, &h.Prefix)
+			h.Label, h.Worst = h.ID, model.Priority(worst)
 			return h, err
 		}, `SELECT o.namespace, count(*), coalesce(max(` + worstOf("st.") + `), 0), o.namespace LIKE ? ESCAPE '\' AS pre FROM owners o
 			LEFT JOIN owner_stats st ON st.owner_key = o.key WHERE o.namespace != '' AND o.namespace LIKE ? ESCAPE '\'
@@ -507,10 +507,13 @@ func (s *Store) Jump(ctx context.Context, q string, limit int) (hits []JumpHit, 
 			h := JumpHit{Kind: "hostpackage"}
 			err := r.Scan(&h.ID, &h.Label, &h.Detail, &h.Prefix)
 			return h, err
-		}, `SELECT p.digest, p.name, ` + installedExpr("p") + `, p.name LIKE ? ESCAPE '\' AS pre FROM packages p
-			WHERE p.digest IN (SELECT digest FROM owner_images WHERE digest LIKE 'nodegroup:%') AND p.name LIKE ? ESCAPE '\'
-			AND NOT EXISTS (SELECT 1 FROM packages c WHERE c.ecosystem = p.ecosystem AND c.name = p.name AND c.digest IN (` + inUse + `))
-			GROUP BY p.digest, p.name ORDER BY pre DESC, p.name, p.digest LIMIT ?`, []any{pre, pat, n}},
+		}, `WITH hp AS (SELECT p.digest, p.name, max(` + installedExpr("p") + `) AS version, p.name LIKE ? ESCAPE '\' AS pre
+				FROM packages p WHERE p.digest IN (SELECT digest FROM owner_images WHERE digest LIKE 'nodegroup:%')
+				AND p.name LIKE ? ESCAPE '\'
+				AND NOT EXISTS (SELECT 1 FROM packages c WHERE c.ecosystem = p.ecosystem AND c.name = p.name AND c.digest IN (` + inUse + `))
+				GROUP BY p.digest, p.name),
+			best AS (SELECT digest, name, version, pre, row_number() OVER (PARTITION BY digest ORDER BY pre DESC, name) AS rn FROM hp)
+			SELECT digest, name, version, pre FROM best WHERE rn = 1 ORDER BY pre DESC, name, digest LIMIT ?`, []any{pre, pat, n}},
 		{"nodes", func(r scanner) (JumpHit, error) {
 			h := JumpHit{Kind: "node"}
 			err := r.Scan(&h.ID, &h.Prefix)
@@ -746,17 +749,23 @@ func (s *Store) OwnerExists(ctx context.Context, key string) (bool, error) {
 
 // ImageGapTally is what a scope's image coverage gaps number, read without listing them: Codes
 // counts the gap codes of its in-use container images other than cpe_only_classifier (one for an
-// image not seen into, one per partial-coverage reason of a catalogued one), and Classified holds
-// the classifier-found packages of its catalogued images, by digest, from which the caller counts
-// the cpe_only_classifier gaps.
+// image not seen into, one per partial-coverage reason of a catalogued one), and Uncovered the
+// cpe_only_classifier ones: the catalogued images with a classifier-found package that the covered
+// list does not name.
 type ImageGapTally struct {
-	Codes      int
-	Classified map[string][]model.Package
+	Codes     int
+	Uncovered int
 }
 
+// CoveredClassifier is a package a curated classifier map covers (upstream.Covered): its ecosystem,
+// classifier and name, compared exactly.
+type CoveredClassifier struct{ Ecosystem, Classifier, Name string }
+
 // ImageGapTally tallies the image coverage gaps of a cluster, namespace or workload scope, as
-// CoverageImages lists them, with an image whose first match has not run counted as pending.
-func (s *Store) ImageGapTally(ctx context.Context, sc model.Scope) (ImageGapTally, error) {
+// CoverageImages lists them, with an image whose first match has not run counted as pending. A
+// classifier-found package is uncovered unless covered names it. It reads one row, however many
+// images and packages the scope holds.
+func (s *Store) ImageGapTally(ctx context.Context, sc model.Scope, covered []CoveredClassifier) (ImageGapTally, error) {
 	var w where
 	w.add(containerDigest("oi.digest"))
 	switch sc.Kind {
@@ -768,22 +777,27 @@ func (s *Store) ImageGapTally(ctx context.Context, sc model.Scope) (ImageGapTall
 	default:
 		return ImageGapTally{}, scopeErr(sc)
 	}
-	inuse := `WITH inuse AS (SELECT DISTINCT oi.digest FROM owner_images oi JOIN owners o ON o.key = oi.owner_key` + w.String() + `)`
-	t := ImageGapTally{Classified: map[string][]model.Package{}}
-	err := s.rdb.QueryRowContext(ctx, inuse+` SELECT coalesce(sum(CASE WHEN i.digest IS NULL OR NOT `+seenSQL("i", "u.digest")+` THEN 1
-		ELSE (i.source = 'attestation') + (i.cov_unattributed > 0) + (i.cov_rust > 0) END), 0)
-		FROM inuse u LEFT JOIN images i ON i.digest = u.digest`, w.args...).Scan(&t.Codes)
+	triples := make([][3]string, len(covered))
+	for i, c := range covered {
+		triples[i] = [3]string{c.Ecosystem, c.Classifier, c.Name}
+	}
+	coveredJSON, err := jsonText(triples)
+	if err != nil {
+		return ImageGapTally{}, err
+	}
+	var t ImageGapTally
+	err = s.rdb.QueryRowContext(ctx, `WITH inuse AS (SELECT DISTINCT oi.digest FROM owner_images oi JOIN owners o ON o.key = oi.owner_key`+
+		w.String()+`),
+		covered(ecosystem, classifier, name) AS (SELECT json_extract(value, '$[0]'), json_extract(value, '$[1]'),
+			json_extract(value, '$[2]') FROM json_each(?))
+		SELECT coalesce(sum(CASE WHEN i.digest IS NULL OR NOT `+seenSQL("i", "u.digest")+` THEN 1
+			ELSE (i.source = 'attestation') + (i.cov_unattributed > 0) + (i.cov_rust > 0) END), 0),
+		coalesce(sum(CASE WHEN i.digest IS NOT NULL AND `+seenSQL("i", "u.digest")+` AND EXISTS (SELECT 1 FROM packages p
+			WHERE p.digest = u.digest AND p.classifier != '' AND NOT EXISTS (SELECT 1 FROM covered c
+				WHERE c.ecosystem = p.ecosystem AND c.classifier = p.classifier AND c.name = p.name)) THEN 1 ELSE 0 END), 0)
+		FROM inuse u LEFT JOIN images i ON i.digest = u.digest`, append(w.args, coveredJSON)...).Scan(&t.Codes, &t.Uncovered)
 	if err != nil {
 		return ImageGapTally{}, fmt.Errorf("store: image gaps of %s: %w", sc, err)
-	}
-	pkgs, err := queryAll(ctx, s.rdb, scanPackage, inuse+` SELECT `+prefixedCols("p.", packageCols, "")+` FROM inuse u
-		JOIN images i ON i.digest = u.digest CROSS JOIN packages p ON p.digest = u.digest
-		WHERE p.classifier != '' AND `+seenSQL("i", "u.digest")+` ORDER BY p.digest, p.name, p.version, p.id`, w.args...)
-	if err != nil {
-		return ImageGapTally{}, fmt.Errorf("store: classified packages of %s: %w", sc, err)
-	}
-	for _, p := range pkgs {
-		t.Classified[p.ImageDigest] = append(t.Classified[p.ImageDigest], p)
 	}
 	return t, nil
 }

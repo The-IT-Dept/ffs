@@ -1,41 +1,45 @@
-package apiserver
+package apiserver_test
 
 import (
-	"fmt"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/the-it-dept/ffs/internal/inventory"
 	"github.com/the-it-dept/ffs/internal/model"
-	"github.com/the-it-dept/ffs/internal/registry"
-	"github.com/the-it-dept/ffs/internal/web/apigen"
+	"github.com/the-it-dept/ffs/internal/web/apiserver"
+	"github.com/the-it-dept/ffs/internal/web/webtest"
 )
 
-func TestUnresolvableGap_ClassifiesReasons(t *testing.T) {
-	for reason, want := range map[string]apigen.GapCode{
-		fmt.Sprintf(registry.ReasonUnauthorized, "r"):               apigen.GapCodeUnresolvableAuth,
-		fmt.Sprintf(registry.ReasonNotFound, "r@d"):                 apigen.GapCodeUnresolvableNotfound,
-		inventory.ReasonSideLoadedNoTag:                             apigen.GapCodeUnresolvableSideloaded,
-		fmt.Sprintf(inventory.ReasonSideLoadedMismatch, "r", "1.0"): apigen.GapCodeUnresolvableSideloaded,
-		fmt.Sprintf(inventory.ReasonUnreachable, "r", "dial"):       apigen.GapCodeUnresolvableUnreachable,
-		"x": apigen.GapCodeUnresolvableOther,
-		fmt.Sprintf(inventory.ReasonNoPlatform, "sha256:1", "linux/arm64"): apigen.GapCodeUnresolvableOther,
-		inventory.ReasonLayersDiscarded:                                    apigen.GapCodeLayersDiscarded,
-	} {
-		require.Equal(t, want, unresolvableGap(reason), reason)
-	}
-}
+// V27: the rail and the summary count a scope's gaps from the store's tally instead of listing every
+// image; the count is exactly the number of gaps /coverage lists, in every scope and coverage state.
+func TestGaps_CountMatchesList(t *testing.T) {
+	f := webtest.Open(t)
+	ctx := t.Context()
+	// Every kind of image gap: a full image with a classifier-found package matched by CPE only, an
+	// image not matched yet, and the fixture's pending, unresolvable, failed and partial images.
+	require.NoError(t, f.Store.PutSBOM(ctx, webtest.DigestCoreDNS, nil, []model.Package{
+		{Ecosystem: "binary", Name: "redis-server", Version: "7.4.1", Classifier: "redis-binary", Path: "/usr/local/bin/redis-server"},
+	}))
+	require.NoError(t, f.Store.MarkUnmatched(ctx, webtest.DigestPayments, webtest.Now))
+	agentReport(t, f, "worker-1", time.Minute, model.GapNodeAgentBlocked)
+	srv := apiserver.New(f.Options())
 
-func TestImageGaps_InOrder(t *testing.T) {
-	require.Equal(t, []apigen.GapCode{apigen.GapCodePending}, imageGaps(model.Image{}, false, nil))
-	require.Equal(t, []apigen.GapCode{apigen.GapCodePending}, imageGaps(model.Image{Status: model.ImagePending}, true, nil))
-	require.Equal(t, []apigen.GapCode{apigen.GapCodeCatalogFailed}, imageGaps(model.Image{Status: model.ImageCatalogFailed}, true, nil))
-	require.Equal(t, []apigen.GapCode{apigen.GapCodeUnresolvableAuth},
-		imageGaps(model.Image{Status: model.ImageUnresolvable, StatusReason: fmt.Sprintf(registry.ReasonUnauthorized, "r")}, true, nil))
-	require.Equal(t, []apigen.GapCode{}, imageGaps(model.Image{Status: model.ImageCatalogued, Source: "registry"}, true, nil))
-	require.Equal(t, []apigen.GapCode{apigen.GapCodeAttestationPartial, apigen.GapCodeUnattributedExecutables,
-		apigen.GapCodeRustNoAuditable, apigen.GapCodeCpeOnlyClassifier},
-		imageGaps(model.Image{Status: model.ImageCatalogued, Source: "attestation",
-			Coverage: model.Coverage{UnattributedELF: 1, RustWithoutAuditable: 2}}, true, []string{"traefik"}))
+	for _, sc := range []model.Scope{
+		{Kind: model.ScopeCluster},
+		{Kind: model.ScopeNamespace, Value: "shop"}, {Kind: model.ScopeNamespace, Value: "payments"},
+		{Kind: model.ScopeNamespace, Value: "ops"}, {Kind: model.ScopeNamespace, Value: "kube-system"},
+		{Kind: model.ScopeWorkload, Value: webtest.Worker.Key()}, {Kind: model.ScopeWorkload, Value: webtest.Payments.Key()},
+		{Kind: model.ScopeImage, Value: webtest.DigestWorker}, {Kind: model.ScopeImage, Value: webtest.DigestWeb},
+		{Kind: model.ScopeImage, Value: webtest.DigestFailed}, {Kind: model.ScopeImage, Value: webtest.DigestCoreDNS},
+		{Kind: model.ScopeNodeGroup, Value: webtest.AgentGroupKey}, {Kind: model.ScopeNode, Value: "worker-1"},
+		{Kind: model.ScopeControlPlane},
+	} {
+		gaps, n, err := srv.ScopeGapsAndCount(ctx, sc)
+		require.NoError(t, err, sc.String())
+		require.Len(t, gaps, n, sc.String())
+	}
+	gaps, _, err := srv.ScopeGapsAndCount(ctx, model.Scope{Kind: model.ScopeCluster})
+	require.NoError(t, err)
+	require.Greater(t, len(gaps), 6, "the fixture covers several gap kinds")
 }

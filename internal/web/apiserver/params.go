@@ -116,6 +116,23 @@ func textParam(name string, p *string, maxLen int) (string, error) {
 	return *p, nil
 }
 
+// canonicalScope is sc as the API names it in answers: a node-group scope by its group's key
+// (groupSet.scope), however the request named the group (its ID, label or a stable form of its key).
+// Any other scope, and a group that is not found, is sc as given.
+func (s *Server) canonicalScope(ctx context.Context, sc model.Scope) (model.Scope, error) {
+	if sc.Kind != model.ScopeNodeGroup {
+		return sc, nil
+	}
+	gs, err := s.groupSet(ctx)
+	if err != nil {
+		return model.Scope{}, err
+	}
+	if g, ok := gs.find(sc.Value); ok {
+		return gs.scope(g), nil
+	}
+	return sc, nil
+}
+
 // resolveScope narrows a parsed scope to one the store answers and checks that its object exists: a
 // node scope is its group's (host findings are per group), a node group scope names the group by
 // its ID (it may name it by its key or label: groupSet.find), and a workload scope must name a

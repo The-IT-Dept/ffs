@@ -307,11 +307,6 @@ func hasGap(a model.NodeAgentStatus, codes ...string) bool {
 // hostGap reports whether ffs does not see a node's host packages in full (hostGapCodes).
 func hostGap(a model.NodeAgentStatus) bool { return hasGap(a, hostGapCodes...) }
 
-// fullyReporting reports whether a node's agent reports and its host inventory is stored.
-func fullyReporting(a model.NodeAgentStatus) bool {
-	return a.State == model.AgentReporting && !hasGap(a, string(apigen.GapCodeHostNotInventoried))
-}
-
 // memberGaps are the gap codes of a group's members, each once, sorted.
 func memberGaps(g model.NodeGroup, agents *agentView) []apigen.GapCode {
 	out := []apigen.GapCode{}
@@ -343,8 +338,9 @@ func liveAgent(st model.AgentState) bool {
 }
 
 // ListNodeGroups lists the control plane and every node group with its members' agent states and
-// coverage gaps and field drift against the largest group of the same architecture. A member whose
-// agent reports but whose host inventory is not stored is not counted as reporting.
+// coverage gaps and field drift against the largest group of the same architecture. Members are
+// counted by their CountState: one whose agent reports but whose host inventory is not stored counts
+// as reportingWithoutInventory, and one the agent does not schedule on as unsupported.
 func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequestObject) (apigen.ListNodeGroupsResponseObject, error) {
 	agents, err := s.agentView(ctx)
 	if err != nil {
@@ -381,11 +377,13 @@ func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequ
 		}
 		for _, m := range g.Members {
 			a := agents.of(m)
-			switch a.State {
+			switch a.CountState() {
 			case model.AgentReporting:
-				if fullyReporting(a) {
-					row.Agents.Reporting++
-				}
+				row.Agents.Reporting++
+			case model.AgentReportingWithoutInventory:
+				row.Agents.ReportingWithoutInventory++
+			case model.AgentUnsupported:
+				row.Agents.Unsupported++
 			case model.AgentStale:
 				row.Agents.Stale++
 			case model.AgentNever:

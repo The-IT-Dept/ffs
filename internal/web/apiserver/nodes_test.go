@@ -272,3 +272,26 @@ func TestNodeAgentFields(t *testing.T) {
 	require.NotNil(t, hit.Detail)
 	require.Equal(t, "2 nodes", *hit.Detail)
 }
+
+// Agent counts follow each member's CountState: a reporting agent whose host inventory is not stored
+// counts as reportingWithoutInventory, not reporting, and a node the agent does not schedule on as
+// unsupported, not never.
+func TestNodeGroups_AgentCountsByCountState(t *testing.T) {
+	f := webtest.Open(t)
+	agentReport(t, f, "worker-1", time.Minute, string(apigen.GapCodeHostNotInventoried))
+	st, err := f.Store.NodesState(t.Context())
+	require.NoError(t, err)
+	st.Unsupported = map[string]string{"cp-1": "architecture arm64 is not in nodeAgent.architectures"}
+	require.NoError(t, f.Store.PutNodesState(t.Context(), st))
+
+	got := ok[apigen.NodeGroupsList](t, get(t, handlerOf(f), "/api/v1/nodegroups"))
+	require.Len(t, got.Groups, 2)
+	require.Equal(t, webtest.AgentGroupKey, got.Groups[0].Id)
+	require.Equal(t, apigen.AgentCounts{ReportingWithoutInventory: 1, Stale: 1}, got.Groups[0].Agents)
+	require.Equal(t, webtest.CP1GroupKey, got.Groups[1].Id)
+	require.Equal(t, apigen.AgentCounts{Unsupported: 1}, got.Groups[1].Agents)
+
+	agentReport(t, f, "worker-2", time.Minute)
+	got = ok[apigen.NodeGroupsList](t, get(t, handlerOf(f), "/api/v1/nodegroups"))
+	require.Equal(t, apigen.AgentCounts{Reporting: 1, ReportingWithoutInventory: 1}, got.Groups[0].Agents)
+}

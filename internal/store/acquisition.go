@@ -148,12 +148,15 @@ type CrashReset struct {
 	Images   int    // catalogue quarantines lifted (the images are pending again)
 	Jobs     int    // agent job records deleted: node host inventories (nodehost:<node>) and agent image work
 	Inflight int    // acquisitions a stopped controller left in flight
+	Attempts int    // pending images, left in flight, whose counted attempts were reset
 	Matches  int    // images whose interrupted first-match runs no longer count
 	Errors   int    // node agent errors that named a lifted quarantine
 }
 
 // Cleared is how many records were cleared in all.
-func (r CrashReset) Cleared() int { return r.Images + r.Jobs + r.Inflight + r.Matches + r.Errors }
+func (r CrashReset) Cleared() int {
+	return r.Images + r.Jobs + r.Inflight + r.Attempts + r.Matches + r.Errors
+}
 
 // ResetCrashQuarantines runs once at controller start. When version differs from the stored
 // controller version (or none is stored), it lifts what a crash or stall of the previous controller
@@ -161,7 +164,9 @@ func (r CrashReset) Cleared() int { return r.Images + r.Jobs + r.Inflight + r.Ma
 //   - catalogFailed images whose reason is a crash or stall (crashReasons) become pending, with no
 //     attempts and no quarantine, so they are acquired again;
 //   - agent job records whose last error is one, for node host inventories and agent image work;
-//   - every acquisition record left in flight, which would otherwise count as another crash;
+//   - every acquisition record left in flight, which would otherwise count as another crash, and the
+//     counted attempts of the pending images those records were for, which earlier crashes may have
+//     counted, so the new version has every try;
 //   - the match runs counted against images whose first match has not completed;
 //   - a node agent error that names a lifted host inventory quarantine.
 //
@@ -191,6 +196,8 @@ func (s *Store) ResetCrashQuarantines(ctx context.Context, version string) (r Cr
 			{&r.Errors, `UPDATE nodes_agent SET last_error = '' WHERE last_error LIKE 'host inventory quarantined until %' AND ` + jobCrash,
 				jobArgs},
 			{&r.Jobs, `DELETE FROM agent_jobs WHERE ` + jobCrash, jobArgs},
+			{&r.Attempts, `UPDATE images SET attempts = 0 WHERE status = ? AND attempts > 0
+				AND digest IN (SELECT digest FROM acquisitions_inflight)`, []any{string(model.ImagePending)}},
 			{&r.Inflight, `DELETE FROM acquisitions_inflight`, nil},
 			{&r.Matches, `UPDATE images_unmatched SET attempts = 0 WHERE attempts > 0`, nil},
 		} {
