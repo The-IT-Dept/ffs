@@ -338,6 +338,21 @@ func (s *Store) DeleteOSVRecords(ctx context.Context, eco string, ids []string) 
 	return s.inTx(ctx, func(tx *sql.Tx) error { return deleteOSVRecords(ctx, tx, eco, ids) })
 }
 
+// AdvisoryIDsListed returns, sorted, those of ids whose advisory listed names: by the id itself, or
+// by its canonical id or any alias of that canonical (advisory_aliases). The KEV feed passes its
+// catalogue's CVE ids, so it reads and decodes only the advisories the catalogue can date.
+func (s *Store) AdvisoryIDsListed(ctx context.Context, ids, listed []string) ([]string, error) {
+	if len(ids) == 0 || len(listed) == 0 {
+		return nil, nil
+	}
+	return queryAll(ctx, s.rdb, scanString, `SELECT DISTINCT j.value FROM json_each(?) j
+		WHERE j.value IN (SELECT value FROM json_each(?)) OR EXISTS (
+			SELECT 1 FROM advisory_aliases a
+			WHERE a.canonical = COALESCE((SELECT c.canonical FROM advisory_aliases c WHERE c.alias = j.value), j.value)
+				AND a.alias IN (SELECT value FROM json_each(?)))
+		ORDER BY j.value`, idList(ids), idList(listed), idList(listed))
+}
+
 // PutUpstreamRanges stores the affected ranges of an advisory for an upstream product.
 func (s *Store) PutUpstreamRanges(ctx context.Context, advisoryID, productKey string, ranges []byte) error {
 	if ranges == nil {

@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/the-it-dept/ffs/internal/model"
 )
 
 func TestFeedState(t *testing.T) {
@@ -61,6 +63,30 @@ func TestFeedState_StaleFrom(t *testing.T) {
 			require.Equal(t, c.earliest, c.st.EarliestAttempt())
 			require.Equal(t, c.ref, c.st.StaleFrom(started))
 		})
+	}
+}
+
+// TestAdvisoryIDsListed (W53): an id is listed by itself, by its canonical id or by any alias of
+// that canonical.
+func TestAdvisoryIDsListed(t *testing.T) {
+	s := newStore(t)
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "GHSA-aaaa", Aliases: []string{"CVE-2026-1000", "CVE-2026-2000"}}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-3000"}))
+	require.NoError(t, s.UpsertAdvisory(ctx, model.Advisory{ID: "CVE-2026-4000"}))
+	ids := []string{"CVE-2026-1000", "CVE-2026-3000", "CVE-2026-4000", "GHSA-aaaa", "CVE-2026-9999"}
+
+	for _, c := range []struct {
+		listed []string
+		want   []string
+	}{
+		{[]string{"CVE-2026-2000"}, []string{"CVE-2026-1000", "GHSA-aaaa"}}, // an alias of the canonical CVE-2026-1000
+		{[]string{"CVE-2026-3000", "CVE-2026-9999"}, []string{"CVE-2026-3000", "CVE-2026-9999"}},
+		{[]string{"CVE-2026-0001"}, nil},
+		{nil, nil},
+	} {
+		got, err := s.AdvisoryIDsListed(ctx, ids, c.listed)
+		require.NoError(t, err)
+		require.Equal(t, c.want, got, "%v", c.listed)
 	}
 }
 

@@ -176,8 +176,12 @@ func (f *Feed) applyCached(ctx context.Context, digests []string) error {
 	if err != nil || len(ids) == 0 {
 		return err
 	}
-	// Every advisory is read, not only those the catalogue lists by id: the catalogue can list one
-	// of an advisory's aliases instead.
+	// Only the advisories the catalogue lists are read: by id, or by an alias, since the catalogue
+	// can list one of an advisory's aliases instead. The store picks them, so a full re-match does
+	// not decode every advisory in use.
+	if ids, err = f.o.Store.AdvisoryIDsListed(ctx, ids, slices.Collect(maps.Keys(dates))); err != nil || len(ids) == 0 {
+		return err
+	}
 	have, err := f.o.Store.Advisories(ctx, ids)
 	if err != nil {
 		return err
