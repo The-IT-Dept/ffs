@@ -8,6 +8,7 @@ import { ProblemNotice } from '@/components/layout/ProblemNotice'
 import { AgentGate, hasAgentData } from '@/components/nodes/AgentGate'
 import { AgentStatusView } from '@/components/nodes/AgentStatusView'
 import { NodeImagesTable } from '@/components/nodes/NodeImagesTable'
+import { EolText } from '@/components/signals/EolText'
 import { Mono } from '@/components/signals/Mono'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -40,7 +41,7 @@ function NodePage() {
         n.kubeletVersion ? <span key="kubelet">{n.kubeletVersion}</span> : null,
         n.arch ? <span key="arch">{n.arch}</span> : null,
         <span key="ready">{n.ready ? copy.nodes.ready : copy.nodes.notReady}</span>,
-        osEol ? <span key="eol">{osEol}</span> : null,
+        osEol ? <EolText key="eol" eol={n.osEol} /> : null,
       ]
         .filter((x) => x !== null)
         .flatMap((x, i) => (i > 0 ? [<span key={`sep${i}`} aria-hidden="true">·</span>, x] : [x]))}

@@ -69,3 +69,16 @@ export function plural(n: number, one: string, many: string): string {
 export function eolText(e: S<'EOL'> | undefined): string {
   return e ? e.text || e.note : ''
 }
+
+// EOL_WARN_MS is how far ahead of an end-of-life date a status warns: the server's text says
+// "reaches end of life <date>" from 90 days before it.
+const EOL_WARN_MS = 90 * 24 * 60 * 60 * 1000
+
+// eolWarns reports whether a lifecycle status calls for the warning tone: end of life has passed, or
+// is at most 90 days away.
+export function eolWarns(e: S<'EOL'> | undefined, now = Date.now()): boolean {
+  if (!e) return false
+  if (e.isEol) return true
+  const at = e.eolDate ? Date.parse(e.eolDate) : Number.NaN
+  return !Number.isNaN(at) && at - now <= EOL_WARN_MS
+}

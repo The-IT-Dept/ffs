@@ -474,6 +474,38 @@ test('the control plane shows each version with its lifecycle, the note when the
   expect(screen.getByText('CRI-O 1.35: rolling release')).toBeInTheDocument()
 })
 
+// W42: every version has lifecycle text now, so an end of life reads in the warning tone.
+test('an end of life on the control plane and a node page reads as a warning', async () => {
+  const eol = { eolDate: '', isEol: false, latest: '', note: '', text: '' }
+  mockApi()
+    .on(
+      '/nodegroups',
+      nodeGroupsList({
+        controlPlane: {
+          kubernetes: [
+            { version: '1.34.2', nodes: 3, eol: { ...eol, product: 'kubernetes', cycle: '1.34', eolDate: '2026-10-27', isEol: true, text: 'Kubernetes 1.34 reached end of life 2026-10-27' } },
+          ],
+          runtimes: [{ name: 'containerd', version: '2.2.1', nodes: 3, eol: { ...eol, product: 'containerd', cycle: '2.2', eolDate: '2099-01-01', text: 'containerd 2.2 supported until 2099-01-01' } }],
+          counts: counts(),
+          fixable: 0,
+          suggestions: [],
+        },
+      }),
+    )
+    .on('/findings', findingsPage())
+  renderApp('/controlplane')
+  expect(await screen.findByText('Kubernetes 1.34 reached end of life 2026-10-27')).toHaveClass('text-(--high-text)')
+  expect(screen.getByText('containerd 2.2 supported until 2099-01-01')).toHaveClass('text-muted-foreground')
+})
+
+test('a node on an operating system past its end of life says so as a warning', async () => {
+  const n = nodeDetail().node
+  const osEol = { product: 'ubuntu', cycle: '20.04', eolDate: '2025-05-31', isEol: true, latest: '', note: '', text: 'Ubuntu 20.04 reached end of life 2025-05-31' }
+  mockApi().on('/nodes/{name}', nodeDetail({ node: { ...n, osImage: 'Ubuntu 20.04.6 LTS', osEol } }))
+  renderApp('/nodes/worker-1')
+  expect(await screen.findByText('Ubuntu 20.04 reached end of life 2025-05-31')).toHaveClass('text-(--high-text)')
+})
+
 test.each([
   ['its text', { note: 'rolling release', text: 'Talos Linux 1.9: rolling release' }, 'Talos Linux 1.9: rolling release'],
   ['its note without text', { note: 'security updates for the two latest minor releases', text: '' }, 'security updates for the two latest minor releases'],
