@@ -20,7 +20,7 @@ An `AlertTarget` sends findings to Slack, Discord, Microsoft Teams or a signed w
 | `spec.quietHours.intervals` | none | Times when immediate alerts are held, in Alertmanager `time_intervals` form: `times` (`startTime`/`endTime` as `HH:MM`, end exclusive, `24:00` allowed), `weekdays` (`monday:friday`), `daysOfMonth` (`1:5`, `-1` for the last day), `months` (`january:march` or `1:3`), `years` (`2026:2027`) and `location` (IANA zone, default UTC). An interval matches when all of its non-empty fields match. |
 | `spec.quietHours.allowUrgent` | `true` | Send `urgent` alerts during quiet hours. |
 | `spec.notifyOnFeedStale` | `false` | Send one alert when a vulnerability feed goes stale. |
-| `spec.paused` | `false` | Stop all deliveries, including retries. Nothing that happens while paused is sent later; alerts queued before the pause wait until it is lifted, and their 24 hours of retries (see [Delivery](#delivery)) start only then. |
+| `spec.paused` | `false` | Stop all deliveries, including retries. Nothing that happens while paused is sent later; alerts queued before the pause wait until it is lifted, and those not tried yet start their 24 hours of retries (see [Delivery](#delivery)) only then. |
 | `spec.allowPrivate` | `false` | Allow delivery to private and carrier-grade NAT addresses, and to plain `http` URLs. |
 
 The status shows `lastDelivery`, `lastError` and a `Ready` condition. Its reason is `Registered` when deliveries are working, `Paused`, or one of `SecretNotFound`, `SecretUnreadable`, `SecretInvalid`, `InvalidSpec`, `DeliveryFailing` (three or more consecutive failures) and `EndpointGone`.
