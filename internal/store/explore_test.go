@@ -2,6 +2,7 @@ package store
 
 import (
 	"fmt"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -655,10 +656,27 @@ func TestTransitionsPage_ScopesNewestFirst(t *testing.T) {
 	require.ErrorIs(t, err, ErrScope)
 }
 
-func TestFindingsExploreIndexIsDropped(t *testing.T) {
-	s := newStore(t)
-	var n int
-	require.NoError(t, s.rdb.QueryRowContext(ctx,
-		`SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name IN ('findings_explore', 'findings_groups')`).Scan(&n))
-	require.Equal(t, 1, n, "findings_groups serves what findings_explore did (060)")
+// TestFindingsExploreIndexIsKept (W4): v0.0.2 keeps findings_explore, which v0.0.1's counts and facets
+// name, so a rollback to v0.0.1 on the same volume still serves the Findings page; the drop is
+// deferred to v0.0.3. A store that ran 060's unreleased first form, which dropped it, gets it back.
+func TestFindingsExploreIndexIsKept(t *testing.T) {
+	indexes := func(s *Store) []string {
+		names, err := queryAll(ctx, s.rdb, scanString, `SELECT name FROM sqlite_schema
+			WHERE type = 'index' AND name IN ('findings_explore', 'findings_groups') ORDER BY name`)
+		require.NoError(t, err)
+		return names
+	}
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	s, err := Open(ctx, path)
+	require.NoError(t, err)
+	require.Equal(t, []string{"findings_explore", "findings_groups"}, indexes(s))
+
+	_, err = s.wdb.ExecContext(ctx, `DROP INDEX findings_explore;
+		UPDATE schema_migrations SET name = '060_drop_findings_explore.sql' WHERE name = '060_keep_findings_explore.sql'`)
+	require.NoError(t, err)
+	require.NoError(t, s.Close())
+	s, err = Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, s.Close()) })
+	require.Equal(t, []string{"findings_explore", "findings_groups"}, indexes(s))
 }
