@@ -2,6 +2,7 @@ package feeds_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"path/filepath"
 	"sync"
@@ -356,6 +357,61 @@ func TestRunner_NeverSyncedStaleAcrossRestarts(t *testing.T) {
 	s, err = st.FeedState(ctx, "fake")
 	require.NoError(t, err)
 	require.True(t, s.FirstAttempt.Equal(t0))
+}
+
+// TestRunner_SyncNowAdoptsStoredFirstAttempt (W53): a SyncNow before Run has read the stored state
+// takes the stored first attempt, or a v0.0.1 state's last attempt, instead of its own start, and
+// stores the latter as the first attempt.
+func TestRunner_SyncNowAdoptsStoredFirstAttempt(t *testing.T) {
+	for name, stored := range map[string]store.FeedState{
+		"stored":  {Name: "fake", FirstAttempt: t0.Add(-2 * time.Hour), LastAttempt: t0.Add(-time.Hour), LastError: "boom", Fails: 2},
+		"v0.0.1":  {Name: "fake", LastAttempt: t0.Add(-2 * time.Hour), LastError: "boom"},
+		"unknown": {Name: "fake"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			st := newStore(t)
+			require.NoError(t, st.PutFeedState(ctx, stored))
+			clk := newFakeTimer()
+			f := &fakeFeed{name: "fake", interval: time.Hour, staleAfter: time.Hour,
+				sync: func(context.Context) error { return errors.New("unreachable") }}
+			r := feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now})
+			require.Error(t, r.SyncNow(ctx, "fake"))
+			s, err := st.FeedState(ctx, "fake")
+			require.NoError(t, err)
+			if name == "unknown" {
+				require.Empty(t, r.Stale())
+				require.True(t, s.FirstAttempt.Equal(t0), "FirstAttempt %v", s.FirstAttempt)
+				return
+			}
+			require.Equal(t, []string{"fake"}, r.Stale(), "an hour past the stored first attempt")
+			require.True(t, s.FirstAttempt.Equal(t0.Add(-2*time.Hour)), "FirstAttempt %v", s.FirstAttempt)
+		})
+	}
+}
+
+// TestRunner_FirstAttemptWriteFailureIsNotTheSyncs (W53): a sync that succeeds is a success even
+// when storing its first attempt beforehand failed; recording the outcome stores it.
+func TestRunner_FirstAttemptWriteFailureIsNotTheSyncs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	st, err := store.Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	inj, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, inj.Close()) })
+	// The first-attempt write is the only one without an attempt time.
+	_, err = inj.ExecContext(ctx, `CREATE TRIGGER fail_first BEFORE INSERT ON feeds WHEN NEW.last_attempt IS NULL
+		BEGIN SELECT RAISE(ABORT, 'injected first-attempt failure'); END`)
+	require.NoError(t, err)
+
+	clk := newFakeTimer()
+	f := &fakeFeed{name: "fake", interval: time.Hour, staleAfter: time.Hour}
+	require.NoError(t, feeds.NewRunner(st, []feeds.Feed{f}, feeds.RunnerOptions{Now: clk.Now}).SyncNow(ctx, "fake"))
+	s, err := st.FeedState(ctx, "fake")
+	require.NoError(t, err)
+	require.True(t, s.LastSuccess.Equal(t0))
+	require.True(t, s.FirstAttempt.Equal(t0), "FirstAttempt %v", s.FirstAttempt)
+	require.Empty(t, s.LastError)
 }
 
 // TestRunner_CancelledSyncNotRecorded (F54): a sync cut short by shutdown is not a failure: the

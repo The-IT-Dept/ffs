@@ -36,6 +36,34 @@ func TestFeedState(t *testing.T) {
 	require.Equal(t, "boom", got.LastError)
 }
 
+// TestFeedState_StaleFrom (W53): staleness is measured from the last success, else from the earliest
+// attempt known (FirstAttempt, or a v0.0.1 state's LastAttempt) when that is before the caller's
+// start, else from the start.
+func TestFeedState_StaleFrom(t *testing.T) {
+	started := t0
+	for _, c := range []struct {
+		name          string
+		st            FeedState
+		earliest, ref time.Time
+	}{
+		{"never attempted", FeedState{}, time.Time{}, started},
+		{"succeeded", FeedState{LastSuccess: t0.Add(-time.Hour), LastAttempt: t0.Add(-time.Hour), FirstAttempt: t0.Add(-48 * time.Hour)},
+			t0.Add(-48 * time.Hour), t0.Add(-time.Hour)},
+		{"succeeded under v0.0.1", FeedState{LastSuccess: t0.Add(-time.Hour), LastAttempt: t0.Add(-time.Minute)},
+			time.Time{}, t0.Add(-time.Hour)},
+		{"first attempt before the start", FeedState{FirstAttempt: t0.Add(-3 * time.Hour), LastAttempt: t0.Add(-time.Hour)},
+			t0.Add(-3 * time.Hour), t0.Add(-3 * time.Hour)},
+		{"first attempt after the start", FeedState{FirstAttempt: t0.Add(time.Minute)}, t0.Add(time.Minute), started},
+		{"failed under v0.0.1", FeedState{LastAttempt: t0.Add(-2 * time.Hour), LastError: "boom"},
+			t0.Add(-2 * time.Hour), t0.Add(-2 * time.Hour)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			require.Equal(t, c.earliest, c.st.EarliestAttempt())
+			require.Equal(t, c.ref, c.st.StaleFrom(started))
+		})
+	}
+}
+
 func TestUpstreamRanges(t *testing.T) {
 	s := newStore(t)
 	a, b, c := []byte(`{"r":"a"}`), []byte(`{"r":"b"}`), []byte(`{"r":"c"}`)

@@ -22,6 +22,31 @@ type FeedState struct {
 	Fails        int
 }
 
+// EarliestAttempt returns when the feed first started a sync: FirstAttempt, or, for a feed that
+// never succeeded and was last run by a version that did not store FirstAttempt (v0.0.1), its
+// LastAttempt, the earliest attempt known. It is zero when neither is known.
+func (st FeedState) EarliestAttempt() time.Time {
+	if st.FirstAttempt.IsZero() && st.LastSuccess.IsZero() {
+		return st.LastAttempt
+	}
+	return st.FirstAttempt
+}
+
+// StaleFrom returns the time the feed's staleness and lag are measured from: its last success, or,
+// for a feed that never succeeded, its earliest attempt (EarliestAttempt) when that is before
+// started, else started. started is when the caller began watching the feed: the feed runner, the
+// notify engine and the metrics collector each pass their own start, and all three measure from
+// this one rule.
+func (st FeedState) StaleFrom(started time.Time) time.Time {
+	if !st.LastSuccess.IsZero() {
+		return st.LastSuccess
+	}
+	if first := st.EarliestAttempt(); !first.IsZero() && first.Before(started) {
+		return first
+	}
+	return started
+}
+
 // FeedState returns the stored state of the named feed, or FeedState{Name: name} when unknown.
 func (s *Store) FeedState(ctx context.Context, name string) (FeedState, error) {
 	st := FeedState{Name: name}
