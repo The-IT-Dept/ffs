@@ -562,8 +562,9 @@ func TestAcquirer_ScratchFull(t *testing.T) {
 	t.Run("alone", func(t *testing.T) {
 		st, clock := acqStore(t), acqClock()
 		src := &fakeSource{name: "registry", err: full}
+		// A retry would wait an hour, so one scheduled shows in Stats until the test ends.
 		a := NewAcquirer(AcquirerOptions{Store: st, Sources: []Source{src}, Concurrency: 1, Now: clock.Now,
-			RetryAfter: 10 * time.Millisecond})
+			RetryAfter: time.Hour})
 		startAcq(t, a)
 		_, err := a.AcquireNow(ctx, acqReq())
 		require.Error(t, err)
@@ -571,8 +572,12 @@ func TestAcquirer_ScratchFull(t *testing.T) {
 		require.Equal(t, model.ImageCatalogFailed, img.Status)
 		require.Equal(t, reasonScratchFull, img.StatusReason)
 		require.True(t, img.QuarantinedUntil.Equal(clock.Now().Add(defaultQuarantineFor)))
-		time.Sleep(50 * time.Millisecond)
-		require.Equal(t, int32(1), src.calls.Load(), "not downloaded again")
+		// A retry is scheduled, and the job leaves flight, in one step before AcquireNow is answered.
+		stats := a.Stats()
+		require.Zero(t, stats.Retrying, "not downloaded again")
+		require.Zero(t, stats.Queued)
+		require.Zero(t, stats.InFlight)
+		require.Equal(t, int32(1), src.calls.Load())
 	})
 
 	t.Run("overlapping", func(t *testing.T) {

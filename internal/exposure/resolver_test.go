@@ -2,6 +2,9 @@ package exposure
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -15,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/cache/informertest"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllertest"
@@ -201,4 +205,53 @@ func TestRediscover_LateGatewayKinds(t *testing.T) {
 	require.Equal(t, []string{"edge", "netbox"}, ch.take())
 	informer(t, fi, &gatewayv1.Gateway{}).Add(gw("public", "edge", "cilium"))
 	require.Equal(t, []string{""}, ch.take())
+}
+
+// failingInformers fails the first informer of one kind, and refuses a second index on a kind, as the
+// manager's cache does.
+type failingInformers struct {
+	*informertest.FakeInformers
+	fail    client.Object // the kind whose first informer fails
+	failed  bool
+	indexed map[string]bool
+}
+
+func (f *failingInformers) GetInformer(ctx context.Context, obj client.Object, opts ...cache.InformerGetOption) (cache.Informer, error) {
+	if !f.failed && reflect.TypeOf(obj) == reflect.TypeOf(f.fail) {
+		f.failed = true
+		return nil, errors.New("informer not started")
+	}
+	return f.FakeInformers.GetInformer(ctx, obj, opts...)
+}
+
+func (f *failingInformers) IndexField(ctx context.Context, obj client.Object, field string, extract client.IndexerFunc) error {
+	k := fmt.Sprintf("%T", obj)
+	if f.indexed[k] {
+		return fmt.Errorf("indexer conflict: map[field:%s]", field)
+	}
+	f.indexed[k] = true
+	return f.FakeInformers.IndexField(ctx, obj, field, extract)
+}
+
+// TestDiscover_FailedKindRetried (W55): a route kind whose change handler fails does not hold up the kinds
+// after it or ReferenceGrants, and the next discovery sets it up without indexing it again, which the cache
+// would refuse.
+func TestDiscover_FailedKindRetried(t *testing.T) {
+	ctx := context.Background()
+	s := testScheme(t, true)
+	fi := &failingInformers{FakeInformers: &informertest.FakeInformers{Scheme: s}, fail: &gatewayv1.HTTPRoute{},
+		indexed: map[string]bool{}}
+	mapper := servedMapper(gwKind("v1", "HTTPRoute"), gwKind("v1", "GRPCRoute"), gwKind("v1", "ReferenceGrant"))
+	var ch changes
+	r := New(nil, config.ExposureConfig{})
+	d := discovery{cache: fi, mapper: mapper, reader: newClient(t, s), onChange: ch.on}
+	require.ErrorContains(t, r.register(ctx, d), "informer not started")
+	require.Equal(t, []string{"GRPCRoute/v1"}, routeVersions(r), "the kind after it is set up")
+	_, grants := r.readKinds()
+	require.Len(t, grants, 1, "and ReferenceGrants")
+
+	require.NoError(t, r.discover(ctx, d))
+	require.Equal(t, []string{"GRPCRoute/v1", "HTTPRoute/v1"}, routeVersions(r))
+	informer(t, fi.FakeInformers, &gatewayv1.HTTPRoute{}).Add(crossRoute(parent("public", "edge")))
+	require.Equal(t, []string{"edge", "netbox"}, ch.take())
 }

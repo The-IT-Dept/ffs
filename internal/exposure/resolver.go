@@ -4,7 +4,9 @@ package exposure
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +40,7 @@ type Resolver struct {
 
 	mu         sync.Mutex      // serialises discovery
 	registered map[string]bool // Gateway API kinds with change handlers
+	indexed    map[string]bool // route kinds with RouteBackendIndex, as "Kind/version": an index is set up once
 	routes     [][]routeKind   // the route kinds registered, one version each
 	grant      *grantKind      // the ReferenceGrant version registered; nil while none is
 	grantsHeld bool            // ReferenceGrants are served but ffs may not read them (logged once)
@@ -53,7 +56,7 @@ var _ inventory.ContextResolver = (*Resolver)(nil)
 
 // New returns a Resolver reading from c (the manager cache).
 func New(c client.Reader, cfg config.ExposureConfig) *Resolver {
-	return &Resolver{c: c, cfg: cfg, registered: map[string]bool{}}
+	return &Resolver{c: c, cfg: cfg, registered: map[string]bool{}, indexed: map[string]bool{}}
 }
 
 // readKinds returns the route kinds (per kind, the versions to try) and the ReferenceGrant versions
@@ -159,8 +162,9 @@ func (r *Resolver) register(ctx context.Context, d discovery) error {
 
 // discover sets up the Gateway API kinds the cluster serves that have no handlers yet: Gateway and
 // GatewayClass; each route kind at the first version served, with its RouteBackendIndex; and
-// ReferenceGrants at the first version served, once ffs may list them. It then publishes the route
-// and ReferenceGrant kinds for Context.
+// ReferenceGrants at the first version served, once ffs may list them. A kind that fails is left for
+// the next discovery and does not hold up the others. It then publishes the route and ReferenceGrant
+// kinds for Context.
 func (r *Resolver) discover(ctx context.Context, d discovery) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -169,6 +173,7 @@ func (r *Resolver) discover(ctx context.Context, d discovery) error {
 		return err == nil || !meta.IsNoMatchError(err)
 	}
 	defer r.publish()
+	var errs []error
 	for _, o := range []struct {
 		kind string
 		obj  client.Object
@@ -177,33 +182,40 @@ func (r *Resolver) discover(ctx context.Context, d discovery) error {
 			continue
 		}
 		if err := addHandler(ctx, d.cache, o.obj, objectHandler(d.onChange, true)); err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
 		r.registered[o.kind] = true
 	}
 	for _, versions := range routeKinds {
-		name := versions[0].name
-		if r.registered[name] {
+		if r.registered[versions[0].name] {
 			continue
 		}
-		for _, k := range versions {
-			if !served(k.name, k.version) {
-				continue
-			}
-			if err := d.cache.IndexField(ctx, k.newObj(), RouteBackendIndex, k.index); err != nil {
-				return fmt.Errorf("exposure: index %s %s: %w", k.name, k.version, err)
-			}
-			if err := addHandler(ctx, d.cache, k.newObj(), routeHandler(d.onChange, k.index)); err != nil {
-				return err
-			}
-			r.registered[name] = true
-			r.routes = append(r.routes, []routeKind{k})
-			break
+		if i := slices.IndexFunc(versions, func(k routeKind) bool { return served(k.name, k.version) }); i >= 0 {
+			errs = append(errs, r.registerRoute(ctx, d, versions[i]))
 		}
 	}
 	if r.grant == nil {
-		return r.discoverGrants(ctx, d, served)
+		errs = append(errs, r.discoverGrants(ctx, d, served))
 	}
+	return errors.Join(errs...)
+}
+
+// registerRoute sets up route kind k: its RouteBackendIndex, which the cache takes only once per kind
+// (a retry after a failed handler skips it), then its change handler.
+func (r *Resolver) registerRoute(ctx context.Context, d discovery, k routeKind) error {
+	key := k.name + "/" + k.version
+	if !r.indexed[key] {
+		if err := d.cache.IndexField(ctx, k.newObj(), RouteBackendIndex, k.index); err != nil {
+			return fmt.Errorf("exposure: index %s %s: %w", k.name, k.version, err)
+		}
+		r.indexed[key] = true
+	}
+	if err := addHandler(ctx, d.cache, k.newObj(), routeHandler(d.onChange, k.index)); err != nil {
+		return err
+	}
+	r.registered[k.name] = true
+	r.routes = append(r.routes, []routeKind{k})
 	return nil
 }
 
