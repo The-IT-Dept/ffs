@@ -39,11 +39,11 @@ var (
 		Help: "Registry requests remaining in the current rate-limit window, by registry.",
 	}, []string{"registry"})
 
-	// NotifyDeliveries counts delivery attempts by AlertTarget name and result: "success", "retry"
-	// or "failed".
+	// NotifyDeliveries counts delivery attempts by AlertTarget name and result: "success", "retry",
+	// "failed", or "dropped" (the oldest pending delivery of a target over its outbox cap).
 	NotifyDeliveries = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: "ffs_notify_deliveries_total",
-		Help: "Total notification delivery attempts, by alert target and result.",
+		Help: "Total notification deliveries by alert target and result: success, retry, failed, or dropped over the outbox cap.",
 	}, []string{"target", "result"})
 
 	// AgentReports counts node agent reports by result, "applied", "duplicate", "deferred" or "rejected",

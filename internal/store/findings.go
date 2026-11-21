@@ -85,8 +85,7 @@ func appendTransitions(ctx context.Context, tx *sql.Tx, ts []model.Transition) e
 // with any already there (moveLedger): the state and time come from the row of the finding that
 // continues, which is the old one unless an open or excepted finding holds NewFingerprint. A
 // resolved one there does not continue, because the next recompute reopens the finding from the
-// moved matches. Transitions keep the old fingerprint as
-// history.
+// moved matches. Transitions keep the old fingerprint as history.
 func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		for _, rk := range rks {

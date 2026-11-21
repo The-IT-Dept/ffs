@@ -87,9 +87,9 @@ func TestSetLogger_KlogAndVerbosity(t *testing.T) {
 	logger := func(buf *lockedBuffer, args ...string) logr.Logger {
 		t.Helper()
 		o := zap.Options{DestWriter: buf}
-		fs := flag.NewFlagSet("zap", flag.ContinueOnError)
-		o.BindFlags(fs)
-		require.NoError(t, fs.Parse(args))
+		zfs := flag.NewFlagSet("zap", flag.ContinueOnError)
+		o.BindFlags(zfs)
+		require.NoError(t, zfs.Parse(args))
 		return zap.New(zap.UseFlagOptions(&o))
 	}
 	require.False(t, logger(&lockedBuffer{}).V(1).Enabled(), "V(1) is off by default")

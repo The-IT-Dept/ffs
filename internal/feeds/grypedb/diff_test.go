@@ -153,7 +153,7 @@ func copyDB(t *testing.T, dir string) string {
 	return dst
 }
 
-// TestExecDiffer_RoundTripsPackageKeys (#7): the diff run in a re-executed process at nice 10
+// TestExecDiffer_RoundTripsPackageKeys (#7): the diff run in a re-executed process, 10 nice levels down,
 // returns the package keys an in-process diff does, through its result file, which it removes.
 func TestExecDiffer_RoundTripsPackageKeys(t *testing.T) {
 	oldDir := grypedbtest.BuildDB(t, built1, "**/debian-12/cve-2022-38178.json")

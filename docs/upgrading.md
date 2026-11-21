@@ -10,6 +10,9 @@ How to upgrade, and a short list of what each release changes, is in the [README
 - `nodeAgent.networkPolicy.enabled` is now the top-level `networkPolicy.enabled` (default `true`). v0.0.2 still honours the old key when set, and the install notes say it is deprecated; v0.0.3 removes it. The chart refuses `networkPolicy.enabled: false` with `nodeAgent.networkPolicy.enabled: true`; `null` unsets the old key. Under `--reuse-values` from v0.0.1, the old key's v0.0.1 default, `true`, counts as unset. See [docs/node-agent.md](node-agent.md).
 - `ffs controller` takes controller-runtime's `--zap-*` logging flags. The chart value `controller.logLevel` (`info` or `debug`) sets `--zap-log-level`. client-go's own verbose messages stay off.
 
+- **arm64 nodes** no longer show `node_agent_unsupported`: the agent now schedules on them by default.
+- **ServiceMonitor:** it used to select the web UI and agent API Services as well as metrics; it now selects only the metrics Service.
+
 ### v0.0.2: Alert delivery
 
 - A delivery that fails transiently is retried until 24 hours after its first attempt (was 12 attempts, about 66 minutes), still at most 15 minutes apart. The 24 hours run from each message's own first attempt, and while a target backs off only its oldest message is tried: after an outage longer than a day, the oldest message is given up and the rest arrive late, in order.
