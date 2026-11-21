@@ -90,6 +90,33 @@ func TestPutOSVRecordAt_Observed(t *testing.T) {
 	require.Equal(t, map[string]time.Time{"GHSA-1": t0.Add(2 * time.Hour)}, obs, "changed content is observed anew")
 }
 
+// TestPutOSVRecordAt_RatingOnlyChangeKeepsObserved (W3): with "<match>:<rating>" hashes, a change to
+// the rating part alone is a change (the record is handed off) that keeps the observation time; a
+// change to the match part moves it. A hash without a ':' (v1) compares as its match part.
+func TestPutOSVRecordAt_RatingOnlyChangeKeepsObserved(t *testing.T) {
+	s := newStore(t)
+	put := func(hash string, at time.Time) bool {
+		t.Helper()
+		changed, err := s.PutOSVRecordAt(ctx, "Ubuntu", "UBUNTU-CVE-1", at, hash, []byte(`{"id":"UBUNTU-CVE-1"}`), at)
+		require.NoError(t, err)
+		return changed
+	}
+	observed := func() time.Time {
+		t.Helper()
+		obs, err := s.OSVRecordsObserved(ctx, []string{"UBUNTU-CVE-1"})
+		require.NoError(t, err)
+		return obs["UBUNTU-CVE-1"]
+	}
+	require.True(t, put("m1", t0))
+	require.True(t, put("m1:medium", t0.Add(time.Hour)), "the v1 hash differs from the full v3 one")
+	require.Equal(t, t0, observed(), "a v1 hash is the match part")
+	require.True(t, put("m1:high", t0.Add(2*time.Hour)), "a rating-only change is handed off")
+	require.Equal(t, t0, observed(), "a rating-only change keeps the observation time")
+	require.False(t, put("m1:high", t0.Add(3*time.Hour)))
+	require.True(t, put("m2:high", t0.Add(4*time.Hour)))
+	require.Equal(t, t0.Add(4*time.Hour), observed(), "a match change is observed anew")
+}
+
 // TestRehashOSVRecords: the affected hash of every cached record, across pages, is recomputed;
 // the raw, modified and observation times stay, an unreadable record keeps its hash and an
 // unchanged hash is not counted.
@@ -115,7 +142,8 @@ func TestRehashOSVRecords(t *testing.T) {
 	n, err := s.RehashOSVRecords(ctx, hash)
 	require.NoError(t, err)
 	require.Equal(t, rehashPage+10, n, "GO-1 already had its hash; GO-2 does not parse")
-	for _, c := range []struct{ eco, id, hash string }{{"PyPI", "GHSA-000", "new:GHSA-000"}, {"PyPI", "GHSA-073", "new:GHSA-073"},
+	last := fmt.Sprintf("GHSA-%03d", rehashPage+9)
+	for _, c := range []struct{ eco, id, hash string }{{"PyPI", "GHSA-000", "new:GHSA-000"}, {"PyPI", last, "new:" + last},
 		{"Go", "GO-1", "new:GO-1"}, {"Go", "GO-2", "old"}} {
 		var got string
 		require.NoError(t, s.rdb.QueryRowContext(ctx, `SELECT affected_hash FROM osv_records WHERE ecosystem = ? AND id = ?`, c.eco, c.id).Scan(&got))

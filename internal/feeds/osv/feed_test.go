@@ -1422,10 +1422,20 @@ func TestAffectedHash_IncludesRatings(t *testing.T) {
 	require.Equal(t, base, hash(rated("GHSA-1", "MODERATE", "medium", now.Add(time.Hour))), "timestamps still do not count")
 	require.NotEqual(t, base, hash(rated("GHSA-1", "HIGH", "medium", now)), "GHSA rating")
 	require.NotEqual(t, base, hash(rated("GHSA-1", "MODERATE", "high", now)), "Ubuntu priority")
+
+	// W3: the hash is "<match>:<rating>"; a rating change leaves the match part alone.
+	matchPart := func(h string) string {
+		m, _, ok := strings.Cut(h, ":")
+		require.True(t, ok, h)
+		return m
+	}
+	require.Equal(t, matchPart(base), matchPart(hash(rated("GHSA-1", "HIGH", "high", now))))
+	require.NotEqual(t, matchPart(base), matchPart(hash(rated("GHSA-2", "MODERATE", "medium", now))), "aliases and affected")
 }
 
-// TestOSVSync_RatingOnlyChangeDelivered (F64): a record whose only change is its rating is handed
-// off, so findings take the new vendor severity without waiting for the weekly full re-match.
+// TestOSVSync_RatingOnlyChangeDelivered (F64, W3): a record whose only change is its rating is handed
+// off, so findings take the new vendor severity without waiting for the weekly full re-match, and
+// keeps its observation time.
 func TestOSVSync_RatingOnlyChangeDelivered(t *testing.T) {
 	e := newEnv(t)
 	e.inUse(t, python)
@@ -1442,8 +1452,16 @@ func TestOSVSync_RatingOnlyChangeDelivered(t *testing.T) {
 	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
 	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "hashver": osv.HashVersion})
 
+	before, err := e.st.OSVRecordsObserved(ctx, []string{"GHSA-a", "GHSA-b", "GHSA-c"})
+	require.NoError(t, err)
+	require.Len(t, before, 3)
+
 	require.NoError(t, e.feed().Sync(ctx))
 	require.Equal(t, []string{"PyPI/GHSA-a", "PyPI/GHSA-b"}, e.sink.keys())
+	// W3: what the records match did not change, so new matches on them are not provisional again.
+	after, err := e.st.OSVRecordsObserved(ctx, []string{"GHSA-a", "GHSA-b", "GHSA-c"})
+	require.NoError(t, err)
+	require.Equal(t, before, after, "a rating-only change keeps the observation time")
 }
 
 // TestOSVSync_HashVersionUpgradeIsSilent (F64): records cached under the previous hash recipe are

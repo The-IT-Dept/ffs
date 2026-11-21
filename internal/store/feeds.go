@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -68,8 +69,11 @@ func (s *Store) PutOSVRecord(ctx context.Context, eco, id string, modified time.
 
 // PutOSVRecordAt caches a raw OSV record that ffs observed at observed. changed is true when there
 // was no prior row or its affected hash differs; the latest modified time and raw record are stored
-// either way. The record's observation time (OSVRecordsObserved) is observed when it changed, and
-// the stored one otherwise: it is when ffs first saw the record's current affected content.
+// either way. The affected hash is "<match>:<rating>" (osv.AffectedHash; a hash without a ':' is all
+// match part). The record's observation time (OSVRecordsObserved) is observed when the match part
+// changed, and the stored one otherwise: it is when ffs first saw what the record currently matches.
+// A rating-only change is a change, so the record is handed off and its findings re-rated, but it
+// keeps the observation time, which decides whether new matches on it are provisional.
 func (s *Store) PutOSVRecordAt(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte, observed time.Time) (bool, error) {
 	var changed bool
 	err := s.inTx(ctx, func(tx *sql.Tx) (err error) {
@@ -104,6 +108,7 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	)
 	err := tx.QueryRowContext(ctx, `SELECT affected_hash, observed FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).
 		Scan(&prev, &prevObs)
+	var matched bool // the stored match part equals affectedHash's
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		changed = true
@@ -111,9 +116,10 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 		return false, err
 	default:
 		changed = prev != affectedHash
+		matched = osvMatchPart(prev) == osvMatchPart(affectedHash)
 	}
 	obs := nanos(orNow(observed))
-	if !changed && prevObs.Valid {
+	if matched && prevObs.Valid {
 		obs = prevObs
 	}
 	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
@@ -121,9 +127,17 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	return changed, err
 }
 
-// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: enough
-// to keep the transactions few, few enough that 4 MiB records cannot hold much memory.
-const rehashPage = 64
+// osvMatchPart returns the match part of an OSV affected hash: what precedes its first ':', or all of
+// it.
+func osvMatchPart(h string) string {
+	m, _, _ := strings.Cut(h, ":")
+	return m
+}
+
+// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: few
+// enough that a page of records at the OSV feed's 4 MiB cap holds at most 64 MiB, the bound the
+// OSV fast path keeps to, and enough to keep the transactions few.
+const rehashPage = 16
 
 // RehashOSVRecords recomputes the affected hash of every cached OSV record with hash and stores it,
 // rehashPage records at a time, and returns how many hashes changed. Nothing else about a record

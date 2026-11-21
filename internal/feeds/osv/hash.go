@@ -13,15 +13,19 @@ import (
 
 // HashVersion names the AffectedHash recipe. Records cached under another version are rehashed
 // silently (see Feed.rehash) before anything compares hashes, so a change to the recipe does not
-// look like a change to every record and re-match the cluster.
-const HashVersion = "2"
+// look like a change to every record and re-match the cluster. v1 hashed what a record matches; v2
+// added its ratings to that one sum; v3 keeps the two apart (see AffectedHash).
+const HashVersion = "3"
 
-// AffectedHash returns the hex sha256 of the parts of an OSV record that decide what it matches and
-// how its findings are rated: its affected entries as canonical JSON (object keys sorted, numbers
-// kept verbatim), its sorted aliases, its withdrawn time, its top-level severity (CVSS vectors and
-// the Ubuntu priority) and its database_specific.severity (the GHSA rating). published and modified
-// are not part of it, so a record whose only change is a timestamp hashes the same; a rating-only
-// change does not.
+// AffectedHash returns "<match>:<rating>", two hex sha256 sums of the parts of an OSV record that
+// decide what it matches and how its findings are rated. The match sum covers its affected entries
+// as canonical JSON (object keys sorted, numbers kept verbatim), its sorted aliases and its
+// withdrawn time: the v1 recipe, so a v1 hash equals the match sum. The rating sum covers its
+// top-level severity (CVSS vectors and the Ubuntu priority) and its database_specific.severity (the
+// GHSA rating). published and modified are in neither, so a record whose only change is a timestamp
+// hashes the same. The cache hands a record off when either sum changes, and moves its observation
+// time only when the match sum does (see store.PutOSVRecordAt): a rating-only change re-rates
+// findings without making new matches on the record provisional again.
 func AffectedHash(raw []byte) (string, error) {
 	var r struct {
 		Affected         json.RawMessage `json:"affected"`
@@ -48,9 +52,9 @@ func AffectedHash(raw []byte) (string, error) {
 	}
 	aliases := slices.Clone(r.Aliases)
 	slices.Sort(aliases)
-	// v1 hashed affected, aliases and withdrawn; v2 appends the two ratings.
-	sum := sha256.Sum256([]byte(parts[0] + "\n" + strings.Join(aliases, ",") + "\n" + r.Withdrawn + "\n" + parts[1] + "\n" + parts[2]))
-	return hex.EncodeToString(sum[:]), nil
+	match := sha256.Sum256([]byte(parts[0] + "\n" + strings.Join(aliases, ",") + "\n" + r.Withdrawn))
+	rating := sha256.Sum256([]byte(parts[1] + "\n" + parts[2]))
+	return hex.EncodeToString(match[:]) + ":" + hex.EncodeToString(rating[:]), nil
 }
 
 // canonicalJSON re-encodes raw with object keys sorted and numbers kept verbatim; absent is "null".
