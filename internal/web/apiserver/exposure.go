@@ -134,7 +134,7 @@ type exposureTable struct {
 	s      *Server
 	d      exposureData
 	expand map[string]bool
-	groups map[string]groupSignals // node group ID → its signals, every group's once loaded (loadGroups)
+	groups map[string]groupSignals // node group ID → its signals (loadGroups)
 	rows   []apigen.ExposureRow
 }
 
@@ -391,12 +391,12 @@ func (t *exposureTable) exposedNodes(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := t.loadGroups(ctx, set); err != nil {
+	if err := t.loadGroups(ctx, set, exposedGroup); err != nil {
 		return err
 	}
 	nodes := &xrow{row: apigen.ExposureRow{Id: rowNodes, Kind: apigen.ExposureRowKindEntry, Label: "Exposed nodes"}, noun: "node"}
 	for _, g := range set.groups {
-		if len(g.ExposedNodes) == 0 {
+		if !exposedGroup(g) {
 			continue
 		}
 		gs := t.groups[g.ID]
@@ -413,14 +413,20 @@ func (t *exposureTable) exposedNodes(ctx context.Context) error {
 	return nil
 }
 
-// loadGroups reads, once, the signal columns of every node group in set: its host findings and
-// coverage, with no privilege or service account columns. The counts and the coverage figures of all
-// groups are each read in one pass (groupStatsOf, groupCoverage), not per group.
-func (t *exposureTable) loadGroups(ctx context.Context, set *groupSet) error {
-	if len(t.groups) > 0 || len(set.groups) == 0 {
+// loadGroups reads the signal columns of the groups of set that want keeps and that are not read
+// yet: their host findings and coverage, with no privilege or service account columns. The counts and
+// the coverage figures are each read in one pass (groupStatsOf, groupCoverage), not per group.
+func (t *exposureTable) loadGroups(ctx context.Context, set *groupSet, want func(model.NodeGroup) bool) error {
+	var missing []model.NodeGroup
+	for _, g := range set.groups {
+		if _, ok := t.groups[g.ID]; !ok && want(g) {
+			missing = append(missing, g)
+		}
+	}
+	if len(missing) == 0 {
 		return nil
 	}
-	stats, err := t.s.groupStatsOf(ctx, set.groups)
+	stats, err := t.s.groupStatsOf(ctx, missing)
 	if err != nil {
 		return err
 	}
@@ -429,12 +435,21 @@ func (t *exposureTable) loadGroups(ctx context.Context, set *groupSet) error {
 		return err
 	}
 	for i, g := range set.groups {
+		if _, ok := t.groups[g.ID]; ok || !want(g) {
+			continue
+		}
 		st := stats[g.ID]
 		t.groups[g.ID] = groupSignals{sig: apigen.RowSignals{Urgent: st.Counts.Urgent, High: st.Counts.High, Fixable: st.Fixable,
 			Exploited: st.Exploited, Coverage: coverageFigure(covs[i])}, worst: st.Counts.Worst()}
 	}
 	return nil
 }
+
+// exposedGroup selects the groups with an exposed node.
+func exposedGroup(g model.NodeGroup) bool { return len(g.ExposedNodes) > 0 }
+
+// anyGroup selects every group.
+func anyGroup(model.NodeGroup) bool { return true }
 
 // sumGroups sums the signals of node groups, and their worst open priority.
 func (t *exposureTable) sumGroups(ids []string) (apigen.RowSignals, model.Priority) {
@@ -527,7 +542,7 @@ func (t *exposureTable) byNode(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := t.loadGroups(ctx, set); err != nil {
+	if err := t.loadGroups(ctx, set, anyGroup); err != nil {
 		return err
 	}
 	groups := set.groups
