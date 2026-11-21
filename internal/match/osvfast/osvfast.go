@@ -147,17 +147,9 @@ func (m *Matcher) eachRecord(ctx context.Context, ids []string, fn func(*osvsche
 				continue
 			}
 			seen[id] = true
-			at, ok := observed[id]
-			if _, asked := slices.BinarySearch(chunk, id); !ok && !asked {
-				// A record whose id is not the one it is cached under: look its observation up by its id,
-				// as records does.
-				o, err := m.st.OSVRecordsObserved(ctx, []string{id})
-				if err != nil {
-					return err
-				}
-				at = o[id]
-			}
-			if err := fn(v, at); err != nil {
+			// The OSV feed caches a record only under its own id (it skips one whose id differs), so
+			// the chunk's observations hold the record's.
+			if err := fn(v, observed[id]); err != nil {
 				return err
 			}
 		}

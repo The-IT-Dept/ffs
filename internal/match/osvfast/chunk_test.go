@@ -2,6 +2,8 @@ package osvfast_test
 
 import (
 	"encoding/json"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -122,14 +124,12 @@ func TestMatchImageBoundsRecordLoads(t *testing.T) {
 }
 
 // TestMatchImageReadsAreBoundedInBytes: by default a read takes as many records as 64 MiB holds of the largest
-// record the OSV feed caches (4 MiB), not a count: a host's kernel records average over 400 KB, and 256 of them
-// at a time, parsed together, held most of a gigabyte.
+// record the OSV feed caches (osv.MaxRecordBytes), not a count: a host's kernel records average over 400 KB, and
+// 256 of them at a time, parsed together, held most of a gigabyte.
 func TestMatchImageReadsAreBoundedInBytes(t *testing.T) {
 	records, bytes := osvfast.RecordChunk()
 	require.Equal(t, 64<<20, bytes)
-	require.Equal(t, 4<<20, osv.MaxRecordBytes, "the OSV feed's record cap")
-	require.Equal(t, 16, records)
-	require.LessOrEqual(t, records*osv.MaxRecordBytes, bytes)
+	require.Equal(t, bytes/osv.MaxRecordBytes, records)
 
 	m, pkgs := hostFixture(t)
 	loads := osvfast.WatchRecordLoads(t)
@@ -137,4 +137,57 @@ func TestMatchImageReadsAreBoundedInBytes(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, ms, 9)
 	require.Equal(t, []int{9}, *loads, "nine records fit one read")
+}
+
+// TestMatchImageReadBytesStayInBudget (W54) measures the reads instead of the arithmetic: five records of the
+// largest size the OSV feed caches, read under a budget of two of them, never put more than the budget in one
+// read, and every record is read once. Reading them all at once would hold five.
+func TestMatchImageReadBytesStayInBudget(t *testing.T) {
+	st := newStore(t)
+	m := osvfast.New(st)
+	pkgs := image(t, st, dHost, model.Package{Ecosystem: "deb", Distro: ubuntu2404, Name: "linux-image-6.8.0-50-generic",
+		Version: "6.8.0-50.51", SourceName: "linux", SourceVersion: "6.8.0-50.51", Arch: "amd64"})
+	const n = 5
+	total := 0
+	for i := range n {
+		raw := largestRecord(t, fmt.Sprintf("UBUNTU-CVE-2026-%04d", 2000+i))
+		cache(t, st, "Ubuntu", raw)
+		total += len(raw)
+	}
+	budget := 2 * osv.MaxRecordBytes
+	osvfast.SetRecordBudget(t, budget)
+	reads := osvfast.WatchRecordBytes(t)
+
+	ms, err := m.MatchImage(ctx, match.ImageInput{Digest: dHost, Packages: pkgs})
+	require.NoError(t, err)
+	require.Len(t, ms, n)
+	require.Len(t, *reads, 3)
+	sum := 0
+	for _, b := range *reads {
+		require.LessOrEqual(t, b, budget, "one read's records")
+		sum += b
+	}
+	require.Equal(t, total, sum, "every record is read once")
+	require.Equal(t, budget, slices.Max(*reads), "a full read holds two of the largest records")
+}
+
+// largestRecord is an Ubuntu 24.04 linux record fixed in 6.8.0-60.63, padded to osv.MaxRecordBytes, the
+// largest record the OSV feed caches.
+func largestRecord(t *testing.T, id string) []byte {
+	t.Helper()
+	rec := func(details string) []byte {
+		raw, err := json.Marshal(map[string]any{
+			"id": id, "modified": "2026-11-19T00:00:00Z", "details": details,
+			"affected": []any{map[string]any{
+				"package": map[string]string{"name": "linux", "ecosystem": "Ubuntu:24.04:LTS"},
+				"ranges": []any{map[string]any{"type": "ECOSYSTEM",
+					"events": []map[string]string{{"introduced": "0"}, {"fixed": "6.8.0-60.63"}}}},
+			}},
+		})
+		require.NoError(t, err)
+		return raw
+	}
+	raw := rec(strings.Repeat("x", osv.MaxRecordBytes-len(rec(""))))
+	require.Len(t, raw, osv.MaxRecordBytes)
+	return raw
 }
