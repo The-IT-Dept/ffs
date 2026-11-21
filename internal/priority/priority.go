@@ -66,6 +66,15 @@ func Thresholds(in Input, cfg config.PriorityConfig) config.PriorityConfig {
 	return cfg
 }
 
+// EPSSEdges returns every EPSS score at which a finding's priority or EPSS signal can change: cfg's
+// enter edges and the leave edges below them (Thresholds), {EPSSBump, EPSSHigh, leave bump, leave
+// high}. An EPSS feed queues a recompute for a score crossing any of them, so a finding a leave
+// edge holds is recomputed when its score falls below that edge.
+func EPSSEdges(cfg config.PriorityConfig) []float64 {
+	l := leaving(cfg)
+	return []float64{cfg.EPSSBump, cfg.EPSSHigh, l.EPSSBump, l.EPSSHigh}
+}
+
 // leaving returns cfg with its EPSS edges at leaveFactor, rounded to the 6 decimals of a score so
 // that a score of exactly 0.09 holds.
 func leaving(cfg config.PriorityConfig) config.PriorityConfig {

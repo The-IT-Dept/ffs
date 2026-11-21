@@ -32,6 +32,7 @@ import (
 	"github.com/the-it-dept/ffs/internal/match/osvfast"
 	"github.com/the-it-dept/ffs/internal/match/upstream"
 	"github.com/the-it-dept/ffs/internal/output/metrics"
+	"github.com/the-it-dept/ffs/internal/priority"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/sbom"
 	"github.com/the-it-dept/ffs/internal/store"
@@ -159,7 +160,7 @@ func newFeeds(cfg config.Config, st *store.Store, eng *engine.Engine, ev *eol.Ev
 	}
 	if c := cfg.Feeds.EPSS; c.Enabled {
 		f := epss.New(epss.Options{Config: c, Store: st, HTTP: hc, Handler: eng.OnAdvisoriesEnriched,
-			DataDir: cfg.DataDir, Thresholds: []float64{cfg.Priority.EPSSBump, cfg.Priority.EPSSHigh}})
+			DataDir: cfg.DataDir, Thresholds: priority.EPSSEdges(cfg.Priority)})
 		eng.AddObserver(f)
 		fs = append(fs, f)
 	}

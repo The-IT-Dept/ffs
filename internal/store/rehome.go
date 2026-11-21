@@ -3,7 +3,6 @@ package store
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -24,10 +23,11 @@ type FindingMove struct {
 //     rewritten. Its notification ledger rows move with it and merge with any already there, as an
 //     alias re-key's do (moveLedger): the higher max_priority is kept, so a move never lowers what a
 //     target was told and an escalation already sent is not sent again, and the state and time come
-//     from the row updated last;
+//     from the moved row, the finding that continues;
 //   - an open or excepted finding at NewFingerprint (the target already reported it): that finding is
-//     kept and the moved one deleted. Its ledger rows move only where the target has none for the new
-//     fingerprint; each target keeps the ledger it already has, and the leftovers are deleted.
+//     kept and the moved one deleted. Its ledger rows merge the same way, except that the state and
+//     time come from the row already at NewFingerprint, the finding that continues; a row with
+//     nothing to merge with moves as it was.
 //
 // Finally every owner in drop is deleted as DeleteOwner does. Transitions keep their old fingerprints
 // as history.
@@ -78,25 +78,17 @@ func (s *Store) rehome(ctx context.Context, upsert *model.Owner, moves []Finding
 
 // moveFinding applies one move of Rehome inside tx.
 func moveFinding(ctx context.Context, tx *sql.Tx, m FindingMove) error {
-	var state string
-	err := tx.QueryRowContext(ctx, `SELECT state FROM findings WHERE fingerprint = ?`, m.NewFingerprint).Scan(&state)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		state = ""
-	case err != nil:
+	state, err := findingState(ctx, tx, m.NewFingerprint)
+	if err != nil {
 		return err
 	}
-	if state != "" && model.FindingState(state) != model.StateResolved {
-		// The target already reported the new fingerprint: it keeps its finding and ledger.
+	if live(state) {
+		// The target already reported the new fingerprint: it keeps its finding, and the state of
+		// its ledger rows.
 		if _, err := tx.ExecContext(ctx, `DELETE FROM findings WHERE fingerprint = ?`, m.OldFingerprint); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE OR IGNORE notified SET fingerprint = ? WHERE fingerprint = ?`,
-			m.NewFingerprint, m.OldFingerprint); err != nil {
-			return err
-		}
-		_, err := tx.ExecContext(ctx, `DELETE FROM notified WHERE fingerprint = ?`, m.OldFingerprint)
-		return err
+		return moveLedger(ctx, tx, m.OldFingerprint, m.NewFingerprint, false)
 	}
 	if state != "" {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM findings WHERE fingerprint = ?`, m.NewFingerprint); err != nil {
@@ -112,5 +104,5 @@ func moveFinding(ctx context.Context, tx *sql.Tx, m FindingMove) error {
 		m.NewFingerprint, m.Owner.Key(), m.Owner.Namespace, m.NewFingerprint, owner, m.ImageRepo, m.OldFingerprint); err != nil {
 		return err
 	}
-	return moveLedger(ctx, tx, m.OldFingerprint, m.NewFingerprint)
+	return moveLedger(ctx, tx, m.OldFingerprint, m.NewFingerprint, true)
 }

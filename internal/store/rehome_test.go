@@ -86,56 +86,86 @@ func TestRehome_MovesFindingsLedgerAndOwnersAtomically(t *testing.T) {
 	require.False(t, ok)
 }
 
-// TestRehome_LedgerKeepsTheHigherPriority (F73): a move onto a fingerprint whose target already has a
-// ledger row (its finding resolved, or gone) merges the two rows as an alias re-key does. The higher
-// max_priority is kept, so the move never lowers what a target was told and a repeat escalation alert
-// cannot follow; the state and time come from the row updated last.
-func TestRehome_LedgerKeepsTheHigherPriority(t *testing.T) {
+// TestRehome_LedgerFollowsTheLiveFinding (F73, W1): a move merges a target's ledger rows for the two
+// fingerprints as an alias re-key does. The higher max_priority is kept, so the move never lowers what
+// a target was told and a repeat escalation alert cannot follow; the state and time come from the row
+// of the finding that stays live, whichever row was updated last: the moved row onto a resolved or
+// absent finding (the cutover), the row already there when an open finding holds the new fingerprint
+// (the taken branch).
+func TestRehome_LedgerFollowsTheLiveFinding(t *testing.T) {
 	s := newStore(t)
 	require.NoError(t, s.PutNotifyTarget(ctx, "uid-a", "a", ""))
 	require.NoError(t, s.PutNotifyTarget(ctx, "uid-b", "b", ""))
 	rt := model.OwnerRef{Kind: model.OwnerKindContainerRuntime, Name: "containerd"}
 	nodes := model.NodesOwner("test")
 	fp := func(o model.OwnerRef, repo, adv string) string { return model.FindingFingerprint("test", o, repo, adv) }
-	moved := model.Finding{Fingerprint: fp(rt, "containerd", "CVE-2026-0001"), Owner: rt, ImageRepo: "containerd",
-		AdvisoryID: "CVE-2026-0001", State: model.StateOpen, Priority: model.PriorityHigh}
-	resolved := model.Finding{Fingerprint: fp(nodes, model.HostRepo, "CVE-2026-0001"), Owner: nodes, ImageRepo: model.HostRepo,
-		AdvisoryID: "CVE-2026-0001", State: model.StateResolved, Priority: model.PriorityUrgent}
-	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{moved, resolved}, nil))
+	f := func(o model.OwnerRef, repo, adv string, st model.FindingState, p model.Priority) model.Finding {
+		return model.Finding{Fingerprint: fp(o, repo, adv), Owner: o, ImageRepo: repo, AdvisoryID: adv, State: st, Priority: p}
+	}
+	moved := f(rt, "containerd", "CVE-2026-0001", model.StateOpen, model.PriorityHigh)
+	resolved := f(nodes, model.HostRepo, "CVE-2026-0001", model.StateResolved, model.PriorityUrgent)
+	movedGone := f(rt, "containerd", "CVE-2026-0002", model.StateOpen, model.PriorityHigh)
+	gone := fp(nodes, model.HostRepo, "CVE-2026-0002") // no finding, a ledger row only
+	movedTaken := f(rt, "containerd", "CVE-2026-0003", model.StateResolved, model.PriorityUrgent)
+	taken := f(nodes, model.HostRepo, "CVE-2026-0003", model.StateOpen, model.PriorityHigh)
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{moved, resolved, movedGone, movedTaken, taken}, nil))
 	entry := func(target, fp string, p model.Priority, st model.FindingState, at time.Time) LedgerEntry {
 		return LedgerEntry{Target: target, Fingerprint: fp, MaxPriority: p, LastState: st, UpdatedAt: at}
 	}
-	// Target a was told urgent about the target fingerprint, later than high about the moved one; target
-	// b was told high about the target fingerprint, earlier than urgent about the moved one.
+	// Cutover: target a was told urgent about the target fingerprint resolved, later than high about
+	// the moved one open; target b high about the target fingerprint, earlier than urgent about the
+	// moved one. Gone: target a was told the target fingerprint resolved after the moved one opened.
+	// Taken: target a was told high about the live target fingerprint, then urgent about the moved
+	// one, later resolved.
 	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-a", Ledger: []LedgerEntry{
 		entry("uid-a", resolved.Fingerprint, model.PriorityUrgent, model.StateResolved, t0.Add(-time.Hour)),
 		entry("uid-a", moved.Fingerprint, model.PriorityHigh, model.StateOpen, t0.Add(-2*time.Hour)),
+		entry("uid-a", gone, model.PriorityMedium, model.StateResolved, t0.Add(-time.Hour)),
+		entry("uid-a", movedGone.Fingerprint, model.PriorityHigh, model.StateOpen, t0.Add(-2*time.Hour)),
+		entry("uid-a", taken.Fingerprint, model.PriorityHigh, model.StateOpen, t0.Add(-2*time.Hour)),
+		entry("uid-a", movedTaken.Fingerprint, model.PriorityUrgent, model.StateResolved, t0.Add(-time.Hour)),
 	}}))
 	require.NoError(t, s.CommitNotify(ctx, NotifyCommit{Target: "uid-b", Ledger: []LedgerEntry{
 		entry("uid-b", resolved.Fingerprint, model.PriorityHigh, model.StateResolved, t0.Add(-2*time.Hour)),
 		entry("uid-b", moved.Fingerprint, model.PriorityUrgent, model.StateOpen, t0.Add(-time.Hour)),
+		entry("uid-b", movedTaken.Fingerprint, model.PriorityMedium, model.StateResolved, t0),
 	}}))
 
-	require.NoError(t, s.Rehome(ctx, nil, []FindingMove{{OldFingerprint: moved.Fingerprint, NewFingerprint: resolved.Fingerprint,
-		Owner: nodes, ImageRepo: model.HostRepo}}, nil))
-	got, err := s.FindingsByFingerprint(ctx, []string{moved.Fingerprint, resolved.Fingerprint})
+	move := func(old model.Finding) FindingMove {
+		return FindingMove{OldFingerprint: old.Fingerprint, NewFingerprint: fp(nodes, model.HostRepo, old.AdvisoryID),
+			Owner: nodes, ImageRepo: model.HostRepo}
+	}
+	require.NoError(t, s.Rehome(ctx, nil, []FindingMove{move(moved), move(movedGone), move(movedTaken)}, nil))
+	got, err := s.FindingsByFingerprint(ctx, []string{moved.Fingerprint, resolved.Fingerprint, movedGone.Fingerprint, gone,
+		movedTaken.Fingerprint, taken.Fingerprint})
 	require.NoError(t, err)
-	require.Len(t, got, 1)
+	require.Len(t, got, 3)
 	require.Equal(t, model.StateOpen, got[resolved.Fingerprint].State, "the moved finding replaces the resolved one")
+	require.Equal(t, model.StateOpen, got[gone].State)
+	require.Equal(t, taken, got[taken.Fingerprint], "the taken target keeps its finding")
 
-	a, err := s.Ledger(ctx, "uid-a", []string{moved.Fingerprint, resolved.Fingerprint})
+	fps := []string{moved.Fingerprint, resolved.Fingerprint, movedGone.Fingerprint, gone, movedTaken.Fingerprint, taken.Fingerprint}
+	a, err := s.Ledger(ctx, "uid-a", fps)
 	require.NoError(t, err)
-	require.Len(t, a, 1, "the moved row merged into the target's")
-	require.Equal(t, model.PriorityUrgent, a[resolved.Fingerprint].MaxPriority, "a move never lowers what a target was told")
-	require.Equal(t, model.StateResolved, a[resolved.Fingerprint].LastState, "the state of the row updated last")
-	require.True(t, a[resolved.Fingerprint].UpdatedAt.Equal(t0.Add(-time.Hour)))
+	require.Len(t, a, 3, "the moved rows merged into the target's")
+	require.Equal(t, entry("uid-a", resolved.Fingerprint, model.PriorityUrgent, model.StateOpen, a[resolved.Fingerprint].UpdatedAt),
+		a[resolved.Fingerprint], "cutover: the moved finding's state, and a move never lowers what a target was told")
+	require.True(t, a[resolved.Fingerprint].UpdatedAt.Equal(t0.Add(-2*time.Hour)))
+	require.Equal(t, entry("uid-a", gone, model.PriorityHigh, model.StateOpen, a[gone].UpdatedAt), a[gone])
+	require.True(t, a[gone].UpdatedAt.Equal(t0.Add(-2*time.Hour)))
+	require.Equal(t, entry("uid-a", taken.Fingerprint, model.PriorityUrgent, model.StateOpen, a[taken.Fingerprint].UpdatedAt),
+		a[taken.Fingerprint], "taken: the live finding's state, with the moved row's higher priority")
+	require.True(t, a[taken.Fingerprint].UpdatedAt.Equal(t0.Add(-2*time.Hour)))
 
-	b, err := s.Ledger(ctx, "uid-b", []string{moved.Fingerprint, resolved.Fingerprint})
+	b, err := s.Ledger(ctx, "uid-b", fps)
 	require.NoError(t, err)
-	require.Len(t, b, 1)
-	require.Equal(t, model.PriorityUrgent, b[resolved.Fingerprint].MaxPriority, "the moved row's higher priority is kept")
-	require.Equal(t, model.StateOpen, b[resolved.Fingerprint].LastState)
+	require.Len(t, b, 2)
+	require.Equal(t, entry("uid-b", resolved.Fingerprint, model.PriorityUrgent, model.StateOpen, b[resolved.Fingerprint].UpdatedAt),
+		b[resolved.Fingerprint])
 	require.True(t, b[resolved.Fingerprint].UpdatedAt.Equal(t0.Add(-time.Hour)))
+	require.Equal(t, entry("uid-b", taken.Fingerprint, model.PriorityMedium, model.StateResolved, b[taken.Fingerprint].UpdatedAt),
+		b[taken.Fingerprint], "a row with nothing to merge with moves as it was")
+	require.True(t, b[taken.Fingerprint].UpdatedAt.Equal(t0))
 }
 
 // TestRehomeWithState_WritesStateWithTheMoves: the runtime cutover's state is written in the moves'

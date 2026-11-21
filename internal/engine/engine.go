@@ -55,7 +55,21 @@ type Store interface {
 	PruneImages(ctx context.Context, now time.Time, unusedFor time.Duration) (int, error)
 	RecordGrypeDBBuild(ctx context.Context, built time.Time) error
 	GrypeDBBuilds(ctx context.Context) ([]time.Time, error)
+	MatchersVersion(ctx context.Context) (string, error)
+	RecordMatchersVersion(ctx context.Context, v string) error
 }
+
+// matchersVersion is the version of the matchers other than grype: the OSV fast path, upstream and
+// k8s. A Grype DB update re-runs grype alone, and their stored matches follow their own feeds, so a
+// change to their code reaches the digests already catalogued only through a re-match of its own.
+// Bump matchersVersion with any change that would change a match they store or its rating, in
+// their code or in what they compute with (OSV parsing, version ranges, a dependency): the next
+// Grype DB update then re-matches every live digest with every matcher, once (OnGrypeDB).
+//
+// "2" is v0.0.2. Its OSV feed rehashes the cached records without handing them off, now that
+// severity ratings are in the hash, while v0.0.1 cached a rating-only change without re-matching
+// it: the pass brings those ratings to the stored OSV matches.
+const matchersVersion = "2"
 
 // ExceptionSource supplies the cached Exception rules (*store.Store, Task 22).
 type ExceptionSource interface {
@@ -268,12 +282,22 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 	return errors.Join(errs...)
 }
 
-// OnGrypeDB loads a new Grype DB and re-matches, one digest at a time, the live digests (those an
-// owner runs or a suggestion holds) it can change:
-//   - on a full update (the first DB, then weekly), every live digest with every matcher: the
-//     safety net for anything an incremental path missed, OSV and upstream included;
-//   - otherwise, with grype alone, the digests whose packages the diff changed plus those with OSV
-//     matches grype has not ruled on yet (store.DigestsAwaitingGrype).
+// OnGrypeDB loads a new Grype DB and re-matches with grype alone, one digest at a time, the live
+// digests (those an owner runs or a suggestion holds) it can change:
+//   - on a full update (the first DB, the weekly one, and every one below
+//     feeds.grypedb.diffMinImages), every live digest;
+//   - otherwise the digests whose packages the diff changed plus those with OSV matches grype has
+//     not ruled on yet (store.DigestsAwaitingGrype).
+//
+// The other matchers' results do not depend on the Grype DB. Every matcher runs on a digest when it
+// is catalogued (OnImageCatalogued), and their matches follow their own feeds from then on
+// (OnOSVRecords, OnCNARecords), so an update re-runs them only for a change to their own code,
+// which no feed reports: matchersVersion. While the store's matchers version
+// (store.MatchersVersion) is not matchersVersion, as on the first install and on the first update
+// after an upgrade that bumped it, the update re-matches every live digest with every matcher, as
+// a full one. The version is recorded once every other matcher has succeeded on every live digest
+// (a digest that could not be read counts as failed); until then each update runs that pass again. Grype takes the OSV matches as its hints: those just
+// computed in that pass, and the stored ones otherwise.
 //
 // A digest that fails is logged and left for the next DB; it never fails the update on its own. The
 // update fails, before the build is recorded so the feed offers it again, only when it is cancelled
@@ -288,17 +312,23 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	if err := e.o.Grype.Load(u.Path, u.Built); err != nil {
 		return fmt.Errorf("engine: load grype database: %w", err)
 	}
+	stored, err := e.o.Store.MatchersVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("engine: matchers version: %w", err)
+	}
+	mode, everyMatcher := matchGrype, stored != matchersVersion
+	if everyMatcher {
+		mode, u.Full = matchPersist, true
+		e.o.Log.Info("re-matching every live image with every matcher, once for this matchers version",
+			"matchersVersion", matchersVersion, "stored", stored)
+	}
 	digests, tests, err := e.grypeTargets(ctx, u)
 	if err != nil {
 		return err
 	}
-	mode := matchGrype
-	if u.Full {
-		mode = matchPersist
-	}
 	var (
-		failed, skipped, grypeFailed int
-		lastErr                      error
+		failed, skipped, grypeFailed, othersFailed int
+		lastErr                                    error
 	)
 	for _, d := range digests {
 		if err := ctx.Err(); err != nil {
@@ -308,6 +338,9 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 		if err != nil {
 			failed++
 			e.o.Log.Error(err, "re-matching an image with the new Grype DB failed; it waits for the next one", "digest", d)
+		}
+		if err != nil && (r.othersFailed || !r.grypeFailed) { // not grype's failure alone: another matcher's, or a read's
+			othersFailed++
 		}
 		switch {
 		case !r.grypeFailed:
@@ -324,6 +357,16 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	if failed > 0 {
 		e.o.Log.Info("some images were not re-matched with the new Grype DB", "failed", failed,
 			"awaitingGrypeSkipped", skipped, "images", len(digests))
+	}
+	switch {
+	case !everyMatcher:
+	case othersFailed > 0:
+		e.o.Log.Info("some images were not re-matched with every matcher; the next Grype DB update re-runs every matcher",
+			"failed", othersFailed, "images", len(digests))
+	default:
+		if err := e.o.Store.RecordMatchersVersion(ctx, matchersVersion); err != nil {
+			return fmt.Errorf("engine: record matchers version: %w", err)
+		}
 	}
 	if err := e.o.Store.RecordGrypeDBBuild(ctx, u.Built); err != nil {
 		return fmt.Errorf("engine: record grype database build: %w", err)

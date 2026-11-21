@@ -39,19 +39,18 @@ const (
 var skippedBuckets = map[string]bool{osv.BucketGIT: true, "Linux": true, "Android": true, "Azure Linux": true}
 
 // recordChunk is how many cached records MatchImage reads at a time: as many as recordChunkBytes holds
-// of the largest record the OSV feed caches (maxCachedRecordBytes), so one read holds at most
+// of the largest record the OSV feed caches (osv.MaxRecordBytes), so one read holds at most
 // recordChunkBytes of records whatever their sizes. A host's Ubuntu linux source package alone indexes
 // thousands of kernel records averaging over 400 KB, so reading a bucket's records at once can take
 // gigabytes. A var so tests can lower it.
-var recordChunk = recordChunkBytes / maxCachedRecordBytes
+var recordChunk = recordsPerRead(recordChunkBytes)
 
-const (
-	// recordChunkBytes bounds the uncompressed records of one read.
-	recordChunkBytes = 64 << 20
-	// maxCachedRecordBytes is the largest record the OSV feed caches: it skips larger ones
-	// (internal/feeds/osv maxRecordBytes).
-	maxCachedRecordBytes = 4 << 20
-)
+// recordChunkBytes bounds the uncompressed records of one read.
+const recordChunkBytes = 64 << 20
+
+// recordsPerRead is how many records of at most osv.MaxRecordBytes fit in a read of budget bytes, at
+// least one.
+func recordsPerRead(budget int) int { return max(1, budget/osv.MaxRecordBytes) }
 
 // loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
 // the batches.
@@ -148,17 +147,9 @@ func (m *Matcher) eachRecord(ctx context.Context, ids []string, fn func(*osvsche
 				continue
 			}
 			seen[id] = true
-			at, ok := observed[id]
-			if _, asked := slices.BinarySearch(chunk, id); !ok && !asked {
-				// A record whose id is not the one it is cached under: look its observation up by its id,
-				// as records does.
-				o, err := m.st.OSVRecordsObserved(ctx, []string{id})
-				if err != nil {
-					return err
-				}
-				at = o[id]
-			}
-			if err := fn(v, at); err != nil {
+			// The OSV feed caches a record only under its own id (it skips one whose id differs), so
+			// the chunk's observations hold the record's.
+			if err := fn(v, observed[id]); err != nil {
 				return err
 			}
 		}

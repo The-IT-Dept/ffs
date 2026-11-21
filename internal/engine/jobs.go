@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -42,28 +43,30 @@ func (e *Engine) CheckExceptionExpiry(ctx context.Context) error {
 // Prune deletes resolved findings, and their history, older than the retention period, and the
 // transitions of the findings that stay older than it, except each one's latest
 // store.TransitionsKept. It then deletes the images no owner has run and no upgrade suggestion has
-// held for a week (superseded rollout digests and stale candidates). It returns the number of
-// findings deleted.
+// held for a week (superseded rollout digests and stale candidates). Every step runs whether or not
+// an earlier one failed, so one that keeps failing never stops the others; their errors are
+// returned together. It returns the number of findings deleted.
 func (e *Engine) Prune(ctx context.Context) (int, error) {
 	now := e.now()
 	cutoff := now.Add(-e.o.Config.Retention.Resolved)
+	var errs []error
 	n, err := e.o.Store.PruneResolved(ctx, cutoff)
 	if err != nil {
-		return 0, fmt.Errorf("engine: prune resolved findings: %w", err)
+		errs = append(errs, fmt.Errorf("engine: prune resolved findings: %w", err))
 	}
 	ts, err := e.o.Store.PruneTransitions(ctx, cutoff, store.TransitionsKept)
 	if err != nil {
-		return n, fmt.Errorf("engine: prune transitions: %w", err)
+		errs = append(errs, fmt.Errorf("engine: prune transitions: %w", err))
 	}
 	if ts > 0 {
 		e.o.Log.Info("pruned the history of long-lived findings", "transitions", ts)
 	}
 	images, err := e.o.Store.PruneImages(ctx, now, unusedImageRetention)
 	if err != nil {
-		return n, fmt.Errorf("engine: prune unused images: %w", err)
+		errs = append(errs, fmt.Errorf("engine: prune unused images: %w", err))
 	}
 	if images > 0 {
 		e.o.Log.Info("pruned unused images", "count", images)
 	}
-	return n, nil
+	return n, errors.Join(errs...)
 }

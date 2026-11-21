@@ -58,8 +58,8 @@ Durations are Go duration strings (`90s`, `5m`, `48h`). Unknown keys are rejecte
 | `feeds.chainguardOSV.url` | `https://packages.cgr.dev/chainguard/osv` | Not read; only `enabled` is read. |
 | `feeds.chainguardOSV.interval` | `0s` | Not read; only `enabled` is read. |
 | `feeds.chainguardOSV.staleAfter` | `0s` | Not read; only `enabled` is read. |
-| `priority.epssHigh` | `0.5` | EPSS score at or above which a finding is ranked `high`. A finding ranked this way keeps it until its score falls below 90% of this (0.45 by default). Modifiers such as won't-fix and not running still apply. |
-| `priority.epssBump` | `0.1` | EPSS score at or above which a finding moves up one priority, but not above `high`. A finding keeps the move until its score falls below 90% of this (0.09 by default). Must satisfy `0 < epssBump <= epssHigh <= 1`. |
+| `priority.epssHigh` | `0.5` | EPSS score at or above which a finding is ranked `high`. Modifiers such as won't-fix and not running still apply. When the two EPSS thresholds would rank a finding below its previous priority, it is ranked against 90% of them instead (0.45 and 0.09 by default) and keeps at most its previous priority. This holds whatever raised the finding: a high-severity finding ranked `high` for its exposure stays `high` after the exposure goes while its score is between 0.09 and 0.1. |
+| `priority.epssBump` | `0.1` | EPSS score at or above which a finding moves up one priority, but not above `high`. Its 90% edge (0.09 by default) works as described for `priority.epssHigh`. Must satisfy `0 < epssBump <= epssHigh <= 1`. |
 | `exposure.internalIngressClasses` | `[]` | IngressClass names whose Ingresses do not count as exposure outside the cluster. |
 | `exposure.internalGatewayClasses` | `[]` | GatewayClass names whose Gateways do not count as exposure outside the cluster. |
 | `exposure.internalGateways` | `[]` | Gateways, as `namespace/name`, that do not count as exposure outside the cluster. |

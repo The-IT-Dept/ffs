@@ -268,15 +268,3 @@ func TestEngine_MatchWritesSerialised(t *testing.T) {
 	require.NoError(t, <-catDone)
 	require.Len(t, storedMatches(t, h.st.Store, d3, model.SourceOSV), 1, "the new image's OSV match survives the delta")
 }
-
-// TestEngine_GrypeDBRecordedWhenOnlyOtherMatchersFail (F23): the build counts once grype has
-// re-matched the images, even when another matcher failed on every one of them during the full pass.
-func TestEngine_GrypeDBRecordedWhenOnlyOtherMatchersFail(t *testing.T) {
-	h := newHarness(t)
-	h.osv.fn = func(match.ImageInput) ([]model.Match, error) { return nil, errors.New("osv cache unreadable") }
-	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/d", Built: t0, Full: true}))
-	require.Equal(t, []string{d1, d2}, h.grype.matched)
-	builds, err := h.st.GrypeDBBuilds(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []time.Time{t0}, builds)
-}

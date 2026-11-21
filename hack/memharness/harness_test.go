@@ -64,6 +64,11 @@ const (
 	// agentBackoff is the node agent's first backoff before it sends a report again whose host part was not
 	// stored (HostRetry).
 	agentBackoff = 10 * time.Second
+	// retryAfterDefault is the wait before sending a report again after a 429 with no usable Retry-After.
+	retryAfterDefault = 10 * time.Second
+	// ingestDeadline bounds TestFirstIngest's wait for the reports and the first ingest: a run takes minutes,
+	// and past this it fails with the state it was waiting on, well before go test's -timeout.
+	ingestDeadline = time.Hour
 )
 
 func workDir() string {
@@ -211,10 +216,13 @@ func TestFirstIngest(t *testing.T) {
 	for _, run := range []func(context.Context) error{acq.Start, eng.Start, rec.Start} {
 		wg.Go(func() { _ = run(runCtx) })
 	}
+	defer func() { stop(); wg.Wait() }() // a failed wait stops the components before the store closes
 	start := time.Now()
-	sendReports(t, ctx, handler, hosts, s)
+	waitCtx, cancelWait := context.WithTimeout(ctx, ingestDeadline)
+	defer cancelWait()
+	sendReports(t, waitCtx, handler, hosts, s)
 	s.mark("reports answered")
-	digests := waitFirstIngest(t, ctx, st, eng, s)
+	digests := waitFirstIngest(t, waitCtx, st, eng, s)
 	elapsed := time.Since(start)
 	s.mark("first ingest done")
 	peak := s.stop()
@@ -249,8 +257,9 @@ func TestFirstIngest(t *testing.T) {
 }
 
 // sendReports sends every node's first full report at once and waits for their answers. Like the agent, a node
-// answered 429 sends the same report again after Retry-After, and one answered HostRetry sends its next report
-// after agentBackoff.
+// answered 429 sends the same report again after Retry-After (retryAfterDefault when it has none it can read),
+// and one answered HostRetry sends its next report after agentBackoff. A node still waiting when ctx ends fails
+// the test with what it last heard.
 func sendReports(t *testing.T, ctx context.Context, h http.Handler, hosts [][]byte, s *sampler) {
 	t.Helper()
 	started := time.Now().UTC()
@@ -275,9 +284,17 @@ func sendReports(t *testing.T, ctx context.Context, h http.Handler, hosts [][]by
 					mu.Unlock()
 					return
 				case code == http.StatusTooManyRequests:
-					wait, _ := strconv.Atoi(header.Get("Retry-After"))
-					s.mark(fmt.Sprintf("%s deferred %ds", name, wait))
-					time.Sleep(time.Duration(wait) * time.Second)
+					wait := retryAfterDefault
+					if secs, err := strconv.Atoi(header.Get("Retry-After")); err == nil && secs > 0 {
+						wait = time.Duration(secs) * time.Second
+					}
+					s.mark(fmt.Sprintf("%s deferred %s", name, wait))
+					if err := sleep(ctx, wait); err != nil {
+						mu.Lock()
+						errs = append(errs, fmt.Errorf("%s: still deferred (429) after %s: %w", name, ingestDeadline, err))
+						mu.Unlock()
+						return
+					}
 					continue
 				case code != http.StatusOK:
 					mu.Lock()
@@ -287,7 +304,12 @@ func sendReports(t *testing.T, ctx context.Context, h http.Handler, hosts [][]by
 				case resp.HostRetry:
 					s.mark(name + " host retry")
 					seq++
-					time.Sleep(agentBackoff)
+					if err := sleep(ctx, agentBackoff); err != nil {
+						mu.Lock()
+						errs = append(errs, fmt.Errorf("%s: host part still not stored after %s: %w", name, ingestDeadline, err))
+						mu.Unlock()
+						return
+					}
 					continue
 				}
 				s.mark(fmt.Sprintf("%s report applied=%t", name, resp.Applied))
@@ -321,51 +343,73 @@ func postReport(ctx context.Context, h http.Handler, node string, r wire.Report)
 	return w.Code, w.Header(), resp, nil
 }
 
+// sleep waits for d, or returns ctx's error when it ends first.
+func sleep(ctx context.Context, d time.Duration) error {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
 // waitFirstIngest waits until every node's host SBOM is stored, every group SBOM is matched, the Nodes owner
 // runs every group and the engine is idle, three checks a second apart in a row, and returns the group digests.
+// When ctx ends first it fails the test with the state the last check was waiting on.
 func waitFirstIngest(t *testing.T, ctx context.Context, st *store.Store, eng *engine.Engine, s *sampler) []string {
 	t.Helper()
 	matched := map[string]bool{}
 	stable := 0
+	last := "the first check"
 	for {
-		digests, done, err := firstIngestDone(ctx, st, eng, matched, s)
+		digests, waiting, err := firstIngestDone(ctx, st, eng, matched, s)
+		if ctx.Err() != nil { // a check cut short says nothing: report the one before
+			t.Fatalf("first ingest not done after %s, waiting on: %s", ingestDeadline, last)
+		}
 		require.NoError(t, err)
-		if done {
+		if waiting == "" {
 			if stable++; stable == 3 {
 				return digests
 			}
+			last = "the engine to stay idle"
 		} else {
-			stable = 0
+			stable, last = 0, waiting
 		}
-		time.Sleep(time.Second)
+		if sleep(ctx, time.Second) != nil {
+			t.Fatalf("first ingest not done after %s, waiting on: %s", ingestDeadline, last)
+		}
 	}
 }
 
-func firstIngestDone(ctx context.Context, st *store.Store, eng *engine.Engine, matched map[string]bool, s *sampler) ([]string, bool, error) {
+// firstIngestDone returns the group digests and "" once the first ingest is done, and otherwise what it is
+// still waiting on.
+func firstIngestDone(ctx context.Context, st *store.Store, eng *engine.Engine, matched map[string]bool, s *sampler) ([]string, string, error) {
 	rows, err := st.AgentNodes(ctx)
 	if err != nil {
-		return nil, false, err
+		return nil, "reading the agent nodes", err
 	}
 	var digests []string
 	for _, r := range rows {
 		if r.Fingerprint == "" {
-			return nil, false, nil
+			return nil, r.Node + " has no host SBOM stored", nil
 		}
 		digests = append(digests, nodegroup.GroupDigest(r.Fingerprint))
 	}
 	slices.Sort(digests)
 	digests = slices.Compact(digests)
 	if len(rows) < nodeCount || len(digests) < groupCount {
-		return nil, false, nil
+		return nil, fmt.Sprintf("%d of %d nodes stored, in %d of %d groups", len(rows), nodeCount, len(digests), groupCount), nil
 	}
 	unmatched, err := st.UnmatchedDigests(ctx, digests)
 	if err != nil {
-		return nil, false, err
+		return nil, "reading the unmatched group digests", err
 	}
 	for _, d := range digests {
 		img, ok, err := st.GetImage(ctx, d)
 		if err != nil {
-			return nil, false, err
+			return nil, "reading group " + d, err
 		}
 		if ok && img.Status == model.ImageCatalogued && !slices.Contains(unmatched, d) && !matched[d] {
 			matched[d] = true
@@ -373,11 +417,14 @@ func firstIngestDone(ctx context.Context, st *store.Store, eng *engine.Engine, m
 		}
 	}
 	if len(matched) < groupCount {
-		return nil, false, nil
+		return nil, fmt.Sprintf("%d of %d groups catalogued and matched", len(matched), groupCount), nil
 	}
 	o, ok, err := st.GetOwner(ctx, model.NodesOwner(clusterName).Key())
-	if err != nil || !ok {
-		return nil, false, err
+	switch {
+	case err != nil:
+		return nil, "reading the Nodes owner", err
+	case !ok:
+		return nil, "the Nodes owner is not stored", nil
 	}
 	running := map[string]bool{}
 	for _, c := range o.Containers {
@@ -385,10 +432,13 @@ func firstIngestDone(ctx context.Context, st *store.Store, eng *engine.Engine, m
 	}
 	for _, d := range digests {
 		if !running[d] {
-			return nil, false, nil
+			return nil, "the Nodes owner does not run group " + d, nil
 		}
 	}
-	return digests, eng.Idle(), nil
+	if !eng.Idle() {
+		return nil, "the engine is recomputing findings", nil
+	}
+	return digests, "", nil
 }
 
 // harnessResults are the matches and findings a run stored, without the times that differ between runs.
@@ -402,7 +452,12 @@ func results(t *testing.T, ctx context.Context, st *store.Store, digests []strin
 	ms, err := st.MatchesForDigests(ctx, digests)
 	require.NoError(t, err)
 	for i := range ms {
-		ms[i].ObservedAt, ms[i].DBBuilt = time.Time{}, time.Time{}
+		// An OSV match is observed when the prepared store first cached its record, the same in every run:
+		// it is kept, so a run that stamped another time differs. Other matches are observed at the run.
+		if ms[i].Source != model.SourceOSV {
+			ms[i].ObservedAt = time.Time{}
+		}
+		ms[i].DBBuilt = time.Time{}
 		slices.Sort(ms[i].FixedVersions)
 	}
 	slices.SortFunc(ms, func(a, b model.Match) int {

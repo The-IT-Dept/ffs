@@ -27,3 +27,18 @@ func TestAdvisoriesWithMatches(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
+
+// TestMatchersVersion: a store no full re-match by every matcher has run on has no matchers
+// version, and a recorded one replaces the last.
+func TestMatchersVersion(t *testing.T) {
+	s := newStore(t)
+	v, err := s.MatchersVersion(ctx)
+	require.NoError(t, err)
+	require.Empty(t, v)
+	for _, want := range []string{"2", "3"} {
+		require.NoError(t, s.RecordMatchersVersion(ctx, want))
+		v, err = s.MatchersVersion(ctx)
+		require.NoError(t, err)
+		require.Equal(t, want, v)
+	}
+}

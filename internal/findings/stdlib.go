@@ -17,7 +17,7 @@ import (
 type StdlibGroup struct {
 	Installed   string // "go1.22.3"
 	AdvisoryIDs []string
-	FixedIn     string // the lowest Go version, on one branch, fixing every advisory that has a fix; "" when none has
+	FixedIn     string // the lowest Go version, on one branch, fixing every advisory that has a fix; "" when none has, or none at or after the installed branch
 	Highest     model.Priority
 }
 
@@ -85,8 +85,10 @@ func fixedAt(ps []model.FindingPackage, installed string) []string {
 // are none. The branch comes first: the installed version's branch when every advisory is fixed on it,
 // else the lowest later branch on which each advisory is fixed, by a fix on that branch or by fixes
 // on earlier branches only. On that branch it takes the highest of each advisory's lowest fix, so
-// it never names a version on a branch where another advisory is still unfixed. Versions that are
-// not Go versions fall back to the highest of each advisory's lowest fix.
+// it never names a version on a branch where another advisory is still unfixed. When no branch at
+// or after the installed one has a fix (every listed fix is on an earlier branch: bad or partial
+// fix data) it returns "", never a version below the installed branch. Versions that are not Go
+// versions fall back to the highest of each advisory's lowest fix.
 func stdlibFixedIn(fixes [][]string, installed string) string {
 	if len(fixes) == 0 {
 		return ""
@@ -113,7 +115,7 @@ func stdlibFixedIn(fixes [][]string, installed string) string {
 			return v
 		}
 	}
-	return highestLowestFix(fixes) // unreachable: every advisory is fixed on the highest branch named
+	return "" // every fix is on a branch below the installed one
 }
 
 // fixedOnBranch returns the lowest version on branch b that fixes every advisory of fixes, and

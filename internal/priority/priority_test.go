@@ -190,6 +190,10 @@ func TestEvaluate_EPSSHysteresis(t *testing.T) {
 		{"high before for another reason, EPSS below both bands", in(low, epss(0.05), prev(pH)), pL},
 		{"not running, bumped before, inside the band", in(low, epss(0.095), notRunning, prev(pM)), pL},
 		{"medium severity exposed with a fix, high before, inside the band", in(med, exposed, fix("1.2"), epss(0.47), prev(pH)), pH},
+		// the band applies whatever raised the finding (docs/configuration.md): high for its exposure,
+		// the exposure gone, inside the bump band
+		{"high severity, high before for its exposure, inside the bump band", in(high, epss(0.095), prev(pH)), pH},
+		{"high severity, high before for its exposure, below the bump band", in(high, epss(0.0899), prev(pH)), pM},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -216,5 +220,50 @@ func TestEvaluate_EPSSHysteresis(t *testing.T) {
 	}
 	if got := Thresholds(in(low, epss(0.75)), custom); got != custom {
 		t.Fatalf("a new finding enters at the configured edges, got %+v", got)
+	}
+}
+
+// TestEPSSEdges_CoverEveryChange (W7): an EPSS feed queues a recompute only for a score that crosses
+// one of EPSSEdges, so every score move that changes a stored finding's priority or EPSS signal must
+// cross one: the leave edges too, or a finding held in the band keeps a priority the rules no longer
+// give it until something else recomputes it.
+func TestEPSSEdges_CoverEveryChange(t *testing.T) {
+	cfg := config.Default().Priority
+	if got, want := EPSSEdges(cfg), []float64{0.1, 0.5, 0.09, 0.45}; !reflect.DeepEqual(got, want) {
+		t.Errorf("EPSSEdges = %v, want %v", got, want)
+	}
+	crossed := func(from, to float64) bool {
+		for _, e := range EPSSEdges(cfg) {
+			if (from < e) != (to < e) {
+				return true
+			}
+		}
+		return false
+	}
+	elevated := func(i Input) bool { return i.EPSS >= Thresholds(i, cfg).EPSSBump }
+	scores := []float64{0, 0.05, 0.085, 0.0899, 0.09, 0.095, 0.0999, 0.1, 0.2, 0.44, 0.4499, 0.45, 0.47, 0.4999, 0.5, 0.9}
+	inputs := []Input{in(low), in(med), in(high), in(crit), in(low, notRunning), in(med, exposed, fix("1.2")),
+		in(high, priv), in(crit, fix("1.2")), in(low, pend), in(high, stdlib), in(low, wontfix)}
+	for _, base := range inputs {
+		for _, prev := range []model.Priority{model.PriorityNone, pL, pM, pH, pU} {
+			for _, from := range scores {
+				// The finding as stored at score from, after its own recompute settled.
+				i := base
+				i.EPSS, i.Previous = from, prev
+				i.Previous, _ = Evaluate(i, cfg)
+				stored, was := i.Previous, elevated(i)
+				for _, to := range scores {
+					i.EPSS = to
+					now, _ := Evaluate(i, cfg)
+					if (now != stored || elevated(i) != was) && !crossed(from, to) {
+						t.Errorf("%+v, previous %v: EPSS %v -> %v moves priority %v -> %v (elevated %v -> %v) across no edge",
+							base, prev, from, to, stored, now, was, elevated(i))
+					}
+				}
+			}
+		}
+	}
+	if !crossed(0.095, 0.085) || !crossed(0.47, 0.44) {
+		t.Fatal("the leave edges are crossings")
 	}
 }

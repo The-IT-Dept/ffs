@@ -74,6 +74,11 @@ func TestGroupStdlib_FixedInChoosesTheBranchFirst(t *testing.T) {
 		{"release candidates parse",
 			[]model.Finding{sf("GO-1", "1.23.0-rc.2"), sf("GO-2", "1.23.1")}, "1.23.1"},
 		{"no fixes", []model.Finding{sf("GO-1"), sf("GO-2")}, ""},
+		// W25: go1.22.3 with fixes on 1.21.x only (bad or partial fix data) names no fix below its branch.
+		{"every fix on an earlier branch: none is named",
+			[]model.Finding{sf("GO-1", "1.21.9"), sf("GO-2", "1.21.12", "1.20.14")}, ""},
+		{"an advisory fixed only on an earlier branch needs nothing on the installed one",
+			[]model.Finding{sf("GO-1", "1.21.9"), sf("GO-2", "1.22.7")}, "1.22.7"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
