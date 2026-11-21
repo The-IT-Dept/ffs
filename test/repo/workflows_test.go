@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -248,13 +249,14 @@ func archRunners(j releaseJob) map[string]string {
 
 var nativeRunners = map[string]string{"amd64": "ubuntu-24.04", "arm64": "ubuntu-24.04-arm"}
 
-// TestWorkflows_ReleaseIsGatedAndMultiArch: a tag publishes only a commit on main that passes make test (F116), and the
-// image is an index of linux/amd64 and linux/arm64 built natively, signed and attested per platform (#17).
+// TestWorkflows_ReleaseIsGatedAndMultiArch: a tag publishes only a commit on main or a release branch that passes make
+// test (F116, W49; TestWorkflows_ReleaseGate runs the check), and the image is an index of linux/amd64 and linux/arm64
+// built natively, signed and attested per platform (#17).
 func TestWorkflows_ReleaseIsGatedAndMultiArch(t *testing.T) {
 	jobs := readJobs(t, "../../.github/workflows/release.yml")
 
 	gate := jobs["test"]
-	require.Contains(t, stepRuns(gate.Steps), "git merge-base --is-ancestor HEAD origin/main")
+	require.GreaterOrEqual(t, stepIndex(gate, releaseGateStep), 0)
 	require.Contains(t, stepRuns(gate.Steps), "make test")
 	i := slices.IndexFunc(gate.Steps, func(s ciStep) bool { return strings.HasPrefix(s.Uses, "actions/checkout@") })
 	require.GreaterOrEqual(t, i, 0)
@@ -310,4 +312,156 @@ func TestWorkflows_E2EOnBothArchitectures(t *testing.T) {
 		require.False(t, strings.HasPrefix(s.Uses, "helm/kind-action@"), "kind comes from make e2e only")
 	}
 	require.Regexp(t, `(?m)^\tGOBIN=\$\(CURDIR\)/bin go install sigs\.k8s\.io/kind@\$\(KIND_VERSION\)$`, readFile(t, "../../Makefile"))
+
+	// kubectl is installed at the Kubernetes version of the kind node image, read from hack/e2e-kind.sh rather than
+	// repeated in the workflow.
+	i := stepIndex(e2e, "Install kubectl")
+	require.GreaterOrEqual(t, i, 0)
+	run := e2e.Steps[i].Run
+	require.NotContains(t, run, "v1.")
+	lines := strings.Split(run, "\n")
+	j := slices.IndexFunc(lines, func(l string) bool { return strings.HasPrefix(l, "base=") })
+	require.Positive(t, j)
+	out, err := command(t, "../..", nil, "bash", "-c", strings.Join(lines[:j], "\n")+"\necho \"${version}\"\n").CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	node := regexp.MustCompile(`(?m)^node_image='kindest/node:(v\d+\.\d+\.\d+)@sha256:[0-9a-f]{64}'$`).FindStringSubmatch(readFile(t, "../../hack/e2e-kind.sh"))
+	require.NotNil(t, node)
+	require.Equal(t, node[1]+"\n", string(out))
+}
+
+// stepIndex returns the index of the job's step called name, or -1.
+func stepIndex(j releaseJob, name string) int {
+	return slices.IndexFunc(j.Steps, func(s ciStep) bool { return s.Name == name })
+}
+
+// command runs name with args in dir, with the test's environment less any git or GitHub Actions settings, plus env.
+// git reads no global or system configuration and commits as a fixed test identity.
+func command(t *testing.T, dir string, env []string, name string, args ...string) *exec.Cmd {
+	t.Helper()
+	cmd := exec.CommandContext(t.Context(), name, args...) //nolint:gosec // G204: git and bash on this repository's own workflow scripts
+	cmd.Dir = dir
+	for _, kv := range os.Environ() {
+		if !strings.HasPrefix(kv, "GIT_") && !strings.HasPrefix(kv, "GITHUB_") && !strings.HasPrefix(kv, "RUNNER_") {
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
+	cmd.Env = append(cmd.Env, "GIT_CONFIG_GLOBAL="+os.DevNull, "GIT_CONFIG_NOSYSTEM=1",
+		"GIT_AUTHOR_NAME=test", "GIT_AUTHOR_EMAIL=test@example.com", "GIT_COMMITTER_NAME=test", "GIT_COMMITTER_EMAIL=test@example.com")
+	cmd.Env = append(cmd.Env, env...)
+	return cmd
+}
+
+const releaseGateStep = "Require the tagged commit to be on main or a release branch"
+
+// TestWorkflows_ReleaseGate runs the release gate's script in a scratch repository (W49): a tag publishes a commit on
+// main or on a release/* branch, where release candidates are tagged before the branch is merged, and nothing else.
+func TestWorkflows_ReleaseGate(t *testing.T) {
+	gate := readJobs(t, "../../.github/workflows/release.yml")["test"]
+	i := stepIndex(gate, releaseGateStep)
+	require.GreaterOrEqual(t, i, 0)
+	script := gate.Steps[i].Run
+
+	dir := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		out, err := command(t, dir, nil, "git", args...).CombinedOutput()
+		require.NoError(t, err, "git %v: %s", args, out)
+		return strings.TrimSpace(string(out))
+	}
+	commit := func(msg string) string {
+		t.Helper()
+		git("commit", "-q", "--allow-empty", "-m", msg)
+		return git("rev-parse", "HEAD")
+	}
+	git("init", "-q", "-b", "main")
+	base := commit("base")
+	onMain := commit("on main")
+	git("checkout", "-q", "-b", "release/v0.0.2", base)
+	onRelease := commit("on release/v0.0.2")
+	git("checkout", "-q", "-b", "release/v0.0.3/fixes", base)
+	onNested := commit("on release/v0.0.3/fixes")
+	git("checkout", "-q", "-b", "feature", base)
+	onFeature := commit("on feature")
+	git("checkout", "-q", "-b", "release-notes", base) // starts like a release branch, but is not one
+	onLookalike := commit("on release-notes")
+	// As actions/checkout with fetch-depth 0 leaves them: the remote's branches under refs/remotes/origin.
+	for branch, sha := range map[string]string{"main": onMain, "release/v0.0.2": onRelease, "release/v0.0.3/fixes": onNested,
+		"feature": onFeature, "release-notes": onLookalike} {
+		git("update-ref", "refs/remotes/origin/"+branch, sha)
+	}
+
+	for _, c := range []struct {
+		name, commit string
+		released     bool
+	}{
+		{"main's history", base, true},
+		{"main", onMain, true},
+		{"a release branch", onRelease, true},
+		{"a nested release branch", onNested, true},
+		{"another branch", onFeature, false},
+		{"a branch named like a release branch", onLookalike, false},
+	} {
+		git("checkout", "-q", "--detach", c.commit)
+		out, err := command(t, dir, []string{"GITHUB_REF_NAME=v0.0.2-rc.1"}, "bash", "-c", script).CombinedOutput()
+		if c.released {
+			require.NoError(t, err, "%s: %s", c.name, out)
+		} else {
+			require.Error(t, err, "%s: %s", c.name, out)
+			require.Contains(t, string(out), "which is not on main or a release/* branch", c.name)
+		}
+	}
+}
+
+// TestWorkflows_ReleaseVerifiesBeforePublishing (W16): the release job writes its notes' Verify block to verify.sh,
+// runs it against the published image and chart, and only then creates and publishes the release. Any failing command
+// fails the step, and so does a last line other than "pinned".
+func TestWorkflows_ReleaseVerifiesBeforePublishing(t *testing.T) {
+	job := readJobs(t, "../../.github/workflows/release.yml")["release"]
+	write := stepIndex(job, "Write the release notes")
+	verify := stepIndex(job, "Verify the published image and chart with the notes' commands")
+	create := slices.IndexFunc(job.Steps, func(s ciStep) bool { return strings.Contains(s.Run, "gh release create") })
+	require.True(t, write >= 0 && write < verify && verify < create, "write %d, verify %d, create %d", write, verify, create)
+	for _, action := range []string{"sigstore/cosign-installer@", "azure/setup-helm@", "docker/login-action@"} {
+		require.True(t, slices.ContainsFunc(job.Steps[:verify], func(s ciStep) bool { return strings.HasPrefix(s.Uses, action) }),
+			"the release job sets up %s before verifying", action)
+	}
+	require.Contains(t, stepRuns(job.Steps[:verify]), "go install \"github.com/google/go-containerregistry/cmd/crane@${v}\"")
+
+	// The notes' sh block is verify.sh, byte for byte.
+	dir := t.TempDir()
+	d, cd := "sha256:"+strings.Repeat("a", 64), "sha256:"+strings.Repeat("b", 64)
+	out, err := command(t, dir, []string{"GITHUB_REF_NAME=v1.2.3-rc.1", "VERSION=1.2.3-rc.1", "DIGEST=" + d, "CHART_DIGEST=" + cd},
+		"bash", "-c", job.Steps[write].Run).CombinedOutput()
+	require.NoError(t, err, "%s", out)
+	script := readFile(t, filepath.Join(dir, "verify.sh"))
+	notes := readFile(t, filepath.Join(dir, "notes.md"))
+	block := regexp.MustCompile("(?s)\n## Verify\n\n```sh\n(.*)```\n$").FindStringSubmatch(notes)
+	require.NotNil(t, block, notes)
+	require.Equal(t, script, block[1])
+	require.True(t, strings.HasPrefix(script, "TAG=v1.2.3-rc.1 V=1.2.3-rc.1\nD="+d+"\nCD="+cd+"\n"), script)
+	loop := regexp.MustCompile(`(?s)\nfor pd in [^\n]*; do\n(.*?)\ndone\n`).FindStringSubmatch(script)
+	require.NotNil(t, loop, script)
+	for _, want := range []string{
+		`cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID"`,
+		`cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID"`,
+		`gh attestation verify oci://ghcr.io/the-it-dept/ffs@$pd`,
+	} {
+		require.Contains(t, loop[1], want, "each platform image is verified")
+	}
+	require.True(t, strings.HasSuffix(script, " && echo pinned\n"), script)
+	out, err = command(t, dir, nil, "bash", "-n", "verify.sh").CombinedOutput()
+	require.NoError(t, err, "%s", out)
+
+	for body, passes := range map[string]bool{
+		"echo checked\necho pinned\n":         true,
+		"false\necho pinned\n":                false, // a failing command anywhere
+		"echo pinned\nfalse\n":                false,
+		"echo checked\n":                      false, // no pinned
+		"test a = b && echo pinned\n":         false, // the image digest the chart pins differs
+		"echo $FFS_TEST_UNSET\necho pinned\n": false, // an unset variable
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "verify.sh"), []byte(body), 0o600))
+		out, err := command(t, dir, nil, "bash", "-c", job.Steps[verify].Run).CombinedOutput()
+		require.Equal(t, passes, err == nil, "%q: %s", body, out)
+	}
 }

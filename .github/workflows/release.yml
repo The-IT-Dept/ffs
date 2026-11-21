@@ -11,7 +11,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # The gate: a tag publishes only a commit on main whose tests pass.
+  # The gate: a tag publishes only a commit on main or a release branch whose tests pass.
   test:
     runs-on: ubuntu-24.04
     permissions:
@@ -27,14 +27,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          fetch-depth: 0 # every branch, so origin/main is there for the ancestry check
-      - name: Require the tagged commit to be on main
+          fetch-depth: 0 # every branch, so origin/main and origin/release/* are there for the ancestry check
+      # Release candidates are tagged on a release branch (release/<version>) before it is merged to main.
+      - name: Require the tagged commit to be on main or a release branch
         run: |
           set -euo pipefail
-          if ! git merge-base --is-ancestor HEAD origin/main; then
-            echo "::error::${GITHUB_REF_NAME} tags $(git rev-parse HEAD), which is not on main; only commits on main are released" >&2
-            exit 1
-          fi
+          for branch in origin/main $(git for-each-ref --format='%(refname:short)' refs/remotes/origin/release/); do
+            if git merge-base --is-ancestor HEAD "${branch}"; then
+              echo "${GITHUB_REF_NAME} tags $(git rev-parse HEAD), which is on ${branch}"
+              exit 0
+            fi
+          done
+          echo "::error::${GITHUB_REF_NAME} tags $(git rev-parse HEAD), which is not on main or a release/* branch; only their commits are released" >&2
+          exit 1
       - id: meta
         name: Compute version, short SHA and source date
         run: |
@@ -290,6 +295,9 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      # The verify step reads the published images, chart and attestations, as a user would.
+      packages: read
+      attestations: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -297,6 +305,32 @@ jobs:
       DIGEST: ${{ needs.image.outputs.digest }}
       CHART_DIGEST: ${{ needs.chart.outputs.digest }}
     steps:
+      # The checkout gives go.mod, which pins the version of crane the verify step uses.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Install crane at the go-containerregistry version of go.mod
+        run: |
+          set -euo pipefail
+          v="$(go list -m -f '{{.Version}}' github.com/google/go-containerregistry)"
+          GOBIN="${RUNNER_TEMP}/bin" go install "github.com/google/go-containerregistry/cmd/crane@${v}"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
+      - uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: v3.22.1
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        with:
+          cosign-release: v3.1.4
+      # crane, cosign, gh and helm read registry credentials from the docker config.
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: sboms
@@ -304,17 +338,11 @@ jobs:
         with:
           name: chart
           path: dist
+      # verify.sh is the notes' Verify block, which the next step runs.
       - name: Write the release notes
         run: |
           set -euo pipefail
           {
-            echo "Image: \`ghcr.io/the-it-dept/ffs@${DIGEST}\`"
-            echo
-            echo "Chart: \`oci://ghcr.io/the-it-dept/charts/ffs --version ${VERSION}\`"
-            echo
-            echo "## Verify"
-            echo
-            echo '```sh'
             echo "TAG=${GITHUB_REF_NAME} V=${VERSION}"
             echo "D=${DIGEST}"
             echo "CD=${CHART_DIGEST}"
@@ -334,8 +362,25 @@ jobs:
           gh attestation verify oci://ghcr.io/the-it-dept/charts/ffs@$CD -R The-IT-Dept/ffs
           test "$(helm show values oci://ghcr.io/the-it-dept/charts/ffs --version $V | yq .image.digest)" = "$D" && echo pinned
           EOF
+          } > verify.sh
+          {
+            echo "Image: \`ghcr.io/the-it-dept/ffs@${DIGEST}\`"
+            echo
+            echo "Chart: \`oci://ghcr.io/the-it-dept/charts/ffs --version ${VERSION}\`"
+            echo
+            echo "## Verify"
+            echo
+            echo '```sh'
+            cat verify.sh
             echo '```'
           } > notes.md
+      # The published artefacts must pass the notes' own Verify block before the release is published: an immutable
+      # release cannot be fixed in place. Any failing command fails the step, and so does a last line other than pinned.
+      - name: Verify the published image and chart with the notes' commands
+        run: |
+          set -euo pipefail
+          bash -euo pipefail verify.sh | tee verify.log
+          test "$(tail -n 1 verify.log)" = pinned
       - name: Create the release with its assets, then publish it
         run: |
           set -euo pipefail
