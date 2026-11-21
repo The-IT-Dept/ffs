@@ -496,8 +496,10 @@ func withOutputLimit(n int) ExecOption { return func(o *execOptions) { o.outputL
 // ExecOption configures ExecRunner.
 type ExecOption func(*execOptions)
 
-// WithNice runs each worker at nice value n (0 to 19), so cataloguing yields the CPU to the node's
-// workloads. 0 leaves the priority alone.
+// WithNice runs each worker n nice levels below the server (0 to 19): at the server's own nice value
+// plus n, at most 19, as nice(1) does. Cataloguing then yields the CPU to the node's workloads, and a
+// server that already runs niced never asks for a higher priority, which needs privileges. 0 leaves
+// the priority alone.
 func WithNice(n int) ExecOption { return func(o *execOptions) { o.nice = n } }
 
 // WithMemoryLimit sets each worker's GOMEMLIMIT to n bytes, in place of the server's own, which the
@@ -509,19 +511,38 @@ func WithMemoryLimit(n int64) ExecOption { return func(o *execOptions) { o.memLi
 var errOutputTooLarge = errors.New("catalog: worker output over the limit")
 
 // limitedBuffer collects up to limit bytes; a write past it fails, which ends the copy from the
-// worker's stdout and closes the pipe, so the worker stops at its next write.
+// worker's stdout and closes the pipe, so the worker stops at its next write. It grows by doubling,
+// but never past limit: a bytes.Buffer would reserve up to twice the limit for an output just under
+// it, in a server whose memory budget is a few times the limit.
 type limitedBuffer struct {
-	buf   bytes.Buffer
+	buf   []byte
 	limit int
 	over  bool
 }
 
+// minBufferCap is the smallest allocation a limitedBuffer makes, when its limit allows it.
+const minBufferCap = 512
+
 func (b *limitedBuffer) Write(p []byte) (int, error) {
-	if b.buf.Len()+len(p) > b.limit {
+	n := len(b.buf) + len(p)
+	if n > b.limit {
 		b.over = true
 		return 0, errOutputTooLarge
 	}
-	return b.buf.Write(p)
+	if n > cap(b.buf) {
+		grown := make([]byte, len(b.buf), min(max(2*cap(b.buf), n, minBufferCap), b.limit))
+		copy(grown, b.buf)
+		b.buf = grown
+	}
+	b.buf = append(b.buf, p...)
+	return len(p), nil
+}
+
+// jsonObject reports whether b is one valid JSON object: a worker's response is one, and any other
+// value (null, an array, a string) is not a response.
+func jsonObject(b []byte) bool {
+	t := bytes.TrimLeft(b, " \t\r\n")
+	return len(t) > 0 && t[0] == '{' && json.Valid(t)
 }
 
 // ExecRunner runs each job as `self catalog worker` in its own process group, with TMPDIR set to the
@@ -556,10 +577,7 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 
 		err = cmd.Start()
 		if err == nil && o.nice > 0 {
-			// The worker's process group, not its process: nice is per thread on Linux, and the
-			// worker's Go runtime has started threads before this call. PRIO_PGRP sets every thread of
-			// the group, and threads created later inherit it.
-			if perr := syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, o.nice); perr != nil {
+			if perr := niceGroup(cmd.Process.Pid, o.nice); perr != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 				_ = cmd.Wait()
 				return nil, &WorkError{Kind: sbom.KindFailed, Msg: "setting worker priority: " + perr.Error()}
@@ -576,17 +594,17 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 				Msg: fmt.Sprintf("SBOM is larger than the %d byte limit", sbom.MaxSBOMBytes)}
 		}
 		if err == nil {
-			if !json.Valid(out.buf.Bytes()) {
+			if !jsonObject(out.buf) {
 				return nil, &WorkError{Kind: sbom.KindFailed, Msg: "cataloguer returned an unreadable response"}
 			}
-			return &sbom.CatalogResponse{Encoded: out.buf.Bytes()}, nil
+			return &sbom.CatalogResponse{Encoded: out.buf}, nil
 		}
 		var ee *exec.ExitError
 		if !errors.As(err, &ee) {
 			return nil, &WorkError{Kind: sbom.KindFailed, Msg: "starting cataloguer: " + err.Error()}
 		}
 		var ce sbom.CatalogError
-		if json.Unmarshal(out.buf.Bytes(), &ce) == nil && ce.Kind != "" {
+		if json.Unmarshal(out.buf, &ce) == nil && ce.Kind != "" {
 			return nil, &WorkError{Kind: ce.Kind, Msg: ce.Error}
 		}
 		if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
@@ -595,6 +613,21 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		return nil, &WorkError{Kind: sbom.KindFailed, Msg: fmt.Sprintf("cataloguer exited with status %d", ee.ExitCode())}
 	}
 }
+
+// niceGroup lowers the priority of the worker's process group pgid by n from this process's own,
+// to at most 19. It sets the group, not the process: nice is per thread on Linux, and the worker's Go
+// runtime has started threads before this call. PRIO_PGRP sets every thread of the group, and threads
+// created later inherit it.
+func niceGroup(pgid, n int) error {
+	own, err := ownNice()
+	if err != nil {
+		return err
+	}
+	return syscall.Setpriority(syscall.PRIO_PGRP, pgid, min(own+n, maxNice))
+}
+
+// maxNice is the lowest priority there is.
+const maxNice = 19
 
 // signalMessage describes a worker that a signal ended, naming the signal once: "cataloguer worker
 // ended by signal 9 (killed)".
