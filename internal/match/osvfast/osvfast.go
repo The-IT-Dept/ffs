@@ -39,19 +39,18 @@ const (
 var skippedBuckets = map[string]bool{osv.BucketGIT: true, "Linux": true, "Android": true, "Azure Linux": true}
 
 // recordChunk is how many cached records MatchImage reads at a time: as many as recordChunkBytes holds
-// of the largest record the OSV feed caches (maxCachedRecordBytes), so one read holds at most
+// of the largest record the OSV feed caches (osv.MaxRecordBytes), so one read holds at most
 // recordChunkBytes of records whatever their sizes. A host's Ubuntu linux source package alone indexes
 // thousands of kernel records averaging over 400 KB, so reading a bucket's records at once can take
 // gigabytes. A var so tests can lower it.
-var recordChunk = recordChunkBytes / maxCachedRecordBytes
+var recordChunk = recordsPerRead(recordChunkBytes)
 
-const (
-	// recordChunkBytes bounds the uncompressed records of one read.
-	recordChunkBytes = 64 << 20
-	// maxCachedRecordBytes is the largest record the OSV feed caches: it skips larger ones
-	// (internal/feeds/osv maxRecordBytes).
-	maxCachedRecordBytes = 4 << 20
-)
+// recordChunkBytes bounds the uncompressed records of one read.
+const recordChunkBytes = 64 << 20
+
+// recordsPerRead is how many records of at most osv.MaxRecordBytes fit in a read of budget bytes, at
+// least one.
+func recordsPerRead(budget int) int { return max(1, budget/osv.MaxRecordBytes) }
 
 // loadRecords reads cached records by id: (*store.Store).OSVRecordsByID, a var so tests can watch
 // the batches.

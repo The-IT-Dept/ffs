@@ -17,9 +17,6 @@ func SetRecordChunk(t testing.TB, n int) {
 // RecordChunk is how many records MatchImage reads at a time, and the bytes one read may hold.
 func RecordChunk() (records, bytes int) { return recordChunk, recordChunkBytes }
 
-// MaxCachedRecordBytes is the largest record MatchImage expects the cache to hold.
-const MaxCachedRecordBytes = maxCachedRecordBytes
-
 // WatchRecordLoads records the number of ids in every read of cached records, for the test.
 func WatchRecordLoads(t testing.TB) *[]int {
 	var sizes []int

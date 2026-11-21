@@ -127,9 +127,9 @@ func TestMatchImageBoundsRecordLoads(t *testing.T) {
 func TestMatchImageReadsAreBoundedInBytes(t *testing.T) {
 	records, bytes := osvfast.RecordChunk()
 	require.Equal(t, 64<<20, bytes)
-	require.Equal(t, 4<<20, osvfast.MaxCachedRecordBytes)
+	require.Equal(t, 4<<20, osv.MaxRecordBytes, "the OSV feed's record cap")
 	require.Equal(t, 16, records)
-	require.LessOrEqual(t, records*osvfast.MaxCachedRecordBytes, bytes)
+	require.LessOrEqual(t, records*osv.MaxRecordBytes, bytes)
 
 	m, pkgs := hostFixture(t)
 	loads := osvfast.WatchRecordLoads(t)
