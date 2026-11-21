@@ -12,7 +12,7 @@ COPY internal/web/ui/dist/.keep /src/internal/web/ui/dist/.keep
 # (ui/scripts/bundled.ts); manifests checks their licences and writes a package.json for each.
 RUN npm run build && node scripts/prodtree.mjs manifests /out/ui-sbom
 
-FROM --platform=$BUILDPLATFORM golang:1.27.1-trixie@sha256:8f58fd67ea075142d947a60e0caa4317746a55118d312f027793d382c7741734 AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-trixie@sha256:af1bfc2614ebb1dbd31af514b78740fd678850e76498762b425ecee4c5c6ea80 AS build
 ARG TARGETOS TARGETARCH VERSION=dev COMMIT=unknown
 WORKDIR /src
 COPY go.mod go.sum ./
