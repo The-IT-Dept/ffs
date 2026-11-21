@@ -78,8 +78,9 @@ func openByAdvisory(fs []model.Finding) map[string]model.Finding {
 // Recommend picks the nearest candidate that helps (spec §6.7.3). Only refresh, patch and minor
 // candidates that fix something are eligible; major is never recommended. The first eligible
 // candidate, nearest tier first, that clears every fixable urgent and high finding, introduces no
-// urgent or high one, and either fixes a medium or higher finding or does not make medium and low
-// worse (net medium and low change of zero or more) wins. Failing that, the eligible candidate with the best net change wins:
+// urgent or high one, and either fixes more findings at medium or above than it introduces or does
+// not make medium and low worse (net medium and low change of zero or more) wins. Failing that, the
+// eligible candidate with the best net change wins:
 // urgent, then high, then medium and low together, net of what it introduces, with ties going to the
 // nearer tier. A best net change of nothing leaves no recommendation. The alternatives are the
 // candidates of further tiers (every candidate when there is no recommendation) that fix an advisory
@@ -128,15 +129,17 @@ func Recommend(cands []Scored) (rec *Scored, alts []Scored) {
 }
 
 // clearsWithoutHarm is the first rule: c clears every fixable urgent and high finding and introduces
-// none, and fixes a finding at medium or above or leaves the net medium and low change non-negative.
-// Without urgent or high findings clearing is vacuous, so the second half keeps a candidate that
-// fixes one low finding from winning while it introduces mediums.
+// none, and makes a net improvement at medium or above (it fixes more urgent, high and medium
+// findings than it introduces) or leaves the net medium and low change non-negative. Without urgent
+// or high findings clearing is vacuous, so the second half keeps a candidate that fixes one low, or
+// one medium, finding from winning while it introduces more mediums.
 func clearsWithoutHarm(c Scored) bool {
 	if !c.ClearsUrgentHigh || c.Introduces[model.PriorityUrgent]+c.Introduces[model.PriorityHigh] > 0 {
 		return false
 	}
-	fixesMedium := c.Fixes[model.PriorityUrgent]+c.Fixes[model.PriorityHigh]+c.Fixes[model.PriorityMedium] > 0
-	return fixesMedium || net(c)[2] >= 0
+	d := net(c)
+	improves := d[0]+d[1]+c.Fixes[model.PriorityMedium]-c.Introduces[model.PriorityMedium] > 0
+	return improves || d[2] >= 0
 }
 
 func total(m map[model.Priority]int) int {
