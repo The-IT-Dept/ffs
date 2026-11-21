@@ -75,6 +75,7 @@ type suite struct {
 	api        string         // base URL of the current step's port-forward
 	agentGroup string         // ID of the agent node group (node-group sets it)
 	grypeFirst string         // path of the first Grype DB archive, published before the install
+	grypeNext  time.Time      // build time of the second Grype DB build, which grypedb-update publishes
 	t7, t9     time.Time
 }
 
@@ -129,10 +130,14 @@ func setup(t *testing.T) *suite {
 	t.Cleanup(func() { s.dumpOnFailure(t) })
 
 	// The first Grype DB build, a small one from the feed's fixtures, is out before ffs starts, so the feed
-	// installs it first thing; grypedb-update publishes the next. Both are stamped in the past, so neither counts
-	// towards settling the OSV findings the suite observes (they stay provisional, as without the feed).
-	s.grypeFirst = s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, grypeBuilt.Add(-24*time.Hour), "**/debian-12/cve-2022-38178.json"),
-		grypeBuilt.Add(-24*time.Hour))
+	// installs it first thing; grypedb-update publishes the next. Both are stamped now, a minute apart and before
+	// the OSV records the later steps publish, so neither counts towards settling the OSV findings the suite
+	// observes (they stay provisional, as without the feed). Each run's builds are newer than an earlier run's,
+	// which a kept cluster's volume remembers as the installed build: the feed takes only newer ones.
+	now := time.Now().UTC().Truncate(time.Second)
+	first := now.Add(-2 * time.Minute)
+	s.grypeNext = now.Add(-time.Minute)
+	s.grypeFirst = s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, first, "**/debian-12/cve-2022-38178.json"), first)
 
 	s.appRepo = s.env.RegistryPush + "/e2e/app"
 	digest := pushAppIndex(t, s.appRepo+":1")
@@ -326,9 +331,6 @@ func (s *suite) catalogued(t *testing.T) {
 	})
 }
 
-// grypeBuilt stamps the second fixture Grype DB build, a day before the suite runs; the first is a day older.
-var grypeBuilt = time.Now().UTC().Truncate(time.Second).Add(-24 * time.Hour)
-
 // feedStatus is one entry of GET /api/v1/feeds.
 type feedStatus struct {
 	Name        string    `json:"name"`
@@ -339,26 +341,18 @@ type feedStatus struct {
 
 // grypeFeed returns the grypedb entry of GET /api/v1/feeds.
 func grypeFeed(ctx context.Context, base string) (feedStatus, error) {
-	var body bytes.Buffer
-	code, err := get(ctx, base+"/api/v1/feeds", &body)
-	if err != nil {
-		return feedStatus{}, err
-	}
-	if code != http.StatusOK {
-		return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: %d %s", code, body.String())
-	}
 	var page struct {
 		Feeds []feedStatus `json:"feeds"`
 	}
-	if err := json.Unmarshal(body.Bytes(), &page); err != nil {
-		return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: %w", err)
+	if err := getJSON(ctx, base, "/api/v1/feeds", &page); err != nil {
+		return feedStatus{}, err
 	}
 	for _, f := range page.Feeds {
 		if f.Name == "grypedb" {
 			return f, nil
 		}
 	}
-	return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: no grypedb feed in %s", body.String())
+	return feedStatus{}, fmt.Errorf("GET /api/v1/feeds: no grypedb feed in %+v", page.Feeds)
 }
 
 // grypeDBUpdate covers the Grype DB feed in the cluster (F120): the first build, published before the install, is
@@ -366,9 +360,14 @@ func grypeFeed(ctx context.Context, base string) (feedStatus, error) {
 // against the first while the matcher holds the first open, and handed to the engine. The feed's lastSuccess
 // advancing past the second download, with no error, says all of that worked.
 func (s *suite) grypeDBUpdate(t *testing.T) {
-	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
-	defer cancel()
-	require.NoError(t, s.feeds.WaitServed(ctx, s.grypeFirst, time.Time{}), "the first Grype DB build was never downloaded")
+	// Each download has a wait of its own.
+	waitServed := func(path string, after time.Time, what string) {
+		t.Helper()
+		ctx, cancel := context.WithTimeout(t.Context(), 3*time.Minute)
+		defer cancel()
+		require.NoError(t, s.feeds.WaitServed(ctx, path, after), "the %s Grype DB build was never downloaded", what)
+	}
+	waitServed(s.grypeFirst, time.Time{}, "first")
 	base := portForward(t)
 	eventually(t, 3*time.Minute, func() (bool, string) {
 		f, err := grypeFeed(t.Context(), base)
@@ -379,8 +378,8 @@ func (s *suite) grypeDBUpdate(t *testing.T) {
 	})
 
 	published := time.Now()
-	second := s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, grypeBuilt), grypeBuilt)
-	require.NoError(t, s.feeds.WaitServed(ctx, second, published), "the second Grype DB build was never downloaded")
+	second := s.feeds.PublishGrypeDB(grypedbtest.BuildDB(t, s.grypeNext), s.grypeNext)
+	waitServed(second, published, "second")
 	downloaded := time.Now()
 	// The success of the sync that took the second build is recorded when the sync ends, after the download. The
 	// sync before it ended a whole interval (10s, less 10% jitter) earlier, so a success up to 2s before the
