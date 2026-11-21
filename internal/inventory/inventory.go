@@ -221,10 +221,11 @@ func (inv *Inventory) NeedLeaderElection() bool { return true }
 
 // Start waits for the caches, runs SyncAll until it succeeds (backing off up to maxRetryBackoff),
 // then flushes batches. Every TagTTL it re-resolves the tags of template-backed owners
-// (refreshTemplates); every VersionPoll it re-reads the control-plane version; every RetryPoll it
-// flushes the owners of images whose quarantine has ended, which hands those images back to the
-// acquirer or the normaliser, and the owners of images catalogued from a node agent's SBOM, which
-// asks the registry to supersede them, and forgets the hand-offs of images no owner uses any more.
+// (refreshTemplates, on a goroutine of its own); every VersionPoll it re-reads the control-plane
+// version; every RetryPoll it flushes the owners of images whose quarantine has ended, which hands
+// those images back to the acquirer or the normaliser, and the owners of images catalogued from a
+// node agent's SBOM, which asks the registry to supersede them, and forgets the hand-offs of images
+// no owner uses any more.
 func (inv *Inventory) Start(ctx context.Context) error {
 	if inv.cache != nil && !inv.cache.WaitForCacheSync(ctx) {
 		if ctx.Err() != nil {
@@ -245,14 +246,12 @@ func (inv *Inventory) Start(ctx context.Context) error {
 		case <-time.After(delay):
 		}
 	}
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		inv.batch.Run(ctx)
-	}()
-	defer func() { <-done }()
-	tags := time.NewTicker(inv.o.TagTTL)
-	defer tags.Stop()
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	wg.Go(func() { inv.batch.Run(ctx) })
+	// The TagTTL refresh flushes every template-backed owner at once, which can take a while: it runs on
+	// its own, so the polls below are not held up behind it.
+	wg.Go(func() { inv.refreshEvery(ctx, inv.o.TagTTL) })
 	versions := time.NewTicker(inv.o.VersionPoll)
 	defer versions.Stop()
 	retries := time.NewTicker(inv.o.RetryPoll)
@@ -275,10 +274,6 @@ func (inv *Inventory) Start(ctx context.Context) error {
 				logf.FromContext(ctx).WithName("inventory").Error(err, "listing owners of images catalogued by a node agent")
 			}
 			inv.batch.Add(append(keys, agent...)...)
-		case <-tags.C:
-			if err := inv.refreshTemplates(ctx); err != nil && ctx.Err() == nil {
-				logf.FromContext(ctx).WithName("inventory").Error(err, "refreshing the tags of owners that are not running failed")
-			}
 		case <-versions.C:
 			inv.refreshVersion(ctx)
 			inv.batch.Add(clusterKey)
@@ -307,6 +302,23 @@ func (inv *Inventory) pruneHandedOff(ctx context.Context) error {
 		maps.DeleteFunc(m, func(d string, _ time.Time) bool { return !used[d] })
 	}
 	return nil
+}
+
+// refreshEvery runs refreshTemplates every interval until ctx is done; a failure is logged and the
+// next interval tries again.
+func (inv *Inventory) refreshEvery(ctx context.Context, every time.Duration) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := inv.refreshTemplates(ctx); err != nil && ctx.Err() == nil {
+				logf.FromContext(ctx).WithName("inventory").Error(err, "refreshing the tags of owners that are not running failed")
+			}
+		}
+	}
 }
 
 // refreshTemplates flushes the template-backed owners now, looking up again every tag whose record

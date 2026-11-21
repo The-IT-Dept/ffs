@@ -2,7 +2,6 @@ package inventory
 
 import (
 	"slices"
-	"sort"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -113,31 +112,16 @@ func (p platformPins) named(def NodePlatform) []NodePlatform {
 
 // templatePlatform is the platform an owner with no running pods is resolved at. When its template
 // pins kubernetes.io/arch or kubernetes.io/os (nodeSelector or required node affinity) to platforms
-// other than the majority one, it is the platform of the most Ready nodes the pins allow, or, with
-// none, the first platform the pins name; otherwise it is majority, the majority Ready-node platform.
+// other than the majority one, it is the platform of the most Ready nodes the pins allow (ties as in
+// majorityPlatform), or, with none, the first platform the pins name; otherwise it is majority, the
+// majority Ready-node platform.
 func templatePlatform(spec *corev1.PodSpec, nodes []model.Node, majority NodePlatform) NodePlatform {
 	pins := pinsOf(spec)
 	if !pins.pinned() || pins.allows(majority) {
 		return majority
 	}
-	counts := map[NodePlatform]int{}
-	for _, n := range nodes {
-		if np := (NodePlatform{OS: n.OS, Arch: n.Arch}); n.Ready && n.OS != "" && n.Arch != "" && pins.allows(np) {
-			counts[np]++
-		}
-	}
-	if len(counts) > 0 {
-		platforms := make([]NodePlatform, 0, len(counts))
-		for np := range counts {
-			platforms = append(platforms, np)
-		}
-		sort.Slice(platforms, func(i, j int) bool {
-			if counts[platforms[i]] != counts[platforms[j]] {
-				return counts[platforms[i]] > counts[platforms[j]]
-			}
-			return platforms[i].Key() < platforms[j].Key()
-		})
-		return platforms[0]
+	if np, ok := commonestPlatform(nodes, pins.allows); ok {
+		return np
 	}
 	for _, np := range pins.named(majority) {
 		if pins.allows(np) {

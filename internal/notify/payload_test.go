@@ -81,6 +81,19 @@ func TestPayload_CapsItemsAndBytes(t *testing.T) {
 	assert.LessOrEqual(t, size, notify.MaxPayloadBytes)
 	assert.Empty(t, got.Feeds[0].LastError)
 
+	// W52: the feeds' last errors go before any item does.
+	withItems := feeds
+	withItems.Kind = notify.KindDigest
+	for i := range 20 {
+		withItems.Items = append(withItems.Items, bigItem(fmt.Sprintf("CVE-2026-%04d", i), medium, 1))
+	}
+	got, size = decode(t, withItems)
+	assert.LessOrEqual(t, size, notify.MaxPayloadBytes)
+	assert.Empty(t, got.Feeds[0].LastError)
+	assert.Len(t, got.Items, 20, "every item is kept")
+	assert.Zero(t, got.Truncated)
+	assert.Len(t, feeds.Feeds[0].LastError, 300<<10, "the message itself is not changed")
+
 	small := notify.Message{ID: "ffs_s", Kind: notify.KindImmediate, Items: []notify.Item{bigItem("CVE-2026-0001", urgent, 3)}}
 	b, err := notify.EncodePayload(small)
 	require.NoError(t, err)

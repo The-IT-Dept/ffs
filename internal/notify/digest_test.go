@@ -258,3 +258,23 @@ func TestDigest_CountsFindingsLikeTheBaseline(t *testing.T) {
 	assert.Equal(t, 4, d.Summary.Workloads)
 	assert.Equal(t, map[model.Priority]int{medium: 3, high: 1}, d.Summary.Counts)
 }
+
+// TestDigest_TitleCountsFindings pins W37: the digest title counts findings, as its summary does, not
+// the advisory items it lists: one advisory in three workloads is three new findings.
+func TestDigest_TitleCountsFindings(t *testing.T) {
+	h := digestHarness(t, true)
+	h.at("2026-11-19T12:00+11:00")
+	for _, w := range []string{"a", "b", "c"} {
+		h.open(dep("shop", w), "CVE-A", medium)
+	}
+	h.open(dep("shop", "d"), "CVE-B", high)
+	h.process()
+	h.at("2026-11-20T09:00+11:00")
+	h.process()
+	d := h.sink.lastOfKind(notify.KindDigest)
+	assert.Equal(t, []string{"CVE-B", "CVE-A"}, ids(d, notify.EventDetected))
+	assert.Equal(t, "ffs digest for test: 4 new, 0 escalated, 0 fixes available, 0 resolved", d.Title)
+	require.NotNil(t, d.Summary)
+	assert.Equal(t, 4, d.Summary.Findings)
+	assert.Equal(t, 4, d.Summary.Workloads)
+}

@@ -21,10 +21,8 @@ func (e *Engine) StartDrains(ctx context.Context) (func() error, error) { return
 // StartupRetain exposes the startup cleanup the reconciler adds to the manager.
 func (r *TargetReconciler) StartupRetain(ctx context.Context) error { return r.startupRetain(ctx) }
 
-// NamespaceGone exposes the deleted-namespace check the reconciler builds for at.
-func (r *TargetReconciler) NamespaceGone(at *ffsv1alpha1.AlertTarget) func(string) bool {
-	return r.namespaceGone(at)
-}
+// CloseStaleLedger exposes the ledger sweep Start runs.
+func (e *Engine) CloseStaleLedger(ctx context.Context) (int, error) { return e.closeStaleLedger(ctx) }
 
 // BlockedRanges exposes the guard's extra ranges: the configured ones and the nodes' pod CIDRs.
 func BlockedRanges(c client.Reader, configured []netip.Prefix, log logr.Logger) func(context.Context) []netip.Prefix {

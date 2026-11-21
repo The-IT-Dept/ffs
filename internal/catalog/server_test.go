@@ -516,19 +516,22 @@ func TestCatalog_ScratchDirCreated(t *testing.T) {
 	require.Equal(t, fs.FileMode(0o700), fi.Mode().Perm())
 }
 
-// TestExecRunner_NiceAppliedToWorker: WithNice lowers the worker's priority right after it starts.
+// TestExecRunner_NiceAppliedToWorker: WithNice lowers the worker's priority right after it starts, by n
+// from the server's own nice value and at most to 19; without it the worker keeps the server's. The test
+// process may itself run niced (a shell's BG_NICE, say), so the worker's value is compared with it.
 func TestExecRunner_NiceAppliedToWorker(t *testing.T) {
-	// The worker polls its own nice value for up to 2s until it is not 0, writes it to $OUT and
-	// answers an empty response.
+	// The worker reads the nice value of its parent, this test process, and polls its own for up to 2s
+	// until it differs, then writes both to $OUT and answers an empty response.
 	const worker = `#!/bin/sh
+base=$(ps -o nice= -p $PPID | tr -d ' ')
 i=0
 n=$(ps -o nice= -p $$ | tr -d ' ')
-while [ "$n" = "0" ] && [ $i -lt 20 ]; do
+while [ "$n" = "$base" ] && [ $i -lt 20 ]; do
   sleep 0.1
   i=$((i+1))
   n=$(ps -o nice= -p $$ | tr -d ' ')
 done
-printf '%s' "$n" > "$OUT"
+printf '%s %s' "$base" "$n" > "$OUT"
 echo '{}'
 `
 	script := filepath.Join(t.TempDir(), "worker.sh")
@@ -536,10 +539,10 @@ echo '{}'
 	req := sbom.CatalogRequest{Ref: "r@sha256:" + strings.Repeat("a", 64)}
 	for _, tc := range []struct {
 		opts []catalog.ExecOption
-		want string
+		add  int
 	}{
-		{[]catalog.ExecOption{catalog.WithNice(10)}, "10"},
-		{nil, "0"},
+		{[]catalog.ExecOption{catalog.WithNice(10)}, 10},
+		{nil, 0},
 	} {
 		out := filepath.Join(t.TempDir(), "nice")
 		t.Setenv("OUT", out)
@@ -547,7 +550,10 @@ echo '{}'
 		require.NoError(t, err)
 		got, err := os.ReadFile(out) //nolint:gosec // G304: the test's own file
 		require.NoError(t, err)
-		require.Equal(t, tc.want, string(got))
+		var parent, nice int
+		_, err = fmt.Sscanf(string(got), "%d %d", &parent, &nice)
+		require.NoError(t, err, "worker wrote %q", got)
+		require.Equal(t, min(parent+tc.add, 19), nice, "parent at nice %d", parent)
 	}
 }
 
@@ -593,9 +599,12 @@ func TestExecRunner_OutputBoundedAndPassedThrough(t *testing.T) {
 	require.Equal(t, sbom.KindTooLarge, we.Kind)
 	require.Equal(t, fmt.Sprintf("SBOM is larger than the %d byte limit", sbom.MaxSBOMBytes), we.Msg)
 
-	_, err = catalog.ExecRunner(script("garbage.sh", "echo 'not json'"))(ctx, req, t.TempDir())
-	require.ErrorAs(t, err, &we)
-	require.Equal(t, sbom.KindFailed, we.Kind)
+	for i, out := range []string{"not json", "null", "[]", `"x"`, "{} {}"} {
+		_, err = catalog.ExecRunner(script(fmt.Sprintf("garbage-%d.sh", i), "printf '%s' '"+out+"'"))(ctx, req, t.TempDir())
+		require.ErrorAs(t, err, &we, out)
+		require.Equal(t, sbom.KindFailed, we.Kind, out)
+		require.Equal(t, "cataloguer returned an unreadable response", we.Msg, out)
+	}
 
 	ok := script("ok.sh", "cat >/dev/null; printf '%s' '"+answer+"'")
 	resp, err := catalog.ExecRunner(ok, catalog.WithOutputLimit(len(answer)))(ctx, req, t.TempDir())

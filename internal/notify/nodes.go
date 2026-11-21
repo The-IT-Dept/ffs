@@ -69,7 +69,7 @@ func (e *Engine) nodesBaseline(ctx context.Context, t *target, readyAt, now time
 	if err != nil {
 		return err
 	}
-	return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, Ledger: ledger, Deliveries: []store.Delivery{d},
+	return e.commit(ctx, t, store.NotifyCommit{Target: uid, Ledger: ledger, Deliveries: []store.Delivery{d},
 		NodesBaselineAt: at})
 }
 

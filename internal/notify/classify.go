@@ -38,7 +38,7 @@ func classify(t model.Transition, l *store.LedgerEntry) Event {
 // immediateEligible reports whether ev goes to the target now rather than waiting for its digest.
 // Provisional findings alert immediately only when urgent (spec §6.5); a resolution is sent
 // immediately when what was sent before was itself at the immediate threshold, also when its
-// namespace has since been deleted.
+// namespace has since left the target.
 func immediateEligible(c TargetConfig, ev Event, t model.Transition, l *store.LedgerEntry) bool {
 	if !c.covers(ev, t.Owner.Namespace) {
 		return false

@@ -12,14 +12,14 @@ import (
 
 // digest sends the target's scheduled summary when it is due (spec §6.10): what changed between
 // the digest cursor and the immediate cursor that was not already sent, in four sections (new,
-// escalated, fixes now available, resolved) plus feed health, and the upgrades that became
+// escalated, fixes now available, resolved), each counted in findings, plus feed health, and the upgrades that became
 // available for findings already reported (see upgradesToList). Every section keeps to the
 // digest's minimum priority; a fix or resolution counts at the priority the target was told about.
 // When nothing qualifies, nothing is sent; the cursor still moves and resolutions are still
 // recorded in the ledger. Classifying against the ledger, which the immediate pass has already
 // updated, keeps anything sent immediately out of the digest. With holdNodes the transitions of
 // Nodes findings are passed over, as the immediate pass does. A resolution in a namespace that has
-// been deleted is still in scope, so the ledger entry of a finding sent before closes.
+// left the target's scope is still in scope, so the ledger entry of a finding sent before closes.
 func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetState, upTo int64, now time.Time, holdNodes bool) error {
 	fire := t.digestFire(st)
 	if !digestDue(fire, now) {
@@ -112,7 +112,7 @@ func (e *Engine) digest(ctx context.Context, t *target, st store.NotifyTargetSta
 		}
 		c.Deliveries = []store.Delivery{dl}
 	}
-	return e.st.CommitNotify(ctx, c)
+	return e.commit(ctx, t, c)
 }
 
 // upgradesToList returns, in order, the findings whose suggested upgrade was announced in the
@@ -202,13 +202,11 @@ func (e *Engine) digestMessage(ctx context.Context, t *target, r latest, byEvent
 		}
 	}
 	slices.SortStableFunc(items, compareItems)
-	n := map[Event]int{}
-	for _, it := range items {
-		n[it.Event]++
-	}
+	// The title counts findings, as the summary does: its sections add up to the summary's findings.
+	n := func(ev Event) int { return len(byEvent[ev]) }
 	m := e.message(t, KindDigest, fire.Format(time.RFC3339),
-		digestTitle(e.o.Cluster, n[EventDetected]+n[EventReopened], n[EventEscalated], n[EventFixAvailable], n[EventResolved],
-			n[EventUpgradeAvailable]), now)
+		digestTitle(e.o.Cluster, n(EventDetected)+n(EventReopened), n(EventEscalated), n(EventFixAvailable), n(EventResolved),
+			n(EventUpgradeAvailable)), now)
 	m.Items = items
 	m.Summary = summarise(listed) // the findings listed, as the baseline counts its findings
 	for _, name := range slices.Sorted(maps.Keys(e.o.FeedStaleAfter)) {

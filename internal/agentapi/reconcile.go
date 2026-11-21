@@ -131,7 +131,8 @@ func (r *Reconciler) Start(ctx context.Context) error {
 	}
 }
 
-// nodeEvents triggers a pass when a Node is added or deleted, or its labels or Ready condition change.
+// nodeEvents triggers a pass when a Node is added or deleted, or its labels, taints or Ready condition
+// change: labels and taints decide whether the agent DaemonSet schedules on it.
 func nodeEvents(trigger func()) toolscache.ResourceEventHandlerFuncs {
 	return toolscache.ResourceEventHandlerFuncs{
 		AddFunc:    func(any) { trigger() },
@@ -139,7 +140,8 @@ func nodeEvents(trigger func()) toolscache.ResourceEventHandlerFuncs {
 		UpdateFunc: func(oldObj, newObj any) {
 			o, ok1 := oldObj.(*corev1.Node)
 			n, ok2 := newObj.(*corev1.Node)
-			if !ok1 || !ok2 || !maps.Equal(o.Labels, n.Labels) || readyStatus(o) != readyStatus(n) {
+			if !ok1 || !ok2 || !maps.Equal(o.Labels, n.Labels) || readyStatus(o) != readyStatus(n) ||
+				!equality.Semantic.DeepEqual(o.Spec.Taints, n.Spec.Taints) {
 				trigger()
 			}
 		},

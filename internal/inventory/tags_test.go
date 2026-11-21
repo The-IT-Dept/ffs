@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -123,4 +124,44 @@ func TestRefreshTemplates_OneLookupPerTagAndCredentials(t *testing.T) {
 		}
 	}
 	require.True(t, h.inv.tagsSince.IsZero())
+}
+
+// TestResolveRef_UnreachableMissKeepsOtherOwnersImages (W2): a registry outage long enough for one owner
+// with no stored image to record a "not reachable" miss does not take the image of the other owners on
+// that reference: within the miss each keeps the image it had, with no registry call, as after a failed
+// lookup of its own. An owner with no image takes the placeholder; a refusal is still used by every owner.
+func TestResolveRef_UnreachableMissKeepsOtherOwnersImages(t *testing.T) {
+	h := newHarness(t, newNode("n1", "amd64"), cronJob("apps", "nightly", "nginx:1.27"))
+	h.res.tags[nginx+":1.27"] = idx
+	h.res.platforms[idx+"|linux/amd64"] = registryManifest(mA, idx, "linux/amd64")
+	require.NoError(t, h.inv.SyncAll(ctx))
+	require.Equal(t, []string{mA}, digestsOf(h.owner(t, "CronJob/apps/nightly").Containers))
+
+	// The registry goes away. A new owner on the same tag fails three times over five minutes, the last
+	// of which records the miss.
+	h.res.err = errors.New("dial tcp 192.0.2.1:443: connect: connection refused")
+	require.NoError(t, h.c.Create(ctx, cronJob("apps", "new", "nginx:1.27")))
+	for _, at := range []time.Duration{7 * time.Hour, 7*time.Hour + 3*time.Minute, 7*time.Hour + 6*time.Minute} {
+		h.now = t0.Add(at)
+		_ = h.inv.Flush(ctx, []string{"CronJob/apps/new"}) // the first two fail and are retried
+	}
+	placeholder := "unknown:" + nginx + ":1.27"
+	require.Equal(t, []string{placeholder}, digestsOf(h.owner(t, "CronJob/apps/new").Containers))
+	calls := h.res.resolveTagCalls
+
+	h.now = t0.Add(7*time.Hour + 7*time.Minute)
+	require.NoError(t, h.inv.Flush(ctx, []string{"CronJob/apps/nightly"}))
+	require.Equal(t, []string{mA}, digestsOf(h.owner(t, "CronJob/apps/nightly").Containers), "its image is kept")
+	require.Equal(t, calls, h.res.resolveTagCalls, "the miss still saves the lookup")
+
+	// A refusal under the same credentials is used by every owner, as before.
+	h.res.err = nil
+	delete(h.res.tags, nginx+":1.27")
+	h.now = t0.Add(9 * time.Hour) // the not-reachable miss (an hour) has ended
+	require.NoError(t, h.inv.Flush(ctx, []string{"CronJob/apps/new"}))
+	require.Equal(t, calls+1, h.res.resolveTagCalls)
+	h.now = t0.Add(9*time.Hour + time.Minute)
+	require.NoError(t, h.inv.Flush(ctx, []string{"CronJob/apps/nightly"}))
+	require.Equal(t, []string{placeholder}, digestsOf(h.owner(t, "CronJob/apps/nightly").Containers), "a refusal reaches every owner")
+	require.Equal(t, calls+1, h.res.resolveTagCalls)
 }

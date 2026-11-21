@@ -268,8 +268,17 @@ type grantKind struct {
 	version string
 	newObj  func() client.Object
 	newList func() client.ObjectList
-	// list lists the grant specs in ns; it reports false when the kind is not served.
-	list func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error)
+	// specs returns the grant specs of a list newList made.
+	specs func(client.ObjectList) []gatewayv1.ReferenceGrantSpec
+}
+
+// list lists the grant specs in ns; it reports false when the kind is not served.
+func (k grantKind) list(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
+	l := k.newList()
+	if err := c.List(ctx, l, client.InNamespace(ns)); err != nil {
+		return grantListErr(err)
+	}
+	return k.specs(l), true, nil
 }
 
 // probe lists at most one ReferenceGrant through c, an uncached reader: it fails when ffs may not
@@ -283,30 +292,24 @@ func (k grantKind) probe(ctx context.Context, c client.Reader) error {
 var grantKinds = []grantKind{
 	{version: "v1", newObj: func() client.Object { return &gatewayv1.ReferenceGrant{} },
 		newList: func() client.ObjectList { return &gatewayv1.ReferenceGrantList{} },
-		list: func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
-			var l gatewayv1.ReferenceGrantList
-			if err := c.List(ctx, &l, client.InNamespace(ns)); err != nil {
-				return grantListErr(err)
-			}
-			out := make([]gatewayv1.ReferenceGrantSpec, len(l.Items))
-			for i := range l.Items {
-				out[i] = l.Items[i].Spec
-			}
-			return out, true, nil
+		specs: func(l client.ObjectList) []gatewayv1.ReferenceGrantSpec {
+			return grantSpecs(l.(*gatewayv1.ReferenceGrantList).Items)
 		}},
 	{version: "v1beta1", newObj: func() client.Object { return &gatewayv1beta1.ReferenceGrant{} },
 		newList: func() client.ObjectList { return &gatewayv1beta1.ReferenceGrantList{} },
-		list: func(ctx context.Context, c client.Reader, ns string) ([]gatewayv1.ReferenceGrantSpec, bool, error) {
-			var l gatewayv1beta1.ReferenceGrantList
-			if err := c.List(ctx, &l, client.InNamespace(ns)); err != nil {
-				return grantListErr(err)
-			}
-			out := make([]gatewayv1.ReferenceGrantSpec, len(l.Items))
-			for i := range l.Items {
-				out[i] = l.Items[i].Spec
-			}
-			return out, true, nil
+		specs: func(l client.ObjectList) []gatewayv1.ReferenceGrantSpec {
+			return grantSpecs(l.(*gatewayv1beta1.ReferenceGrantList).Items)
 		}},
+}
+
+// grantSpecs returns the specs of ReferenceGrants of either version: a v1beta1 ReferenceGrant is a v1
+// one under another name.
+func grantSpecs[G gatewayv1.ReferenceGrant | gatewayv1beta1.ReferenceGrant](items []G) []gatewayv1.ReferenceGrantSpec {
+	out := make([]gatewayv1.ReferenceGrantSpec, len(items))
+	for i := range items {
+		out[i] = gatewayv1.ReferenceGrant(items[i]).Spec
+	}
+	return out
 }
 
 func grantListErr(err error) ([]gatewayv1.ReferenceGrantSpec, bool, error) {

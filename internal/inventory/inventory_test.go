@@ -173,7 +173,7 @@ func newHarness(t *testing.T, objs ...client.Object) *harness {
 	clock := func() time.Time { return h.now }
 	h.c = fake.NewClientBuilder().WithObjects(objs...).Build()
 	h.inv = New(Options{Client: h.c, Store: st, Normalizer: NewNormalizer(h.res, st, clock), Resolver: h.res,
-		Context: fakeContext{}, Hooks: h.hooks, Acquirer: h.acq, ClusterName: "dev", Now: clock})
+		Context: fakeContext{}, Hooks: h.hooks, Acquirer: h.acq, ClusterName: "test", Now: clock})
 	return h
 }
 
@@ -270,7 +270,7 @@ func TestSyncAll_DeploymentViaReplicaSet(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, model.ImagePending, img.Status)
 	require.ElementsMatch(t, []string{"k8s:1.35.2", "runtime:containerd@2.1.4"}, h.hooks.catalogued)
-	h.owner(t, "Cluster//dev")
+	h.owner(t, "Cluster//test")
 	h.owner(t, "ContainerRuntime//containerd")
 	nodes, err := h.st.ListNodes(ctx)
 	require.NoError(t, err)
@@ -377,7 +377,7 @@ func TestSyncAll_UnchangedOwnerNotReported(t *testing.T) {
 	ci, ok, err := h.st.GetClusterInfo(ctx)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.Equal(t, model.ClusterInfo{Name: "dev", GitVersion: "v1.35.2+k3s1", Version: "1.35.2", Distribution: "k3s",
+	require.Equal(t, model.ClusterInfo{Name: "test", GitVersion: "v1.35.2+k3s1", Version: "1.35.2", Distribution: "k3s",
 		KubeProxyVersion: "1.35.2", UpdatedAt: t0}, ci)
 	pkgs, err := h.st.PackagesForImage(ctx, "k8s:1.35.2")
 	require.NoError(t, err)
@@ -405,7 +405,7 @@ func TestSyncAll_DeletedOwnerRemoved(t *testing.T) {
 	for _, o := range []model.Owner{
 		{Ref: model.OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "old"}},
 		{Ref: model.OwnerRef{Kind: "Pod", Namespace: "apps", Name: "gone"}},
-		{Ref: model.OwnerRef{Kind: "Cluster", Name: "dev"}, Containers: []model.ContainerUse{{Name: "kubernetes", Digest: "k8s:1.35.2"}}},
+		{Ref: model.OwnerRef{Kind: "Cluster", Name: "test"}, Containers: []model.ContainerUse{{Name: "kubernetes", Digest: "k8s:1.35.2"}}},
 		{Ref: model.OwnerRef{Kind: "ContainerRuntime", Name: "containerd"}},
 	} {
 		require.NoError(t, h.st.UpsertOwner(ctx, o))
@@ -418,7 +418,7 @@ func TestSyncAll_DeletedOwnerRemoved(t *testing.T) {
 		require.False(t, ok, key)
 	}
 	require.Equal(t, [][]string{{"Deployment/apps/old", "Pod/apps/gone"}}, h.hooks.owners)
-	h.owner(t, "Cluster//dev")
+	h.owner(t, "Cluster//test")
 	h.owner(t, "ContainerRuntime//containerd")
 }
 

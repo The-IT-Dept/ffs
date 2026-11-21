@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
 	"regexp"
 	"slices"
@@ -446,24 +447,33 @@ func nodeModel(n *corev1.Node, now time.Time) model.Node {
 	return out
 }
 
+// defaultPlatform is the platform ties between node platforms go to, and the majority platform of a
+// cluster with no Ready nodes.
+var defaultPlatform = NodePlatform{OS: "linux", Arch: "amd64"}
+
 // majorityPlatform returns the most common platform among Ready nodes; ties prefer linux/amd64.
 func majorityPlatform(nodes []model.Node) NodePlatform {
+	if np, ok := commonestPlatform(nodes, func(NodePlatform) bool { return true }); ok {
+		return np
+	}
+	return defaultPlatform
+}
+
+// commonestPlatform returns the platform of the most Ready nodes whose platform allow accepts; ties
+// prefer linux/amd64, then the lowest key. ok is false when no Ready node with a known platform is
+// accepted.
+func commonestPlatform(nodes []model.Node, allow func(NodePlatform) bool) (best NodePlatform, ok bool) {
 	counts := map[NodePlatform]int{}
 	for _, n := range nodes {
-		if n.Ready && n.OS != "" && n.Arch != "" {
-			counts[NodePlatform{OS: n.OS, Arch: n.Arch}]++
+		if np := (NodePlatform{OS: n.OS, Arch: n.Arch}); n.Ready && n.OS != "" && n.Arch != "" && allow(np) {
+			counts[np]++
 		}
 	}
-	best := NodePlatform{OS: "linux", Arch: "amd64"}
-	platforms := make([]NodePlatform, 0, len(counts))
-	for p := range counts {
-		platforms = append(platforms, p)
-	}
-	sort.Slice(platforms, func(i, j int) bool { return platforms[i].Key() < platforms[j].Key() })
-	for _, p := range platforms {
-		if counts[p] > counts[best] {
-			best = p
+	byKey := func(a, b NodePlatform) int { return strings.Compare(a.Key(), b.Key()) }
+	for _, np := range slices.SortedFunc(maps.Keys(counts), byKey) {
+		if !ok || counts[np] > counts[best] || (counts[np] == counts[best] && np == defaultPlatform) {
+			best, ok = np, true
 		}
 	}
-	return best
+	return best, ok
 }

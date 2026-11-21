@@ -91,6 +91,20 @@ type Summary struct {
 	Counts    map[model.Priority]int
 }
 
+// Legacy reports a summary queued by v0.0.1, which counted no findings: Findings is zero while Counts
+// is not. Its Workloads and Counts are what v0.0.1 sent, and it is shown as v0.0.1 showed it.
+func (s *Summary) Legacy() bool {
+	if s.Findings > 0 {
+		return false
+	}
+	for _, n := range s.Counts {
+		if n > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // summarise counts fs for a Summary.
 func summarise(fs []model.Finding) *Summary {
 	owners := map[string]bool{}
@@ -170,7 +184,8 @@ func baselineTitle(n, urgent, high int) string {
 	return fmt.Sprintf("ffs is watching %s: %d urgent, %d high", workloads(n), urgent, high)
 }
 
-// digestTitle counts the digest's sections; upgrades are named only when there are some.
+// digestTitle counts the findings in each of the digest's sections; upgrades are named only when
+// there are some.
 func digestTitle(cluster string, added, escalated, fixes, resolved, upgrades int) string {
 	t := fmt.Sprintf("ffs digest for %s: %d new, %d escalated, %s, %d resolved",
 		cluster, added, escalated, plural(fixes, "fix available", "fixes available"), resolved)

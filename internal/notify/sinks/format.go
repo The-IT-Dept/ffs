@@ -183,7 +183,11 @@ func more(n int, one, many string) string {
 // feed health of a digest, or the stale feeds of a feed-stale alert.
 func extraLines(m notify.Message, esc escaper) []string {
 	var lines []string
-	if s := m.Summary; s != nil {
+	switch s := m.Summary; {
+	case s == nil:
+	case s.Legacy(): // queued by v0.0.1, which did not count findings
+		lines = append(lines, fmt.Sprintf("%s: %s", workloads(s.Workloads), netCounts(s.Counts)))
+	default:
 		lines = append(lines, fmt.Sprintf("%s in %s: %s", findings(s.Findings), workloads(s.Workloads), netCounts(s.Counts)))
 	}
 	switch m.Kind {

@@ -134,7 +134,8 @@ type wireSuggestion struct {
 }
 
 type wireSummary struct {
-	Findings  int        `json:"findings"`
+	// Findings is absent from a summary queued by v0.0.1, which did not count findings.
+	Findings  *int       `json:"findings,omitempty"`
 	Workloads int        `json:"workloads"`
 	Counts    wireCounts `json:"counts"`
 }
@@ -188,9 +189,12 @@ func wireOf(m notify.Message) wireData {
 		d.Items = append(d.Items, wi)
 	}
 	if s := m.Summary; s != nil {
-		d.Summary = &wireSummary{Findings: s.Findings, Workloads: s.Workloads, Counts: wireCounts{
+		d.Summary = &wireSummary{Workloads: s.Workloads, Counts: wireCounts{
 			Urgent: s.Counts[model.PriorityUrgent], High: s.Counts[model.PriorityHigh],
 			Medium: s.Counts[model.PriorityMedium], Low: s.Counts[model.PriorityLow]}}
+		if !s.Legacy() {
+			d.Summary.Findings = &s.Findings
+		}
 	}
 	for _, f := range m.Feeds {
 		d.Feeds = append(d.Feeds, wireFeed{Name: f.Name, LastSuccess: f.LastSuccess, StaleAfterSeconds: int64(f.StaleAfter / time.Second), Stale: f.Stale})

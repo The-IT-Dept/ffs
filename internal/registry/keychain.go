@@ -7,12 +7,12 @@ import (
 	"net/url"
 	"time"
 
-	"github.com/go-logr/logr"
 	"github.com/google/go-containerregistry/pkg/authn"
 	kauth "github.com/google/go-containerregistry/pkg/authn/kubernetes"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 )
 
 // keychainTTL is how long a resolved keychain is reused for one CredSet.
@@ -92,15 +92,15 @@ func (c *Client) operatorKeychain(ctx context.Context) (authn.Keychain, error) {
 }
 
 // operatorSecretSeen records whether the configured operator secret exists, and logs the change to
-// missing. Only the reference configured in registry.operatorSecret is logged, never anything read
-// from a secret.
+// missing, through the context's logger or else the manager's. Only the reference configured in
+// registry.operatorSecret is logged, never anything read from a secret.
 func (c *Client) operatorSecretSeen(ctx context.Context, exists bool) {
 	c.mu.Lock()
 	logIt := !exists && !c.operatorMissing
 	c.operatorMissing = !exists
 	c.mu.Unlock()
 	if logIt {
-		logr.FromContextOrDiscard(ctx).WithName("registry").Info("the configured operator registry secret does not exist; "+
+		logf.FromContext(ctx).WithName("registry").Info("the configured operator registry secret does not exist; "+
 			"registries are accessed without it", "secret", c.namespace+"/"+c.cfg.OperatorSecret)
 	}
 }

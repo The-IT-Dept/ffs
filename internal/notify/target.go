@@ -25,13 +25,10 @@ type TargetConfig struct {
 	ImmediateMin                model.Priority
 	Digest                      DigestConfig
 	// NamespaceMatch limits the target to some namespaces; nil means all of them. Cluster-level
-	// subjects (Namespace "") pass only when it is nil.
-	NamespaceMatch func(ns string) bool
-	// NamespaceGone reports that namespace ns has been deleted, which a NamespaceMatch reading its
-	// labels can no longer match; nil means never. Resolutions in a deleted namespace still go out:
-	// the target was told about those findings while the namespace was in scope. New findings there
-	// do not.
-	NamespaceGone           func(ns string) bool
+	// subjects (Namespace "") pass only when it is nil. A namespace can leave it (deleted, relabelled
+	// out of a selector, or no longer listed): the resolutions of findings the target was told about
+	// there still go out (see covers), new findings do not.
+	NamespaceMatch          func(ns string) bool
 	QuietHours              []TimeInterval
 	AllowUrgentInQuietHours bool
 	NotifyOnFeedStale       bool
@@ -43,10 +40,13 @@ func (c TargetConfig) allows(ns string) bool {
 	return c.NamespaceMatch == nil || (ns != "" && c.NamespaceMatch(ns))
 }
 
-// covers reports whether the target covers event ev of a finding in namespace ns: when it covers
-// the namespace, or, for a resolution, when the namespace has been deleted.
+// covers reports whether the target covers event ev of a finding in namespace ns: when it covers the
+// namespace, and for a resolution always. A resolution is classified only for a finding the target was
+// told about (its ledger entry is open), so it goes out even when the namespace has left the target
+// since, deleted, relabelled out of a selector or no longer listed, and the entry closes; otherwise a
+// later reappearance would pass as already sent.
 func (c TargetConfig) covers(ev Event, ns string) bool {
-	return c.allows(ns) || (ev == EventResolved && ns != "" && c.NamespaceGone != nil && c.NamespaceGone(ns))
+	return ev == EventResolved || c.allows(ns)
 }
 
 // target is a registered target: its config, sink and parsed digest schedule.

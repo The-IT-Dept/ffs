@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
@@ -174,7 +175,10 @@ func TestServer_StartServesTLS13AndStops(t *testing.T) {
 
 	rec := &reportRecorder{resp: wire.ReportResponse{Applied: true}}
 	srv := NewServer(ServerOptions{Listen: addr, CertDir: dir, Auth: fixedAuth{}, Reports: rec})
-	require.ErrorContains(t, srv.Start(context.Background()), "agent API: ", "Start listens on Listen, which is taken")
+	// Short-lived, so a platform that let the port bind twice fails here rather than hanging.
+	taken, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	require.ErrorContains(t, srv.Start(taken), "agent API: ", "Start listens on Listen, which is taken")
+	stop()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- srv.serve(ctx, ln) }() // the listener is handed over: no port to lose between two listens
@@ -205,6 +209,53 @@ func TestServer_StartServesTLS13AndStops(t *testing.T) {
 	require.Equal(t, uint16(tls.VersionTLS13), version)
 	require.Equal(t, big.NewInt(7), serial)
 	hc.CloseIdleConnections()
+
+	cancel()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("Start did not return")
+	}
+}
+
+// TestServer_StartListensOnListen (W51): Start binds Listen itself (any free port here), serves TLS 1.3 on it and
+// returns nil once ctx ends. ctx is short-lived, so a Start that never returned fails the test rather than
+// hanging it.
+func TestServer_StartListensOnListen(t *testing.T) {
+	dir := t.TempDir()
+	writeCert(t, dir, 7)
+	addrs := make(chan string, 1)
+	log := funcr.New(func(_, args string) { // the address Start logs once it listens
+		if _, rest, ok := strings.Cut(args, `"address"="`); ok {
+			addr, _, _ := strings.Cut(rest, `"`)
+			select {
+			case addrs <- addr:
+			default:
+			}
+		}
+	}, funcr.Options{})
+	srv := NewServer(ServerOptions{Listen: "127.0.0.1:0", CertDir: dir, Auth: fixedAuth{}, Reports: &reportRecorder{}, Log: log})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- srv.Start(ctx) }()
+	var addr string
+	select {
+	case addr = <-addrs:
+	case err := <-done:
+		t.Fatalf("Start returned before it listened: %v", err)
+	}
+
+	pemBytes, err := os.ReadFile(filepath.Join(dir, "tls.crt")) //nolint:gosec // G304: the test's own file
+	require.NoError(t, err)
+	pool := x509.NewCertPool()
+	require.True(t, pool.AppendCertsFromPEM(pemBytes))
+	d := &tls.Dialer{Config: &tls.Config{RootCAs: pool, ServerName: "localhost", MinVersion: tls.VersionTLS12}}
+	conn, err := d.DialContext(ctx, "tcp", addr)
+	require.NoError(t, err)
+	require.Equal(t, uint16(tls.VersionTLS13), conn.(*tls.Conn).ConnectionState().Version)
+	require.NoError(t, conn.Close())
 
 	cancel()
 	select {
@@ -730,7 +781,8 @@ func TestServer_SBOMBodyReadAfterALongWait(t *testing.T) {
 }
 
 // TestServer_StalledBodyIsCutOff: with no server ReadTimeout, the handlers' read deadline still ends a body that
-// stops arriving, over HTTP/2 and HTTP/1.1, and nothing of it is handled.
+// stops arriving, over HTTP/2 and HTTP/1.1, and nothing of it is handled. The result had its share at once, so
+// the controller did not hold it up: its request is not marked unread, and counts.
 func TestServer_StalledBodyIsCutOff(t *testing.T) {
 	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
 		t.Run(proto, func(t *testing.T) {
@@ -738,6 +790,7 @@ func TestServer_StalledBodyIsCutOff(t *testing.T) {
 			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms}})
 			s.readTimeout = 200 * time.Millisecond
 			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+			held := inFlight()
 			body, stall := io.Pipe()
 			defer func() { _ = stall.Close() }()
 			go func() { _, _ = stall.Write([]byte(`{"id":"w1","node":"worker-1",`)) }() // then nothing more
@@ -750,56 +803,72 @@ func TestServer_StalledBodyIsCutOff(t *testing.T) {
 			case <-time.After(10 * time.Second):
 				t.Fatal("the stalled body was not cut off")
 			}
+			// The handler decides before it gives back its share.
+			require.Eventually(t, func() bool { return inFlight() == held }, 10*time.Second, time.Millisecond)
 			require.Empty(t, sboms.entered, "nothing was handled")
+			require.Empty(t, sboms.unreadRequests(), "a body that stalls without a wait is the agent's failure")
 		})
 	}
 }
 
-// TestServer_UnreadableResultAfterAWaitIsUnread: a result whose body cannot be read in full once it has its share
-// of the SBOM budget leaves its request unread, so it is not counted against the image, over HTTP/2 and
-// HTTP/1.1. After a wait close to MaxResultWait the agent's client timeout leaves about a minute for the body;
-// here the agent gives up after sending a quarter of it.
+// TestServer_UnreadableResultAfterAWaitIsUnread: a result whose body cannot be read in full after the controller
+// held it longer than heldUpAfter leaves its request unread, so it is not counted against the image, over HTTP/2
+// and HTTP/1.1. After a wait close to MaxResultWait the agent's client timeout leaves about a minute for the body;
+// here the agent gives up after sending a quarter of it. After a shorter hold the failure is the agent's own, and
+// counts.
 func TestServer_UnreadableResultAfterAWaitIsUnread(t *testing.T) {
-	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
-		t.Run(proto, func(t *testing.T) {
-			const size = 1 << 20
-			sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
-			s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
-				MaxSBOMBytes: 2 * size, SBOMBudget: size})
-			url, hc := serveTLS(t, s, proto == "HTTP/2.0")
-			held := inFlight()
-			result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
-			first := sendResult(hc, url, strings.NewReader(result), "w1")
-			select { // the first result holds the whole SBOM budget
-			case <-sboms.entered:
-			case got := <-first:
-				t.Fatalf("the first result was answered without being handled: %+v", got)
-			}
+	for _, tc := range []struct {
+		name   string
+		heldUp time.Duration
+		unread []string
+	}{
+		{"held long", 100 * time.Millisecond, []string{"worker-1/w2"}},
+		{"held briefly", time.Hour, nil},
+	} {
+		for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
+			t.Run(tc.name+"/"+proto, func(t *testing.T) {
+				const size = 1 << 20
+				sboms := &blockingSBOMs{entered: make(chan struct{}, 4), release: make(chan struct{}), wait: time.Hour}
+				s := NewServer(ServerOptions{Auth: fixedAuth{}, Reports: &reportRecorder{}, SBOMs: windowedSBOMs{sboms},
+					MaxSBOMBytes: 2 * size, SBOMBudget: size})
+				s.heldUpAfter = tc.heldUp
+				url, hc := serveTLS(t, s, proto == "HTTP/2.0")
+				held := inFlight()
+				result := sizedBody(t, `{"id":"w1","node":"worker-1","digest":"sha256:aa","failure":"`, `"}`, size)
+				first := sendResult(hc, url, strings.NewReader(result), "w1")
+				select { // the first result holds the whole SBOM budget
+				case <-sboms.entered:
+				case got := <-first:
+					t.Fatalf("the first result was answered without being handled: %+v", got)
+				}
 
-			// The second result is half the size, so its share tells it apart from the first's.
-			body, stall := io.Pipe()
-			defer func() { _ = stall.Close() }()
-			go func() { _, _ = stall.Write([]byte(result[:size/4])) }() // then nothing more
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			second := sendResultWith(ctx, hc, url, body, size/2, "w2")
-			require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second,
-				time.Millisecond)
-			close(sboms.release)
-			require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, <-first)
-			require.Eventually(t, func() bool { return inFlight() == held+size/2 }, 10*time.Second, time.Millisecond,
-				"the second result has its share and reads its body")
-			require.Empty(t, sboms.unreadRequests())
+				// The second result is half the size, so its share tells it apart from the first's.
+				body, stall := io.Pipe()
+				defer func() { _ = stall.Close() }()
+				go func() { _, _ = stall.Write([]byte(result[:size/4])) }() // then nothing more
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				second := sendResultWith(ctx, hc, url, body, size/2, "w2")
+				require.Eventually(t, func() bool { return slices.Contains(sboms.askedFor(), "worker-1/w2") }, 10*time.Second,
+					time.Millisecond)
+				// It arrived before it asked for its window, so it is held at least this long.
+				time.Sleep(2 * min(tc.heldUp, 100*time.Millisecond))
+				close(sboms.release)
+				require.Equal(t, sent{proto: proto, status: http.StatusNoContent}, <-first)
+				require.Eventually(t, func() bool { return inFlight() == held+size/2 }, 10*time.Second, time.Millisecond,
+					"the second result has its share and reads its body")
+				require.Empty(t, sboms.unreadRequests())
 
-			cancel() // the agent's client timeout
-			// Over HTTP/1.1 the client's write of the body ends only when its body does; the agent's is a file.
-			_ = stall.CloseWithError(context.Canceled)
-			require.Error(t, (<-second).err)
-			require.Eventually(t, func() bool { return len(sboms.unreadRequests()) > 0 }, 10*time.Second, time.Millisecond)
-			require.Equal(t, []string{"worker-1/w2"}, sboms.unreadRequests(), "the request it answers is not counted")
-			require.Eventually(t, func() bool { return inFlight() == held }, 10*time.Second, time.Millisecond)
-			require.Empty(t, sboms.entered, "nothing of it was handled")
-		})
+				cancel() // the agent's client timeout
+				// Over HTTP/1.1 the client's write of the body ends only when its body does; the agent's is a file.
+				_ = stall.CloseWithError(context.Canceled)
+				require.Error(t, (<-second).err)
+				// The handler decides before it gives back its share.
+				require.Eventually(t, func() bool { return inFlight() == held }, 10*time.Second, time.Millisecond)
+				require.Equal(t, tc.unread, sboms.unreadRequests(), "only a result held long enough is not counted")
+				require.Empty(t, sboms.entered, "nothing of it was handled")
+			})
+		}
 	}
 }
 
@@ -827,7 +896,8 @@ func (s slowHandlers) SBOM(ctx context.Context, _ Identity, _ *wire.SBOMResult) 
 // TestServer_HandlingOutlastsTheReadTimeout: once a report's or a result's body is read, handling it may take
 // longer than the read timeout, over HTTP/2 and HTTP/1.1. Over HTTP/1.1 the server watches the connection with
 // a background read once the body is read, and a read deadline still in force would end that read and cancel
-// the request's context.
+// the request's context. It pins the behaviour only: on Go 1.27 net/http clears the read deadline itself when
+// the background read starts at the body's end, so it passes without decode lifting the deadline too.
 func TestServer_HandlingOutlastsTheReadTimeout(t *testing.T) {
 	for _, proto := range []string{"HTTP/2.0", "HTTP/1.1"} {
 		t.Run(proto, func(t *testing.T) {
