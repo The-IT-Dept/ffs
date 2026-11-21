@@ -166,6 +166,7 @@ func TestShipping_WorkflowMakeTargetsExist(t *testing.T) {
 
 // ciStep and ciJob are the parts of a workflow the shipping checks read.
 type ciStep struct {
+	Name             string         `json:"name"`
 	Uses             string         `json:"uses"`
 	Run              string         `json:"run"`
 	If               string         `json:"if"`
@@ -207,6 +208,7 @@ func TestShipping_CIRunsUIJobs(t *testing.T) {
 
 	test := runs(jobs["test"])
 	require.Contains(t, test, "npm ci")
+	require.Contains(t, test, "go vet -tags memharness ./hack/memharness/...", "CI compiles the memory harness without running it")
 	require.Contains(t, test,
 		"make generate && git diff --exit-code -- api config charts/ffs/crds internal/web/apigen ui/src/api/schema.d.ts")
 
@@ -254,4 +256,23 @@ func TestShipping_CIRunsUIJobs(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal([]byte(readFile(t, "../../ui/package.json")), &pkg))
 	require.True(t, strings.HasPrefix(pkg.Scripts["lint:api"], "REDOCLY_TELEMETRY=off "), "local runs never report to Redocly either")
+}
+
+// TestShipping_LintCoversTaggedPackages: golangci-lint builds the end-to-end suite and the memory harness, which build
+// only with their tags, so CI lints them with everything else (W48).
+func TestShipping_LintCoversTaggedPackages(t *testing.T) {
+	var cfg struct {
+		Run struct {
+			BuildTags []string `json:"build-tags"`
+		} `json:"run"`
+	}
+	require.NoError(t, yaml.Unmarshal([]byte(readFile(t, "../../.golangci.yml")), &cfg))
+	require.Subset(t, cfg.Run.BuildTags, []string{"e2e", "memharness"})
+	for dir, tag := range map[string]string{"../../test/e2e": "e2e", "../../hack/memharness": "memharness"} {
+		files := glob(t, dir+"/*_test.go")
+		require.NotEmpty(t, files, dir)
+		for _, f := range files {
+			require.True(t, strings.HasPrefix(readFile(t, f), "//go:build "+tag+"\n"), "%s builds with the %s tag only", f, tag)
+		}
+	}
 }

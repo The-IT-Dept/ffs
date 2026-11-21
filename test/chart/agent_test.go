@@ -594,6 +594,11 @@ func TestChart_NetworkPolicyKey(t *testing.T) {
 		{"without the agent", []string{"nodeAgent.enabled=false", "nodeAgent.networkPolicy.enabled=false"}, false, true},
 		// helm upgrade --reuse-values from v0.0.1 keeps the old values, which have no top-level networkPolicy.
 		{"no top-level key (reuse-values)", []string{"networkPolicy=null"}, true, false},
+		// null is how Helm unsets a key, and what the conflict error asks for (W46).
+		{"old key null", []string{"nodeAgent.networkPolicy.enabled=null"}, true, false},
+		{"old key null, new key off", []string{"networkPolicy.enabled=false", "nodeAgent.networkPolicy.enabled=null"}, false, false},
+		{"old map null", []string{"nodeAgent.networkPolicy=null"}, true, false},
+		{"old map null, new key off", []string{"networkPolicy.enabled=false", "nodeAgent.networkPolicy=null"}, false, false},
 	} {
 		require.Equal(t, c.policy, render(t, c.sets...).has("NetworkPolicy", "ffs"), c.name)
 		notes := renderNotes(t, c.sets...)
@@ -617,24 +622,51 @@ func TestChart_NetworkPolicyKey(t *testing.T) {
 	np := as[networkingv1.NetworkPolicy](t, render(t, "nodeAgent.networkPolicy.enabled=true", "config.listen=0.0.0.0:9090", webPeer).
 		get(t, "NetworkPolicy", "ffs"))
 	require.Len(t, np.Spec.Ingress, 3)
+
+	// A values file's nulls, as on a fresh install or a helm upgrade -f, are unset too (W46).
+	for _, values := range []string{
+		"networkPolicy:\n  enabled: false\nnodeAgent:\n  networkPolicy:\n    enabled: null\n",
+		"networkPolicy:\n  enabled: false\nnodeAgent:\n  networkPolicy: null\n",
+	} {
+		out, err := helmTemplateChart(t, chartDir, "-f", writeTemp(t, values))
+		require.NoError(t, err, values)
+		require.False(t, decodeObjs(t, out).has("NetworkPolicy", "ffs"), values)
+	}
 }
 
 // renderNotes renders NOTES.txt with the values sets. helm template does not render it, so a chart copy carries it as
 // the data of a ConfigMap.
 func renderNotes(t *testing.T, sets ...string) string {
 	t.Helper()
-	notes := readFile(t, chartDir+"/templates/NOTES.txt")
-	dir := copyChart(t, map[string]string{
+	notes, _ := renderNotesIn(t, copyChart(t, nil), sets...)
+	return notes
+}
+
+// renderNotesIn renders the chart copy in dir with the values sets, adding NOTES.txt as the data of the ConfigMap
+// notes-test, and returns the notes and every other object rendered.
+func renderNotesIn(t *testing.T, dir string, sets ...string) (string, objs) {
+	t.Helper()
+	notes := readFile(t, filepath.Join(dir, "templates", "NOTES.txt"))
+	for name, body := range map[string]string{
 		"_notes_test.tpl": `{{- define "ffs.notesTest" -}}` + notes + `{{- end -}}`,
 		"notes-test.yaml": "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: notes-test\ndata:\n  notes: {{ include \"ffs.notesTest\" . | toJson }}\n",
-	})
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "templates", name), []byte(body), 0o600))
+	}
 	var args []string
 	for _, s := range sets {
 		args = append(args, "--set", s)
 	}
 	out, err := helmTemplateChart(t, dir, args...)
 	require.NoError(t, err, out)
-	return as[corev1.ConfigMap](t, decodeObjs(t, out).get(t, "ConfigMap", "notes-test")).Data["notes"]
+	o := decodeObjs(t, out)
+	var rest objs
+	for _, u := range o {
+		if u.GetKind() != "ConfigMap" || u.GetName() != "notes-test" {
+			rest = append(rest, u)
+		}
+	}
+	return as[corev1.ConfigMap](t, o.get(t, "ConfigMap", "notes-test")).Data["notes"], rest
 }
 
 func TestChart_AgentOptIns(t *testing.T) {

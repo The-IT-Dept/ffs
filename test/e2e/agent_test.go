@@ -3,9 +3,7 @@
 package e2e
 
 import (
-	"bytes"
 	"cmp"
-	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -166,18 +164,7 @@ func (s *suite) apiStatus(t *testing.T, path string) int {
 // apiGet GETs an ffs API path through the step's port-forward and decodes its 200 JSON body into out.
 func (s *suite) apiGet(t *testing.T, path string, out any) error {
 	t.Helper()
-	var body bytes.Buffer
-	code, err := get(t.Context(), s.api+path, &body)
-	if err != nil {
-		return fmt.Errorf("GET %s: %w", path, err)
-	}
-	if code != http.StatusOK {
-		return fmt.Errorf("GET %s: %d %s", path, code, body.String())
-	}
-	if err := json.Unmarshal(body.Bytes(), out); err != nil {
-		return fmt.Errorf("GET %s: %w", path, err)
-	}
-	return nil
+	return getJSON(t.Context(), s.api, path, out)
 }
 
 // agentReady waits until the agent DaemonSet runs an up-to-date, ready pod on every node.

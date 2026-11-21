@@ -1,0 +1,386 @@
+# Container image.
+image:
+  # Image repository.
+  repository: ghcr.io/the-it-dept/ffs
+  # Image tag; defaults to the chart appVersion.
+  tag: ""
+  # Image digest (sha256:...); when set it replaces the tag.
+  digest: ""
+  # Image pull policy.
+  pullPolicy: IfNotPresent
+
+# Pull secrets for the ffs image itself.
+imagePullSecrets: []
+
+# RBAC options.
+rbac:
+  # Grant cluster-wide get on Secrets so pull secrets can be read for private images.
+  readPullSecrets: true
+
+# Controller container settings.
+controller:
+  # Controller container resources.
+  resources:
+    # Guaranteed resources.
+    requests:
+      # CPU request.
+      cpu: 200m
+      # Memory limit.
+      memory: 512Mi
+    # Resource ceilings.
+    limits:
+      # Memory limit, as a byte count or a quantity such as 1536Mi or 1.5Gi. GOMEMLIMIT is set to 90% of it.
+      # The first node-agent inventories of a cluster are the peak: an 8-node cluster held about 860 MiB
+      # live while matching its node groups' host packages for the first time.
+      memory: 2Gi
+  # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
+  tmpSizeLimit: 1Gi
+
+# Catalog container settings.
+catalog:
+  # Catalog container resources.
+  resources:
+    # Guaranteed resources.
+    requests:
+      # CPU request.
+      cpu: 100m
+      # Memory limit.
+      memory: 256Mi
+    # Resource ceilings.
+    limits:
+      # Memory limit, as a byte count or a quantity such as 2Gi or 1.5Gi. GOMEMLIMIT is set to 90% of it; the catalog workers share it less 128Mi.
+      memory: 2Gi
+  # Size limit of the catalog scratch emptyDir.
+  scratchSizeLimit: 20Gi
+  # Scratch the catalog jobs may use, in bytes or as a quantity such as 18Gi; must be below scratchSizeLimit.
+  scratchLimit: 19327352832
+
+# Persistent storage for the store and feed data.
+persistence:
+  # PVC size for the store and feed data. A Grype DB update holds two builds of a few GB each plus about 2.5 GB of SQLite temporary files; keep at least 10Gi.
+  size: 20Gi
+  # PVC storage class; empty uses the cluster default.
+  storageClass: ""
+  # Use an existing PVC instead of creating one.
+  existingClaim: ""
+
+# Extra pod annotations.
+podAnnotations: {}
+# Extra pod labels.
+podLabels: {}
+# Pod node selector.
+nodeSelector: {}
+# Pod tolerations.
+tolerations: []
+# Pod affinity.
+affinity: {}
+# Pod priority class.
+priorityClassName: ""
+
+# Web UI exposure.
+web:
+  # Service settings.
+  service:
+    # Create a ClusterIP Service for the web UI; needs config.listen bound beyond loopback.
+    enabled: false
+    # Service port for the web UI.
+    port: 8080
+  # Who may reach the web UI port through the ffs pod's NetworkPolicy, which nodeAgent.networkPolicy.enabled creates, with or without the node agent.
+  networkPolicy:
+    # NetworkPolicyPeers (podSelector, namespaceSelector or ipBlock) admitted to the web UI port, such as your authenticating proxy's pods. Empty admits none. Required with web.service.enabled while nodeAgent.networkPolicy.enabled is true, and refused while it is false, which leaves the port to a NetworkPolicy of your own.
+    from: []
+
+# Authenticated metrics endpoint.
+metrics:
+  # Metrics Service.
+  service:
+    # Create the metrics Service.
+    enabled: false
+    # Metrics Service port.
+    port: 8443
+  # Prometheus Operator ServiceMonitor.
+  serviceMonitor:
+    # Create a Prometheus Operator ServiceMonitor.
+    enabled: false
+    # Scrape interval.
+    interval: 60s
+    # Extra ServiceMonitor labels.
+    labels: {}
+
+# Prometheus alert rules.
+prometheusRule:
+  # Create a PrometheusRule with the ffs alerts.
+  enabled: false
+  # Extra PrometheusRule labels.
+  labels: {}
+
+# Grafana dashboard.
+grafanaDashboard:
+  # Create a ConfigMap carrying the Grafana dashboard.
+  enabled: false
+  # Namespace of the Grafana dashboard ConfigMap; defaults to the release namespace.
+  namespace: ""
+  # Extra Grafana dashboard ConfigMap labels.
+  labels:
+    # Label the Grafana sidecar selects dashboards by.
+    grafana_dashboard: "1"
+  # Extra Grafana dashboard ConfigMap annotations.
+  annotations: {}
+
+# Node agent: a DaemonSet that reports each node's host packages and cached images to ffs.
+nodeAgent:
+  # Run the node agent. When false, no agent objects are installed.
+  enabled: true
+  # Agent namespace; empty means <release namespace>-agent.
+  namespace: ""
+  # Create the agent namespace.
+  createNamespace: true
+  # Container runtime layout of the nodes: auto, containerd, k3s, rke2 or crio.
+  distribution: auto
+  # Package databases to mount: auto, or a list of dpkg, rpm and apk.
+  packageDatabases: auto
+  # Extra host paths to read.
+  hostPaths:
+    # Extra binary directories to scan, each under /usr or /opt, listed once and not /usr/bin, /usr/sbin or /usr/local/bin.
+    extraBinDirs: []
+    # containerd root directory (absolute), such as /var/lib/k0s/containerd for k0s; empty uses the distribution's.
+    containerdRoot: ""
+  # Node architectures to schedule on, at least one; published images are amd64 only, so other architectures are skipped.
+  architectures: [amd64]
+  # Node selector of the agent pods.
+  nodeSelector:
+    kubernetes.io/os: linux
+  # Tolerations of the agent pods; the default runs on every node.
+  tolerations:
+    - operator: Exists
+  # Priority class of the agent pods.
+  priorityClassName: ""
+  # Agent container resources. Memory limits are byte counts or quantities such as 640Mi or 1.5Gi; GOMEMLIMIT is 90% of each, and the cataloguer's workers get its limit less 128Mi.
+  resources:
+    # Collector container.
+    collector:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 100m, memory: 128Mi}
+    # Cataloguer container.
+    catalog:
+      requests: {cpu: 10m, memory: 32Mi}
+      limits: {cpu: 400m, memory: 640Mi}
+  # Total size limit of the agent's scratch volumes: the staging volume takes maxImageBytes or 512Mi, whichever is larger, plus 256Mi, and the cataloguer's the rest, at least 512Mi.
+  scratchSizeLimit: 4Gi
+  # Ephemeral storage the collector requests for the scratch volumes, so pods are scheduled where staging fits; empty requests none.
+  scratchRequest: 1Gi
+  # DaemonSet update strategy; the default replaces a tenth of the agent pods at a time.
+  updateStrategy:
+    # RollingUpdate or OnDelete.
+    type: RollingUpdate
+    # Rolling update settings.
+    rollingUpdate:
+      # Agent pods replaced at once, as a number or a percentage of the nodes.
+      maxUnavailable: 10%
+  # Largest image the agent catalogues, as a byte count or a quantity such as 1Gi.
+  maxImageBytes: 1Gi
+  # Port of the agent API on the controller.
+  port: 8444
+  # Node label selector; host findings on matching nodes count as exposed, and empty exposes no node.
+  exposedNodes: ""
+  # Time between full host reports per node.
+  reportInterval: 6h
+  # Time between cached-image checks, which also act as the heartbeat.
+  imageListInterval: 5m
+  # Time without a report before a node shows "node agent not reporting".
+  staleAfter: 30m
+  # How long nodes must lack fresh reports before runtime findings move back to the node-status owner.
+  runtimeGrace: 2h
+  # Largest agent report accepted, as a byte count or a quantity such as 32Mi.
+  maxReportBytes: 33554432
+  # Image SBOM requests handed out with each report, 0 to 10; 0 turns them off.
+  workPerReport: 3
+  # How long a request stays with the node it was offered to; workTimeout plus imageListInterval must be shorter than staleAfter.
+  workTimeout: 20m
+  # TLS of the agent API.
+  tls:
+    # Certificate issued by cert-manager; needs tls.caBundle.
+    certManager:
+      # Issue the agent API certificate with cert-manager.
+      enabled: false
+      # Issuer reference for the certificate.
+      issuerRef: {}
+    # PEM CA bundle the agents trust for the agent API.
+    caBundle: ""
+  # SELinux type of the collector container, for example spc_t.
+  seLinuxType: ""
+  # OpenShift settings.
+  openshift:
+    # Create an SCC for the agent and bind its ServiceAccount to it.
+    scc: false
+  # NetworkPolicy settings.
+  networkPolicy:
+    # Create a NetworkPolicy for the ffs pod, with or without the node agent: the agent API from the agent pods while nodeAgent.enabled, metrics and health from anywhere, the web UI only from web.networkPolicy.from.
+    enabled: true
+
+# ffs configuration rendered to /etc/ffs/config.yaml; namespace, deploymentName and registry.readPullSecrets are injected.
+config:
+  # Cluster name shown in findings and alerts.
+  clusterName: default
+  # Path of the SQLite store.
+  storePath: /var/lib/ffs/ffs.db
+  # Directory for feed data and the store.
+  dataDir: /var/lib/ffs
+  # Web UI and API listen address.
+  listen: 127.0.0.1:8080
+  # Host names the web UI answers besides localhost and IP addresses; web.service.enabled adds the Service's names.
+  allowedHosts: []
+  # External URL of the web UI, used in alert links.
+  dashboardURL: ""
+  # Cataloguer socket and limits.
+  catalog:
+    # Unix socket shared with the catalog container.
+    socket: /run/ffs/catalog.sock
+    # Per-image catalog timeout.
+    timeout: 10m
+    # Maximum image size in bytes to catalog.
+    maxImageBytes: 10737418240
+    # Concurrent catalog jobs.
+    concurrency: 2
+  # Registry access.
+  registry:
+    # Secret in the install namespace holding operator-level registry credentials.
+    operatorSecret: ""
+    # Registry mirror rewrite map.
+    mirrors: {}
+  # Vulnerability data feeds.
+  feeds:
+    # Grype database feed.
+    grypedb:
+      # Enable the Grype DB feed.
+      enabled: true
+      # Feed URL.
+      url: https://grype.anchore.io/databases/v6/latest.json
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 48h
+    # OSV feed.
+    osv:
+      # Enable the OSV feed.
+      enabled: true
+      # Feed URL.
+      url: https://osv-vulnerabilities.storage.googleapis.com
+      # Refresh interval.
+      interval: 5m
+      # Age after which the feed is stale.
+      staleAfter: 2h
+    # CVE list feed.
+    cvelist:
+      # Enable the CVE list feed.
+      enabled: true
+      # Feed URL.
+      url: https://github.com/CVEProject/cvelistV5/releases/download
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 6h
+    # CISA KEV feed.
+    kev:
+      # Enable the CISA KEV feed.
+      enabled: true
+      # Feed URL.
+      url: https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json
+      # Refresh interval.
+      interval: 1h
+      # Age after which the feed is stale.
+      staleAfter: 24h
+    # EPSS feed.
+    epss:
+      # Enable the EPSS feed.
+      enabled: true
+      # Feed URL.
+      url: https://epss.empiricalsecurity.com/epss_scores-current.csv.gz
+      # Refresh interval.
+      interval: 24h
+      # Age after which the feed is stale.
+      staleAfter: 72h
+    # End-of-life feed.
+    eol:
+      # Enable the end-of-life feed.
+      enabled: true
+      # Feed URL.
+      url: https://endoflife.date/api/v1
+      # Refresh interval.
+      interval: 24h
+      # Age after which the feed is stale.
+      staleAfter: 72h
+    # NVD feed (reserved).
+    nvd:
+      # Reserved; enabling is rejected in this release.
+      enabled: false
+      # Feed URL.
+      url: https://services.nvd.nist.gov/rest/json/cves/2.0
+      # Refresh interval.
+      interval: 0s
+      # Age after which the feed is stale.
+      staleAfter: 0s
+    # Chainguard OSV buckets.
+    chainguardOSV:
+      # Add the Wolfi/Chainguard buckets to the OSV feed.
+      enabled: false
+      # Feed URL.
+      url: https://packages.cgr.dev/chainguard/osv
+      # Refresh interval.
+      interval: 0s
+      # Age after which the feed is stale.
+      staleAfter: 0s
+  # Priority scoring thresholds.
+  priority:
+    # EPSS score at or above which a finding counts as likely exploited.
+    epssHigh: 0.5
+    # EPSS score at or above which priority is bumped one level.
+    epssBump: 0.1
+  # Exposure classification.
+  exposure:
+    # Ingress classes treated as internal.
+    internalIngressClasses: []
+    # Gateway classes treated as internal.
+    internalGatewayClasses: []
+    # Gateways treated as internal, as namespace/name.
+    internalGateways: []
+    # Load balancer annotations that mark a Service as internal.
+    internalLBAnnotations: {}
+  # Finding resource output.
+  crd:
+    # Lowest priority written as a Finding resource.
+    minPriority: high
+    # Maximum Finding resources; 0 is unlimited.
+    maxFindings: 2000
+  # Event output.
+  events:
+    # Lowest priority that emits Events.
+    minPriority: high
+  # OpenReports output.
+  openReports:
+    # Report publishing: auto, on or off.
+    mode: auto
+    # Maximum results per report.
+    maxResults: 100
+    # Also write wgpolicyk8s.io PolicyReports.
+    wgPolicy: false
+  # Exception limits.
+  exceptions:
+    # Longest allowed Exception duration.
+    maxDuration: 8760h
+  # Retention.
+  retention:
+    # How long resolved findings are kept.
+    resolved: 2160h
+  # Image upgrade candidates.
+  upgrades:
+    # Enable image upgrade candidates.
+    enabled: true
+    # Maximum upgrade candidates per repository.
+    maxCandidatesPerRepo: 4
+    # Daily upgrade scan time, HH:MM.
+    dailyAt: "03:00"
+    # Per-repository tag parsing overrides.
+    overrides: {}
+    # Kubernetes release URL; empty uses the default.
+    kubernetesReleaseURL: ""

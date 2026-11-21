@@ -2,6 +2,7 @@ package chart
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -76,7 +77,7 @@ func TestChart_DeploymentShape(t *testing.T) {
 	require.Equal(t, "catalog", ps.Containers[1].Name)
 	ctl, cat := ps.Containers[0], ps.Containers[1]
 	require.Equal(t, ctl.Image, cat.Image)
-	require.Equal(t, []string{"controller", "--config=/etc/ffs/config.yaml"}, ctl.Args)
+	require.Equal(t, []string{"controller", "--config=/etc/ffs/config.yaml", "--zap-log-level=info"}, ctl.Args)
 	require.Equal(t, []string{"catalog", "--socket=/run/ffs/catalog.sock", "--scratch=/tmp", "--scratch-limit=19327352832", "--max-concurrent=2",
 		"--worker-memory-limit=1006632960"}, cat.Args) // (2Gi − 128Mi) / 2
 
@@ -135,6 +136,30 @@ func TestChart_DeploymentShape(t *testing.T) {
 		for _, e := range c.Env {
 			require.NotContains(t, []string{"POD_NAME", "POD_NAMESPACE"}, e.Name)
 		}
+	}
+}
+
+// TestChart_ControllerLogLevel: controller.logLevel is the controller's --zap-log-level, info or debug (W29). Values
+// without it, as after helm upgrade --reuse-values from v0.0.1, give info.
+func TestChart_ControllerLogLevel(t *testing.T) {
+	level := func(sets ...string) []string {
+		t.Helper()
+		var out []string
+		for _, a := range container(t, podSpec(t, sets...), "controller").Args {
+			if strings.HasPrefix(a, "--zap-") {
+				out = append(out, a)
+			}
+		}
+		return out
+	}
+	require.Equal(t, []string{"--zap-log-level=info"}, level())
+	require.Equal(t, []string{"--zap-log-level=debug"}, level("controller.logLevel=debug"))
+	require.Equal(t, []string{"--zap-log-level=info"}, level("controller.logLevel=info"))
+	require.Equal(t, []string{"--zap-log-level=info"}, level("controller.logLevel=null"))
+	require.Equal(t, []string{"--zap-log-level=info"}, level("controller.logLevel="))
+	for _, bad := range []string{"trace", "error", "1", "DEBUG"} {
+		_, err := renderErr(t, "controller.logLevel="+bad)
+		require.ErrorContains(t, err, fmt.Sprintf("controller.logLevel must be info or debug, not %q", bad))
 	}
 }
 

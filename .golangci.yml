@@ -1,8 +1,10 @@
 version: "2"
 run:
-  # The end-to-end suite (test/e2e) builds only with the e2e tag; lint it with everything else.
+  # The end-to-end suite (test/e2e) and the memory harness (hack/memharness) build only with their tags; lint them
+  # with everything else.
   build-tags:
     - e2e
+    - memharness
 linters:
   default: standard
   enable:

@@ -251,20 +251,29 @@ func fetch(t *testing.T, url string) (int, http.Header, []byte) {
 	return resp.StatusCode, resp.Header, body
 }
 
-// apiObjects GETs an ffs API path and returns every JSON object in the response, at any depth. It returns errors
-// rather than failing the test, so a poll retries a transient failure, such as a dropped port-forward.
-func apiObjects(ctx context.Context, base, path string) ([]map[string]any, error) {
+// getJSON GETs an ffs API path from base and decodes its 200 JSON body into out. It returns errors rather than
+// failing the test, so a poll retries a transient failure, such as a dropped port-forward.
+func getJSON(ctx context.Context, base, path string, out any) error {
 	var body bytes.Buffer
 	code, err := get(ctx, base+path, &body)
 	if err != nil {
-		return nil, fmt.Errorf("GET %s: %w", path, err)
+		return fmt.Errorf("GET %s: %w", path, err)
 	}
 	if code != http.StatusOK {
-		return nil, fmt.Errorf("GET %s: %d %s", path, code, body.String())
+		return fmt.Errorf("GET %s: %d %s", path, code, body.String())
 	}
+	if err := json.Unmarshal(body.Bytes(), out); err != nil {
+		return fmt.Errorf("GET %s: %w", path, err)
+	}
+	return nil
+}
+
+// apiObjects GETs an ffs API path and returns every JSON object in the response, at any depth. Like getJSON, it
+// returns errors rather than failing the test.
+func apiObjects(ctx context.Context, base, path string) ([]map[string]any, error) {
 	var doc any
-	if err := json.Unmarshal(body.Bytes(), &doc); err != nil {
-		return nil, fmt.Errorf("GET %s: %w", path, err)
+	if err := getJSON(ctx, base, path, &doc); err != nil {
+		return nil, err
 	}
 	var out []map[string]any
 	var walk func(any)

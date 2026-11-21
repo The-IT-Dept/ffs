@@ -34,13 +34,13 @@ jobs:
         with:
           version: v3.22.1
       # make e2e installs kind itself, at the version the Makefile pins. kubectl is not on the arm64 runner image,
-      # so both runners install the version of the kind node image.
+      # so both runners install it, at the Kubernetes version of the kind node image in hack/e2e-kind.sh.
       - name: Install kubectl
-        env:
-          KUBECTL_VERSION: v1.37.0
         run: |
           set -euo pipefail
-          base="https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/$(dpkg --print-architecture)"
+          version="$(sed -n "s|^node_image='kindest/node:\(v[0-9][0-9.]*\)@sha256:.*|\1|p" hack/e2e-kind.sh)"
+          [[ "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          base="https://dl.k8s.io/release/${version}/bin/linux/$(dpkg --print-architecture)"
           curl -fsSLo kubectl "${base}/kubectl"
           echo "$(curl -fsSL "${base}/kubectl.sha256")  kubectl" | sha256sum -c -
           sudo install -m 0755 kubectl /usr/local/bin/kubectl
