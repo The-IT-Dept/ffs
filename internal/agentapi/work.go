@@ -69,11 +69,12 @@ type WorkOptions struct {
 // skipped when it did not attempt it for a reason that is not the image's (too little time left, a busy
 // cataloguer, a scratch volume that cannot take it, the agent stopping). A skipped request is released
 // without counting. So a request that expires unanswered was cut short: the agent process died on it (killed
-// out of memory, say), or its result was lost. It counts against its image unless it was queued behind
-// another: an agent process works through its requests one at a time, in the order they were offered, so an
-// unanswered offer made while an earlier unanswered offer to the same process was still before its deadline
-// was never attempted, and is not counted. Of the requests a process held when it died, only the one it died
-// on counts. A restarted agent (a new Instance) starts a new queue.
+// out of memory, say), or its result was lost. It counts against its image unless the controller held its
+// result up (see ResultWait) or it was queued behind another: an agent process works through its requests one
+// at a time, in the order they were offered, so an unanswered offer made while an earlier unanswered offer to
+// the same process was still before its deadline was never attempted, and is not counted. Of the requests a
+// process held when it died, only the one it died on counts. A restarted agent (a new Instance) starts a new
+// queue.
 //
 // Agents older than 0.0.1-rc.7 send no Instance, so all of a node's processes share one queue: until a rollout
 // has replaced them, their requests are accounted per node rather than per process. After such an agent
@@ -99,9 +100,10 @@ type offer struct {
 	seq      uint64    // offer order: an agent works through its offers in this order
 	at       time.Time // when the offer was made
 	deadline time.Time
-	// answered: a result for the offer arrived but was not stored (a transient failure) or not read (it waited
-	// for the ingest budget too long). The offer stays, because the agent sends the result again while the
-	// offer takes one, and its expiry is not counted against the image.
+	// answered: a result for the offer arrived but was not stored (a transient failure) or not read because the
+	// controller held it up (it waited for the ingest budget too long, or its body could not be read in full
+	// after a wait long enough to cut it short). The offer stays, because the agent sends the result again while
+	// the offer takes one, and its expiry is not counted against the image.
 	answered bool
 }
 
@@ -390,8 +392,10 @@ func (q *WorkQueue) release(digest, id string) {
 }
 
 // ResultWait is how long a result from node answering the request id may wait for the ingest budget before
-// it is read, and what to call when it waited that long unread: the time until that request stops taking a
-// result, and unread marks that request answered, because the controller held its result up, not the image.
+// it is read, and what to call when the controller held it up: the time until that request stops taking a
+// result, and unread, which the server calls when the result waited that long unread or its body could not be
+// read in full after a long wait, marks that request answered, because the controller held its result up, not
+// the image.
 // Only that request is marked: the requests the agent has not reached yet need answers of their own, and one
 // it dies on still counts. A request marked answered keeps taking a result, as the agent sends a result again
 // after a 5xx (the 503 for a result not read included), a 429 or no answer while its request takes one. wait

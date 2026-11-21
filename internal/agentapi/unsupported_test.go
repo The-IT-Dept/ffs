@@ -24,11 +24,11 @@ func TestUnsupportedNodes_Taints(t *testing.T) {
 	evict := corev1.Taint{Key: "dedicated", Value: "gpu", Effect: corev1.TaintEffectNoExecute}
 	nodes := []corev1.Node{
 		node("worker-1"),
-		node("gpu-1", gpu),
-		node("gpu-2", gpu, evict),
-		node("cordoned", corev1.Taint{Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule},
+		node("worker-2", gpu),
+		node("worker-3", gpu, evict),
+		node("worker-4", corev1.Taint{Key: corev1.TaintNodeUnschedulable, Effect: corev1.TaintEffectNoSchedule},
 			corev1.Taint{Key: corev1.TaintNodeNotReady, Effect: corev1.TaintEffectNoExecute}),
-		node("soft", corev1.Taint{Key: "spot", Value: "true", Effect: corev1.TaintEffectPreferNoSchedule}),
+		node("worker-5", corev1.Taint{Key: "spot", Value: "true", Effect: corev1.TaintEffectPreferNoSchedule}),
 		node("cp-1", corev1.Taint{Key: "node-role.kubernetes.io/control-plane", Effect: corev1.TaintEffectNoSchedule}),
 	}
 	na := config.Default().NodeAgent
@@ -37,16 +37,16 @@ func TestUnsupportedNodes_Taints(t *testing.T) {
 
 	na.Tolerations = nil
 	require.Equal(t, map[string]string{
-		"gpu-1": "taint dedicated=gpu:NoSchedule is not tolerated by nodeAgent.tolerations",
-		"gpu-2": "taint dedicated=gpu:NoSchedule is not tolerated by nodeAgent.tolerations",
-		"cp-1":  "taint node-role.kubernetes.io/control-plane:NoSchedule is not tolerated by nodeAgent.tolerations",
+		"worker-2": "taint dedicated=gpu:NoSchedule is not tolerated by nodeAgent.tolerations",
+		"worker-3": "taint dedicated=gpu:NoSchedule is not tolerated by nodeAgent.tolerations",
+		"cp-1":     "taint node-role.kubernetes.io/control-plane:NoSchedule is not tolerated by nodeAgent.tolerations",
 	}, unsupportedNodes(na, nodes))
 
 	na.Tolerations = []config.Toleration{
 		{Key: "dedicated", Operator: "Equal", Value: "gpu", Effect: "NoSchedule"},
 		{Key: "node-role.kubernetes.io/control-plane", Operator: "Exists"},
 	}
-	require.Equal(t, map[string]string{"gpu-2": "taint dedicated=gpu:NoExecute is not tolerated by nodeAgent.tolerations"},
+	require.Equal(t, map[string]string{"worker-3": "taint dedicated=gpu:NoExecute is not tolerated by nodeAgent.tolerations"},
 		unsupportedNodes(na, nodes), "a toleration for NoSchedule does not tolerate NoExecute")
 
 	na.Tolerations = append(na.Tolerations, config.Toleration{Key: "dedicated", Operator: "Exists"})
@@ -54,5 +54,5 @@ func TestUnsupportedNodes_Taints(t *testing.T) {
 
 	// The node selector still comes first.
 	na.NodeSelector = map[string]string{"pool": "general"}
-	require.Equal(t, "node labels do not match nodeAgent.nodeSelector", unsupportedNodes(na, nodes)["gpu-1"])
+	require.Equal(t, "node labels do not match nodeAgent.nodeSelector", unsupportedNodes(na, nodes)["worker-2"])
 }

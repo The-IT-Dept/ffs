@@ -62,6 +62,11 @@ const (
 	// maxResultWait is the longest an SBOM result waits for its share of the SBOM budget: a minute short of
 	// the agent's client timeout, so the agent sees the answer and can send the result again.
 	maxResultWait = wire.ClientTimeout - time.Minute
+	// heldUpAfter is how long the controller may hold an SBOM result before reading its body and still leave
+	// the agent's client timeout at least readTimeout for the body. A body that cannot be read in full after
+	// a longer hold may have been cut off by that timeout, so it is the controller's doing; after a shorter
+	// one it would have failed the body's own read deadline too.
+	heldUpAfter = wire.ClientTimeout - readTimeout
 )
 
 var (
@@ -104,8 +109,9 @@ type ServerOptions struct {
 type ResultWindow interface {
 	// ResultWait is how long a result from node answering the request id (wire.HeaderWorkID; "" when the
 	// agent sent none) may wait before it is read, zero or less when that request takes no result, and
-	// unread, which the server calls when the result was not read: it waited too long, its HTTP request
-	// ended while it waited, or its body could not be read in full after the wait.
+	// unread, which the server calls when the controller held the result up: it waited too long, its HTTP
+	// request ended while it waited, or its body could not be read in full after a wait long enough to cut
+	// it short (heldUpAfter).
 	ResultWait(node, id string) (wait time.Duration, unread func())
 }
 
@@ -116,6 +122,7 @@ type Server struct {
 	reports     *semaphore.Weighted // the report budget, by body bytes
 	sboms       *semaphore.Weighted // the SBOM result budget, by body bytes
 	readTimeout time.Duration       // readTimeout; tests shorten it
+	heldUpAfter time.Duration       // heldUpAfter; tests shorten it
 }
 
 // NewServer returns the agent API server.
@@ -142,7 +149,7 @@ func NewServer(o ServerOptions) *Server {
 		o.MaxResultWait = maxResultWait
 	}
 	return &Server{o: o, fails: newFailLimiter(), reports: semaphore.NewWeighted(o.IngestBudget),
-		sboms: semaphore.NewWeighted(o.SBOMBudget), readTimeout: readTimeout}
+		sboms: semaphore.NewWeighted(o.SBOMBudget), readTimeout: readTimeout, heldUpAfter: heldUpAfter}
 }
 
 // limitRead gives the request's body readTimeout from now to arrive. A writer without read deadlines (a test's
@@ -537,12 +544,14 @@ func (s *Server) serveReport(rw http.ResponseWriter, r *http.Request) {
 // the agent's client timeout. A node whose request takes no result is answered 403 at once. A result that
 // waited that long is answered 503, which the agent answers by sending it again while its request takes one.
 // A result that was not read, because it waited that long, because its HTTP request ended while it waited, or
-// because its body could not be read in full once it had its share (after a wait close to MaxResultWait, the
-// agent's client timeout leaves about a minute for the body), leaves its request uncounted against the image:
-// the controller held it up.
+// because its body could not be read in full after it was held longer than heldUpAfter (after a wait close to
+// MaxResultWait, the agent's client timeout leaves about a minute for the body), leaves its request uncounted
+// against the image: the controller held it up. A body that fails after a shorter hold counts as the agent's
+// own failure, so a result whose transfer always fails still leads to a quarantine.
 func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 	w := &statusWriter{ResponseWriter: rw}
 	defer countAnswer(w)
+	arrived := time.Now()
 	id, ok := s.authenticate(w, r)
 	if !ok || declaredTooLarge(w, r, s.o.MaxSBOMBytes, "SBOM result") {
 		return
@@ -567,9 +576,10 @@ func (s *Server) serveSBOM(rw http.ResponseWriter, r *http.Request) {
 		return // or the agent went away
 	}
 	defer release()
+	held := time.Since(arrived) // how long the agent's client timeout ran before the body was read
 	var res wire.SBOMResult
 	ok, failed := decode(w, r, s.o.MaxSBOMBytes, "SBOM result", &res)
-	if failed {
+	if failed && held > s.heldUpAfter {
 		unread()
 	}
 	if !ok || nodeMismatch(w, id, res.Node) {

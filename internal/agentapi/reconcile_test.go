@@ -432,7 +432,7 @@ func TestReconciler_NodesOwnerShape(t *testing.T) {
 	require.True(t, imgs[0].InUse)
 }
 
-func TestNodeEvents_TriggerOnAddDeleteLabelOrReady(t *testing.T) {
+func TestNodeEvents_TriggerOnAddDeleteLabelTaintOrReady(t *testing.T) {
 	n := 0
 	h := nodeEvents(func() { n++ })
 	node := testNode("worker-1", "Ubuntu 26.04 LTS")
@@ -457,6 +457,16 @@ func TestNodeEvents_TriggerOnAddDeleteLabelOrReady(t *testing.T) {
 		LastHeartbeatTime: metav1.NewTime(t0)}}
 	h.OnUpdate(node, notReady)
 	require.Equal(t, 4, n)
+
+	// W31: a taint decides whether the agent schedules on the node, so tainting and untainting trigger.
+	tainted := node.DeepCopy()
+	tainted.Spec.Taints = []corev1.Taint{{Key: "dedicated", Value: "gpu", Effect: corev1.TaintEffectNoSchedule}}
+	h.OnUpdate(node, tainted)
+	require.Equal(t, 5, n)
+	h.OnUpdate(tainted, tainted.DeepCopy())
+	require.Equal(t, 5, n, "the same taints do not")
+	h.OnUpdate(tainted, node)
+	require.Equal(t, 6, n)
 }
 
 // TestReconciler_IdlePassWritesNothing: the grouping and the in-use marks are one transaction that writes
