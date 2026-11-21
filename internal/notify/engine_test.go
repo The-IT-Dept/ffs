@@ -563,16 +563,15 @@ func TestNotify_NamespaceFilter(t *testing.T) {
 	assert.Equal(t, "CVE-2026-0003", imm[0].Items[0].AdvisoryID)
 }
 
-// TestNotify_DeletedNamespaceLetsResolutionsThrough pins F95: for a target limited by a namespace
-// selector, a deleted namespace no longer matches, but the resolutions of findings sent from it
-// still go out, immediately or in the digest, and close their ledger entries. New findings there
-// are not sent.
-func TestNotify_DeletedNamespaceLetsResolutionsThrough(t *testing.T) {
+// TestNotify_NamespaceLeavingLetsResolutionsThrough pins F95 and W39: for a target limited by a
+// namespace selector, a namespace that is deleted or relabelled out of it no longer matches, but the
+// resolutions of findings sent from it still go out, immediately or in the digest, and close their
+// ledger entries. New findings there are not sent.
+func TestNotify_NamespaceLeavingLetsResolutionsThrough(t *testing.T) {
 	h := newHarness(t)
-	deleted := false
+	left := false
 	h.target("ops", func(c *notify.TargetConfig) {
-		c.NamespaceMatch = func(ns string) bool { return ns == "team-a" && !deleted }
-		c.NamespaceGone = func(ns string) bool { return ns == "team-a" && deleted }
+		c.NamespaceMatch = func(ns string) bool { return ns == "team-a" && !left }
 	})
 	h.process() // baseline
 
@@ -584,7 +583,7 @@ func TestNotify_DeletedNamespaceLetsResolutionsThrough(t *testing.T) {
 	h.process()
 	assert.Equal(t, []string{"CVE-2026-0002"}, ids(h.sink.lastOfKind(notify.KindDigest), notify.EventDetected))
 
-	deleted = true
+	left = true
 	h.at("2026-11-19T10:00Z")
 	h.move(u, model.StateResolved, urgent, model.TriggerInventoryChange)
 	h.move(m, model.StateResolved, medium, model.TriggerInventoryChange)
@@ -605,6 +604,50 @@ func TestNotify_DeletedNamespaceLetsResolutionsThrough(t *testing.T) {
 	assert.Equal(t, model.StateResolved, l[u].LastState)
 	assert.Equal(t, model.StateResolved, l[m].LastState)
 	assert.NotContains(t, l, late)
+}
+
+// TestNotify_StaleLedgerClosedAtStart pins W39: an open ledger entry whose finding resolved past the
+// target's cursors without the entry closing, as v0.0.1 left them for namespaces it saw deleted, is
+// closed at start, so the finding coming back (the namespace recreated with the same workload) alerts
+// as reopened instead of passing as already sent. An entry whose resolution no pass has reached yet is
+// left for the pass to send.
+func TestNotify_StaleLedgerClosedAtStart(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	h.process() // baseline
+	gone := h.open(dep("team-a", "web"), "CVE-2026-0001", urgent)
+	pending := h.open(dep("team-b", "api"), "CVE-2026-0002", urgent)
+	h.process()
+	require.Len(t, h.sink.ofKind(notify.KindImmediate), 2)
+
+	// As v0.0.1 did: the passes moved past gone's resolution and left its ledger entry open.
+	h.move(gone, model.StateResolved, urgent, model.TriggerInventoryChange)
+	last, err := h.st.MaxTransitionID(ctx)
+	require.NoError(t, err)
+	require.NoError(t, h.st.CommitNotify(ctx, store.NotifyCommit{Target: "uid-ops",
+		Cursors: map[string]int64{"notify:uid-ops": last, "notify-digest:uid-ops": last}}))
+	h.move(pending, model.StateResolved, urgent, model.TriggerInventoryChange) // no pass has seen it yet
+
+	n, err := h.eng.CloseStaleLedger(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+	l, err := h.st.Ledger(ctx, "uid-ops", []string{gone, pending})
+	require.NoError(t, err)
+	assert.Equal(t, model.StateResolved, l[gone].LastState)
+	assert.Equal(t, model.StateOpen, l[pending].LastState, "its resolution is still to be sent")
+
+	h.process()
+	imm := h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 3)
+	assert.Equal(t, notify.EventResolved, imm[2].Items[0].Event)
+	assert.Equal(t, "CVE-2026-0002", imm[2].Items[0].AdvisoryID)
+
+	h.move(gone, model.StateOpen, urgent, model.TriggerInventoryChange) // the namespace is back
+	h.process()
+	imm = h.sink.ofKind(notify.KindImmediate)
+	require.Len(t, imm, 4)
+	assert.Equal(t, notify.EventReopened, imm[3].Items[0].Event)
+	assert.Equal(t, "CVE-2026-0001", imm[3].Items[0].AdvisoryID)
 }
 
 func TestNotify_PausedAdvancesWithoutSending(t *testing.T) {

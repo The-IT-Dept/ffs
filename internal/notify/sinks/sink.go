@@ -12,6 +12,21 @@ import (
 // Sink is a destination for notification messages.
 type Sink = notify.Sink
 
+// idleCloser is a sink that keeps idle connections, which the engine closes when it replaces or drops
+// the sink. Every sink is one: a sink that stopped forwarding CloseIdleConnections would keep the
+// connections of a replaced endpoint open.
+type idleCloser interface {
+	Sink
+	CloseIdleConnections()
+}
+
+var (
+	_ idleCloser = (*slack)(nil)
+	_ idleCloser = (*discord)(nil)
+	_ idleCloser = (*teams)(nil)
+	_ idleCloser = (*webhook)(nil)
+)
+
 // New builds the sink for an AlertTarget of type typ. The URL must be absolute https (http only
 // with AllowPrivate); webhooks also need a valid signing secret. Errors never contain the URL.
 func New(typ string, cfg notify.SinkConfig) (Sink, error) {

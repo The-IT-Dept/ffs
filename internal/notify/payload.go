@@ -19,8 +19,9 @@ var listCaps = []int{100, 25, 5}
 
 // encodePayload encodes m as a stored delivery payload of at most MaxPayloadBytes. It lists at
 // most MaxItems items. While the message is too large, it cuts every item's owners and packages to
-// 100, then 25, then 5, and then leaves out items from the end, the lowest priority, counting what
-// it leaves out. The counts in the title and summary are those of the whole message.
+// 100, then 25, then 5, then clears the feeds' last errors, and then leaves out items from the end,
+// the lowest priority, counting what it leaves out. The counts in the title and summary are those
+// of the whole message.
 func encodePayload(m Message) ([]byte, error) {
 	if n := len(m.Items); n > MaxItems {
 		m.Items, m.Truncated = m.Items[:MaxItems], m.Truncated+n-MaxItems
@@ -33,6 +34,16 @@ func encodePayload(m Message) ([]byte, error) {
 	for _, n := range listCaps {
 		for i := range m.Items {
 			capLists(&m.Items[i], n)
+		}
+		if b, err = json.Marshal(m); err != nil || len(b) <= MaxPayloadBytes {
+			return b, err
+		}
+	}
+	// The feeds' last errors go before any item does.
+	if slices.ContainsFunc(m.Feeds, func(f FeedStatus) bool { return f.LastError != "" }) {
+		m.Feeds = slices.Clone(m.Feeds)
+		for i := range m.Feeds {
+			m.Feeds[i].LastError = ""
 		}
 		if b, err = json.Marshal(m); err != nil || len(b) <= MaxPayloadBytes {
 			return b, err
@@ -58,15 +69,8 @@ func encodePayload(m Message) ([]byte, error) {
 			hi = mid - 1
 		}
 	}
-	if b, ok, err := fits(lo); err != nil || ok {
-		return b, err
-	}
-	// Even with no items it is too large: only the feeds' last errors can be that long.
-	m.Feeds = slices.Clone(m.Feeds)
-	for i := range m.Feeds {
-		m.Feeds[i].LastError = ""
-	}
-	return json.Marshal(m)
+	b, _, err = fits(lo) // at lo = 0 it may still be over: nothing else is left to cut
+	return b, err
 }
 
 // capLists cuts the owners and packages of it to at most n each, counting what it leaves out.

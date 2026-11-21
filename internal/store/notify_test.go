@@ -305,3 +305,80 @@ func TestStoreNotify_FirstAttemptMovesNotBefore(t *testing.T) {
 		assert.Equal(t, first, ds[0].NotBefore, "attempt %d", i+1)
 	}
 }
+
+// TestStoreNotify_DropOldestPending pins W23's bound: the target's oldest pending deliveries past keep,
+// in send order, are dropped with the reason; its other states and other targets are left alone.
+func TestStoreNotify_DropOldestPending(t *testing.T) {
+	st := newStore(t)
+	var ds []Delivery
+	for i := range 5 {
+		ds = append(ds, delivery(fmt.Sprintf("d%d", i), t0.Add(time.Duration(i)*time.Minute)))
+	}
+	sent := delivery("sent", t0.Add(-time.Hour))
+	sent.State = DeliverySent
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Deliveries: append(ds, sent)}))
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u2", Deliveries: []Delivery{delivery("other", t0.Add(-2*time.Hour))}}))
+
+	n, err := st.DropOldestPending(ctx, "u1", 3, "dropped: too many")
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	got, err := st.ListDeliveries(ctx, "u1", 0)
+	require.NoError(t, err)
+	states := map[string]DeliveryState{}
+	for _, d := range got {
+		states[d.ID] = d.State
+		if d.State == DeliveryDropped {
+			assert.Equal(t, "dropped: too many", d.LastError, d.ID)
+		}
+	}
+	assert.Equal(t, map[string]DeliveryState{"d0": DeliveryDropped, "d1": DeliveryDropped, "d2": DeliveryPending,
+		"d3": DeliveryPending, "d4": DeliveryPending, "sent": DeliverySent}, states)
+	other, err := st.ListDeliveries(ctx, "u2", 0)
+	require.NoError(t, err)
+	assert.Equal(t, DeliveryPending, other[0].State)
+
+	n, err = st.DropOldestPending(ctx, "u1", 3, "dropped: too many")
+	require.NoError(t, err)
+	assert.Zero(t, n, "within the bound")
+}
+
+// TestStoreNotify_CloseStaleLedger pins W39's sweep: an open ledger entry closes when its finding is
+// resolved or gone and none of its transitions is past either cursor of the target. An open or excepted
+// finding, or a resolution the digest cursor has not passed yet, keeps its entry open.
+func TestStoreNotify_CloseStaleLedger(t *testing.T) {
+	st := newStore(t)
+	require.NoError(t, st.ApplyFindings(ctx, []model.Finding{fd("open", model.StateOpen, model.PriorityHigh),
+		fd("excepted", model.StateExcepted, model.PriorityHigh), fd("resolved", model.StateResolved, model.PriorityHigh),
+		fd("late", model.StateResolved, model.PriorityHigh)}, []model.Transition{tr("resolved", model.StateOpen, model.StateResolved)}))
+	require.NoError(t, st.ApplyFindings(ctx, nil, []model.Transition{tr("late", model.StateOpen, model.StateResolved)}))
+	ts, err := st.TransitionsAfter(ctx, 0, 0)
+	require.NoError(t, err)
+	require.Len(t, ts, 2)
+	var ledger []LedgerEntry
+	for _, fp := range []string{"open", "excepted", "resolved", "late", "gone"} {
+		ledger = append(ledger, ledgerEntry(fp, model.PriorityHigh, model.StateOpen))
+	}
+	ledger = append(ledger, ledgerEntry("done", model.PriorityHigh, model.StateResolved))
+	// The immediate pass has read both transitions; the digest has read only the first.
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Ledger: ledger,
+		Cursors: map[string]int64{"notify:u1": ts[1].ID, "notify-digest:u1": ts[0].ID}}))
+
+	at := t0.Add(time.Hour)
+	n, err := st.CloseStaleLedger(ctx, at)
+	require.NoError(t, err)
+	assert.Equal(t, 2, n)
+	l, err := st.Ledger(ctx, "u1", []string{"open", "excepted", "resolved", "late", "gone", "done"})
+	require.NoError(t, err)
+	for fp, want := range map[string]model.FindingState{"open": model.StateOpen, "excepted": model.StateOpen,
+		"resolved": model.StateResolved, "late": model.StateOpen, "gone": model.StateResolved, "done": model.StateResolved} {
+		assert.Equal(t, want, l[fp].LastState, fp)
+	}
+	assert.Equal(t, at, l["resolved"].UpdatedAt)
+	assert.Equal(t, at, l["gone"].UpdatedAt)
+	assert.Equal(t, t0, l["done"].UpdatedAt, "an entry already closed is left alone")
+	assert.Equal(t, model.PriorityHigh, l["gone"].MaxPriority)
+
+	n, err = st.CloseStaleLedger(ctx, at)
+	require.NoError(t, err)
+	assert.Zero(t, n)
+}

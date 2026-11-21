@@ -8,11 +8,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/notify"
+	"github.com/the-it-dept/ffs/internal/output/metrics"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -356,26 +358,31 @@ func (s *blockingSink) Send(ctx context.Context, m notify.Message) error {
 
 // TestDrain_SlowTargetDoesNotGateTheNextDrain pins the other half of F31: while one target is
 // still sending, the next drain sends the other targets' alerts instead of waiting for it, and
-// never drains the slow target twice at once.
+// never drains the slow target twice at once. The other target is paused during the first drain,
+// so that drain claims the slow target only: had it claimed both, the second drain would race the
+// first one's release of the other target.
 func TestDrain_SlowTargetDoesNotGateTheNextDrain(t *testing.T) {
 	h := newHarness(t)
-	h.target("ops")
+	h.target("ops", func(c *notify.TargetConfig) { c.Paused = true })
 	slow := &blockingSink{started: make(chan struct{}), release: make(chan struct{})}
 	slowCfg := h.cfg("ops")
-	slowCfg.UID, slowCfg.Name = "uid-slow", "slow"
+	slowCfg.UID, slowCfg.Name, slowCfg.Paused = "uid-slow", "slow", false
 	require.NoError(t, h.eng.Register(ctx, slowCfg, slow))
-	require.NoError(t, h.eng.ProcessOnce(ctx)) // baselines, queued for both
+	require.NoError(t, h.eng.ProcessOnce(ctx)) // the slow target's baseline; none while ops is paused
 	h.queueBacklog("uid-slow", 3)
 
 	waitSlow, err := h.eng.StartDrains(ctx)
 	require.NoError(t, err)
-	<-slow.started
+	<-slow.started // its batch is read: the backlog and the baseline
 
+	h.target("ops")
+	require.NoError(t, h.eng.ProcessOnce(ctx)) // ops' baseline
 	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
 	require.NoError(t, h.eng.ProcessOnce(ctx))
 	waitNext, err := h.eng.StartDrains(ctx)
 	require.NoError(t, err)
 	require.NoError(t, waitNext())
+	assert.Len(t, h.sink.ofKind(notify.KindBaseline), 1)
 	assert.Len(t, h.sink.ofKind(notify.KindImmediate), 1, "sent while the slow target is still sending")
 
 	close(slow.release)
@@ -418,4 +425,29 @@ func TestDrain_PausedHoldsDeliveries(t *testing.T) {
 	h.target("ops")
 	require.NoError(t, h.eng.DrainOnce(ctx))
 	assert.Len(t, h.sink.ofKind(notify.KindImmediate), 1, "sent once the pause is lifted")
+}
+
+// TestDrain_PendingCappedPerTarget pins W23: a target holds at most MaxPending queued deliveries. A
+// message that takes it past that drops the oldest, with the reason in the delivery log, counted in
+// ffs_notify_deliveries_total{result="dropped"}; the newest stay queued.
+func TestDrain_PendingCappedPerTarget(t *testing.T) {
+	h := newHarness(t)
+	h.target("ops")
+	h.process() // baseline, sent
+	h.queueBacklog("uid-ops", notify.MaxPending)
+	dropped := metrics.NotifyDeliveries.WithLabelValues("ops", "dropped")
+	before := testutil.ToFloat64(dropped)
+
+	h.open(dep("a", "x"), "CVE-2026-0001", urgent)
+	require.NoError(t, h.eng.ProcessOnce(ctx))
+	byState := map[store.DeliveryState][]store.Delivery{}
+	for _, d := range h.deliveries() {
+		byState[d.State] = append(byState[d.State], d)
+	}
+	assert.Len(t, byState[store.DeliveryPending], notify.MaxPending)
+	require.Len(t, byState[store.DeliveryDropped], 1)
+	assert.Equal(t, "ffs_uid-ops_0000", byState[store.DeliveryDropped][0].ID, "the oldest")
+	assert.Equal(t, "dropped: more than 1000 messages were waiting for this target", byState[store.DeliveryDropped][0].LastError)
+	assert.InDelta(t, 1, testutil.ToFloat64(dropped)-before, 0)
+	assert.Equal(t, string(notify.KindImmediate), byState[store.DeliveryPending][0].Kind, "the new alert is queued")
 }

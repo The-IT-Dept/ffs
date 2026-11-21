@@ -52,7 +52,7 @@ func immediate(n int) notify.Message {
 
 func digest(items int) notify.Message {
 	m := notify.Message{ID: "ffs_d", Kind: notify.KindDigest, Cluster: "prod", TargetName: "ops", At: t0, Title: "ffs digest for prod",
-		Summary: &notify.Summary{Workloads: 7, Counts: map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityLow: 3}},
+		Summary: &notify.Summary{Findings: 4, Workloads: 7, Counts: map[model.Priority]int{model.PriorityUrgent: 1, model.PriorityLow: 3}},
 		Feeds:   []notify.FeedStatus{{Name: "osv", LastSuccess: t0, StaleAfter: time.Hour}}}
 	for i := range items {
 		m.Items = append(m.Items, item(fmt.Sprintf("CVE-2026-%04d", i), 30))
@@ -270,6 +270,20 @@ func TestFormat_SummaryCountsFindings(t *testing.T) {
 	assert.Equal(t, "5 findings in 3 workloads: 2 urgent, 3 high", extraLines(m, plain)[0])
 	m.Summary = &notify.Summary{Findings: 1, Workloads: 1, Counts: map[model.Priority]int{model.PriorityLow: 1}}
 	assert.Equal(t, "1 finding in 1 workload: 1 low", extraLines(m, plain)[0])
+	m.Summary = &notify.Summary{Workloads: 3}
+	assert.Equal(t, "0 findings in 3 workloads: none", extraLines(m, plain)[0], "nothing open is not a v0.0.1 summary")
+}
+
+// TestFormat_LegacySummary pins W38: a baseline or digest queued by v0.0.1, which counted no findings,
+// and sent after the upgrade reads as v0.0.1 wrote it, not as "0 findings".
+func TestFormat_LegacySummary(t *testing.T) {
+	for _, kind := range []notify.Kind{notify.KindBaseline, notify.KindDigest} {
+		m := digest(1)
+		m.Kind = kind
+		m.Summary = &notify.Summary{Workloads: 120, Counts: map[model.Priority]int{model.PriorityUrgent: 3, model.PriorityHigh: 5}}
+		require.True(t, m.Summary.Legacy())
+		assert.Equal(t, "120 workloads: 3 urgent, 5 high", extraLines(m, plain)[0], kind)
+	}
 }
 
 // TestGuard_BlockedRanges pins F98 in the guard: a globally routable IPv6 pod CIDR and a configured
@@ -307,6 +321,13 @@ func TestNew_SinkRefusesBlockedRanges(t *testing.T) {
 	p := newPoster(false, blocked)
 	p.lookup = nil // the dial guard alone must refuse
 	err = p.Post(context.Background(), "https://[2001:db8:42:1::10]/hook", "application/json", nil, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "alertTargets.blockedCIDRs")
+
+	// An IPv4 range too: the guard runs before connecting, so neither family needs to be reachable.
+	p = newPoster(false, func(context.Context) []netip.Prefix { return []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")} })
+	p.lookup = nil
+	err = p.Post(context.Background(), "https://203.0.113.9/hook", "application/json", nil, nil)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "alertTargets.blockedCIDRs")
 }

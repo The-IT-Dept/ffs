@@ -197,6 +197,20 @@ func TestWebhook_TruncatedAndFindings(t *testing.T) {
 	require.NoError(t, json.Unmarshal(send(t, immediate(2)).body, &raw))
 	assert.EqualValues(t, 0, raw.Data["truncated"])
 	assert.NotContains(t, raw.Data["items"].([]any)[0], "truncatedOwners")
+
+	// W38: a summary queued by v0.0.1 has no findings count, so none is sent rather than 0.
+	summary := func(s *notify.Summary) map[string]any {
+		m.Summary = s
+		var got struct {
+			Data struct{ Summary map[string]any }
+		}
+		require.NoError(t, json.Unmarshal(send(t, m).body, &got))
+		return got.Data.Summary
+	}
+	legacy := summary(&notify.Summary{Workloads: 120, Counts: map[model.Priority]int{model.PriorityUrgent: 3}})
+	assert.NotContains(t, legacy, "findings")
+	assert.EqualValues(t, 120, legacy["workloads"])
+	assert.EqualValues(t, 0, summary(&notify.Summary{Workloads: 2})["findings"], "an empty v0.0.2 summary counts 0")
 }
 
 // TestWebhook_BodyTracksStoredPayload pins the other half of F92: the webhook body of a message

@@ -237,7 +237,6 @@ func (r *TargetReconciler) register(ctx context.Context, at *ffsv1alpha1.AlertTa
 		}
 		return notReady("InvalidSpec", err.Error())
 	}
-	cfg.NamespaceGone = r.namespaceGone(at)
 	sc.Cluster, sc.Blocked = r.Cluster, r.Blocked
 	// A resync with nothing changed keeps the registered sink, and with it its idle connections.
 	sink, ok := r.Engine.sinkFor(cfg.UID, cfg.ConfigHash)
@@ -334,19 +333,6 @@ func (r *TargetReconciler) namespaceMatch(at *ffsv1alpha1.AlertTarget) func(stri
 			return false
 		}
 		return selector.Matches(labels.Set(n.Labels))
-	}
-}
-
-// namespaceGone reports, for a target with a namespace selector, that a namespace has been
-// deleted, so the resolutions of findings sent from it still reach the target; nil without a
-// selector, since spec.namespaces matches by name whether the namespace exists or not.
-func (r *TargetReconciler) namespaceGone(at *ffsv1alpha1.AlertTarget) func(string) bool {
-	if at.Spec.NamespaceSelector == nil {
-		return nil
-	}
-	return func(ns string) bool {
-		var n corev1.Namespace
-		return apierrors.IsNotFound(r.Client.Get(context.Background(), types.NamespacedName{Name: ns}, &n))
 	}
 }
 

@@ -22,6 +22,12 @@ const (
 	// still gets every queued alert.
 	GiveUpAfter = 24 * time.Hour
 
+	// MaxPending is the most deliveries a target holds queued. Past that, the oldest are dropped and
+	// counted (ffs_notify_deliveries_total{result="dropped"}): a receiver that is down for days, or
+	// gone while it answers with transient errors, then costs a bounded outbox, and gets the most
+	// recent alerts when it returns.
+	MaxPending = 1000
+
 	drainBatch  = 200 // deliveries read per target per drain
 	sendTimeout = 30 * time.Second
 
@@ -188,6 +194,22 @@ func (e *Engine) drainTarget(ctx context.Context, t *target, now time.Time) erro
 		}
 	}
 	return nil
+}
+
+// droppedReason is the last error of a delivery dropped to keep its target within MaxPending.
+var droppedReason = fmt.Sprintf("dropped: more than %d messages were waiting for this target", MaxPending)
+
+// commit applies c, then holds the target t to MaxPending queued deliveries when c queued any: the
+// oldest past that are dropped, and counted in the delivery metric as "dropped".
+func (e *Engine) commit(ctx context.Context, t *target, c store.NotifyCommit) error {
+	if err := e.st.CommitNotify(ctx, c); err != nil || len(c.Deliveries) == 0 {
+		return err
+	}
+	n, err := e.st.DropOldestPending(ctx, c.Target, MaxPending, droppedReason)
+	if n > 0 {
+		metrics.NotifyDeliveries.WithLabelValues(t.cfg.Name, "dropped").Add(float64(n))
+	}
+	return err
 }
 
 // deliveryResult names the outcome of attempt a for the delivery metric: success, failed (the

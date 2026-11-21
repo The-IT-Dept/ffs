@@ -258,10 +258,10 @@ func (e *Engine) snapshot() []*target {
 // NeedLeaderElection makes the engine leader-only.
 func (e *Engine) NeedLeaderElection() bool { return true }
 
-// Start processes transitions on every Changed signal and every 15s, drains the outbox every 2s,
-// and prunes old deliveries daily, until ctx is done. Errors are logged and the loops go on. A
-// drain is not waited for before the next tick, so a target sending a long backlog never holds up
-// the other targets' drains.
+// Start closes stale ledger entries (closeStaleLedger), then processes transitions on every Changed
+// signal and every 15s, drains the outbox every 2s, and prunes old deliveries daily, until ctx is
+// done. Errors are logged and the loops go on. A drain is not waited for before the next tick, so a
+// target sending a long backlog never holds up the other targets' drains.
 func (e *Engine) Start(ctx context.Context) error {
 	log := logr.FromContextOrDiscard(ctx).WithName("notify")
 	var wg sync.WaitGroup
@@ -296,6 +296,11 @@ func (e *Engine) Start(ctx context.Context) error {
 	prune := time.NewTicker(pruneInterval)
 	defer prune.Stop()
 	e.prune(ctx, log)
+	if n, err := e.closeStaleLedger(ctx); err != nil && ctx.Err() == nil {
+		log.Error(err, "closing the ledger entries of findings resolved without notice failed")
+	} else if n > 0 {
+		log.V(1).Info("closed the ledger entries of findings resolved without notice", "entries", n)
+	}
 	for {
 		if err := e.ProcessOnce(ctx); err != nil && ctx.Err() == nil {
 			log.Error(err, "processing notifications failed")
@@ -320,6 +325,16 @@ func (e *Engine) prune(ctx context.Context, log logr.Logger) {
 	} else if n > 0 {
 		log.V(1).Info("pruned the delivery log", "rows", n)
 	}
+}
+
+// closeStaleLedger closes, once at start, the open ledger entries of findings that resolved, or went,
+// past every target's cursors without the entry closing (store.CloseStaleLedger): those v0.0.1 left
+// for namespaces it saw deleted, and those of paused targets. A finding that comes back is then
+// reported as reopened instead of passing as already sent.
+func (e *Engine) closeStaleLedger(ctx context.Context) (int, error) {
+	e.passMu.Lock()
+	defer e.passMu.Unlock()
+	return e.st.CloseStaleLedger(ctx, e.now())
 }
 
 // ProcessOnce runs one pass for every registered target: the baseline for a new target, otherwise
@@ -467,7 +482,7 @@ func (e *Engine) immediate(ctx context.Context, t *target, ts []model.Transition
 			return err
 		}
 	}
-	return e.st.CommitNotify(ctx, store.NotifyCommit{Target: uid, Cursors: map[string]int64{immediateCursor(uid): last},
+	return e.commit(ctx, t, store.NotifyCommit{Target: uid, Cursors: map[string]int64{immediateCursor(uid): last},
 		Ledger: updates, Deliveries: deliveries})
 }
 
@@ -609,7 +624,7 @@ func (e *Engine) baseline(ctx context.Context, t *target, now time.Time) error {
 		return err
 	}
 	c.Deliveries = []store.Delivery{d}
-	return e.st.CommitNotify(ctx, c)
+	return e.commit(ctx, t, c)
 }
 
 // feedStale queues one alert per stale feed and episode for a target that opted in (spec §6.4).
@@ -636,7 +651,7 @@ func (e *Engine) feedStale(ctx context.Context, t *target, now time.Time) error 
 		if err != nil {
 			return err
 		}
-		if err := e.st.CommitNotify(ctx, store.NotifyCommit{Target: t.cfg.UID, Deliveries: []store.Delivery{d}}); err != nil {
+		if err := e.commit(ctx, t, store.NotifyCommit{Target: t.cfg.UID, Deliveries: []store.Delivery{d}}); err != nil {
 			return err
 		}
 		e.feedSent[m.ID] = true

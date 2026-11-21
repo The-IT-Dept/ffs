@@ -416,26 +416,9 @@ func TestTargetReconciler_StartupRetainLogsErrors(t *testing.T) {
 	assert.Contains(t, logged[1], "notify: retain")
 }
 
-// TestTargetReconciler_NamespaceGone pins F95's reconciler half: a target with a namespace
-// selector learns that a namespace is deleted (not found); one without a selector does not need
-// to, since spec.namespaces matches by name.
-func TestTargetReconciler_NamespaceGone(t *testing.T) {
-	h := newRecHarness(t, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "web", Labels: map[string]string{"team": "a"}}})
-	at := alertTarget("slack", "s")
-	assert.Nil(t, h.r.NamespaceGone(at))
-	at.Spec.Namespaces = []string{"prod"}
-	assert.Nil(t, h.r.NamespaceGone(at))
-
-	at.Spec.NamespaceSelector = &metav1.LabelSelector{MatchLabels: map[string]string{"team": "a"}}
-	gone := h.r.NamespaceGone(at)
-	require.NotNil(t, gone)
-	assert.False(t, gone("web"))
-	assert.True(t, gone("deleted"))
-}
-
 // TestBlockedRanges pins F98's ranges: the configured alertTargets.blockedCIDRs and the pod CIDRs
-// of every node in the cache, IPv4 and globally routable IPv6, with host bits cleared. A failed
-// node list leaves the configured ranges.
+// of every node in the cache, IPv4 and globally routable IPv6, with host bits cleared, each once. A
+// failed node list leaves the configured ranges, and is logged at most every 10 minutes.
 func TestBlockedRanges(t *testing.T) {
 	node := func(name string, cidrs ...string) *corev1.Node {
 		n := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}, Spec: corev1.NodeSpec{PodCIDRs: cidrs}}
@@ -456,9 +439,11 @@ func TestBlockedRanges(t *testing.T) {
 		List: func(context.Context, client.WithWatch, client.ObjectList, ...client.ListOption) error {
 			return errors.New("the server is currently unable to handle the request")
 		}})
-	got = notify.BlockedRanges(failing, configured, funcr.New(func(_, args string) { logged = append(logged, args) },
-		funcr.Options{}))(ctx)
-	assert.Equal(t, configured, got)
+	ranges := notify.BlockedRanges(failing, configured, funcr.New(func(_, args string) { logged = append(logged, args) },
+		funcr.Options{}))
+	assert.Equal(t, configured, ranges(ctx))
 	require.Len(t, logged, 1)
 	assert.Contains(t, logged[0], "pod CIDRs")
+	assert.Equal(t, configured, ranges(ctx))
+	assert.Len(t, logged, 1, "a failure that persists is not logged on every send")
 }

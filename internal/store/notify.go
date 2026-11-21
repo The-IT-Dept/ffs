@@ -331,6 +331,38 @@ func (s *Store) RecordAttempt(ctx context.Context, a DeliveryAttempt) error {
 	})
 }
 
+// DropOldestPending holds the target to keep pending deliveries: the oldest past that, in the order
+// they are sent, are dropped, with reason as their last error. It returns how many it dropped.
+func (s *Store) DropOldestPending(ctx context.Context, target string, keep int, reason string) (int, error) {
+	res, err := s.wdb.ExecContext(ctx, `UPDATE deliveries SET state = ?, last_error = ? WHERE id IN (
+		SELECT id FROM deliveries WHERE target = ? AND state = ? ORDER BY created_at DESC, id DESC LIMIT -1 OFFSET ?)`,
+		string(DeliveryDropped), reason, target, string(DeliveryPending), max(keep, 0))
+	if err != nil {
+		return 0, fmt.Errorf("store: drop pending deliveries of %q: %w", target, err)
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
+// CloseStaleLedger records as resolved, at at, the open ledger entries whose finding is resolved or no
+// longer stored and has no transition past either of its target's cursors: resolutions the notification
+// passes went past without closing the entry, such as those v0.0.1 dropped for a namespace deleted
+// under a namespaceSelector target, or those of a paused target. A finding that appears again is then
+// reported as reopened, not passed over as already sent. It returns the entries closed.
+func (s *Store) CloseStaleLedger(ctx context.Context, at time.Time) (int, error) {
+	res, err := s.wdb.ExecContext(ctx, `UPDATE notified SET last_state = ?, updated_at = ? WHERE last_state = ?
+		AND NOT EXISTS (SELECT 1 FROM findings f WHERE f.fingerprint = notified.fingerprint AND f.state <> ?)
+		AND NOT EXISTS (SELECT 1 FROM transitions t WHERE t.fingerprint = notified.fingerprint AND t.id > MIN(
+			COALESCE((SELECT c.id FROM cursors c WHERE c.consumer = 'notify:' || notified.target), 0),
+			COALESCE((SELECT c.id FROM cursors c WHERE c.consumer = 'notify-digest:' || notified.target), 0)))`,
+		string(model.StateResolved), nanos(orNow(at)), string(model.StateOpen), string(model.StateResolved))
+	if err != nil {
+		return 0, fmt.Errorf("store: close stale ledger entries: %w", err)
+	}
+	n, err := res.RowsAffected()
+	return int(n), err
+}
+
 // ListDeliveries returns up to limit of the target's deliveries, newest first (the delivery log).
 // limit <= 0 means no limit.
 func (s *Store) ListDeliveries(ctx context.Context, target string, limit int) ([]Delivery, error) {
