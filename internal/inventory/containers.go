@@ -290,7 +290,9 @@ func (p prevUses) of(name string, kind model.ContainerKind, ref string) *model.C
 //
 // A lookup that ended in an unresolvable placeholder is not repeated for the same credentials and
 // platform while its miss holds (missTTL, doubling up to maxMissTTL), so a tag that never resolves
-// does not cost a registry call on every flush of its owners.
+// does not cost a registry call on every flush of its owners. A refusal's placeholder is used by
+// every owner; after a registry that was not reachable, an owner keeps the image prev had, as after a
+// failed lookup of its own, and only an owner with none takes the placeholder.
 func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodePlatform, cs registry.CredSet,
 	prev *model.ContainerUse) (model.Image, error) {
 	repo, tag, digest, err := SplitRef(ref)
@@ -309,8 +311,8 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 			digest = recorded
 		} else {
 			mk := missKeyOf(cs, lookup, platform)
-			if img, ok := inv.misses.get(mk, now); ok {
-				return img, nil
+			if m, ok := inv.misses.get(mk, now); ok {
+				return inv.missed(ctx, m, repo, prev)
 			}
 			d, err := inv.o.Resolver.ResolveTag(ctx, repo, tag, cs)
 			if err != nil {
@@ -325,8 +327,8 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 		}
 	} else if !inv.access.confirmed(cs, repo, digest, now) {
 		mk := missKeyOf(cs, lookup, platform)
-		if img, ok := inv.misses.get(mk, now); ok {
-			return img, nil
+		if m, ok := inv.misses.get(mk, now); ok {
+			return inv.missed(ctx, m, repo, prev)
 		}
 		if _, err := inv.o.Resolver.Head(ctx, repo+"@"+digest, cs); err != nil {
 			return inv.unconfirmed(ctx, err, mk, lookup, repo, platform, prev)
@@ -340,26 +342,46 @@ func (inv *Inventory) resolveRef(ctx context.Context, ref string, platform NodeP
 // unconfirmed handles a registry lookup that did not confirm access: a refusal is an unresolvable
 // placeholder for the reference; another failure keeps prev's image when there is one, and is
 // otherwise returned (or, after repeated failures, unresolvable as not reachable). A placeholder is
-// recorded as a miss under mk.
+// recorded as a miss under mk, with whether the registry refused.
 func (inv *Inventory) unconfirmed(ctx context.Context, err error, mk missKey, lookup, repo string, platform NodePlatform,
 	prev *model.ContainerUse) (model.Image, error) {
 	refused := errors.Is(err, registry.ErrUnauthorized) || errors.Is(err, registry.ErrNotFound)
-	if !refused && prev != nil && ctx.Err() == nil {
-		img, ok, serr := inv.o.Store.GetImage(ctx, prev.Digest)
-		if serr != nil {
-			return model.Image{}, serr
-		}
-		if ok {
-			img.Repo = repo
-			return img, nil
+	if !refused && ctx.Err() == nil {
+		if img, ok, serr := inv.kept(ctx, repo, prev); serr != nil || ok {
+			return img, serr
 		}
 	}
 	placeholder := "unknown:" + lookup
 	img, ferr := inv.o.Normalizer.fail(ctx, err, placeholder, repo, lookup, "", platform.Key())
 	if ferr == nil && img.Digest == placeholder {
-		img = inv.misses.add(mk, img, inv.now())
+		img = inv.misses.add(mk, img, refused, inv.now())
 	}
 	return img, ferr
+}
+
+// missed answers a lookup that the miss m still covers, with no registry call: the placeholder it
+// recorded, unless the registry was not reachable and prev had an image, which is kept.
+func (inv *Inventory) missed(ctx context.Context, m miss, repo string, prev *model.ContainerUse) (model.Image, error) {
+	if !m.refused {
+		if img, ok, err := inv.kept(ctx, repo, prev); err != nil || ok {
+			return img, err
+		}
+	}
+	return m.img, nil
+}
+
+// kept returns the stored image of prev, this container's stored use, under repo; false when there is
+// none.
+func (inv *Inventory) kept(ctx context.Context, repo string, prev *model.ContainerUse) (model.Image, bool, error) {
+	if prev == nil {
+		return model.Image{}, false, nil
+	}
+	img, ok, err := inv.o.Store.GetImage(ctx, prev.Digest)
+	if err != nil || !ok {
+		return model.Image{}, false, err
+	}
+	img.Repo = repo
+	return img, true, nil
 }
 
 // recordImage stores a new image row (or a refreshed unresolvable one) and collects an SBOM request

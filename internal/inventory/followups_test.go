@@ -131,3 +131,31 @@ func TestPruneHandedOff_DepartedDigests(t *testing.T) {
 	require.Equal(t, mA, h.acq.digests()[2])
 	require.Equal(t, []string{mA, mB}, handedOff())
 }
+
+// TestCommonestPlatform (W55): majorityPlatform and templatePlatform count Ready nodes the same way, and
+// ties prefer linux/amd64, then the lowest key.
+func TestCommonestPlatform(t *testing.T) {
+	amd, arm := NodePlatform{OS: "linux", Arch: "amd64"}, NodePlatform{OS: "linux", Arch: "arm64"}
+	node := func(arch string, ready bool) model.Node { return model.Node{OS: "linux", Arch: arch, Ready: ready} }
+	all := func(NodePlatform) bool { return true }
+	for name, tc := range map[string]struct {
+		nodes []model.Node
+		want  NodePlatform
+		ok    bool
+	}{
+		"no nodes":                       {nil, NodePlatform{}, false},
+		"none ready":                     {[]model.Node{node("arm64", false)}, NodePlatform{}, false},
+		"the most":                       {[]model.Node{node("arm64", true), node("arm64", true), node("amd64", true)}, arm, true},
+		"a tie prefers amd64":            {[]model.Node{node("386", true), node("amd64", true)}, amd, true},
+		"other ties take the lowest key": {[]model.Node{node("s390x", true), node("arm64", true)}, arm, true},
+	} {
+		got, ok := commonestPlatform(tc.nodes, all)
+		require.Equal(t, tc.ok, ok, name)
+		require.Equal(t, tc.want, got, name)
+	}
+	require.Equal(t, amd, majorityPlatform(nil), "a cluster with no Ready nodes")
+	got, ok := commonestPlatform([]model.Node{node("arm64", true), node("amd64", true), node("amd64", true)},
+		func(np NodePlatform) bool { return np != amd })
+	require.True(t, ok)
+	require.Equal(t, arm, got, "only the platforms allow accepts are counted")
+}

@@ -26,7 +26,7 @@ import (
 func (h *harness) restart() {
 	clock := func() time.Time { return h.now }
 	h.inv = New(Options{Client: h.c, Store: h.st, Normalizer: NewNormalizer(h.res, h.st, clock), Resolver: h.res,
-		Context: fakeContext{}, Hooks: h.hooks, Acquirer: h.acq, ClusterName: "dev", Now: clock})
+		Context: fakeContext{}, Hooks: h.hooks, Acquirer: h.acq, ClusterName: "test", Now: clock})
 }
 
 // TestSyncAll_ExpiredCatalogFailedEnqueued (F9): the 24 h retry of a catalogFailed image comes from
@@ -182,7 +182,7 @@ func TestNamespacedClusterKind(t *testing.T) {
 	h.res.platforms[mA+"|linux/amd64"] = registryManifest(mA, "", "linux/amd64")
 	require.NoError(t, h.inv.SyncAll(ctx))
 	h.owner(t, "Cluster/apps/pg")
-	h.owner(t, "Cluster//dev")
+	h.owner(t, "Cluster//test")
 	h.inv.batch.take()
 
 	// The pod goes away: MarkNamespace's flush reaches the owner, not the synthetic Cluster.
@@ -194,7 +194,7 @@ func TestNamespacedClusterKind(t *testing.T) {
 	_, ok, err := h.st.GetOwner(ctx, "Cluster/apps/pg")
 	require.NoError(t, err)
 	require.False(t, ok)
-	h.owner(t, "Cluster//dev")
+	h.owner(t, "Cluster//test")
 
 	// Deleted while ffs was down: SyncAll in the next process removes it.
 	require.NoError(t, h.st.UpsertOwner(ctx, model.Owner{Ref: model.OwnerRef{Kind: "Cluster", Namespace: "db", Name: "gone"},
@@ -204,7 +204,7 @@ func TestNamespacedClusterKind(t *testing.T) {
 	_, ok, err = h.st.GetOwner(ctx, "Cluster/db/gone")
 	require.NoError(t, err)
 	require.False(t, ok)
-	h.owner(t, "Cluster//dev")
+	h.owner(t, "Cluster//test")
 }
 
 // TestRegister_QueuesObjectKeys covers the informer handlers: object events queue their key, and
