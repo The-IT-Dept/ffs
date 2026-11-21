@@ -27,7 +27,10 @@ const UI = fileURLToPath(new URL('..', import.meta.url))
 // is not embedded itself.
 export const MANIFEST = fileURLToPath(new URL('../../internal/web/ui/bundle-packages.json', import.meta.url))
 
-// VIRTUAL_PACKAGES is the package behind each virtual module a build may render, by ID prefix.
+// VIRTUAL_PACKAGES is the package behind each virtual module a build may render, by ID prefix. vite
+// and rolldown stay in the image SBOM manifests, not only in the licence check: code from them (the
+// preload helper, the modulepreload polyfill, the runtime) ships in the bundle, so a scanner should see
+// them, even though an advisory against either is almost always about the dev server or the build.
 const VIRTUAL_PACKAGES: readonly (readonly [string, string])[] = [
   ['\0vite/', 'vite'],
   ['\0rolldown/', 'rolldown'],
@@ -68,10 +71,13 @@ function readJSON(file: string): Record<string, unknown> {
   return JSON.parse(readFileSync(file, 'utf8')) as Record<string, unknown>
 }
 
-// packageAt reads the package in dir.
-function packageAt(dir: string): BundledPackage {
+// packageAt reads the package in dir, which must be below ui/node_modules: the manifest lists each
+// package by its lockfile path, which a package resolved from outside the UI does not have.
+export function packageAt(dir: string): BundledPackage {
+  const path = relative(UI, dir).split(sep).join('/')
+  if (!path.startsWith('node_modules/')) throw new Error(`${dir}: a bundled package outside ui/node_modules`)
   const pkg = readJSON(join(dir, 'package.json'))
-  return { path: relative(UI, dir).split(sep).join('/'), name: String(pkg.name ?? ''), version: String(pkg.version ?? ''), license: licenseOf(pkg) }
+  return { path, name: String(pkg.name ?? ''), version: String(pkg.version ?? ''), license: licenseOf(pkg) }
 }
 
 const COMMENT = /\/\*[\s\S]*?\*\//g
@@ -116,23 +122,30 @@ function styleEntry(dir: string, subpath: string): string | undefined {
   return existsSync(file) ? file : undefined
 }
 
-// cssPackages are the directories of the packages a stylesheet imports, through package CSS too.
+// cssPackages are the directories of the packages a stylesheet imports, through package CSS too. A
+// reference it cannot follow throws, so no package goes unlisted: a relative stylesheet that does not
+// exist, a package that does not resolve, or a package stylesheet named by path that it does not
+// ship. A reference to a non-stylesheet (a @plugin module, a URL) has no CSS to follow.
 export function cssPackages(file: string, seen = new Set<string>()): string[] {
   if (seen.has(file)) return []
   seen.add(file)
   const out: string[] = []
   for (const spec of cssRefs(readFileSync(file, 'utf8'))) {
+    const path = spec.split('?')[0] ?? ''
     if (!isBare(spec)) {
-      const local = resolve(dirname(file), spec.split('?')[0] ?? '')
-      if (spec.startsWith('.') && local.endsWith('.css') && existsSync(local)) out.push(...cssPackages(local, seen))
+      if (!spec.startsWith('.') || !path.endsWith('.css')) continue
+      const local = resolve(dirname(file), path)
+      if (!existsSync(local)) throw new Error(`${file}: cannot resolve the stylesheet ${spec}`)
+      out.push(...cssPackages(local, seen))
       continue
     }
-    const [name, subpath] = packageName(spec)
+    const [name, subpath] = packageName(path)
     const dir = findPackageDir(name, dirname(file))
     if (!dir) throw new Error(`${file}: cannot resolve the package of ${spec}`)
     out.push(dir)
     const entry = styleEntry(dir, subpath)
     if (entry) out.push(...cssPackages(entry, seen))
+    else if (subpath.endsWith('.css')) throw new Error(`${file}: ${name} has no stylesheet ${subpath}`)
   }
   return out
 }
