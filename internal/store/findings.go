@@ -82,19 +82,24 @@ func appendTransitions(ctx context.Context, tx *sql.Tx, ts []model.Transition) e
 // RekeyFindings applies alias re-keys in one transaction. When no finding holds NewFingerprint,
 // the old row takes the new fingerprint and advisory id (in its columns and data); otherwise the
 // old row is deleted. Notification ledger rows move to the new fingerprint either way, merging
-// with any already there (moveLedger). Transitions keep the old fingerprint as history.
+// with any already there (moveLedger): the state and time come from the old row unless an open or
+// excepted finding holds NewFingerprint. A resolved one there counts as no live finding, because
+// the next recompute reopens it from the moved matches. Transitions keep the old fingerprint as
+// history.
 func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
 		for _, rk := range rks {
-			var taken bool
-			if rk.NewFingerprint != rk.OldFingerprint {
-				if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM findings WHERE fingerprint = ?)`,
-					rk.NewFingerprint).Scan(&taken); err != nil {
+			moved := rk.NewFingerprint != rk.OldFingerprint
+			var (
+				state model.FindingState
+				err   error
+			)
+			if moved {
+				if state, err = findingState(ctx, tx, rk.NewFingerprint); err != nil {
 					return err
 				}
 			}
-			var err error
-			if taken {
+			if state != "" {
 				_, err = tx.ExecContext(ctx, `DELETE FROM findings WHERE fingerprint = ?`, rk.OldFingerprint)
 			} else {
 				_, err = tx.ExecContext(ctx, `UPDATE findings SET fingerprint = ?, advisory_id = ?,
@@ -105,8 +110,8 @@ func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 				return fmt.Errorf("store: rekey finding %q: %w", rk.OldFingerprint, err)
 			}
 			// The never-twice ledger follows the finding, so an alias merge is not re-alerted.
-			if rk.NewFingerprint != rk.OldFingerprint {
-				if err := moveLedger(ctx, tx, rk.OldFingerprint, rk.NewFingerprint); err != nil {
+			if moved {
+				if err := moveLedger(ctx, tx, rk.OldFingerprint, rk.NewFingerprint, !live(state)); err != nil {
 					return fmt.Errorf("store: rekey ledger %q: %w", rk.OldFingerprint, err)
 				}
 			}
@@ -115,16 +120,32 @@ func (s *Store) RekeyFindings(ctx context.Context, rks []FindingRekey) error {
 	})
 }
 
+// findingState returns the state of the finding at fp, "" when there is none.
+func findingState(ctx context.Context, tx *sql.Tx, fp string) (model.FindingState, error) {
+	var state string
+	err := tx.QueryRowContext(ctx, `SELECT state FROM findings WHERE fingerprint = ?`, fp).Scan(&state)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return model.FindingState(state), err
+}
+
+// live reports whether a finding in state (as findingState returns it) is one a move must not
+// replace: open or excepted.
+func live(state model.FindingState) bool { return state != "" && state != model.StateResolved }
+
 // moveLedger moves every target's never-twice ledger row of fingerprint from to fingerprint to.
 // Where the target already has a row for to, the two merge: the higher max_priority is kept, so the
-// move never lowers what a target was told and an escalation already sent is not sent again, and
-// the state and time come from the row updated last.
-func moveLedger(ctx context.Context, tx *sql.Tx, from, to string) error {
+// move never lowers what a target was told and an escalation already sent is not sent again. The
+// state and time come from the row of the finding that stays live: the moved row (from) when
+// movedLive, else the row already at to. A row with nothing to merge with moves as it was.
+func moveLedger(ctx context.Context, tx *sql.Tx, from, to string, movedLive bool) error {
 	if _, err := tx.ExecContext(ctx, `INSERT INTO notified(target, fingerprint, max_priority, last_state, updated_at)
 		SELECT target, ?, max_priority, last_state, updated_at FROM notified WHERE fingerprint = ?
 		ON CONFLICT(target, fingerprint) DO UPDATE SET max_priority = max(max_priority, excluded.max_priority),
-			last_state = CASE WHEN excluded.updated_at > updated_at THEN excluded.last_state ELSE last_state END,
-			updated_at = max(updated_at, excluded.updated_at)`, to, from); err != nil {
+			last_state = CASE WHEN ? THEN excluded.last_state ELSE last_state END,
+			updated_at = CASE WHEN ? THEN excluded.updated_at ELSE updated_at END`,
+		to, from, movedLive, movedLive); err != nil {
 		return err
 	}
 	_, err := tx.ExecContext(ctx, `DELETE FROM notified WHERE fingerprint = ?`, from)
