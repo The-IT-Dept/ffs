@@ -1,6 +1,7 @@
 import type { S } from '@/api/types'
 import { AppLink } from '@/components/layout/AppLink'
 import { CoverageMark } from '@/components/signals/CoverageMark'
+import { EolText } from '@/components/signals/EolText'
 import { RelativeTime } from '@/components/signals/RelativeTime'
 import { copy, facetValueLabel } from '@/lib/copy'
 import { eolText } from '@/lib/format'
@@ -47,6 +48,7 @@ export function ImageGaps({ image, className }: { image: S<'ImageDetail'>; class
 // coverage gaps (hatched), notes, the ecosystem breakdown, lifecycle and the workloads using it.
 export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
   const { sbom, coverage } = image
+  const lifecycle = image.eol.filter((e) => eolText(e) !== '')
   return (
     <div className="max-w-3xl text-[12px]">
       <p>{copy.image.sbom(sbom.source, sbom.tool, sbom.toolVersion)}</p>
@@ -55,7 +57,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           {copy.image.agent(sbom.agent.node, sbom.agent.agentVersion)} · <RelativeTime iso={sbom.agent.receivedAt} />
         </p>
       ) : null}
-      <p className="mt-1">{copy.workload.coverage(facetValueLabel('coverage', coverage.class, 0))}</p>
+      <p className="mt-1">{copy.workload.coverage(facetValueLabel('coverage', coverage.class))}</p>
       <ImageGaps image={image} className="mt-2" />
       {coverage.notes.length > 0 ? (
         <ul className="mt-2 list-disc pl-4 text-muted-foreground">
@@ -70,11 +72,13 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           <EcosystemBreakdown ecosystems={image.ecosystems} />
         </>
       ) : null}
-      {image.eol.length > 0 ? (
+      {lifecycle.length > 0 ? (
         <>
           <Heading>{copy.image.lifecycle}</Heading>
-          {image.eol.map((e) => (
-            <p key={`${e.product}:${e.cycle}`}>{eolText(e)}</p>
+          {lifecycle.map((e) => (
+            <p key={`${e.product}:${e.cycle}`}>
+              <EolText eol={e} />
+            </p>
           ))}
         </>
       ) : null}

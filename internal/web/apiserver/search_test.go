@@ -157,8 +157,7 @@ func TestSearch_PageHitsHaveTheirOwnKinds(t *testing.T) {
 		"containerd": apigen.SearchHitKindControlplane, "nodes": apigen.SearchHitKindNodes, "host packages": apigen.SearchHitKindNodes,
 	} {
 		res := ok[apigen.SearchResult](t, get(t, h, "/api/v1/search?q="+url.QueryEscape(q)))
-		hit := hitOf(t, res, want, webtest.ClusterName)
-		require.True(t, hit.Kind.Valid(), q)
+		hitOf(t, res, want, webtest.ClusterName) // the page is a hit of its own kind
 		for _, other := range res.Hits {
 			if other.Kind != apigen.SearchHitKindWorkload {
 				continue

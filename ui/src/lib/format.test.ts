@@ -1,6 +1,6 @@
 import { expect, test } from 'vitest'
 import { NOW } from '@/test/fixtures'
-import { eolText, formatAge, formatBytes, formatCompact, formatCount, formatPercent, plural, shortDigest } from './format'
+import { eolText, eolWarns, formatAge, formatBytes, formatCompact, formatCount, formatPercent, plural, shortDigest } from './format'
 
 test('formats counts, percentages, ages and digests', () => {
   expect(formatCount(1356)).toBe('1,356')
@@ -29,4 +29,16 @@ test('eolText is the lifecycle text, else the override note', () => {
   expect(eolText({ ...e, text: 'Alpine Linux: rolling release' })).toBe('Alpine Linux: rolling release')
   expect(eolText({ ...e, note: '' })).toBe('')
   expect(eolText(undefined)).toBe('')
+})
+
+// W42: end of life past, or at most 90 days away, warns; a later date, a note or no status does not.
+test('eolWarns marks an end of life that has passed or is near', () => {
+  const now = Date.parse(NOW)
+  const e = { product: 'kubernetes', cycle: '1.35', eolDate: '', isEol: false, latest: '', note: '', text: '' }
+  expect(eolWarns({ ...e, isEol: true }, now)).toBe(true)
+  expect(eolWarns({ ...e, eolDate: '2026-10-27' }, now)).toBe(true)
+  expect(eolWarns({ ...e, eolDate: '2027-02-16' }, now)).toBe(true)
+  expect(eolWarns({ ...e, eolDate: '2027-02-18' }, now)).toBe(false)
+  expect(eolWarns({ ...e, note: 'rolling release' }, now)).toBe(false)
+  expect(eolWarns(undefined, now)).toBe(false)
 })

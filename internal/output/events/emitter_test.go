@@ -40,7 +40,7 @@ func newHarness(t *testing.T, s *corev1.ObjectReference) *harness {
 // seed stores a finding for the transition's fingerprint and the transition itself.
 func (h *harness) seed(t *testing.T, tr model.Transition, pkg *model.FindingPackage) {
 	t.Helper()
-	tr.Fingerprint = model.FindingFingerprint("c", tr.Owner, "repo", tr.AdvisoryID)
+	tr.Fingerprint = model.FindingFingerprint("test", tr.Owner, "repo", tr.AdvisoryID)
 	f := model.Finding{Fingerprint: tr.Fingerprint, Owner: tr.Owner, ImageRepo: "repo", AdvisoryID: tr.AdvisoryID,
 		State: tr.ToState, Priority: tr.ToPriority, Provisional: tr.Provisional}
 	if pkg != nil {
@@ -141,7 +141,7 @@ func TestEvents_BatchesOf500AndNoteCap(t *testing.T) {
 
 func TestEvents_ClusterSubjectsOnFFSDeployment(t *testing.T) {
 	h := newHarness(t, self)
-	h.seed(t, create(model.OwnerRef{Kind: "Cluster", Name: "prod"}, "CVE-2026-1111", model.PriorityHigh),
+	h.seed(t, create(model.OwnerRef{Kind: "Cluster", Name: "test"}, "CVE-2026-1111", model.PriorityHigh),
 		&model.FindingPackage{Name: "kubernetes", Installed: "1.35.0", Fixed: []string{"1.35.2"}})
 	h.seed(t, create(model.OwnerRef{Kind: "ContainerRuntime", Name: "containerd"}, "CVE-2026-1112", model.PriorityHigh), nil)
 	require.NoError(t, h.em.Drain(context.Background()))
@@ -154,7 +154,7 @@ func TestEvents_ClusterSubjectsOnFFSDeployment(t *testing.T) {
 	require.Equal(t, "Container runtime containerd: 1 new: CVE-2026-1112 (high)", ev[1].Note)
 
 	h2 := newHarness(t, nil)
-	h2.seed(t, create(model.OwnerRef{Kind: "Cluster", Name: "prod"}, "CVE-2026-1111", model.PriorityHigh), nil)
+	h2.seed(t, create(model.OwnerRef{Kind: "Cluster", Name: "test"}, "CVE-2026-1111", model.PriorityHigh), nil)
 	require.NoError(t, h2.em.Drain(context.Background()))
 	require.Empty(t, h2.rec.Snapshot())
 	cur, err := h2.st.Cursor(context.Background(), CursorName)
@@ -166,7 +166,7 @@ func TestEvents_ClusterSubjectsOnFFSDeployment(t *testing.T) {
 
 func TestEvents_NodesOnFFSDeployment(t *testing.T) {
 	h := newHarness(t, self)
-	h.seed(t, create(model.NodesOwner("prod"), "CVE-2026-1113", model.PriorityHigh),
+	h.seed(t, create(model.NodesOwner("test"), "CVE-2026-1113", model.PriorityHigh),
 		&model.FindingPackage{Name: "openssl", Installed: "3.0.13-0ubuntu3.4", Fixed: []string{"3.0.13-0ubuntu3.6"}})
 	require.NoError(t, h.em.Drain(context.Background()))
 	ev := h.rec.Snapshot()
@@ -264,7 +264,7 @@ func TestEvents_UpgradeNoteUsesTarget(t *testing.T) {
 	} {
 		tr := model.Transition{Owner: o, AdvisoryID: id, FromState: model.StateOpen, ToState: model.StateOpen,
 			FromPriority: model.PriorityHigh, ToPriority: model.PriorityHigh, Trigger: model.TriggerUpgradeAvailable}
-		tr.Fingerprint = model.FindingFingerprint("c", o, sg.Repo, id)
+		tr.Fingerprint = model.FindingFingerprint("test", o, sg.Repo, id)
 		f := model.Finding{Fingerprint: tr.Fingerprint, Owner: o, ImageRepo: sg.Repo, AdvisoryID: id, State: model.StateOpen,
 			Priority: model.PriorityHigh}
 		require.NoError(t, h.st.ApplyFindings(context.Background(), []model.Finding{f}, []model.Transition{tr}))
@@ -277,8 +277,9 @@ func TestEvents_UpgradeNoteUsesTarget(t *testing.T) {
 		"CVE-2026-0002 (upgrade to ghcr.io/example/app:1.30.7)", ev[0].Note)
 }
 
-// TestEvents_FeedStaleRepeatsWhileStale (F94): Events expire after about an hour, so a feed that stays
-// stale is reported again every hour until it syncs.
+// TestEvents_FeedStaleRepeatsWhileStale (F94, W34): Events expire an hour after their last update, so
+// a feed that stays stale is reported again every 50 minutes, before the last Event expires, until it
+// syncs.
 func TestEvents_FeedStaleRepeatsWhileStale(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, self)
@@ -289,22 +290,25 @@ func TestEvents_FeedStaleRepeatsWhileStale(t *testing.T) {
 	h.em.FeedStale("osv", last, 2*time.Hour)
 	require.Len(t, h.byReason(ReasonFeedStale), 1)
 
-	now = now.Add(59 * time.Minute)
+	now = now.Add(49 * time.Minute)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 1, "within the hour the first Event is still visible")
+	require.Len(t, h.byReason(ReasonFeedStale), 1, "within 50 minutes the first Event is not repeated")
 	now = now.Add(time.Minute)
 	h.em.RepeatStale(ctx)
 	ev := h.byReason(ReasonFeedStale)
-	require.Len(t, ev, 2)
+	require.Len(t, ev, 2, "repeated at 50 minutes, ten before the first Event expires")
 	require.Equal(t, ev[0].Note, ev[1].Note)
 	now = now.Add(30 * time.Minute)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 2, "an hour from the repeat, not from the first")
+	require.Len(t, h.byReason(ReasonFeedStale), 2, "50 minutes from the repeat, not from the first")
+	now = now.Add(20 * time.Minute)
+	h.em.RepeatStale(ctx)
+	require.Len(t, h.byReason(ReasonFeedStale), 3)
 
 	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "osv", LastSuccess: now}))
 	now = now.Add(2 * time.Hour)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 2, "a feed that synced is not reported again")
+	require.Len(t, h.byReason(ReasonFeedStale), 3, "a feed that synced is not reported again")
 	h.em.mu.Lock()
 	require.Empty(t, h.em.stale)
 	h.em.mu.Unlock()

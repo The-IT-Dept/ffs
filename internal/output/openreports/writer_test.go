@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -89,7 +90,7 @@ func (h *harness) seed(t *testing.T, ref model.OwnerRef, id string, p model.Prio
 	ctx := context.Background()
 	require.NoError(t, h.st.UpsertOwner(ctx, model.Owner{Ref: ref}))
 	require.NoError(t, h.st.UpsertAdvisory(ctx, model.Advisory{ID: id, Title: "t " + id}))
-	f := model.Finding{Fingerprint: model.FindingFingerprint("c", ref, "docker.io/library/nginx", id), Owner: ref,
+	f := model.Finding{Fingerprint: model.FindingFingerprint("test", ref, "docker.io/library/nginx", id), Owner: ref,
 		ImageRepo: "docker.io/library/nginx", AdvisoryID: id, Priority: p, Severity: model.SeverityHigh,
 		State: model.StateOpen, Matched: t0, LastSeen: t0, Observed: t0, Published: t0}
 	require.NoError(t, h.st.ApplyFindings(ctx, []model.Finding{f}, nil))
@@ -255,14 +256,29 @@ func TestWriter_StaleViewListsAgain(t *testing.T) {
 	require.Equal(t, orv1alpha1.ReportSummary{Fail: 2}, h.reports(t)[0].Summary)
 }
 
-// TestWriter_ModeOnSurvivesDiscoveryError (F54): in mode on a discovery failure does not stop the
-// Reports, and discovery is tried again; in mode auto it is returned.
+// countSink counts the error and info lines logged through it.
+type countSink struct{ errors, infos int }
+
+func (s *countSink) Init(logr.RuntimeInfo)          {}
+func (s *countSink) Enabled(int) bool               { return true }
+func (s *countSink) Info(int, string, ...any)       { s.infos++ }
+func (s *countSink) Error(error, string, ...any)    { s.errors++ }
+func (s *countSink) WithValues(...any) logr.LogSink { return s }
+func (s *countSink) WithName(string) logr.LogSink   { return s }
+
+// TestWriter_ModeOnSurvivesDiscoveryError (F54, W56): in mode on a discovery failure does not stop
+// the Reports, and discovery is tried again; the first failure of a run is logged as an error, the
+// rest at V(1). In mode auto it is returned.
 func TestWriter_ModeOnSurvivesDiscoveryError(t *testing.T) {
-	ctx := context.Background()
+	sink := &countSink{}
+	ctx := logr.NewContext(context.Background(), logr.New(sink))
 	h := newHarness(t, config.OpenReportsConfig{Mode: "on", MaxResults: 100, WGPolicy: true}, orGV, wgGV.String())
-	calls := 0
+	calls, failing := 0, true
 	h.disc.AddReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {
 		calls++
+		if !failing {
+			return false, nil, nil
+		}
 		return true, nil, errors.New("discovery unavailable")
 	})
 	h.seed(t, dref, "CVE-2026-0001", model.PriorityHigh)
@@ -271,6 +287,15 @@ func TestWriter_ModeOnSurvivesDiscoveryError(t *testing.T) {
 	require.Empty(t, h.policyReports(t), "the PolicyReport mirror waits for discovery")
 	require.NoError(t, h.w.ReconcileOnce(ctx))
 	require.Equal(t, 2, calls, "discovery is tried again on the next reconcile")
+	require.Equal(t, 1, sink.errors, "a failure that persists is logged as an error once")
+
+	failing = false
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.Len(t, h.policyReports(t), 1, "the mirror is written once discovery works")
+	failing = true
+	h.now = h.now.Add(10 * time.Minute) // discovery is cached for ten minutes
+	require.NoError(t, h.w.ReconcileOnce(ctx))
+	require.Equal(t, 2, sink.errors, "a new run of failures is logged as an error again")
 
 	h = newHarness(t, config.OpenReportsConfig{Mode: "auto", MaxResults: 100}, orGV)
 	h.disc.AddReactor("get", "resource", func(clienttesting.Action) (bool, runtime.Object, error) {

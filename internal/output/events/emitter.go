@@ -30,8 +30,9 @@ const (
 
 	resyncInterval = 60 * time.Second
 	// staleRepeat is how often FeedStale is emitted again while a feed stays stale: Kubernetes
-	// expires Events after about an hour, so a feed that stays stale keeps a visible Event.
-	staleRepeat = time.Hour
+	// expires Events an hour after their last update (the API server's --event-ttl), and RepeatStale
+	// runs on the 60-second tick, so repeating well inside the hour keeps a visible Event.
+	staleRepeat = 50 * time.Minute
 )
 
 func typesUID(s string) types.UID { return types.UID(s) }
@@ -209,7 +210,7 @@ func (e *Emitter) FeedStale(feed string, lastSuccess time.Time, staleAfter time.
 	e.mu.Unlock()
 }
 
-// RepeatStale emits FeedStale again for every remembered feed whose Event is an hour old, and
+// RepeatStale emits FeedStale again for every remembered feed whose Event is 50 minutes old, and
 // forgets the feeds that synced since they were reported (the feed state's last success moved on).
 func (e *Emitter) RepeatStale(ctx context.Context) {
 	e.mu.Lock()

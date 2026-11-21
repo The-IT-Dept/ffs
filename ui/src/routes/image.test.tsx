@@ -106,3 +106,34 @@ test('the SBOM view shows each lifecycle with its note when there is no end-of-l
   expect(screen.getByText('Python 3.13 supported until 2029-10-31')).toBeInTheDocument()
   expect(screen.getByText('lifecycle published by Microsoft')).toBeInTheDocument()
 })
+
+// W42 and the SbomCard guard: an end of life reads as a warning, and a status with nothing to say
+// adds no empty line; with none to say, the lifecycle heading goes too.
+test('the SBOM view warns of an end of life and skips statuses with no text', async () => {
+  const d = 'sha256:' + '2'.repeat(64)
+  const eol = { eolDate: '', isEol: false, latest: '', note: '', text: '' }
+  mockApi().on(
+    '/images/{digest}',
+    imageDetail({
+      digest: d,
+      eol: [
+        { ...eol, product: 'debian', cycle: '11', eolDate: '2026-08-31', isEol: true, text: 'Debian 11 reached end of life 2026-08-31' },
+        { ...eol, product: 'nosuch', cycle: '1' },
+      ],
+    }),
+  )
+  renderApp(`${imagePath(d)}?view=sbom`)
+  const line = await screen.findByText('Debian 11 reached end of life 2026-08-31')
+  expect(line).toHaveClass('text-(--high-text)')
+  const section = line.closest('p')?.parentElement
+  expect(section?.querySelectorAll('p:empty')).toHaveLength(0)
+})
+
+test('the SBOM view has no lifecycle heading when no status has text', async () => {
+  const d = 'sha256:' + '3'.repeat(64)
+  const detail = imageDetail({ digest: d, eol: [{ product: 'nosuch', cycle: '1', eolDate: '', isEol: false, latest: '', note: '', text: '' }] })
+  mockApi().on('/images/{digest}', detail)
+  renderApp(`${imagePath(d)}?view=sbom`)
+  expect(await screen.findByText(copy.image.sbom(detail.sbom.source, detail.sbom.tool, detail.sbom.toolVersion))).toBeInTheDocument()
+  expect(screen.queryByText(copy.image.lifecycle)).toBeNull()
+})

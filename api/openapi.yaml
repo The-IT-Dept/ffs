@@ -658,7 +658,9 @@ components:
       enum: [upgrade, rebuild, package, none, wontfix]
     Signal:
       type: string
-      description: A ranking signal. epss means the EPSS score is at or above the configured threshold.
+      description: >-
+        A ranking signal. epss is the EPSS bump: the finding's EPSS score reached priority.epssBump and has not
+        fallen below 90% of it since.
       enum: [exposed, privileged, sa_power, exploited, malicious, provisional, not_running, epss]
     CoverageClass:
       type: string
@@ -1532,7 +1534,7 @@ components:
         stale: {type: integer}
         never: {type: integer}
         disabled: {type: integer}
-        unsupported: {type: integer, description: Nodes the node agent does not schedule on (architecture or node selector).}
+        unsupported: {type: integer, description: 'Nodes the node agent does not schedule on: their architecture, the node selector or a taint the agent does not tolerate excludes them.'}
 
     NodeGroupDetail:
       allOf:

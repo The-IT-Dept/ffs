@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
+	"github.com/the-it-dept/ffs/internal/model"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
@@ -133,4 +134,26 @@ func TestSupport_LabelsNotesAndDates(t *testing.T) {
 	require.Equal(t, Unknown, JoinSupport(nil, now))
 	require.Equal(t, "unknown", Unknown)
 	require.Equal(t, "nosuch", Label("nosuch"))
+}
+
+// TestImageEOL_CentOSStream (W32): CentOS Stream images share CentOS Linux's os-release ID. Stream 9
+// and 10 are CentOS Stream by version; Stream 8 by its release package, so it is not dated by CentOS
+// Linux 8's end of life.
+func TestImageEOL_CentOSStream(t *testing.T) {
+	e := newEvaluator(t,
+		store.EOLCycle{Product: "centos", Cycle: "8", EOLDate: day(2021, 12, 31), IsEOL: true},
+		store.EOLCycle{Product: "centos", Cycle: "7", EOLDate: day(2024, 6, 30), IsEOL: true},
+		store.EOLCycle{Product: "centos-stream", Cycle: "8", EOLDate: day(2024, 5, 31), IsEOL: true},
+		store.EOLCycle{Product: "centos-stream", Cycle: "9", EOLDate: day(2027, 5, 31)},
+	)
+	image := func(version, release string) []model.Package {
+		d := &model.Distro{ID: "centos", VersionID: version}
+		return []model.Package{{Ecosystem: "rpm", Distro: d, Name: "bash", Version: "5.1.8-9.el9"},
+			{Ecosystem: "rpm", Distro: d, Name: release, Version: version + "-1"}}
+	}
+	support := func(pkgs []model.Package) string { return JoinSupport(e.ImageEOL("quay.io/centos/centos", pkgs), now) }
+	require.Equal(t, "CentOS Stream 9 supported until 2027-05-31", support(image("9", centosStreamRelease)))
+	require.Equal(t, "CentOS Stream 8 reached end of life 2024-05-31", support(image("8", centosStreamRelease)))
+	require.Equal(t, "CentOS 8 reached end of life 2021-12-31", support(image("8", "centos-linux-release")))
+	require.Equal(t, "CentOS 7 reached end of life 2024-06-30", support(image("7", "centos-release")))
 }

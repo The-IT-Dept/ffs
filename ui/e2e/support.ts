@@ -85,10 +85,19 @@ export function imageIdOf(href: string): string | null {
   return m ? decodeURIComponent(m[1]) : null
 }
 
-// imageLinkTo returns the href of the first link on the page to the image with ID id.
+// imageLinkTo returns the href of the first link on the page to the image with ID id, waiting for
+// one: the rail's container links can render after the page has settled.
 export async function imageLinkTo(page: Page, id: string): Promise<string> {
-  const hrefs = await page.locator('a[href^="/images/"]').evaluateAll((els) => els.map((e) => e.getAttribute('href') ?? ''))
-  const href = hrefs.find((h) => imageIdOf(h) === id)
-  if (!href) throw new Error(`no link to image ${id} among ${hrefs.join(', ')}`)
-  return href
+  let hrefs: string[] = []
+  const href = () => hrefs.find((h) => imageIdOf(h) === id)
+  await expect
+    .poll(
+      async () => {
+        hrefs = await page.locator('a[href^="/images/"]').evaluateAll((els) => els.map((e) => e.getAttribute('href') ?? ''))
+        return href() !== undefined
+      },
+      { message: `a link to image ${id}` },
+    )
+    .toBe(true)
+  return href()!
 }

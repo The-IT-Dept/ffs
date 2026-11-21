@@ -1,19 +1,18 @@
 import type { S } from '@/api/types'
 import { AppLink } from '@/components/layout/AppLink'
 import { Mono } from '@/components/signals/Mono'
+import { EolText } from '@/components/signals/EolText'
 import { PriorityCountsText } from '@/components/signals/PriorityCountsText'
 import { copy } from '@/lib/copy'
-import { eolText } from '@/lib/format'
 import { cn, touchLink } from '@/lib/utils'
 
 function Version({ name, version, nodes, eol }: { name?: string; version: string; nodes: number; eol?: S<'EOL'> }) {
-  const lifecycle = eolText(eol)
   return (
     <li className="flex flex-wrap items-baseline gap-2">
       {name ? <span>{name}</span> : null}
       <Mono>{version}</Mono>
       <span className="text-muted-foreground">{copy.nodes.nodesCount(nodes)}</span>
-      {lifecycle ? <span className="text-muted-foreground">{lifecycle}</span> : null}
+      <EolText eol={eol} className="text-muted-foreground" />
     </li>
   )
 }

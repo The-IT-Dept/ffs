@@ -66,7 +66,7 @@ test('node gaps for agents that report without a host inventory, or do not run, 
   expect(screen.getByText("Check the node agent's logs on these nodes; the last error is shown.")).toBeInTheDocument()
   expect(screen.getByText('host inventory quarantined')).toBeInTheDocument()
   expect(screen.getByText('not scheduled by the node agent').closest('.hatched')).not.toBeNull()
-  expect(screen.getByText('Its architecture or node selector excludes this node from the node agent.')).toBeInTheDocument()
+  expect(screen.getByText(/a taint the agent does not tolerate excludes this node from the node agent\. To cover it, add it to nodeAgent\.architectures, nodeAgent\.nodeSelector or nodeAgent\.tolerations\./)).toBeInTheDocument()
 })
 
 test('no gaps says so, not that nothing needs attention', async () => {

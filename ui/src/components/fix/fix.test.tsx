@@ -11,7 +11,13 @@ test('net change is per priority and never sums across priorities', () => {
   render(
     <UpgradeTable
       suggestions={[
-        suggestion({ toTag: '1.5.0', fixes: counts({ low: 3 }), introduces: counts({ urgent: 1 }), netChange: 'fixes 3 low; introduces 1 urgent' }),
+        suggestion({
+          toTag: '1.5.0',
+          target: 'ghcr.io/example/web:1.5.0',
+          fixes: counts({ low: 3 }),
+          introduces: counts({ urgent: 1 }),
+          netChange: 'fixes 3 low; introduces 1 urgent',
+        }),
         suggestion({ toTag: '1.4.3', fixes: counts({ high: 2 }), introduces: counts({ high: 2 }), netChange: 'fixes 2 high; introduces 2 high' }),
       ]}
     />,
@@ -24,6 +30,26 @@ test('net change is per priority and never sums across priorities', () => {
   expect(net).not.toHaveTextContent('−2')
   const even = within(screen.getByRole('row', { name: /1\.4\.3/ })).getAllByRole('cell')[6]
   expect(even).toHaveTextContent(copy.upgrades.noChange)
+})
+
+// W11: a candidate reads by its target, never "from → to": a digest-only reference has no from tag,
+// and a refresh moves to the tag already running.
+test('the upgrade column names the target', () => {
+  render(
+    <UpgradeTable
+      suggestions={[
+        suggestion({ repo: 'docker.io/library/nginx', fromTag: '', toTag: '1.30.7', target: 'nginx:1.30.7' }),
+        suggestion({ repo: 'ghcr.io/example/app', fromTag: '2.1.0', toTag: '2.1.0', tier: 'refresh', target: 'ghcr.io/example/app:2.1.0 (new digest)' }),
+        suggestion({ repo: 'ghcr.io/example/db', fromTag: '3.0', toTag: '', tier: 'none', target: '', fixes: counts() }),
+      ]}
+    />,
+  )
+  const change = (name: RegExp) => within(screen.getByRole('row', { name })).getAllByRole('cell')[1]
+  expect(change(/nginx:1\.30\.7/)).toHaveTextContent(/^nginx:1\.30\.7$/)
+  expect(change(/example\/app/)).toHaveTextContent(/^ghcr\.io\/example\/app:2\.1\.0 \(new digest\)$/)
+  expect(change(/example\/db/)).toHaveTextContent(copy.noValue)
+  expect(screen.queryByText(/→/)).toBeNull()
+  expect(screen.getByRole('columnheader', { name: copy.upgrades.cols.change })).toBeInTheDocument()
 })
 
 test('grouped findings ask for a page of groups and link the rest in the explorer', async () => {

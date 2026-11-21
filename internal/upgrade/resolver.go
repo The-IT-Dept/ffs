@@ -1,6 +1,7 @@
 package upgrade
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -85,6 +86,16 @@ type Resolver struct {
 	queue  []string // owner keys, oldest first
 	queued map[string]bool
 	wake   chan struct{}
+	// from holds, for each owner a transition queued and that is not resolved yet (queued, or being
+	// resolved), the first transition that queued it. The stored transitions cursor stays below the
+	// oldest of them (saveCursor), so a restart reads those transitions again and queues their owners.
+	from map[string]int64
+	read int64 // the last transition ConsumeTransitions read; valid once readSet
+	// readSet is set once read and saved hold the stored cursor, read at the first ConsumeTransitions.
+	readSet bool
+
+	cmu   sync.Mutex // serialises saveCursor
+	saved int64      // the transitions cursor last stored
 }
 
 // NewResolver returns a resolver with an empty queue.
@@ -92,7 +103,7 @@ func NewResolver(o Options) *Resolver {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	return &Resolver{o: o, queued: map[string]bool{}, wake: make(chan struct{}, 1)}
+	return &Resolver{o: o, queued: map[string]bool{}, from: map[string]int64{}, wake: make(chan struct{}, 1)}
 }
 
 func (r *Resolver) now() time.Time { return r.o.Now().UTC() }
@@ -137,8 +148,11 @@ func (r *Resolver) Run(ctx context.Context) error {
 
 // startup drains the transitions outbox, queues the owners whose suggestions a restart may have left
 // out of date (store.OwnersToResolve: the queue is held in memory only), then runs the daily pass
-// when the last one finished more than a day ago. Consuming first lets the daily pass dequeue the
-// owners it resolves, so none is resolved twice.
+// when the last one finished more than a day ago. The outbox is read from the stored cursor, which
+// stays below every transition whose owner was still queued or being resolved (saveCursor), so the
+// owners transitions queued before the restart are queued again; OwnersToResolve adds those that
+// stale suggestions and rollouts queued. Consuming first lets the daily pass dequeue the owners it
+// resolves, so none is resolved twice.
 func (r *Resolver) startup(ctx context.Context) {
 	r.consume(ctx)
 	if keys, err := r.o.Store.OwnersToResolve(ctx); err != nil {
@@ -190,15 +204,22 @@ func (r *Resolver) dailyPass(ctx context.Context) {
 	}
 }
 
-// resolveNext resolves the oldest queued owner, and wakes the worker again when more are queued.
+// resolveNext resolves the oldest queued owner, and wakes the worker again when more are queued. An
+// owner whose resolution shutdown interrupts is not released (release), so the next start queues it
+// again.
 func (r *Resolver) resolveNext(ctx context.Context) {
 	key, ok, more := r.pop()
 	if !ok {
 		return
 	}
-	if err := r.ResolveOwner(ctx, key); err != nil && ctx.Err() == nil {
+	err := r.ResolveOwner(ctx, key)
+	if ctx.Err() != nil {
+		return
+	}
+	if err != nil {
 		r.o.Log.Error(err, "resolving upgrades failed", "owner", key)
 	}
+	r.release(ctx, key)
 	if more {
 		r.signal()
 	}
@@ -225,6 +246,7 @@ func (r *Resolver) DailyPass(ctx context.Context) error {
 			failed++
 			r.o.Log.Error(err, "resolving upgrades failed", "owner", key)
 		}
+		r.release(ctx, key)
 	}
 	if err := r.o.Store.SetCursor(ctx, dailyCursor, r.now().Unix()); err != nil {
 		return fmt.Errorf("upgrade: record daily pass: %w", err)
@@ -240,31 +262,33 @@ func (r *Resolver) DailyPass(ctx context.Context) error {
 // created, reopened, raised in priority or given a fix. It also queues every owner with a stored
 // suggestion that has a finding leave a qualifying state (resolved, excepted or lowered below
 // medium), so a suggestion does not outlive its reason. UpgradeAvailable transitions, the
-// resolver's own, are ignored. It advances the cursor and returns the number of transitions read.
+// resolver's own, are ignored. It reads on from the last transition it read, stores the cursor
+// (saveCursor) and returns the number of transitions read.
 func (r *Resolver) ConsumeTransitions(ctx context.Context) (int, error) {
-	cur, err := r.o.Store.Cursor(ctx, transitionsCursor)
+	after, err := r.readFrom(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("upgrade: transitions cursor: %w", err)
+		return 0, err
 	}
-	ts, err := r.o.Store.TransitionsAfter(ctx, cur, transitionsBatch)
+	ts, err := r.o.Store.TransitionsAfter(ctx, after, transitionsBatch)
 	if err != nil {
 		return 0, fmt.Errorf("upgrade: transitions: %w", err)
 	}
 	if len(ts) == 0 {
 		return 0, nil
 	}
-	var wanted []model.Transition
-	var fps, leaving []string
+	var wanted, leaving []model.Transition
+	var fps, leavingKeys []string
 	for _, t := range ts {
 		switch {
 		case qualifies(t) && !clusterLevel(t.Owner):
 			wanted = append(wanted, t)
 			fps = append(fps, t.Fingerprint)
 		case leaves(t):
-			leaving = append(leaving, t.Owner.Key())
+			leaving = append(leaving, t)
+			leavingKeys = append(leavingKeys, t.Owner.Key())
 		}
 	}
-	var keys []string
+	var queue []model.Transition // the transitions that queue their owner
 	if len(fps) > 0 {
 		fs, err := r.o.Store.FindingsByFingerprint(ctx, fps)
 		if err != nil {
@@ -272,26 +296,91 @@ func (r *Resolver) ConsumeTransitions(ctx context.Context) (int, error) {
 		}
 		for _, t := range wanted {
 			if f, ok := fs[t.Fingerprint]; ok && f.FixAvailable {
-				keys = append(keys, t.Owner.Key())
+				queue = append(queue, t)
 			}
 		}
 	}
 	if len(leaving) > 0 {
-		has, err := r.o.Store.OwnersWithSuggestions(ctx, leaving)
+		has, err := r.o.Store.OwnersWithSuggestions(ctx, leavingKeys)
 		if err != nil {
 			return 0, fmt.Errorf("upgrade: suggestions of transitions: %w", err)
 		}
-		for _, k := range leaving {
-			if has[k] {
-				keys = append(keys, k)
+		for _, t := range leaving {
+			if has[t.Owner.Key()] {
+				queue = append(queue, t)
 			}
 		}
 	}
-	r.enqueue(keys...)
-	if err := r.o.Store.SetCursor(ctx, transitionsCursor, ts[len(ts)-1].ID); err != nil {
-		return 0, fmt.Errorf("upgrade: set transitions cursor: %w", err)
+	r.enqueueTransitions(queue)
+	r.qmu.Lock()
+	r.read = ts[len(ts)-1].ID
+	r.qmu.Unlock()
+	if err := r.saveCursor(ctx); err != nil {
+		return 0, err
 	}
 	return len(ts), nil
+}
+
+// readFrom is the transition ConsumeTransitions reads after: the last one it read, or the stored
+// cursor the first time.
+func (r *Resolver) readFrom(ctx context.Context) (int64, error) {
+	r.qmu.Lock()
+	read, ok := r.read, r.readSet
+	r.qmu.Unlock()
+	if ok {
+		return read, nil
+	}
+	cur, err := r.o.Store.Cursor(ctx, transitionsCursor)
+	if err != nil {
+		return 0, fmt.Errorf("upgrade: transitions cursor: %w", err)
+	}
+	r.cmu.Lock()
+	r.saved = cur
+	r.cmu.Unlock()
+	r.qmu.Lock()
+	r.read, r.readSet = cur, true
+	r.qmu.Unlock()
+	return cur, nil
+}
+
+// saveCursor stores the transitions cursor: just below the oldest transition whose owner is queued
+// or being resolved (from), else the last transition read. It writes only when that moved, and
+// nothing before the first ConsumeTransitions.
+func (r *Resolver) saveCursor(ctx context.Context) error {
+	r.cmu.Lock()
+	defer r.cmu.Unlock()
+	r.qmu.Lock()
+	if !r.readSet {
+		r.qmu.Unlock()
+		return nil
+	}
+	to := r.read
+	for _, id := range r.from {
+		to = min(to, id-1)
+	}
+	r.qmu.Unlock()
+	if to == r.saved {
+		return nil
+	}
+	if err := r.o.Store.SetCursor(ctx, transitionsCursor, to); err != nil {
+		return fmt.Errorf("upgrade: set transitions cursor: %w", err)
+	}
+	r.saved = to
+	return nil
+}
+
+// release records that key was resolved: its transitions no longer hold the cursor back.
+func (r *Resolver) release(ctx context.Context, key string) {
+	r.qmu.Lock()
+	_, held := r.from[key]
+	delete(r.from, key)
+	r.qmu.Unlock()
+	if !held {
+		return
+	}
+	if err := r.saveCursor(ctx); err != nil && ctx.Err() == nil {
+		r.o.Log.Error(err, "recording the upgrade transitions read failed")
+	}
 }
 
 // qualifies reports whether t may make its owner newly qualify for a suggestion.
@@ -374,6 +463,35 @@ func (r *Resolver) Pending() []string {
 // enqueue queues the keys not already queued and wakes the worker.
 func (r *Resolver) enqueue(keys ...string) {
 	r.qmu.Lock()
+	added := r.add(keys)
+	r.qmu.Unlock()
+	if added {
+		r.signal()
+	}
+}
+
+// enqueueTransitions queues the owners of ts, oldest transition first, and records for each owner
+// the first transition that queued it (from).
+func (r *Resolver) enqueueTransitions(ts []model.Transition) {
+	slices.SortStableFunc(ts, func(a, b model.Transition) int { return cmp.Compare(a.ID, b.ID) })
+	keys := make([]string, 0, len(ts))
+	r.qmu.Lock()
+	for _, t := range ts {
+		k := t.Owner.Key()
+		if _, ok := r.from[k]; !ok {
+			r.from[k] = t.ID
+		}
+		keys = append(keys, k)
+	}
+	added := r.add(keys)
+	r.qmu.Unlock()
+	if added {
+		r.signal()
+	}
+}
+
+// add queues the keys not already queued, under qmu, and reports whether any was.
+func (r *Resolver) add(keys []string) bool {
 	added := false
 	for _, k := range keys {
 		if !r.queued[k] {
@@ -382,10 +500,7 @@ func (r *Resolver) enqueue(keys ...string) {
 			added = true
 		}
 	}
-	r.qmu.Unlock()
-	if added {
-		r.signal()
-	}
+	return added
 }
 
 func (r *Resolver) signal() {
@@ -395,7 +510,8 @@ func (r *Resolver) signal() {
 	}
 }
 
-// pop removes the oldest queued key; more reports whether others remain.
+// pop removes the oldest queued key; more reports whether others remain. The key stays in from until
+// it is released.
 func (r *Resolver) pop() (key string, ok, more bool) {
 	r.qmu.Lock()
 	defer r.qmu.Unlock()
@@ -407,7 +523,7 @@ func (r *Resolver) pop() (key string, ok, more bool) {
 	return key, true, len(r.queue) > 0
 }
 
-// dequeue removes key from the queue, if queued.
+// dequeue removes key from the queue, if queued. The key stays in from until it is released.
 func (r *Resolver) dequeue(key string) {
 	r.qmu.Lock()
 	defer r.qmu.Unlock()

@@ -52,7 +52,7 @@ function StatusLine({ d }: { d: S<'ImageDetail'> }) {
   return (
     <p>
       <CoverageMark title={d.statusReason || undefined}>
-        {facetValueLabel('status', d.status, 0)}
+        {facetValueLabel('status', d.status)}
         {d.statusReason ? `: ${d.statusReason}` : ''}
       </CoverageMark>
     </p>

@@ -20,7 +20,7 @@ func TestFixActionOf_ShapesEachKind(t *testing.T) {
 
 	upgrade := model.Finding{Fix: rebuild, Suggestion: &model.Suggestion{Repo: "docker.io/library/nginx", FromTag: "1.30.6", ToTag: "1.30.7",
 		Tier: model.TierPatch, Introduces: map[model.Priority]int{model.PriorityHigh: 1}}}
-	require.Equal(t, apigen.FixAction{Kind: apigen.FixKindUpgrade, Key: "upgrade:docker.io/library/nginx:1.30.7", Label: "1.30.6 → 1.30.7",
+	require.Equal(t, apigen.FixAction{Kind: apigen.FixKindUpgrade, Key: "upgrade:docker.io/library/nginx:1.30.7", Label: "nginx:1.30.7",
 		Repo: str("docker.io/library/nginx"), FromTag: str("1.30.6"), ToTag: str("1.30.7"), Tier: str("patch"),
 		Introduces: &apigen.PriorityCounts{Urgent: 0, High: 1, Medium: 0, Low: 0}}, fixActionOf(upgrade))
 

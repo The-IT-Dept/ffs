@@ -469,10 +469,18 @@ func TestResolver_UpgradeAppliedStillAffected(t *testing.T) {
 
 	rg.r.OwnersRecomputed(rctx, []string{webKey})
 	require.Equal(t, []string{webKey}, rg.r.Pending())
+	require.NoError(t, rg.st.SetCursor(rctx, dailyCursor, rnow.Unix()))
+	restarted := NewResolver(rg.r.o) // a restart loses the in-memory queue
+	restarted.startup(rctx)
+	require.Equal(t, []string{webKey}, restarted.Pending(), "an owner that runs a scored candidate is queued again")
+
 	rg.resolve()
 	sg := rg.suggestion().Suggestion
 	require.Equal(t, "1.30.7", sg.FromTag)
 	require.Contains(t, sg.Notes, "upgrade applied, still affected: "+advA)
+	toResolve, err := rg.st.OwnersToResolve(rctx)
+	require.NoError(t, err)
+	require.NotContains(t, toResolve, webKey, "the resolution keeps no candidate the owner runs")
 }
 
 func TestResolver_AppliedNoteLastsUntilFixed(t *testing.T) {
@@ -638,11 +646,61 @@ func TestResolver_ConsumeTransitions(t *testing.T) {
 	require.NoError(t, err)
 	cur, err := rg.st.Cursor(rctx, "upgrade")
 	require.NoError(t, err)
-	require.Equal(t, all[len(all)-1].ID, cur)
+	require.Equal(t, all[0].ID-1, cur, "the stored cursor stays below the first transition whose owner is queued")
 
 	n, err = rg.r.ConsumeTransitions(rctx)
 	require.NoError(t, err)
-	require.Zero(t, n)
+	require.Zero(t, n, "reading goes on from the last transition read")
+
+	rg.r.resolveNext(rctx)
+	cur, err = rg.st.Cursor(rctx, "upgrade")
+	require.NoError(t, err)
+	require.Equal(t, all[4].ID-1, cur, "then below the transition that queued the owner still queued")
+	rg.r.resolveNext(rctx)
+	cur, err = rg.st.Cursor(rctx, "upgrade")
+	require.NoError(t, err)
+	require.Equal(t, all[len(all)-1].ID, cur, "and at the last transition read once every owner is resolved")
+}
+
+// TestResolver_RestartKeepsQueuedOwners (W8): an owner that holds a suggestion and was queued by a
+// transition is queued again after a restart, until it is resolved.
+func TestResolver_RestartKeepsQueuedOwners(t *testing.T) {
+	rg := newRig(t)
+	rg.resolve() // webKey holds a suggestion on nginx
+	require.NoError(t, rg.st.SetCursor(rctx, dailyCursor, rnow.Unix()))
+	_, err := rg.r.ConsumeTransitions(rctx) // its UpgradeAvailable transitions queue nothing
+	require.NoError(t, err)
+	require.Empty(t, rg.r.Pending())
+
+	const advC = "CVE-2026-1003"
+	c := rg.finding(advC, high, curAMD64)
+	created := model.Transition{Fingerprint: c.Fingerprint, Owner: webRef, AdvisoryID: advC, ToState: model.StateOpen,
+		ToPriority: high, Trigger: model.TriggerNewAdvisory, At: rnow}
+	require.NoError(t, rg.st.ApplyFindings(rctx, []model.Finding{c}, []model.Transition{created}))
+	_, err = rg.r.ConsumeTransitions(rctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{webKey}, rg.r.Pending())
+	toResolve, err := rg.st.OwnersToResolve(rctx)
+	require.NoError(t, err)
+	require.Empty(t, toResolve, "nothing else marks the owner: its suggestion is current and covers the repository")
+
+	restarted := NewResolver(rg.r.o) // a restart loses the in-memory queue
+	restarted.startup(rctx)
+	require.Equal(t, []string{webKey}, restarted.Pending(), "the restart reads the transition again and queues the owner")
+
+	cancelled, cancel := context.WithCancel(rctx)
+	cancel()
+	restarted.resolveNext(cancelled) // shutdown interrupts the resolution
+	require.Empty(t, restarted.Pending())
+	again := NewResolver(rg.r.o)
+	again.startup(rctx)
+	require.Equal(t, []string{webKey}, again.Pending(), "an interrupted resolution is not taken as done")
+
+	again.resolveNext(rctx)
+	require.Empty(t, again.Pending())
+	last := NewResolver(rg.r.o)
+	last.startup(rctx)
+	require.Empty(t, last.Pending(), "a resolved owner is not queued again")
 }
 
 func TestResolver_NoRefireWhenUnchanged(t *testing.T) {

@@ -361,4 +361,20 @@ func TestStore_OwnersToResolve(t *testing.T) {
 	got, err = s.OwnersToResolve(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []string{web.Key()}, got)
+
+	// api's suggestion scored sha256:cand; api rolls it out
+	cands := []CandidateDigest{{Tag: "1.1", Tier: model.TierPatch, Platform: "linux/amd64", Digest: "sha256:cand"}}
+	require.NoError(t, s.PutSuggestion(ctx, api.Key(), sg("ghcr.io/a"), cands))
+	runs := func(digest string) {
+		require.NoError(t, s.UpsertOwner(ctx, model.Owner{Ref: api, Containers: []model.ContainerUse{{Name: "app",
+			Kind: model.ContainerRegular, ImageRef: "ghcr.io/a:1.0", Repo: "ghcr.io/a", Digest: digest}}}))
+	}
+	runs("sha256:old")
+	got, err = s.OwnersToResolve(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{web.Key()}, got)
+	runs("sha256:cand")
+	got, err = s.OwnersToResolve(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{api.Key(), web.Key()}, got, "an owner that runs a candidate its suggestion scored")
 }

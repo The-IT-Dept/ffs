@@ -554,3 +554,39 @@ func TestDigestsSeenInto_CataloguedAndMatched(t *testing.T) {
 	require.NoError(t, err)
 	require.Empty(t, none)
 }
+
+// TestNodeGroupStats_MatchesScopeStats (W44): the batched per-group counts are each group's
+// ScopeStats, in one query; a group with no findings has no entry.
+func TestNodeGroupStats_MatchesScopeStats(t *testing.T) {
+	s := newStore(t)
+	nodes := model.NodesOwner("test")
+	finding := func(id string, p model.Priority, state model.FindingState, groups ...string) model.Finding {
+		var digests []string
+		for _, g := range groups {
+			digests = append(digests, model.NodeGroupDigestPrefix+g)
+		}
+		return model.Finding{Fingerprint: model.FindingFingerprint("test", nodes, model.HostRepo, id), Owner: nodes,
+			ImageRepo: model.HostRepo, AdvisoryID: id, Digests: digests, Priority: p, State: state, FixAvailable: p >= model.PriorityHigh}
+	}
+	require.NoError(t, s.ApplyFindings(ctx, []model.Finding{
+		finding("CVE-2026-0001", model.PriorityUrgent, model.StateOpen, "g1", "g2"),
+		finding("CVE-2026-0002", model.PriorityHigh, model.StateOpen, "g1"),
+		finding("CVE-2026-0003", model.PriorityMedium, model.StateExcepted, "g2"),
+		finding("CVE-2026-0004", model.PriorityLow, model.StateResolved, "g1"),
+	}, nil))
+
+	got, err := s.NodeGroupStats(ctx, []string{"g1", "g2", "g3"})
+	require.NoError(t, err)
+	require.Len(t, got, 2, "g3 has no findings")
+	for _, id := range []string{"g1", "g2", "g3"} {
+		want, err := s.ScopeStats(ctx, model.Scope{Kind: model.ScopeNodeGroup, Value: id})
+		require.NoError(t, err)
+		require.Equal(t, want, got[id], id)
+	}
+	require.Equal(t, 2, got["g1"].Open)
+	require.Equal(t, 1, got["g2"].Excepted)
+
+	empty, err := s.NodeGroupStats(ctx, nil)
+	require.NoError(t, err)
+	require.Empty(t, empty)
+}

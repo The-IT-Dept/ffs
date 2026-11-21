@@ -152,12 +152,14 @@ export const copy = {
       malicious: 'malicious',
       provisional: 'provisional',
       not_running: 'not running',
+      // The EPSS bump keeps a finding raised until its score falls below 90% of priority.epssBump, so a
+      // threshold ("EPSS ≥ 10%") would contradict a score shown just under it.
+      epss: 'EPSS bump',
     },
     priority: { urgent: 'urgent', high: 'high', medium: 'medium', low: 'low', none: 'no open findings' },
     coverage: { full: 'full detail', partial: 'partial detail', none: 'not seen into' },
     status: { pending: 'pending', catalogued: 'catalogued', unresolvable: 'unresolvable', catalogFailed: 'cataloguing failed' },
   } as Record<string, Record<string, string> | undefined>,
-  epss: (bump: number) => `EPSS ≥ ${formatPercent(bump)}`,
   clusterLevel: 'cluster-level',
   noValue: '—',
   coverageLink: 'Coverage',
@@ -218,7 +220,8 @@ export const copy = {
     },
     node_agent_unsupported: {
       gap: 'not scheduled by the node agent',
-      todo: 'Its architecture or node selector excludes this node from the node agent.',
+      todo:
+        'Its architecture, the node selector or a taint the agent does not tolerate excludes this node from the node agent. To cover it, add it to nodeAgent.architectures, nodeAgent.nodeSelector or nodeAgent.tolerations.',
     },
     feed_stale: { gap: 'feed out of date', todo: 'Check that ffs can reach the {feed} feed; the last error is shown.' },
   } satisfies Record<GapCode, { gap: string; todo: string }>,
@@ -399,7 +402,7 @@ export const copy = {
     none: 'No upgrade candidates.',
     cols: {
       image: 'Image',
-      change: 'Change',
+      change: 'Upgrade to',
       tier: 'Tier',
       fixes: 'Fixes',
       remaining: 'Remaining',
@@ -556,8 +559,7 @@ const singular: Record<CountNoun, string> = {
 }
 
 // facetValueLabel is how a facet value reads in a facet list or a chip.
-export function facetValueLabel(facet: string, value: string, epssBump: number): string {
-  if (facet === 'signal' && value === 'epss') return copy.epss(epssBump)
+export function facetValueLabel(facet: string, value: string): string {
   // A cluster-level owner kind (store ClusterLevelKindPrefix) reads by what it holds, before the
   // server's facet label arrives.
   if (facet === 'kind' && value.startsWith('cluster-level:')) {

@@ -1,6 +1,9 @@
 package model
 
-import "slices"
+import (
+	"slices"
+	"strings"
+)
 
 // Signal is a value of the signals facet: a priority input, or a mark, a finding carries.
 type Signal string
@@ -13,7 +16,7 @@ const (
 	SignalMalicious   Signal = "malicious"
 	SignalProvisional Signal = "provisional"
 	SignalNotRunning  Signal = "not_running"
-	SignalEPSS        Signal = "epss" // EPSS at or above the configured bump
+	SignalEPSS        Signal = "epss" // the EPSS bump: EPSS reached priority.epssBump and has not fallen below its leave edge
 )
 
 // Signals lists every signal in bit order: a signal's bit in the read model's signals column is
@@ -121,13 +124,39 @@ type FixAction struct {
 	Package, Ecosystem, From, To string  // package
 }
 
-// UpgradeAction is the action of moving the image to the suggested tag.
+// UpgradeAction is the action of moving the image to the suggested tag. Its label is the
+// suggestion's UpgradeTarget, which names the tag alone, so a digest-only reference (no FromTag)
+// reads as well as a tagged one.
 func UpgradeAction(sg Suggestion) FixAction {
-	label := sg.FromTag + " → " + sg.ToTag
-	if sg.Tier == TierRefresh {
-		label = "Image refresh (" + sg.ToTag + ")"
+	return FixAction{Kind: FixKindUpgrade, Key: "upgrade:" + sg.Repo + ":" + sg.ToTag, Label: UpgradeTarget(sg)}
+}
+
+// syntheticRepos are the cluster-level subjects, whose versions read "kubernetes v1.35.10".
+var syntheticRepos = map[string]bool{"kubernetes": true, "containerd": true, "cri-o": true}
+
+// UpgradeTargetRef is the image a suggestion moves to, as a user would write it: "nginx:1.30.7",
+// "ghcr.io/org/app:2.1.0", or "kubernetes v1.35.10" for a cluster-level subject. Docker Hub's
+// docker.io/ and library/ prefixes are left out. It is empty for a suggestion with tier none.
+func UpgradeTargetRef(sg Suggestion) string {
+	if sg.Tier == TierNone {
+		return ""
 	}
-	return FixAction{Kind: FixKindUpgrade, Key: "upgrade:" + sg.Repo + ":" + sg.ToTag, Label: label}
+	if syntheticRepos[sg.Repo] {
+		return sg.Repo + " " + sg.ToTag
+	}
+	repo := strings.TrimPrefix(sg.Repo, "docker.io/library/")
+	repo = strings.TrimPrefix(repo, "docker.io/")
+	return repo + ":" + sg.ToTag
+}
+
+// UpgradeTarget is UpgradeTargetRef, with " (new digest)" for a refresh of the tag the owner runs:
+// "ghcr.io/org/app:2.1.0 (new digest)".
+func UpgradeTarget(sg Suggestion) string {
+	t := UpgradeTargetRef(sg)
+	if t != "" && sg.Tier == TierRefresh {
+		t += " (new digest)"
+	}
+	return t
 }
 
 // EffectiveFix is the action that clears the finding, in the precedence of the read model's fix_key

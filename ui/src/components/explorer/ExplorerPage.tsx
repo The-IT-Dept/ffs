@@ -2,7 +2,7 @@ import { useQuery } from '@tanstack/react-query'
 import { useNavigate } from '@tanstack/react-router'
 import { SlidersHorizontal } from 'lucide-react'
 import { type ReactNode, useEffect, useMemo, useRef } from 'react'
-import { ApiProblem, apiQuery } from '@/api/client'
+import { ApiProblem } from '@/api/client'
 import type { S } from '@/api/types'
 import { EmptyState } from '@/components/layout/EmptyState'
 import { goneState } from '@/components/layout/GoneNotice'
@@ -114,8 +114,6 @@ export function ExplorerPage<K extends ExplorerKind>({
   // in a shared URL never reaches the server and is dropped from the URL on the next change.
   const search = useMemo(() => revalidate(explorerSearchFor(kind), routeSearch), [kind, routeSearch])
   const q = useQuery({ ...explorerQuery(kind, search), placeholderData: keepWhileGroup(search.group) })
-  const settings = useQuery(apiQuery('/settings', {}))
-  const epssBump = settings.data?.priority.epssBump ?? 0.1
   const scope = scopeOf(search)
   // The rail's own query, so the coverage beside the count costs no request.
   const card = useQuery(railQuery(scope))
@@ -136,7 +134,7 @@ export function ExplorerPage<K extends ExplorerKind>({
     if (gone) void navigate({ to: gone === 'nodegroup' || gone === 'node' ? '/nodes' : '/workloads', replace: true, state: goneState(gone) })
   }, [gone, navigate])
 
-  const chips = chipsOf(search, epssBump, q.data?.facets)
+  const chips = chipsOf(search, q.data?.facets)
   const data = q.data
   const grouped = kind === 'findings' && search.group !== undefined
   const findingsData = kind === 'findings' ? (data as S<'FindingsPage'> | undefined) : undefined
@@ -187,7 +185,6 @@ export function ExplorerPage<K extends ExplorerKind>({
       kind={kind}
       facets={data?.facets ?? {}}
       search={search}
-      epssBump={epssBump}
       onToggle={(key, value, on) => onSearch(withFacet(search, key, value, on))}
       className={className}
     />

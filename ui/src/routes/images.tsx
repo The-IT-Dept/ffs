@@ -36,9 +36,9 @@ const columns: Column<Row>[] = [
     header: copy.col.status,
     cell: (r) =>
       r.status === 'catalogued' ? (
-        facetValueLabel('status', r.status, 0)
+        facetValueLabel('status', r.status)
       ) : (
-        <CoverageMark title={r.statusReason || undefined}>{facetValueLabel('status', r.status, 0)}</CoverageMark>
+        <CoverageMark title={r.statusReason || undefined}>{facetValueLabel('status', r.status)}</CoverageMark>
       ),
   },
   { id: 'source', header: copy.col.source, cell: (r) => r.source || <span className="text-muted-foreground">{copy.noValue}</span> },
@@ -47,9 +47,9 @@ const columns: Column<Row>[] = [
     header: copy.col.coverage,
     cell: (r) =>
       r.coverage === 'full' ? (
-        facetValueLabel('coverage', r.coverage, 0)
+        facetValueLabel('coverage', r.coverage)
       ) : (
-        <CoverageMark title={r.gaps.map((g) => copy.gaps[g].gap).join(' · ') || undefined}>{facetValueLabel('coverage', r.coverage, 0)}</CoverageMark>
+        <CoverageMark title={r.gaps.map((g) => copy.gaps[g].gap).join(' · ') || undefined}>{facetValueLabel('coverage', r.coverage)}</CoverageMark>
       ),
   },
   { id: 'workloads', header: copy.col.workloads, sort: '-workloads', align: 'right', cell: (r) => <Count n={r.workloads} /> },

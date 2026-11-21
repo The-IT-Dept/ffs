@@ -59,17 +59,44 @@ type Writer struct {
 	hasOR      bool
 	hasWG      bool
 
-	reports, policyReports reportCache // used by ReconcileOnce only, which Start runs one at a time
+	// Used by ReconcileOnce only, which Start runs one at a time; they have no lock of their own.
+	reports, policyReports reportCache
+	discoveryFailing       bool // in mode on, the last discovery failed and was logged
 }
 
 // reportCache is the writer's view of the reports it manages of one kind, keyed "namespace/name":
-// a full LIST at most every listEvery, kept current by the writer's own writes. A write that fails
-// on a stale view (a create that finds the report, an update that finds it changed or gone) drops
-// the view, so the next reconcile lists. A report someone else deletes comes back after the next
-// list.
+// a full LIST at most every listEvery, kept current by the writer's own writes. It holds a stub of
+// each report (stub), not the report. A write that fails on a stale view (a create that finds the
+// report, an update that finds it changed or gone) drops the view, so the next reconcile lists. A
+// report someone else deletes comes back after the next list.
 type reportCache struct {
 	listedAt time.Time
 	objs     map[string]client.Object
+}
+
+// stub is what a reportCache keeps of a report: an object of the same kind with only its namespace,
+// name, resourceVersion and content hash, which is all sync compares, updates against and deletes
+// by. The results stay out of memory between reconciles. An object of another type is kept whole.
+func stub(o client.Object) client.Object {
+	var out client.Object
+	switch o := o.(type) {
+	case *orv1alpha1.Report:
+		out = &orv1alpha1.Report{}
+	case *unstructured.Unstructured:
+		u := &unstructured.Unstructured{}
+		u.SetAPIVersion(o.GetAPIVersion())
+		u.SetKind(o.GetKind())
+		out = u
+	default:
+		return o
+	}
+	out.SetNamespace(o.GetNamespace())
+	out.SetName(o.GetName())
+	out.SetResourceVersion(o.GetResourceVersion())
+	if h, ok := o.GetAnnotations()[AnnotationContentHash]; ok {
+		out.SetAnnotations(map[string]string{AnnotationContentHash: h})
+	}
+	return out
 }
 
 // New returns a Writer. r must be a non-caching reader: an informer on an absent CRD would block.
@@ -151,18 +178,29 @@ func (w *Writer) served(ctx context.Context, gv, kind string) (bool, error) {
 
 // ReconcileOnce brings the Reports (and PolicyReports) in line with the open findings. A discovery
 // failure is returned in mode auto; in mode on it is logged, Reports are written anyway, the
-// PolicyReport mirror waits, and discovery is tried again on the next reconcile.
+// PolicyReport mirror waits, and discovery is tried again on the next reconcile. The first failure
+// of a run of them is logged as an error, the rest at V(1). It must not run concurrently with
+// itself: Start is its only caller in ffs.
 func (w *Writer) ReconcileOnce(ctx context.Context) error {
 	if w.cfg.Mode == "off" {
 		return nil
 	}
 	hasOR, hasWG, err := w.detect(ctx)
-	if err != nil {
-		if w.cfg.Mode != "on" {
-			return err
+	switch {
+	case err != nil && w.cfg.Mode != "on":
+		return err
+	case err != nil:
+		log := logr.FromContextOrDiscard(ctx)
+		const msg = "discovering the report kinds failed; writing Reports (openReports.mode on) and trying again next time"
+		if w.discoveryFailing {
+			log.V(1).Info(msg, "error", err.Error())
+		} else {
+			log.Error(err, msg)
 		}
-		logr.FromContextOrDiscard(ctx).Error(err, "discovering the report kinds failed; writing Reports (openReports.mode on) and trying again next time")
+		w.discoveryFailing = true
 		hasOR, hasWG = false, false
+	default:
+		w.discoveryFailing = false
 	}
 	writeOR := hasOR || w.cfg.Mode == "on"
 	if !writeOR && !hasWG {
@@ -282,7 +320,7 @@ func (w *Writer) sync(ctx context.Context, rc *reportCache, want map[string]clie
 		}
 		rc.objs = make(map[string]client.Object, len(have))
 		for _, o := range have {
-			rc.objs[o.GetNamespace()+"/"+o.GetName()] = o
+			rc.objs[o.GetNamespace()+"/"+o.GetName()] = stub(o)
 		}
 		rc.listedAt = w.now()
 	}
@@ -307,14 +345,14 @@ func (w *Writer) sync(ctx context.Context, rc *reportCache, want map[string]clie
 				fail("create", k, err)
 				continue
 			}
-			rc.objs[k] = obj
+			rc.objs[k] = stub(obj)
 		case cur.GetAnnotations()[AnnotationContentHash] != obj.GetAnnotations()[AnnotationContentHash]:
 			obj.SetResourceVersion(cur.GetResourceVersion())
 			if err := w.c.Update(ctx, obj); err != nil {
 				fail("update", k, err)
 				continue
 			}
-			rc.objs[k] = obj
+			rc.objs[k] = stub(obj)
 		}
 	}
 	for _, k := range slices.Sorted(maps.Keys(rc.objs)) {

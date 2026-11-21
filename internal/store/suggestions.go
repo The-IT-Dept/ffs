@@ -213,11 +213,15 @@ func (s *Store) OwnersWithSuggestions(ctx context.Context, keys []string) (map[s
 }
 
 // OwnersToResolve returns, sorted, the owners whose upgrade suggestions a restart may have left out
-// of date: those with a stale suggestion, and those with an open finding at or above medium on an
-// image repository that has no stored suggestion. A workload's finding needs a fix; a Cluster or
-// ContainerRuntime owner's does not, as its advice does not. The Nodes owner is never advised.
+// of date: those with a stale suggestion, those that run a candidate their suggestion scored (a
+// rollout onto it, which a resolution leaves no candidate of), and those with an open finding at or
+// above medium on an image repository that has no stored suggestion. A workload's finding needs a
+// fix; a Cluster or ContainerRuntime owner's does not, as its advice does not. The Nodes owner is
+// never advised. Owners that transitions queued are the resolver's to queue again (its cursor).
 func (s *Store) OwnersToResolve(ctx context.Context) ([]string, error) {
 	got, err := queryAll(ctx, s.rdb, scanString, `SELECT owner_key FROM suggestions WHERE stale = 1
+		UNION
+		SELECT c.owner_key FROM candidates c JOIN owner_images oi ON oi.owner_key = c.owner_key AND oi.digest = c.digest
 		UNION
 		SELECT f.owner_key FROM findings f WHERE f.state = ? AND f.priority >= ?
 			AND (f.fix_available = 1 OR (f.namespace = '' AND f.owner_kind IN (?, ?)))

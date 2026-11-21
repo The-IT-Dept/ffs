@@ -202,12 +202,12 @@ const CHIP_STRING_KEYS: readonly StringKey[] = ['advisory', 'package', 'repo', '
 // chipsOf lists the removable filters of a search: the scope, then every array value, then the
 // single-value filters. Grouping, sorting and paging are not filters. A value reads by the label
 // the server gives it in facets, when it gives one.
-export function chipsOf(s: ExplorerSearch, epssBump = 0.1, facets?: S<'Facets'>): Chip[] {
+export function chipsOf(s: ExplorerSearch, facets?: S<'Facets'>): Chip[] {
   const chips: Chip[] = []
   if (s.scope && s.scope !== 'cluster') chips.push({ key: 'scope', value: s.scope, label: `${copy.facetTitle.scope}: ${s.scope}` })
   for (const k of ARRAY_KEYS) {
     for (const v of s[k] ?? []) {
-      const label = facets?.[k]?.find((f) => f.value === v)?.label || facetValueLabel(k, v, epssBump)
+      const label = facets?.[k]?.find((f) => f.value === v)?.label || facetValueLabel(k, v)
       chips.push({ key: k, value: v, label: `${copy.facetTitle[k]}: ${label}` })
     }
   }

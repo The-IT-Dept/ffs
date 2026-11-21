@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/the-it-dept/ffs/internal/model"
-	"github.com/the-it-dept/ffs/internal/upgrade"
 )
 
 // Event reasons, in the order they are emitted for one owner.
@@ -89,12 +88,11 @@ func buildItem(reason string, t model.Transition, f *model.Finding) item {
 		it.priority = t.FromPriority
 	case ReasonUpgradeAvailable:
 		if f != nil && f.Suggestion != nil {
-			if target := upgrade.Target(*f.Suggestion); target != "" {
-				// "nginx:1.30.6 (new digest)" reads "nginx:1.30.6, new digest" inside the item's parentheses
-				if t, ok := strings.CutSuffix(target, ")"); ok {
-					if head, rest, found := strings.Cut(t, " ("); found {
-						target = head + ", " + rest
-					}
+			if target := model.UpgradeTargetRef(*f.Suggestion); target != "" {
+				// upgrade.Target's "nginx:1.30.6 (new digest)" reads "nginx:1.30.6, new digest" inside
+				// the item's parentheses
+				if f.Suggestion.Tier == model.TierRefresh {
+					target += ", new digest"
 				}
 				it.text = fmt.Sprintf("%s (upgrade to %s)", t.AdvisoryID, target)
 			}

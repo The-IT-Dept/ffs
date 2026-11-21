@@ -254,15 +254,6 @@ func (gs *groupSet) of(node string) (model.NodeGroup, bool) {
 	return gs.groups[i], true
 }
 
-// nodeGroups are the node groups the API shows (readNodeGroups), read once per request.
-func (s *Server) nodeGroups(ctx context.Context) ([]model.NodeGroup, error) {
-	gs, err := s.groupSet(ctx)
-	if err != nil {
-		return nil, err
-	}
-	return gs.groups, nil
-}
-
 // groupOf is the group a node belongs to (groupSet.of).
 func (s *Server) groupOf(ctx context.Context, node string) (model.NodeGroup, bool, error) {
 	gs, err := s.groupSet(ctx)
@@ -295,6 +286,18 @@ func (s *Server) groupStats(ctx context.Context, g model.NodeGroup) (store.Owner
 		return store.OwnerStats{}, nil
 	}
 	return s.o.Store.ScopeStats(ctx, model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID})
+}
+
+// groupStatsOf is groupStats of every group of groups, by group ID, read in one query: a nodeinfo
+// group, and a group with no findings, are absent and read as the zero OwnerStats.
+func (s *Server) groupStatsOf(ctx context.Context, groups []model.NodeGroup) (map[string]store.OwnerStats, error) {
+	var ids []string
+	for _, g := range groups {
+		if g.Kind == model.NodeGroupAgent {
+			ids = append(ids, g.ID)
+		}
+	}
+	return s.o.Store.NodeGroupStats(ctx, ids)
 }
 
 // hostGapCodes are the node gaps after which ffs does not see a node's host packages in full: its
@@ -366,12 +369,13 @@ func (s *Server) ListNodeGroups(ctx context.Context, _ apigen.ListNodeGroupsRequ
 			base[g.Arch] = g
 		}
 	}
+	stats, err := s.groupStatsOf(ctx, gs.groups)
+	if err != nil {
+		return nil, err
+	}
 	rows := make([]apigen.NodeGroupRow, 0, len(gs.groups))
 	for _, g := range gs.groups {
-		st, err := s.groupStats(ctx, g)
-		if err != nil {
-			return nil, err
-		}
+		st := stats[g.ID]
 		gaps := memberGaps(g, agents)
 		row := apigen.NodeGroupRow{
 			Id: gs.key(g), Kind: apigen.NodeGroupKind(g.Kind), Name: g.Name, Label: g.Label, OsImage: g.OSImage,

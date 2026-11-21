@@ -122,11 +122,11 @@ func TestRecommend_FirstRuleNeedsAMediumFixOrNoHarm(t *testing.T) {
 	// no urgent or high findings: clearing them is vacuous for every candidate
 	lowFixAddsMediums := Scored{Tag: "refresh", Tier: model.TierRefresh, Fixes: byPriority{low: 1},
 		Introduces: byPriority{medium: 2}, FixedIDs: []string{"L"}, ClearsUrgentHigh: true}
-	fixesMedium := Scored{Tag: "patch", Tier: model.TierPatch, Fixes: byPriority{medium: 1},
-		Introduces: byPriority{medium: 2}, FixedIDs: []string{"M"}, ClearsUrgentHigh: true}
+	fixesMedium := Scored{Tag: "patch", Tier: model.TierPatch, Fixes: byPriority{medium: 2},
+		Introduces: byPriority{medium: 1}, FixedIDs: []string{"M", "N"}, ClearsUrgentHigh: true}
 	rec, _ := Recommend([]Scored{lowFixAddsMediums, fixesMedium})
 	require.NotNil(t, rec)
-	require.Equal(t, model.TierPatch, rec.Tier, "a candidate that fixes a medium wins on the first rule")
+	require.Equal(t, model.TierPatch, rec.Tier, "a net medium improvement wins on the first rule")
 
 	noHarm := Scored{Tag: "minor", Tier: model.TierMinor, Fixes: byPriority{low: 2}, Introduces: byPriority{low: 1},
 		FixedIDs: []string{"L", "K"}, ClearsUrgentHigh: true}
@@ -136,6 +136,38 @@ func TestRecommend_FirstRuleNeedsAMediumFixOrNoHarm(t *testing.T) {
 
 	rec, _ = Recommend([]Scored{lowFixAddsMediums})
 	require.Nil(t, rec, "fixing one low while introducing two mediums is no recommendation")
+}
+
+// TestRecommend_FirstRuleNeedsANetMediumImprovement (W35): fixing one medium while introducing more
+// does not pass the first rule, so a further tier that fixes the same medium cleanly wins.
+func TestRecommend_FirstRuleNeedsANetMediumImprovement(t *testing.T) {
+	tradesMediums := Scored{Tag: "patch", Tier: model.TierPatch, Fixes: byPriority{medium: 1},
+		Introduces: byPriority{medium: 3}, FixedIDs: []string{"M"}, ClearsUrgentHigh: true}
+	clean := Scored{Tag: "minor", Tier: model.TierMinor, Fixes: byPriority{medium: 1}, FixedIDs: []string{"M"},
+		ClearsUrgentHigh: true}
+	rec, _ := Recommend([]Scored{tradesMediums, clean})
+	require.NotNil(t, rec)
+	require.Equal(t, model.TierMinor, rec.Tier)
+
+	rec, _ = Recommend([]Scored{tradesMediums})
+	require.Nil(t, rec, "alone, fixing one medium for three new ones is no recommendation")
+
+	// with a fixable high H: fixing it for one new medium is no net improvement at medium or above,
+	// so a further tier that fixes H cleanly wins; fixing a medium as well makes it one
+	highForMedium := Scored{Tag: "patch", Tier: model.TierPatch, Fixes: byPriority{high: 1}, Introduces: byPriority{medium: 1},
+		FixedIDs: []string{"H"}, ClearsUrgentHigh: true}
+	cleanHigh := Scored{Tag: "minor", Tier: model.TierMinor, Fixes: byPriority{high: 1}, FixedIDs: []string{"H"}, ClearsUrgentHigh: true}
+	rec, _ = Recommend([]Scored{highForMedium, cleanHigh})
+	require.NotNil(t, rec)
+	require.Equal(t, model.TierMinor, rec.Tier)
+	highAndMedium := highForMedium
+	highAndMedium.Fixes, highAndMedium.FixedIDs = byPriority{high: 1, medium: 1}, []string{"H", "M"}
+	rec, _ = Recommend([]Scored{highAndMedium, cleanHigh})
+	require.NotNil(t, rec)
+	require.Equal(t, model.TierPatch, rec.Tier, "two fixed for one introduced: the nearer tier wins on the first rule")
+	rec, _ = Recommend([]Scored{highForMedium})
+	require.NotNil(t, rec, "alone, it is still the best net change")
+	require.Equal(t, model.TierPatch, rec.Tier)
 }
 
 func TestNetChange(t *testing.T) {
