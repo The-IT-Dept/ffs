@@ -62,8 +62,9 @@ type Update struct {
 	Path    string // DB directory holding vulnerability.db
 	Built   time.Time
 	Changed []PackageKey // packages whose records changed since the previous build; empty when Full
-	// Full re-matches everything: on the first install, when the last full re-match is over 7 days
-	// old, and when fewer SBOMs are catalogued than Options.DiffMinImages.
+	// Full re-matches every live digest with grype: on the first install, when the last full re-match
+	// is over 7 days old, and when fewer SBOMs are catalogued than Options.DiffMinImages. (The engine
+	// also runs every matcher, once, when its matchers version changes.)
 	Full bool
 }
 

@@ -143,7 +143,7 @@ func TestRekeyFindings(t *testing.T) {
 
 // TestRekeyFindings_LedgerFollowsTheLiveFinding (W1): an alias merge merges a target's ledger rows
 // for the two fingerprints. The higher max_priority is kept, so a re-key never lowers what a target
-// was told; the state and time come from the row of the finding that stays live, whichever row was
+// was told; the state and time come from the row of the finding that continues, whichever row was
 // updated last: the moved row when no finding, or a resolved one, holds the new fingerprint (the
 // next recompute reopens it from the moved matches), else the row already there.
 func TestRekeyFindings_LedgerFollowsTheLiveFinding(t *testing.T) {

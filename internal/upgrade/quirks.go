@@ -107,7 +107,7 @@ func newRuleSet(rules []rule) (*ruleSet, error) {
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", r.Repo, err)
 		}
-		if strings.ContainsAny(r.Repo, globChars) {
+		if strings.ContainsAny(r.Repo, config.GlobChars) {
 			s.globs = append(s.globs, c)
 		} else {
 			s.exact[r.Repo] = c
@@ -116,9 +116,6 @@ func newRuleSet(rules []rule) (*ruleSet, error) {
 	slices.SortFunc(s.globs, func(a, b *compiledRule) int { return moreSpecific(a.Repo, b.Repo) })
 	return s, nil
 }
-
-// globChars are the characters that make a repository key a path.Match glob.
-const globChars = "*?[\\"
 
 // moreSpecific orders repository globs most specific first: the longer literal prefix (the text
 // before the first glob character), then the longer glob, then alphabetically. So for
@@ -129,7 +126,7 @@ func moreSpecific(a, b string) int {
 
 // literalPrefix is the length of g before its first glob character.
 func literalPrefix(g string) int {
-	if i := strings.IndexAny(g, globChars); i >= 0 {
+	if i := strings.IndexAny(g, config.GlobChars); i >= 0 {
 		return i
 	}
 	return len(g)

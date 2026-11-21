@@ -12,20 +12,20 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/anchore/grype/grype/db/v6/diff"
 
 	"github.com/the-it-dept/ffs/internal/feeds"
+	"github.com/the-it-dept/ffs/internal/subproc"
 )
 
 // DiffCommand is the hidden ffs subcommand that runs one diff for ExecDiffer:
 // `ffs grypedb-diff --old <dir> --new <dir> --out <file>`.
 const DiffCommand = "grypedb-diff"
 
-// DiffNice is the nice value ExecDiffer runs the controller's diffs at: a diff of two production
-// builds takes minutes of CPU, which matching and the API should not wait behind.
+// DiffNice is how many nice levels below the controller ExecDiffer runs its diffs: a diff of two
+// production builds takes minutes of CPU, which matching and the API should not wait behind.
 const DiffNice = 10
 
 // diffWaitDelay bounds how long a cancelled diff process may take to exit after it is killed.
@@ -99,12 +99,13 @@ func RunDiff(ctx context.Context, oldDir, newDir, out string) error {
 }
 
 // ExecDiffer returns a Differ that runs each diff as `<this executable> grypedb-diff` in its own
-// process group at nice (0 to 19; 0 leaves the priority alone), so the diff neither competes with
-// the controller at full priority nor shares its heap. The process runs in the controller's
-// container, under the same memory limit: it gets its own GOMEMLIMIT, a quarter of the
-// controller's, which the controller gives up while it runs (see shareMemoryLimit). The process
-// writes the keys to a file beside oldDir, which the Differ reads and removes. When ctx ends, the
-// whole process group is killed. A process that fails is an error carrying the end of its output.
+// process group, nice levels below the controller (at most 19; 0 leaves the priority alone; see
+// subproc.Start), so the diff neither competes with the controller at full priority nor shares its
+// heap. The process runs in the controller's container, under the same memory limit: it gets its
+// own GOMEMLIMIT, a quarter of the controller's, which the controller gives up while it runs (see
+// shareMemoryLimit). The process writes the keys to a file beside oldDir, which the Differ reads
+// and removes. When ctx ends, the whole process group is killed. A process that fails is an error
+// carrying the end of its output.
 func ExecDiffer(nice int) Differ {
 	return func(ctx context.Context, oldDir, newDir string) ([]PackageKey, error) {
 		self, err := os.Executable()
@@ -128,24 +129,14 @@ func ExecDiffer(nice int) Differ {
 			cmd.Env = append(cmd.Env, "GOMEMLIMIT="+strconv.FormatInt(limit, 10)) // the last one wins
 		}
 		cmd.Stderr = &stderr
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-		cmd.WaitDelay = diffWaitDelay
-		if err := cmd.Start(); err != nil {
+		if err := subproc.Start(cmd, nice, diffWaitDelay); err != nil {
+			if pe, ok := errors.AsType[*subproc.PriorityError](err); ok {
+				return nil, fmt.Errorf("setting the diff process's priority: %w", pe.Err)
+			}
 			if ctx.Err() != nil { // done before the start: the same error as a diff cut short
 				return nil, context.Cause(ctx)
 			}
 			return nil, fmt.Errorf("starting the diff process: %w", err)
-		}
-		if nice > 0 {
-			// The process group, not the process: nice is per thread on Linux, and the Go runtime of
-			// the process has started threads before this call. PRIO_PGRP sets every thread of the
-			// group, and threads created later inherit it.
-			if err := syscall.Setpriority(syscall.PRIO_PGRP, cmd.Process.Pid, nice); err != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				_ = cmd.Wait()
-				return nil, fmt.Errorf("setting the diff process's priority: %w", err)
-			}
 		}
 		err = cmd.Wait()
 		if ctx.Err() != nil {

@@ -123,14 +123,12 @@ func (c *Collector) Refresh(ctx context.Context) error {
 			return fmt.Errorf("metrics: feed state %s: %w", feed, err)
 		}
 		var last float64
-		// A feed that never succeeded lags from its first attempt, stored across restarts, or from
-		// the collector's start when that is earlier, as the feed runner measures staleness.
-		lag := now.Sub(c.started)
-		if !fstate.FirstAttempt.IsZero() && fstate.FirstAttempt.Before(c.started) {
-			lag = now.Sub(fstate.FirstAttempt)
-		}
+		// Lag is measured as the feed runner measures staleness (store.FeedState.StaleFrom): from the
+		// last success, or, for a feed that never succeeded, from its earliest attempt, stored across
+		// restarts, or the collector's start when that is earlier.
+		lag := now.Sub(fstate.StaleFrom(c.started))
 		if !fstate.LastSuccess.IsZero() {
-			last, lag = float64(fstate.LastSuccess.Unix()), now.Sub(fstate.LastSuccess)
+			last = float64(fstate.LastSuccess.Unix())
 		}
 		snap = append(snap,
 			prometheus.MustNewConstMetric(feedSuccessDesc, prometheus.GaugeValue, last, feed),

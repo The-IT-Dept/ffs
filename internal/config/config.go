@@ -150,13 +150,17 @@ type TagOverride struct {
 	Ignore  []string `yaml:"ignore"`
 }
 
-// DefaultDiffMinImages is the default feeds.grypedb.diffMinImages. Measured on one machine with the
-// 2026-11-18 and 2026-11-20 production builds: the diff took 228 CPU-seconds, and a full re-match as
-// the engine runs it (every matcher, matches stored) 0.4 CPU-seconds per small image, 4 per large
-// image and 5 per Ubuntu node group. The diff selected every one of those SBOMs for re-matching, so
-// the diff path cost the diff plus a full re-match. It pays off only where a diff leaves enough
-// SBOMs untouched to save more than it costs: at 1000 SBOMs, over half of a cluster of small images,
-// or about 5% of one of large images.
+// DefaultDiffMinImages is the default feeds.grypedb.diffMinImages. Below it, a new Grype DB re-matches
+// every live SBOM with grype alone; from it, only the SBOMs the diff selects. Either way the other
+// matchers re-run on every SBOM only once, at the first update after their version changes
+// (engine.matchersVersion), which this setting does not affect. Measured on one machine with the
+// 2026-11-18 and 2026-11-20 production builds: the diff took 228 CPU-seconds, and a full re-match 0.4
+// CPU-seconds per small image, 4 per large image and 5 per Ubuntu node group. That re-match ran every
+// matcher, but with empty OSV and CNA caches, so it was nearly all grype: the figures hold for the
+// grype-only re-match. The diff selected every one of those SBOMs for re-matching, so the diff path
+// cost the diff plus a full re-match. It pays off only where a diff leaves enough SBOMs untouched to
+// save more than it costs: at 1000 SBOMs, over half of a cluster of small images, or about 5% of one
+// of large images.
 const DefaultDiffMinImages = 1000
 
 // Default returns the built-in configuration.

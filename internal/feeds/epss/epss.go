@@ -57,7 +57,8 @@ type Options struct {
 	HTTP    *http.Client // nil = feeds.NewHTTPClient(version.UserAgent())
 	Handler Handler
 	DataDir string // the downloaded scores are cached at DataDir/feeds/epss.csv.gz
-	// Thresholds are the scores whose crossing is reported: {Priority.EPSSBump, Priority.EPSSHigh}.
+	// Thresholds are the scores whose crossing is reported: priority.EPSSEdges, the entry edges and
+	// the leave edges below them.
 	Thresholds []float64
 	Now        func() time.Time // nil = time.Now
 }

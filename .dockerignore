@@ -11,6 +11,7 @@ test
 .cache
 .superpowers
 ui/node_modules
+ui/.bundled-test-*
 ui/test-results
 ui/playwright-report
 ui/e2e/screenshots

@@ -49,7 +49,7 @@ func newCatalogCmd() *cobra.Command {
 	f.Int64Var(&scratchLimit, "scratch-limit", 19327352832, "bytes of scratch space all jobs may use together")
 	f.IntVar(&maxConcurrent, "max-concurrent", 2, "jobs run at once; further requests are refused as busy")
 	f.StringVar(&localRoot, "local-root", "", "local sources (oci-dir, host-dir) must resolve inside this directory; empty refuses them")
-	f.IntVar(&nice, "nice", 0, "nice value of catalog workers, 0 to 19")
+	f.IntVar(&nice, "nice", 0, "nice increment of catalog workers over the server's own, 0 to 19")
 	f.Int64Var(&workerMemory, "worker-memory-limit", 0, "GOMEMLIMIT of each catalog worker in bytes; 0 keeps the server's")
 
 	cmd.AddCommand(&cobra.Command{

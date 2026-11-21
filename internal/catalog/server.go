@@ -27,6 +27,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
 	"github.com/the-it-dept/ffs/internal/sbom"
+	"github.com/the-it-dept/ffs/internal/subproc"
 	"github.com/the-it-dept/ffs/internal/version"
 )
 
@@ -571,17 +572,10 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		}
 		cmd.Stdin = bytes.NewReader(in)
 		cmd.Stdout = out
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
-		cmd.WaitDelay = workerWaitDelay
 
-		err = cmd.Start()
-		if err == nil && o.nice > 0 {
-			if perr := niceGroup(cmd.Process.Pid, o.nice); perr != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-				_ = cmd.Wait()
-				return nil, &WorkError{Kind: sbom.KindFailed, Msg: "setting worker priority: " + perr.Error()}
-			}
+		err = subproc.Start(cmd, o.nice, workerWaitDelay)
+		if pe, ok := errors.AsType[*subproc.PriorityError](err); ok {
+			return nil, &WorkError{Kind: sbom.KindFailed, Msg: "setting worker priority: " + pe.Err.Error()}
 		}
 		if err == nil {
 			err = cmd.Wait()
@@ -613,21 +607,6 @@ func ExecRunner(self string, opts ...ExecOption) Runner {
 		return nil, &WorkError{Kind: sbom.KindFailed, Msg: fmt.Sprintf("cataloguer exited with status %d", ee.ExitCode())}
 	}
 }
-
-// niceGroup lowers the priority of the worker's process group pgid by n from this process's own,
-// to at most 19. It sets the group, not the process: nice is per thread on Linux, and the worker's Go
-// runtime has started threads before this call. PRIO_PGRP sets every thread of the group, and threads
-// created later inherit it.
-func niceGroup(pgid, n int) error {
-	own, err := ownNice()
-	if err != nil {
-		return err
-	}
-	return syscall.Setpriority(syscall.PRIO_PGRP, pgid, min(own+n, maxNice))
-}
-
-// maxNice is the lowest priority there is.
-const maxNice = 19
 
 // signalMessage describes a worker that a signal ended, naming the signal once: "cataloguer worker
 // ended by signal 9 (killed)".

@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/require"
+	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -32,7 +33,8 @@ type startFunc func(ctx context.Context) error
 func (f startFunc) Start(ctx context.Context) error { return f(ctx) }
 
 // TestRunManager_ClosesTheStoreOnlyOnceRunnablesStopped: the store closes after Start returns, unless Start gave up
-// waiting for the runnables, which may still be using it (F117).
+// waiting for the runnables, which may still be using it (F117). Only that error leaves it open: a runnable's own
+// timeout, which also wraps context.DeadlineExceeded, comes once every runnable has returned (W58).
 func TestRunManager_ClosesTheStoreOnlyOnceRunnablesStopped(t *testing.T) {
 	timedOut := fmt.Errorf("failed waiting for all runnables to end within grace period of 30s: %w", context.DeadlineExceeded)
 	for _, c := range []struct {
@@ -44,8 +46,12 @@ func TestRunManager_ClosesTheStoreOnlyOnceRunnablesStopped(t *testing.T) {
 	}{
 		{"clean stop", nil, nil, true, nil},
 		{"a runnable failed", errors.New("engine: boom"), nil, true, []string{"engine: boom"}},
+		{"a runnable timed out", fmt.Errorf("failed to start caches: %w", context.DeadlineExceeded), nil, true,
+			[]string{"failed to start caches"}},
 		{"close fails", nil, errors.New("disk gone"), true, []string{"close store: disk gone"}},
 		{"grace period exceeded", timedOut, nil, false, []string{"within grace period"}},
+		{"a runnable failed, then the grace period", kerrors.NewAggregate([]error{errors.New("engine: boom"), timedOut}), nil,
+			false, []string{"engine: boom", "within grace period"}},
 	} {
 		st := &fakeStore{err: c.closeErr}
 		err := runManager(t.Context(), startFunc(func(context.Context) error { return c.start }), st, logr.Discard())
@@ -97,6 +103,7 @@ func TestRunManager_RealManagerTimeout(t *testing.T) {
 	st := &fakeStore{}
 	err := stopOnceStarted(stuck, stuckStarted, st)
 	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorContains(t, err, shutdownTimedOutMsg, "the message shutdownTimedOut looks for")
 	require.False(t, st.closed, "a runnable may still use the store")
 
 	promptStarted := make(chan struct{})

@@ -1776,3 +1776,66 @@ func TestOSVSync_MissingOverflowCounted(t *testing.T) {
 	require.InDelta(t, 3, skipped(feeds.SkipMissingOverflow)-before, 1e-9)
 	require.Equal(t, heldSince(now.Add(-time.Hour), held...), e.meta(t)["missing.PyPI"])
 }
+
+// TestOSVSync_OversizedRecordsCounted: a record over osv.MaxRecordBytes is passed over for good and
+// counted in ffs_feed_skipped_total{feed="osv", reason="too_large"}, whichever transport reads it: a
+// GET per record, Range reads of all.zip, or all of all.zip (a Go bootstrap). The rest are taken in.
+func TestOSVSync_OversizedRecordsCounted(t *testing.T) {
+	t0, t1 := now.Add(-time.Hour), now.Add(-10*time.Minute)
+	polled := func(t *testing.T, size string, zipCap bool) (*env, *bucketServer) {
+		t.Helper()
+		e := newEnv(t)
+		e.inUse(t, python)
+		records := map[string][]byte{
+			"PYSEC-small": pypi("PYSEC-small", "1.0", t1),
+			"PYSEC-big":   bigPyPI("PYSEC-big", t1, osv.MaxRecordBytes),
+		}
+		e.srv.set("PyPI", &fakeBucket{csv: csvOf(row{t1, "PYSEC-big"}, row{t1, "PYSEC-small"}), records: records})
+		meta := map[string]string{"wm.PyPI": ts(t0), "mal.PyPI": ts(now), "setdiff": ts(now)}
+		if size != "" {
+			meta["size.PyPI"] = size
+		}
+		e.putMeta(t, meta)
+		if zipCap { // all.zip cannot be read whole, so Range reads are the cheapest
+			osv.SetMaxZipBytes(t, int64(len(zipOf(records))-1))
+		}
+		return e, e.srv
+	}
+
+	t.Run("per record", func(t *testing.T) {
+		e, srv := polled(t, "", false)
+		before := skipped(feeds.SkipTooLarge)
+		require.NoError(t, e.feed().Sync(ctx))
+		require.Equal(t, 1, srv.count("PyPI/PYSEC-big.json"), "read one GET per record")
+		require.InDelta(t, 1, skipped(feeds.SkipTooLarge)-before, 1e-9)
+		require.Equal(t, []string{"PyPI/PYSEC-small"}, e.sink.keys())
+		require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+		require.NotContains(t, e.meta(t), "missing.PyPI", "not held to be asked for again")
+	})
+
+	t.Run("ranged zip", func(t *testing.T) {
+		e, srv := polled(t, fmt.Sprint(1<<20), true)
+		before := skipped(feeds.SkipTooLarge)
+		require.NoError(t, e.feed().Sync(ctx))
+		require.Zero(t, srv.recordGETs("PyPI"), "read with Range requests")
+		require.Zero(t, srv.wholeZips("PyPI"))
+		require.InDelta(t, 1, skipped(feeds.SkipTooLarge)-before, 1e-9)
+		require.Equal(t, []string{"PyPI/PYSEC-small"}, e.sink.keys())
+		require.Equal(t, ts(t1), e.meta(t)["wm.PyPI"])
+	})
+
+	t.Run("whole zip", func(t *testing.T) {
+		e := newEnv(t)
+		e.srv.set("Go", &fakeBucket{csv: csvOf(row{t1, "GO-2026-0001"}, row{t1, "GO-2026-0002"}), records: map[string][]byte{
+			"GO-2026-0001": record("GO-2026-0001", "Go", "stdlib", "1.22.5", t1),
+			"GO-2026-0002": bigPyPI("GO-2026-0002", t1, osv.MaxRecordBytes),
+		}})
+		e.putMeta(t, map[string]string{"setdiff": ts(now)})
+		before := skipped(feeds.SkipTooLarge)
+		require.NoError(t, e.feed().Sync(ctx))
+		require.Equal(t, 1, e.srv.count("Go/all.zip"), "the bootstrap reads all of all.zip")
+		require.InDelta(t, 1, skipped(feeds.SkipTooLarge)-before, 1e-9)
+		require.Equal(t, []string{"GO-2026-0001"}, e.ids(t, "Go"))
+		require.Equal(t, []string{"Go/GO-2026-0001"}, e.sink.keys())
+	})
+}

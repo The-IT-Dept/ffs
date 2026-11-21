@@ -290,9 +290,10 @@ func (s *Store) pendingDeliveries(ctx context.Context, now time.Time, limit int,
 // RecordAttempt records one send attempt in a single transaction. The delivery's attempt count goes
 // up by one and it takes a.State; a sent delivery also gets SentAt. The first attempt also moves
 // the delivery's not_before to a.At: it was not sent before then anyway, and the time of the first
-// attempt is what a delivery that keeps failing is given up by. The target's status follows:
-// a success clears its error and failure count, anything else records the error and counts a
-// failure. Disable also disables the target and drops its other pending deliveries.
+// attempt is what a delivery that keeps failing is given up by. A delivery that is no longer pending
+// (DropOldestPending dropped it while it was being sent) is left as it is. The target's status
+// follows: a success clears its error and failure count, anything else records the error and counts
+// a failure. Disable also disables the target and drops its other pending deliveries.
 func (s *Store) RecordAttempt(ctx context.Context, a DeliveryAttempt) error {
 	at := orNow(a.At)
 	sent := a.State == DeliverySent
@@ -304,7 +305,8 @@ func (s *Store) RecordAttempt(ctx context.Context, a DeliveryAttempt) error {
 		if _, err := tx.ExecContext(ctx, `UPDATE deliveries SET attempts = attempts + 1, state = ?,
 			next_attempt = COALESCE(?, next_attempt), last_error = ?, http_status = ?, sent_at = COALESCE(?, sent_at),
 			not_before = CASE WHEN attempts = 0 THEN ? ELSE not_before END
-			WHERE id = ?`, string(a.State), nanos(a.NextAttempt), a.Error, a.HTTPStatus, sentAt, nanos(at), a.ID); err != nil {
+			WHERE id = ? AND state = ?`, string(a.State), nanos(a.NextAttempt), a.Error, a.HTTPStatus, sentAt, nanos(at), a.ID,
+			string(DeliveryPending)); err != nil {
 			return fmt.Errorf("store: delivery %q: %w", a.ID, err)
 		}
 		var err error

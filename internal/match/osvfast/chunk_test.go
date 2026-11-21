@@ -123,13 +123,12 @@ func TestMatchImageBoundsRecordLoads(t *testing.T) {
 	require.Equal(t, []int{3, 3, 3}, *loads)
 }
 
-// TestMatchImageReadsAreBoundedInBytes: by default a read takes as many records as 64 MiB holds of the largest
-// record the OSV feed caches (osv.MaxRecordBytes), not a count: a host's kernel records average over 400 KB, and
-// 256 of them at a time, parsed together, held most of a gigabyte.
+// TestMatchImageReadsAreBoundedInBytes: by default a read is bounded by 64 MiB of the largest record the OSV feed
+// caches (osv.MaxRecordBytes), not by a count: a host's kernel records average over 400 KB, and 256 of them at a
+// time, parsed together, held most of a gigabyte. TestMatchImageReadBytesStayInBudget measures the bound.
 func TestMatchImageReadsAreBoundedInBytes(t *testing.T) {
-	records, bytes := osvfast.RecordChunk()
+	_, bytes := osvfast.RecordChunk()
 	require.Equal(t, 64<<20, bytes)
-	require.Equal(t, bytes/osv.MaxRecordBytes, records)
 
 	m, pkgs := hostFixture(t)
 	loads := osvfast.WatchRecordLoads(t)

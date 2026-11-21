@@ -756,29 +756,38 @@ func TestNotify_FeedStaleBeforeReady(t *testing.T) {
 	assert.Len(t, h.sink.ofKind(notify.KindBaseline), 2, "the baselines of ops and quiet follow Ready")
 }
 
-// TestNotify_FeedStaleFromFirstAttempt (F67): a feed that never synced is stale measured from its
-// stored first attempt, so a controller restarted more often than staleAfter still alerts; a first
-// attempt after the engine started counts from the start.
+// TestNotify_FeedStaleFromFirstAttempt (F67, W53): a feed that never synced is stale measured from
+// its stored first attempt, so a controller restarted more often than staleAfter still alerts; a
+// state v0.0.1 wrote, with no first attempt, is measured from its last attempt; a first attempt
+// after the engine started counts from the start. This is store.FeedState.StaleFrom, the feed
+// runner's rule.
 func TestNotify_FeedStaleFromFirstAttempt(t *testing.T) {
 	h := newHarness(t, func(o *notify.Options) {
-		o.FeedStaleAfter = map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 2 * time.Hour}
+		o.FeedStaleAfter = map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 2 * time.Hour, "epss": 2 * time.Hour}
 	})
 	h.target("ops", func(c *notify.TargetConfig) { c.NotifyOnFeedStale = true })
 	h.process() // baseline
 	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "grypedb", FirstAttempt: h.now.Add(-49 * time.Hour),
 		LastAttempt: h.now.Add(-time.Minute), LastError: "connection refused"}))
 	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "kev", FirstAttempt: h.now.Add(time.Hour)}))
+	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "epss", LastAttempt: h.now.Add(-time.Hour),
+		LastError: "connection refused"})) // as v0.0.1 left it: no first attempt
+	titles := func() []string {
+		var out []string
+		for _, m := range h.sink.ofKind(notify.KindFeedStale) {
+			out = append(out, m.Title)
+		}
+		return out
+	}
 	h.now = h.now.Add(90 * time.Minute)
 	h.process()
-	stale := h.sink.ofKind(notify.KindFeedStale)
-	require.Len(t, stale, 1, "grypedb is stale from its first attempt; kev, first tried after the start, is not yet")
-	assert.Equal(t, "Feed grypedb has never synced successfully", stale[0].Title)
+	assert.ElementsMatch(t, []string{"Feed grypedb has never synced successfully", "Feed epss has never synced successfully"}, titles(),
+		"grypedb is stale from its first attempt and epss from its last; kev, first tried after the start, is not yet")
 
 	h.now = h.now.Add(time.Hour) // 2h30m after the engine started, 1h30m after kev's first attempt
 	h.process()
-	stale = h.sink.ofKind(notify.KindFeedStale)
-	require.Len(t, stale, 2)
-	assert.Equal(t, "Feed kev has never synced successfully", stale[1].Title)
+	assert.ElementsMatch(t, []string{"Feed grypedb has never synced successfully", "Feed epss has never synced successfully",
+		"Feed kev has never synced successfully"}, titles())
 }
 
 func TestNotify_UnregisterAndRetainDeleteState(t *testing.T) {

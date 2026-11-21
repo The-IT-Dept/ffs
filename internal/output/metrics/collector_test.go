@@ -140,24 +140,28 @@ ffs_feed_stale_after_seconds{feed="osv"} 7200
 `, osvLast.Unix()))))
 }
 
-// TestCollector_NeverSyncedLagsFromFirstAttempt (F67): a feed that never succeeded lags from its
-// stored first attempt when that is before the collector started, so a restart does not reset it;
-// a first attempt after the start counts from the start.
+// TestCollector_NeverSyncedLagsFromFirstAttempt (F67, W53): a feed that never succeeded lags from
+// its stored first attempt when that is before the collector started, so a restart does not reset
+// it; a state v0.0.1 wrote, with no first attempt, lags from its last attempt; a first attempt
+// after the start counts from the start. This is store.FeedState.StaleFrom, the feed runner's rule.
 func TestCollector_NeverSyncedLagsFromFirstAttempt(t *testing.T) {
 	st := newStore(t)
 	now := t0
 	c := metrics.NewCollector(st, metrics.CollectorOptions{
-		FeedStaleAfter: map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 24 * time.Hour},
+		FeedStaleAfter: map[string]time.Duration{"grypedb": 48 * time.Hour, "kev": 24 * time.Hour, "epss": 72 * time.Hour},
 		Now:            func() time.Time { return now },
 	})
 	now = t0.Add(time.Hour) // the collector started an hour ago
 	require.NoError(t, st.PutFeedState(ctx, store.FeedState{Name: "grypedb", FirstAttempt: t0.Add(-71 * time.Hour),
 		LastAttempt: t0, LastError: "connection refused"}))
 	require.NoError(t, st.PutFeedState(ctx, store.FeedState{Name: "kev", FirstAttempt: t0.Add(30 * time.Minute)}))
+	require.NoError(t, st.PutFeedState(ctx, store.FeedState{Name: "epss", LastAttempt: t0.Add(-5 * time.Hour),
+		LastError: "connection refused"})) // as v0.0.1 left it: no first attempt
 	require.NoError(t, c.Refresh(ctx))
 	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(`
 # HELP ffs_feed_lag_seconds Seconds since a feed last synced successfully, or if it never has, since its first attempt or since ffs started, whichever is earlier.
 # TYPE ffs_feed_lag_seconds gauge
+ffs_feed_lag_seconds{feed="epss"} 21600
 ffs_feed_lag_seconds{feed="grypedb"} 259200
 ffs_feed_lag_seconds{feed="kev"} 3600
 `), "ffs_feed_lag_seconds"))

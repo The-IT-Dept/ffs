@@ -89,7 +89,7 @@ func TestRehome_MovesFindingsLedgerAndOwnersAtomically(t *testing.T) {
 // TestRehome_LedgerFollowsTheLiveFinding (F73, W1): a move merges a target's ledger rows for the two
 // fingerprints as an alias re-key does. The higher max_priority is kept, so the move never lowers what
 // a target was told and a repeat escalation alert cannot follow; the state and time come from the row
-// of the finding that stays live, whichever row was updated last: the moved row onto a resolved or
+// of the finding that continues, whichever row was updated last: the moved row onto a resolved or
 // absent finding (the cutover), the row already there when an open finding holds the new fingerprint
 // (the taken branch).
 func TestRehome_LedgerFollowsTheLiveFinding(t *testing.T) {

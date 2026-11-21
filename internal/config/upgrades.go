@@ -8,14 +8,18 @@ import (
 	"strings"
 )
 
+// GlobChars are the characters that make an upgrades.overrides key, or a part of one, a path.Match
+// glob: the metacharacters and the escape.
+const GlobChars = "*?[\\"
+
 // NormalizeRepoKey returns an upgrades.overrides key in the form ffs records image repositories in,
 // as image references are normalised: a key whose first component is not a registry host (it has
-// no "." or ":", is not "localhost" and holds no glob character) is on Docker Hub, and a Docker Hub
+// no "." or ":", is not "localhost" and holds none of GlobChars) is on Docker Hub, and a Docker Hub
 // repository with a single path component is under "library". So "postgres" becomes
 // "docker.io/library/postgres" and "bitnami/*" becomes "docker.io/bitnami/*".
 func NormalizeRepoKey(key string) string {
 	host, rest, found := strings.Cut(key, "/")
-	if !found || (!strings.ContainsAny(host, ".:*?[") && host != "localhost") {
+	if !found || (!strings.ContainsAny(host, ".:"+GlobChars) && host != "localhost") {
 		host, rest = "docker.io", key
 	}
 	switch host {

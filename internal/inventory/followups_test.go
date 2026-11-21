@@ -103,7 +103,8 @@ func TestSyncAll_TemplatePlatformPins(t *testing.T) {
 }
 
 // TestPruneHandedOff_DepartedDigests (F54): digests handed to the acquirer are forgotten once no owner
-// uses them, and handed off again if an owner uses them later.
+// uses them, and handed off again if an owner uses them later. A prune while a flush runs skips
+// rather than wait for it.
 func TestPruneHandedOff_DepartedDigests(t *testing.T) {
 	web, api := newPod("web", "n1", nil, "nginx:1.27", nginx+"@"+mA), newPod("api", "n1", nil, "nginx:1.27", nginx+"@"+mB)
 	h := newHarness(t, newNode("n1", "amd64"), web, api)
@@ -121,6 +122,10 @@ func TestPruneHandedOff_DepartedDigests(t *testing.T) {
 	require.NoError(t, h.c.Delete(ctx, web.DeepCopy()))
 	require.NoError(t, h.inv.Flush(ctx, []string{"Pod/apps/web"}))
 	require.Equal(t, []string{mA, mB}, handedOff(), "kept until a prune")
+	h.inv.flushMu.Lock() // a flush is running
+	require.NoError(t, h.inv.pruneHandedOff(ctx), "returns at once")
+	h.inv.flushMu.Unlock()
+	require.Equal(t, []string{mA, mB}, handedOff(), "skipped while the flush ran")
 	require.NoError(t, h.inv.pruneHandedOff(ctx))
 	require.Equal(t, []string{mB}, handedOff())
 

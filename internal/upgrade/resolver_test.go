@@ -692,6 +692,11 @@ func TestResolver_RestartKeepsQueuedOwners(t *testing.T) {
 	cancel()
 	restarted.resolveNext(cancelled) // shutdown interrupts the resolution
 	require.Empty(t, restarted.Pending())
+	restarted.qmu.Lock()
+	_, held := restarted.from[webKey]
+	restarted.qmu.Unlock()
+	require.True(t, held, "an interrupted resolution is not released")
+	require.NoError(t, restarted.saveCursor(rctx)) // a later save, as another owner's release makes, keeps it held
 	again := NewResolver(rg.r.o)
 	again.startup(rctx)
 	require.Equal(t, []string{webKey}, again.Pending(), "an interrupted resolution is not taken as done")

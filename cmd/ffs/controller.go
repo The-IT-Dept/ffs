@@ -25,7 +25,7 @@ func newControllerCmd() *cobra.Command {
 		Short: "Run the in-cluster controller",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			setLogger(zap.New(zap.UseFlagOptions(&logOpts)))
+			installLogger(zap.New(zap.UseFlagOptions(&logOpts)))
 			cfg, err := config.Load(configPath)
 			if err != nil {
 				return err
@@ -57,6 +57,10 @@ func newControllerCmd() *cobra.Command {
 	f.AddGoFlagSet(zfs)
 	return cmd
 }
+
+// installLogger installs the logger the controller command builds from its --zap-* flags: setLogger, which a test
+// replaces to see that logger.
+var installLogger = setLogger
 
 // setLogger makes l the logger of controller-runtime and of klog, so client-go and leader election log through it,
 // in the same format and at the same level, rather than as klog text among the JSON lines.

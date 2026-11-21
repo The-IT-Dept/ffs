@@ -25,5 +25,5 @@ func TestSkipped_InitialSeries(t *testing.T) {
 			got[labels["feed"]+"/"+labels["reason"]] = m.GetCounter().GetValue()
 		}
 	}
-	require.Equal(t, map[string]float64{"cvelist/too_large": 0, "osv/not_found": 0, "osv/missing_overflow": 0}, got)
+	require.Equal(t, map[string]float64{"cvelist/too_large": 0, "osv/too_large": 0, "osv/not_found": 0, "osv/missing_overflow": 0}, got)
 }

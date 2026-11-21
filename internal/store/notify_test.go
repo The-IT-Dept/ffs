@@ -342,6 +342,42 @@ func TestStoreNotify_DropOldestPending(t *testing.T) {
 	assert.Zero(t, n, "within the bound")
 }
 
+// TestStoreNotify_RecordAttemptLeavesDroppedAlone: a delivery DropOldestPending dropped while a drain
+// was sending it stays dropped, with its reason, whatever the attempt's outcome; the attempt still
+// updates the target's status.
+func TestStoreNotify_RecordAttemptLeavesDroppedAlone(t *testing.T) {
+	st := newStore(t)
+	require.NoError(t, st.PutNotifyTarget(ctx, "u1", "ops", "h1"))
+	require.NoError(t, st.CommitNotify(ctx, NotifyCommit{Target: "u1", Deliveries: []Delivery{
+		delivery("d0", t0), delivery("d1", t0.Add(time.Minute)), delivery("d2", t0.Add(2*time.Minute))}}))
+	n, err := st.DropOldestPending(ctx, "u1", 1, "dropped: too many")
+	require.NoError(t, err)
+	require.Equal(t, 2, n)
+
+	at := t0.Add(time.Hour)
+	require.NoError(t, st.RecordAttempt(ctx, DeliveryAttempt{ID: "d0", Target: "u1", At: at, State: DeliverySent, HTTPStatus: 200}))
+	require.NoError(t, st.RecordAttempt(ctx, DeliveryAttempt{ID: "d1", Target: "u1", At: at, State: DeliveryPending,
+		NextAttempt: at.Add(time.Minute), Error: "HTTP 503", HTTPStatus: 503}))
+	ds, err := st.ListDeliveries(ctx, "u1", 0)
+	require.NoError(t, err)
+	byID := map[string]Delivery{}
+	for _, d := range ds {
+		byID[d.ID] = d
+	}
+	for _, id := range []string{"d0", "d1"} {
+		assert.Equal(t, DeliveryDropped, byID[id].State, id)
+		assert.Equal(t, "dropped: too many", byID[id].LastError, id)
+		assert.Zero(t, byID[id].Attempts, id)
+	}
+	assert.Equal(t, DeliveryPending, byID["d2"].State)
+	pending, err := st.PendingDeliveriesFor(ctx, at.Add(time.Hour), []string{"u1"}, 0)
+	require.NoError(t, err)
+	require.Len(t, pending, 1, "a failed attempt does not put a dropped delivery back in the queue")
+	ts, _, err := st.NotifyTarget(ctx, "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "HTTP 503", ts.LastError, "the target's status follows the attempts")
+}
+
 // TestStoreNotify_CloseStaleLedger pins W39's sweep: an open ledger entry closes when its finding is
 // resolved or gone and none of its transitions is past either cursor of the target. An open or excepted
 // finding, or a resolution the digest cursor has not passed yet, keeps its entry open.

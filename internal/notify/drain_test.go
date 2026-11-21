@@ -449,5 +449,9 @@ func TestDrain_PendingCappedPerTarget(t *testing.T) {
 	assert.Equal(t, "ffs_uid-ops_0000", byState[store.DeliveryDropped][0].ID, "the oldest")
 	assert.Equal(t, "dropped: more than 1000 messages were waiting for this target", byState[store.DeliveryDropped][0].LastError)
 	assert.InDelta(t, 1, testutil.ToFloat64(dropped)-before, 0)
-	assert.Equal(t, string(notify.KindImmediate), byState[store.DeliveryPending][0].Kind, "the new alert is queued")
+	newest := byState[store.DeliveryPending][0] // ListDeliveries lists the newest first
+	var m notify.Message
+	require.NoError(t, json.Unmarshal(newest.Payload, &m))
+	require.Len(t, m.Items, 1, "not a backlog message")
+	assert.Equal(t, "CVE-2026-0001", m.Items[0].AdvisoryID, "the new alert is queued")
 }

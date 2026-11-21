@@ -50,7 +50,9 @@ test('a bundled package must be below ui/node_modules', () => {
 })
 
 test('a stylesheet reference that cannot be followed fails the list', (t) => {
-  const dir = mkdtempSync(join(fileURLToPath(new URL('../node_modules/', import.meta.url)), '.bundled-test-'))
+  // In ui/, outside node_modules, so a run killed before t.after leaves nothing among the installed packages; package
+  // resolution walks up from here to ui/node_modules.
+  const dir = mkdtempSync(join(fileURLToPath(new URL('../', import.meta.url)), '.bundled-test-'))
   t.after(() => rmSync(dir, { recursive: true, force: true }))
   const css = (name: string, body: string) => {
     const file = join(dir, name)

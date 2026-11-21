@@ -7,19 +7,20 @@ import (
 
 // Skipped reasons.
 const (
-	// SkipTooLarge is a download over its size limit.
+	// SkipTooLarge is a download over its size limit: a CVE List delta release, or an OSV record.
 	SkipTooLarge = "too_large"
-	// SkipNotFound is a record the feed's listing names that the source still answered 404 for
-	// after a day of asking.
+	// SkipNotFound is a record the feed's listing names that the source still has not served after
+	// a day of asking: it answered 404, or the record's GET kept failing.
 	SkipNotFound = "not_found"
-	// SkipMissingOverflow is a record the listing names and the source answered 404 for, beyond
-	// the number the feed asks for again.
+	// SkipMissingOverflow is a record the listing names and the source did not serve, beyond the
+	// number the feed asks for again.
 	SkipMissingOverflow = "missing_overflow"
 )
 
 // Skipped counts the downloads a feed gave up on and moved past, by feed and reason: data ffs will
 // not have unless it is published again. The package registers it itself, with a zero series for
-// each feed and reason in skippedSeries, so increase() sees 0 before the first skip.
+// each feed and reason in skippedSeries, so increase() sees 0 before the first skip. A sync that
+// fails after a skip and is retried may count the same download again.
 var Skipped = prometheus.NewCounterVec(prometheus.CounterOpts{
 	Name: "ffs_feed_skipped_total",
 	Help: "Feed downloads skipped and moved past, by feed and reason.",
@@ -28,6 +29,7 @@ var Skipped = prometheus.NewCounterVec(prometheus.CounterOpts{
 // skippedSeries are the feed and reason pairs Skipped counts.
 var skippedSeries = [][2]string{
 	{NameCVEList, SkipTooLarge},
+	{NameOSV, SkipTooLarge},
 	{NameOSV, SkipNotFound},
 	{NameOSV, SkipMissingOverflow},
 }

@@ -11,6 +11,7 @@ cover.out
 !/internal/web/ui/dist/.keep
 /internal/web/ui/bundle-packages.json
 /ui/node_modules/
+/ui/.bundled-test-*/
 /ui/test-results/
 /ui/playwright-report/
 /ui/e2e/screenshots/

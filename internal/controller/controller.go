@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -227,16 +228,27 @@ type starter interface {
 }
 
 // runManager runs m until ctx is done, then closes st once every runnable has returned. Start returns before they all
-// have only when they outlast the graceful shutdown timeout (its error then wraps context.DeadlineExceeded), and they
-// may still be using the store: it is left open for them, since the process exits next and SQLite's journal keeps
-// the database consistent. The pod's termination grace period leaves room for the timeout and the close (F117).
+// have only when they outlast the graceful shutdown timeout (shutdownTimedOut), and they may still be using the store:
+// it is left open for them, since the process exits next and SQLite's journal keeps the database consistent. Every
+// other error, a runnable's that wraps context.DeadlineExceeded included, comes once they have all returned, so the
+// store is closed. The pod's termination grace period leaves room for the timeout and the close (F117).
 func runManager(ctx context.Context, m starter, st io.Closer, log logr.Logger) error {
 	err := m.Start(ctx)
-	if errors.Is(err, context.DeadlineExceeded) {
+	if shutdownTimedOut(err) {
 		log.Info("components did not stop within the graceful shutdown timeout; the store is left open for them", "error", err.Error())
 		return err
 	}
 	return errors.Join(err, closeStore(st))
+}
+
+// shutdownTimedOutMsg starts the error a controller-runtime manager's Start returns when its runnables outlast the
+// graceful shutdown timeout, alone or aggregated with a runnable's error. TestRunManager_RealManagerTimeout pins it.
+const shutdownTimedOutMsg = "failed waiting for all runnables to end within grace period of "
+
+// shutdownTimedOut reports whether err, from a manager's Start, says it stopped waiting for its runnables at the
+// graceful shutdown timeout: the manager's own error, which wraps context.DeadlineExceeded.
+func shutdownTimedOut(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) && strings.Contains(err.Error(), shutdownTimedOutMsg)
 }
 
 func closeStore(st io.Closer) error {

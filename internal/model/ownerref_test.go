@@ -23,27 +23,27 @@ func TestAPIVersionForKind(t *testing.T) {
 }
 
 func TestClusterLevel(t *testing.T) {
-	require.True(t, OwnerRef{Kind: "Cluster", Name: "dev"}.ClusterLevel())
+	require.True(t, OwnerRef{Kind: "Cluster", Name: "test"}.ClusterLevel())
 	require.True(t, OwnerRef{Kind: "ContainerRuntime", Name: "containerd"}.ClusterLevel())
 	// A CloudNativePG Cluster is a namespaced workload owner, not the synthetic one.
 	require.False(t, OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg"}.ClusterLevel())
 	require.False(t, OwnerRef{Kind: "Deployment", Namespace: "apps", Name: "web"}.ClusterLevel())
-	require.True(t, ClusterLevelKey("Cluster//dev"))
+	require.True(t, ClusterLevelKey("Cluster//test"))
 	require.True(t, ClusterLevelKey("ContainerRuntime//containerd"))
 	require.False(t, ClusterLevelKey("Cluster/db/pg"))
 	require.False(t, ClusterLevelKey("cluster"))
-	require.True(t, OwnerRef{Kind: "Nodes", Name: "prod"}.ClusterLevel())
-	require.False(t, OwnerRef{Kind: "Nodes", Namespace: "ops", Name: "prod"}.ClusterLevel())
-	require.True(t, ClusterLevelKey("Nodes//prod"))
+	require.True(t, OwnerRef{Kind: "Nodes", Name: "test"}.ClusterLevel())
+	require.False(t, OwnerRef{Kind: "Nodes", Namespace: "ops", Name: "test"}.ClusterLevel())
+	require.True(t, ClusterLevelKey("Nodes//test"))
 }
 
 func TestNodesOwner(t *testing.T) {
-	o := NodesOwner("prod")
-	require.Equal(t, OwnerRef{Kind: OwnerKindNodes, Name: "prod"}, o)
-	require.Equal(t, "Nodes//prod", o.Key())
-	// golden: sha256("prod|Nodes||prod|host|CVE-2026-0001"). Task 5 must not change it.
-	require.Equal(t, "05e7813802473e285dcc97c21f886ea0da448a12bbbe6c3e74ed3916e6bf34d1",
-		FindingFingerprint("prod", o, HostRepo, "CVE-2026-0001"))
+	o := NodesOwner("test")
+	require.Equal(t, OwnerRef{Kind: OwnerKindNodes, Name: "test"}, o)
+	require.Equal(t, "Nodes//test", o.Key())
+	// golden: sha256("test|Nodes||test|host|CVE-2026-0001"). Task 5 must not change it.
+	require.Equal(t, "dc31783eb081cad036f72271debdd9690c6082441a4d571158b2e239ed7eb1b7",
+		FindingFingerprint("test", o, HostRepo, "CVE-2026-0001"))
 	_, ok := APIVersionForKind(OwnerKindNodes)
 	require.False(t, ok)
 }
@@ -58,8 +58,8 @@ func TestObjectAPIVersion(t *testing.T) {
 		{OwnerRef{Kind: "Cluster", Namespace: "db", Name: "pg", APIVersion: "postgresql.cnpg.io/v1"}, "postgresql.cnpg.io/v1", true},
 		{OwnerRef{Kind: "Deployment", Namespace: "web", Name: "api"}, "apps/v1", true}, // recorded before APIVersion was
 		{OwnerRef{Kind: "CloneSet", Namespace: "web", Name: "c"}, "", false},
-		{OwnerRef{Kind: OwnerKindCluster, Name: "dev"}, "", false},
-		{NodesOwner("dev"), "", false},
+		{OwnerRef{Kind: OwnerKindCluster, Name: "test"}, "", false},
+		{NodesOwner("test"), "", false},
 	} {
 		got, ok := tc.ref.ObjectAPIVersion()
 		require.Equal(t, tc.ok, ok, tc.ref.Key())
@@ -67,6 +67,6 @@ func TestObjectAPIVersion(t *testing.T) {
 	}
 	ref := OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r", APIVersion: "argoproj.io/v1alpha1"}
 	require.Equal(t, "Rollout/web/r", ref.Key(), "the key leaves the apiVersion out")
-	require.Equal(t, FindingFingerprint("prod", OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r"}, "repo", "CVE-1"),
-		FindingFingerprint("prod", ref, "repo", "CVE-1"), "so does the fingerprint")
+	require.Equal(t, FindingFingerprint("test", OwnerRef{Kind: "Rollout", Namespace: "web", Name: "r"}, "repo", "CVE-1"),
+		FindingFingerprint("test", ref, "repo", "CVE-1"), "so does the fingerprint")
 }

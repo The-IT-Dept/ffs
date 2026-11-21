@@ -5,6 +5,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"flag"
+	"io"
+	"io/fs"
+	"path/filepath"
 	"sync"
 	"testing"
 
@@ -48,6 +51,34 @@ func TestControllerCmd_LogFlags(t *testing.T) {
 		require.NotNil(t, cmd.Flags().Lookup(name), name)
 	}
 	require.NoError(t, cmd.Flags().Parse([]string{"--zap-log-level=debug"}))
+}
+
+// TestControllerCmd_LogFlagsReachTheLogger (W58): the --zap-* flags the controller command parses build the logger it
+// installs. The command runs until it reads its configuration, which is missing, after the logger is installed.
+func TestControllerCmd_LogFlagsReachTheLogger(t *testing.T) {
+	prev := installLogger
+	t.Cleanup(func() { installLogger = prev })
+	missing := filepath.Join(t.TempDir(), "missing.yaml")
+	for _, c := range []struct {
+		args   []string
+		v1, v2 bool
+	}{
+		{nil, false, false},
+		{[]string{"--zap-log-level=debug"}, true, false},
+		{[]string{"--zap-log-level=2"}, true, true},
+		{[]string{"--zap-devel"}, true, false},
+	} {
+		var got *logr.Logger
+		installLogger = func(l logr.Logger) { got = &l }
+		cmd := newControllerCmd()
+		cmd.SetArgs(append([]string{"--config=" + missing}, c.args...))
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		require.ErrorIs(t, cmd.Execute(), fs.ErrNotExist, c.args)
+		require.NotNil(t, got, "%v: the logger is installed before the configuration is read", c.args)
+		require.Equal(t, c.v1, got.V(1).Enabled(), "%v: V(1)", c.args)
+		require.Equal(t, c.v2, got.V(2).Enabled(), "%v: V(2)", c.args)
+	}
 }
 
 // TestSetLogger_KlogAndVerbosity: klog, which client-go and leader election use, writes through the controller's

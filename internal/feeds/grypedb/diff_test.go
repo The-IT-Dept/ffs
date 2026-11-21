@@ -101,7 +101,8 @@ func held(ready, release, out string) int {
 
 // startHeld runs differ in the background with the stand-in process held (see envReady) and returns
 // its report once it has started, and a channel that receives the differ's error. Creating release
-// lets the process finish.
+// lets the process finish. However the test ends, its cleanup releases the process, cancels the
+// differ's context and waits for the differ, so a failed test leaves no process behind.
 func startHeld(t *testing.T, c context.Context, differ grypedb.Differ, grandchild bool) (pid, grandchildPID int, limit, release string, done <-chan error) {
 	t.Helper()
 	dir := t.TempDir()
@@ -112,11 +113,24 @@ func startHeld(t *testing.T, c context.Context, differ grypedb.Differ, grandchil
 	if grandchild {
 		t.Setenv(envGrandchild, "1")
 	}
+	c, cancel := context.WithCancel(c)
 	errc := make(chan error, 1)
+	finished := make(chan struct{})
+	newDir := t.TempDir()
 	go func() {
-		_, err := differ(c, filepath.Join(dir, "old"), t.TempDir())
+		defer close(finished)
+		_, err := differ(c, filepath.Join(dir, "old"), newDir)
 		errc <- err
 	}()
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, nil, 0o600)
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(30 * time.Second):
+			t.Error("the Differ did not return after its release and cancel")
+		}
+	})
 	var report []byte
 	require.Eventually(t, func() bool {
 		var err error

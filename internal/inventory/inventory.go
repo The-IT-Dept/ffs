@@ -250,7 +250,7 @@ func (inv *Inventory) Start(ctx context.Context) error {
 	defer wg.Wait()
 	wg.Go(func() { inv.batch.Run(ctx) })
 	// The TagTTL refresh flushes every template-backed owner at once, which can take a while: it runs on
-	// its own, so the polls below are not held up behind it.
+	// its own, so the polls below are not held up behind it (pruneHandedOff skips while it runs).
 	wg.Go(func() { inv.refreshEvery(ctx, inv.o.TagTTL) })
 	versions := time.NewTicker(inv.o.VersionPoll)
 	defer versions.Stop()
@@ -283,9 +283,13 @@ func (inv *Inventory) Start(ctx context.Context) error {
 
 // pruneHandedOff forgets the digests handed to the acquirer, or asked to be superseded, that no owner
 // uses any more: an image whose workloads left the cluster is not held in memory for the life of the
-// process. If an owner uses it again, it is handed off again as any new image would be.
+// process. If an owner uses it again, it is handed off again as any new image would be. While a
+// flush runs (a TagTTL refresh can take a while) it skips, so the RetryPoll tick that calls it does
+// not wait behind the flush; the next tick prunes.
 func (inv *Inventory) pruneHandedOff(ctx context.Context) error {
-	inv.flushMu.Lock()
+	if !inv.flushMu.TryLock() {
+		return nil
+	}
 	defer inv.flushMu.Unlock()
 	if len(inv.enqueued) == 0 && len(inv.superseded) == 0 {
 		return nil

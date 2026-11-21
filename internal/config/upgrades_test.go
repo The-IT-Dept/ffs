@@ -18,6 +18,7 @@ func TestNormalizeRepoKey(t *testing.T) {
 		"localhost/app":                 "localhost/app",
 		"localhost:5000/app":            "localhost:5000/app",
 		"*.example.com/app":             "*.example.com/app",
+		`registry\-1/app`:               `registry\-1/app`, // an escape makes the first component a host glob too
 	} {
 		require.Equal(t, want, NormalizeRepoKey(key), key)
 	}
