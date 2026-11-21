@@ -1673,28 +1673,41 @@ func heldSince(since time.Time, ids ...string) string {
 }
 
 // TestOSVSync_PollRunsWhenRetryFails (W6): a held record whose retry keeps failing with an error
-// other than 404 does not hold back the bucket's poll or its MAL- load: the new records are taken in
-// and handed off, the error is returned with them, and the record stays held from when it was first
-// missed.
+// other than 404 holds back neither the other held records, the bucket's poll and its MAL- load,
+// nor the Sync: the records found are taken in and handed off, the Sync succeeds, and the failing
+// record stays held from when it was first missed, like one still not found, until both are given
+// up on and counted a day after.
 func TestOSVSync_PollRunsWhenRetryFails(t *testing.T) {
 	e := newEnv(t)
 	e.inUse(t, python)
 	t1 := now.Add(-10 * time.Minute)
 	missed := now.Add(-time.Hour)
+	held := []string{"PYSEC-failing", "PYSEC-found", "PYSEC-gone"}
 	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "hashver": osv.HashVersion,
-		"missing.PyPI": heldSince(missed, "PYSEC-held")})
+		"missing.PyPI": heldSince(missed, held...)})
 	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: csvOf(row{t1, "PYSEC-a"}, row{t1.Add(-5 * 24 * time.Hour), "MAL-2026-0001"}),
-		records: map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1), "MAL-2026-0001": pypi("MAL-2026-0001", "1.0", t1)},
-		status:  map[string]int{"PYSEC-held": http.StatusServiceUnavailable}})
+		records: map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1), "MAL-2026-0001": pypi("MAL-2026-0001", "1.0", t1),
+			"PYSEC-found": pypi("PYSEC-found", "1.0", t1)},
+		status: map[string]int{"PYSEC-failing": http.StatusServiceUnavailable}})
+	clock := now
+	f := e.feed(func(o *osv.Options) { o.Now = func() time.Time { return clock } })
 
-	err := e.feed().Sync(ctx)
-	require.ErrorContains(t, err, "PYSEC-held.json: 503")
-	require.Equal(t, []string{"PyPI/MAL-2026-0001", "PyPI/PYSEC-a"}, e.sink.keys())
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/MAL-2026-0001", "PyPI/PYSEC-a", "PyPI/PYSEC-found"}, e.sink.keys())
 	m := e.meta(t)
 	require.Equal(t, ts(t1), m["wm.PyPI"], "the poll ran")
 	require.NotEmpty(t, m["mal.PyPI"], "the MAL- load ran")
-	require.Equal(t, heldSince(missed, "PYSEC-held"), m["missing.PyPI"])
+	require.Equal(t, heldSince(missed, "PYSEC-failing", "PYSEC-gone"), m["missing.PyPI"])
 	require.Empty(t, feeds.Pending(store.FeedState{Meta: m}))
+	require.Equal(t, 1, e.srv.count("PyPI/PYSEC-failing.json"))
+
+	// A day after they were first missed, both are given up on and counted.
+	before := skipped(feeds.SkipNotFound)
+	clock = missed.Add(osv.MissingFor)
+	require.NoError(t, f.Sync(ctx))
+	require.NotContains(t, e.meta(t), "missing.PyPI")
+	require.Equal(t, 1, e.srv.count("PyPI/PYSEC-failing.json"))
+	require.InDelta(t, 2, skipped(feeds.SkipNotFound)-before, 1e-9)
 }
 
 // TestOSVSync_RetryWithPendingStops (W6): a retry whose hand-off fails leaves its records pending,

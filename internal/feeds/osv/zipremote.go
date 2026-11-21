@@ -49,13 +49,14 @@ const (
 type transport uint8
 
 const (
-	perRecord transport = iota // one GET per record
-	rangedZip                  // Range reads of the records' entries in all.zip
-	wholeZip                   // all of all.zip
+	perRecord   transport = iota // one GET per record
+	rangedZip                    // Range reads of the records' entries in all.zip
+	wholeZip                     // all of all.zip
+	heldRecords                  // one GET per record, passing over one whose GET fails (retryMissing only; choose never picks it)
 )
 
 func (t transport) String() string {
-	return [...]string{"per-record", "ranged-zip", "whole-zip"}[t]
+	return [...]string{"per-record", "ranged-zip", "whole-zip", "held-records"}[t]
 }
 
 // zipProbe is what one Range read of the end of a bucket's all.zip tells about it.
