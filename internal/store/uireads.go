@@ -257,6 +257,33 @@ func (s *Store) DigestsSeenInto(ctx context.Context, digests []string) (map[stri
 	return out, nil
 }
 
+// NodeGroupStats returns the rollup counts of the node groups with ids, each over the findings on its
+// host digest as ScopeStats counts a node group scope, in one query. A group with no open or excepted
+// finding has no entry, so it reads as the zero OwnerStats.
+func (s *Store) NodeGroupStats(ctx context.Context, ids []string) (map[string]OwnerStats, error) {
+	out := make(map[string]OwnerStats, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	rows, err := s.rdb.QueryContext(ctx, `SELECT substr(d.digest, ?), `+findingContributions+`
+		FROM finding_digests d JOIN findings f ON f.fingerprint = d.fingerprint
+		WHERE d.digest IN (SELECT ? || value FROM json_each(?)) GROUP BY d.digest`,
+		len(nodeGroupDigestPrefix)+1, nodeGroupDigestPrefix, idList(ids))
+	if err != nil {
+		return nil, fmt.Errorf("store: node group stats: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var id string
+		st, err := scanOwnerStats(rows, &id)
+		if err != nil {
+			return nil, fmt.Errorf("store: node group stats: %w", err)
+		}
+		out[id] = st
+	}
+	return out, rows.Err()
+}
+
 // OwnerCoverage returns the coverage figure of each owner of keys that runs a container image;
 // the others are absent, so they read as zero.
 func (s *Store) OwnerCoverage(ctx context.Context, keys []string) (map[string]CoverageFigure, error) {

@@ -160,3 +160,40 @@ func TestScale_FindingsOnCataloguedImages(t *testing.T) {
 		}
 	}
 }
+
+// TestScale_AgentGroups (W44): AgentGroups agent node groups of two workers each, the other workers in
+// a nodeinfo group, and HostFindings open host findings counted among OpenFindings: the even ones on
+// every group, the odd ones on one.
+func TestScale_AgentGroups(t *testing.T) {
+	n := webtest.ScaleSize{Namespaces: 2, Workloads: 19, Images: 14, PackagesPerImage: 20, OpenFindings: 200, Excepted: 20,
+		Resolved: 30, Suggestions: 2, ExposedWorkloads: 3, AgentGroups: 2, HostFindings: 10}
+	f := scale(t, n)
+	open, err := f.Store.CountFindings(t.Context(), store.FindingFilter{States: []model.FindingState{model.StateOpen}})
+	require.NoError(t, err)
+	require.Equal(t, 200, open)
+
+	groups, err := f.Store.NodeGroups(t.Context())
+	require.NoError(t, err)
+	var agent []string
+	kinds := map[model.NodeGroupKind]int{}
+	for _, g := range groups {
+		kinds[g.Kind] += len(g.Members)
+		if g.Kind == model.NodeGroupAgent {
+			require.Len(t, g.Members, 2, g.Label)
+			agent = append(agent, g.ID)
+		}
+	}
+	require.Equal(t, map[model.NodeGroupKind]int{model.NodeGroupAgent: 4, model.NodeGroupNodeInfo: 6}, kinds)
+	stats, err := f.Store.NodeGroupStats(t.Context(), agent)
+	require.NoError(t, err)
+	var opens []int
+	for _, id := range agent {
+		opens = append(opens, stats[id].Open)
+	}
+	slices.Sort(opens)
+	require.Equal(t, []int{5, 10}, opens)
+
+	n.AgentGroups = 5
+	_, err = webtest.Scale(t.Context(), t.TempDir()+"/ffs.db", n)
+	require.ErrorContains(t, err, "at most 4 agent groups")
+}

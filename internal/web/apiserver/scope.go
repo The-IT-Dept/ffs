@@ -193,18 +193,18 @@ func (r *rail) cluster(ctx context.Context) error {
 		return err
 	}
 	// Each group's own coverage figure, as its card shows it: a host SBOM pending, unmatched or failed
-	// is a gap as much as a member's. All groups' are read in one pass.
+	// is a gap as much as a member's. All groups' figures and counts are read in one pass each.
 	covs, err := s.groupCoverage(ctx, gs)
+	if err != nil {
+		return err
+	}
+	groupStats, err := s.groupStatsOf(ctx, gs.groups)
 	if err != nil {
 		return err
 	}
 	items = make([]relItem, 0, len(gs.groups))
 	for i, g := range gs.groups {
-		st, err := s.groupStats(ctx, g)
-		if err != nil {
-			return err
-		}
-		items = append(items, countsItem(gs.scope(g), "nodegroup", g.Label, plural(len(g.Members), "node"), st,
+		items = append(items, countsItem(gs.scope(g), "nodegroup", g.Label, plural(len(g.Members), "node"), groupStats[g.ID],
 			covs[i].Full < covs[i].InUse))
 	}
 	r.related(apigen.RelatedSectionIdNodegroups, items)

@@ -13,22 +13,30 @@ import (
 	"time"
 
 	"github.com/the-it-dept/ffs/internal/model"
+	"github.com/the-it-dept/ffs/internal/nodegroup"
 	"github.com/the-it-dept/ffs/internal/registry"
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
 // ScaleSize is the shape of a Scale fixture. OpenFindings counts every open finding, the
-// control-plane ones included.
+// control-plane and host ones included. AgentGroups is the number of agent node groups, of two
+// worker nodes each, the node agent reports; the other workers are grouped by node status.
+// HostFindings is the number of open findings on their host packages (the Nodes owner), each on one
+// group or, every other one, on every group.
 type ScaleSize struct {
 	Namespaces, Workloads, Images, PackagesPerImage int
 	OpenFindings, Excepted, Resolved                int
 	Suggestions, ExposedWorkloads                   int
+	AgentGroups, HostFindings                       int
 }
 
 // DefaultScale is the cluster the API latency gate measures (spec G8): 25,000 open findings over
-// 300 workloads.
+// 300 workloads and four agent node groups.
 var DefaultScale = ScaleSize{Namespaces: 20, Workloads: 300, Images: 120, PackagesPerImage: 400, OpenFindings: 25000,
-	Excepted: 2500, Resolved: 5000, Suggestions: 40, ExposedWorkloads: 60}
+	Excepted: 2500, Resolved: 5000, Suggestions: 40, ExposedWorkloads: 60, AgentGroups: 4, HostFindings: 2000}
+
+// scaleNodes is the number of worker nodes of a Scale fixture.
+const scaleNodes = 10
 
 // scaleBatch is the number of findings written per ApplyFindings.
 const scaleBatch = 2000
@@ -91,8 +99,16 @@ func Scale(ctx context.Context, path string, n ScaleSize) (*Fixture, error) {
 		return nil, errors.New("webtest: scale needs a namespace, a workload, an image, a package and 16 open findings")
 	}
 	bearers := scaleBearers(n)
-	if n.OpenFindings-controlPlaneFindings+n.Excepted+n.Resolved > len(bearers)*(n.OpenFindings/8) {
+	if n.OpenFindings-controlPlaneFindings-n.HostFindings+n.Excepted+n.Resolved > len(bearers)*(n.OpenFindings/8) {
 		return nil, errors.New("webtest: scale has more findings than pairs of an advisory and a workload with a catalogued image")
+	}
+	switch {
+	case 2*n.AgentGroups >= scaleNodes:
+		return nil, fmt.Errorf("webtest: scale has %d nodes, so at most %d agent groups of two", scaleNodes, (scaleNodes-1)/2)
+	case n.HostFindings > 0 && n.AgentGroups == 0:
+		return nil, errors.New("webtest: scale host findings need an agent group")
+	case n.HostFindings > n.OpenFindings/8 || n.HostFindings > n.OpenFindings-controlPlaneFindings:
+		return nil, errors.New("webtest: scale has more host findings than advisories or open findings")
 	}
 	st, err := store.Open(ctx, path)
 	if err != nil {
@@ -114,9 +130,11 @@ type scaler struct {
 	bearers []scaleBearer // the workloads that carry findings, from scaleBearers
 	rng     *rand.Rand
 
-	owners     []model.Owner    // the workloads, by index
-	images     []model.Image    // by index
-	advisories []model.Advisory // by index
+	nodes      []model.Node      // the worker nodes, by index
+	groups     []model.NodeGroup // the agent node groups, by index
+	owners     []model.Owner     // the workloads, by index
+	images     []model.Image     // by index
+	advisories []model.Advisory  // by index
 	findings   []model.Finding
 	ts         map[int]model.Transition // creation transitions, by index in findings
 }
@@ -124,8 +142,8 @@ type scaler struct {
 func (s *scaler) seed(ctx context.Context) error {
 	s.f.seedConfig()
 	for _, step := range []func(context.Context) error{
-		s.f.seedLifecycle, s.seedBase, s.seedClusterLevel, s.seedImages, s.seedWorkloads, s.seedAdvisories,
-		s.seedFindings, s.seedSuggestions,
+		s.f.seedLifecycle, s.seedBase, s.seedClusterLevel, s.seedImages, s.seedWorkloads, s.seedAgentGroups,
+		s.seedAdvisories, s.seedFindings, s.seedSuggestions,
 	} {
 		if err := step(ctx); err != nil {
 			return err
@@ -134,7 +152,8 @@ func (s *scaler) seed(ctx context.Context) error {
 	return nil
 }
 
-// seedBase writes fresh feeds, ten worker nodes and the cluster version.
+// seedBase writes fresh feeds, ten worker nodes and the cluster version. The nodes of agent group g
+// (scaleAgentNode) run kernel scaleKernel(g), the others Small's worker kernel.
 func (s *scaler) seedBase(ctx context.Context) error {
 	for _, name := range []string{"osv", "kev", "eol"} {
 		at := Now.Add(-10 * time.Minute)
@@ -142,11 +161,15 @@ func (s *scaler) seedBase(ctx context.Context) error {
 			return err
 		}
 	}
-	nodes := make([]model.Node, 10)
-	for i := range nodes {
-		nodes[i] = smallNode(fmt.Sprintf("worker-%02d", i), kernelWorker)
+	s.nodes = make([]model.Node, scaleNodes)
+	for i := range s.nodes {
+		kernel := kernelWorker
+		if g, ok := s.agentGroupOf(i); ok {
+			kernel = scaleKernel(g)
+		}
+		s.nodes[i] = smallNode(fmt.Sprintf("worker-%02d", i), kernel)
 	}
-	if err := s.f.Store.ReplaceNodes(ctx, nodes); err != nil {
+	if err := s.f.Store.ReplaceNodes(ctx, s.nodes); err != nil {
 		return err
 	}
 	return s.f.Store.PutClusterInfo(ctx, model.ClusterInfo{Name: ClusterName, GitVersion: "v1.34.2", Version: "1.34.2", UpdatedAt: Now})
@@ -311,6 +334,96 @@ func (s *scaler) workloadContext(i int, ns, name string) model.WorkloadContext {
 	return c
 }
 
+// agentGroupOf is the agent group worker node i reports in: nodes 2g and 2g+1 are group g.
+func (s *scaler) agentGroupOf(i int) (int, bool) {
+	return i / 2, i/2 < s.n.AgentGroups
+}
+
+// scaleKernel is the kernel release of agent group g's nodes.
+func scaleKernel(g int) string { return fmt.Sprintf("6.8.0-%d-generic", 90+g) }
+
+// scaleGroupID is the host fingerprint of agent group g.
+func scaleGroupID(g int) string {
+	sum := sha256.Sum256(fmt.Appendf(nil, "agent-group-%d", g))
+	return hex.EncodeToString(sum[:])
+}
+
+// seedAgentGroups writes n.AgentGroups agent node groups as Small's node agent data is written: each
+// member node's agent report and host fingerprint, the groups and the grouping (the other workers in
+// nodeinfo groups, the first group's first node exposed), each group's catalogued host SBOM, the
+// Nodes owner running them, and the agent state. The host findings are written with the rest.
+func (s *scaler) seedAgentGroups(ctx context.Context) error {
+	if s.n.AgentGroups == 0 {
+		return nil
+	}
+	ubuntu := &model.Distro{ID: "ubuntu", VersionID: "24.04", Codename: "noble"}
+	members := map[string]string{}
+	var rest []model.Node
+	for i, n := range s.nodes {
+		g, ok := s.agentGroupOf(i)
+		if !ok {
+			rest = append(rest, n)
+			continue
+		}
+		at := Now.Add(-5 * time.Minute)
+		if _, err := s.f.Store.AcceptAgentReport(ctx, store.AgentReport{Node: n.Name, AgentVersion: "v0.1.0", BootID: "boot-" + n.Name,
+			StartedAt: at.Add(-time.Minute), Seq: 1, At: at, Full: true, KernelRelease: scaleKernel(g), Arch: "amd64",
+			PackageDB: "dpkg"}); err != nil {
+			return err
+		}
+		if err := s.f.Store.SetAgentFingerprint(ctx, n.Name, scaleGroupID(g)); err != nil {
+			return err
+		}
+		members[n.Name] = scaleGroupID(g)
+	}
+	fallback := nodegroup.FallbackGroups(rest, Now)
+	for _, fb := range fallback {
+		for _, m := range fb.Members {
+			members[m] = fb.ID
+		}
+	}
+	owner := model.Owner{Ref: Nodes, UpdatedAt: Now}
+	for g := range s.n.AgentGroups {
+		id, kernel := scaleGroupID(g), scaleKernel(g)
+		pkgs := []model.Package{{Ecosystem: "deb", Distro: ubuntu, Name: "linux-image-" + kernel, Version: "6.8.0-1", Arch: "amd64"}}
+		for k := range 50 {
+			pkgs = append(pkgs, model.Package{Ecosystem: "deb", Distro: ubuntu, Name: fmt.Sprintf("host-pkg-%d", k), Version: "1.0-1",
+				Arch: "amd64"})
+		}
+		name := nodegroup.GroupName(ubuntu, osImage, kernel)
+		group := model.NodeGroup{ID: id, Kind: model.NodeGroupAgent, Name: name, Label: nodegroup.GroupLabel(name, id),
+			Digest: nodegroup.GroupDigest(id), Distro: ubuntu, OSImage: osImage, KernelRelease: kernel,
+			ContainerRuntimeVersion: "containerd://2.2.1", KubeletVersion: "v1.34.2", Arch: "amd64",
+			Kernel:    &model.NodeKernel{Release: kernel, Package: "linux-image-" + kernel, Version: "6.8.0-1", SourceName: "linux"},
+			PackageDB: "dpkg", PackageCount: len(pkgs)}
+		if err := s.f.Store.PutNodeGroup(ctx, group, Now); err != nil {
+			return err
+		}
+		if err := s.f.Store.UpsertImage(ctx, model.Image{Digest: group.Digest, Repo: model.HostRepo, Platform: "linux/amd64",
+			Status: model.ImageCatalogued, Source: "agent", CataloguedAt: Now}); err != nil {
+			return err
+		}
+		if err := s.f.Store.PutSBOM(ctx, group.Digest, nil, pkgs); err != nil {
+			return err
+		}
+		use := model.ContainerUse{Name: group.Label, Kind: model.ContainerRegular, ImageRef: group.Label, Repo: model.HostRepo,
+			Digest: group.Digest, Platform: "linux/amd64"}
+		if g == 0 {
+			use.ExposurePaths = []string{fmt.Sprintf(model.NodeExposurePathFmt, s.nodes[0].Name)}
+		}
+		owner.Containers = append(owner.Containers, use)
+		s.groups = append(s.groups, group)
+	}
+	if err := s.f.Store.ApplyNodeGrouping(ctx, store.NodeGrouping{Members: members, Fallback: fallback,
+		Exposed: map[string][]string{scaleGroupID(0): {s.nodes[0].Name}}, Now: Now}); err != nil {
+		return err
+	}
+	if err := s.f.Store.UpsertOwner(ctx, owner); err != nil {
+		return err
+	}
+	return s.f.Store.PutNodesState(ctx, store.NodesState{AgentEnabled: true})
+}
+
 // seedAdvisories writes n.OpenFindings/8 advisories: 2% in CISA KEV, EPSS uniform in [0, 0.6).
 func (s *scaler) seedAdvisories(ctx context.Context) error {
 	severities := []model.Severity{model.SeverityCritical, model.SeverityHigh, model.SeverityMedium, model.SeverityLow}
@@ -367,10 +480,11 @@ const controlPlaneFindings = 2
 // seedFindings writes the control-plane findings, then finding k for k from 0: open, then
 // n.Excepted excepted and n.Resolved resolved ones. Finding k belongs to bearer k%len(bearers) and
 // advisory (k/len(bearers))%Advisories, on the bearer's first catalogued image, so no two share a key
-// and none is on an image without an SBOM. Every tenth finding has a creation transition.
+// and none is on an image without an SBOM. Every tenth finding has a creation transition. The host
+// findings come last.
 func (s *scaler) seedFindings(ctx context.Context) error {
 	s.controlPlane()
-	open := s.n.OpenFindings - controlPlaneFindings
+	open := s.n.OpenFindings - controlPlaneFindings - s.n.HostFindings
 	for k := range open + s.n.Excepted + s.n.Resolved {
 		state := model.StateOpen
 		switch {
@@ -380,6 +494,9 @@ func (s *scaler) seedFindings(ctx context.Context) error {
 			state = model.StateExcepted
 		}
 		s.finding(k, state)
+	}
+	for h := range s.n.HostFindings {
+		s.hostFinding(h)
 	}
 	for start := 0; start < len(s.findings); start += scaleBatch {
 		end := min(start+scaleBatch, len(s.findings))
@@ -419,6 +536,28 @@ func (s *scaler) controlPlane() {
 			Fix: packageFix(c.eco, c.repo, c.from, c.to),
 		})
 	}
+}
+
+// hostFinding adds open host finding h, on advisory h: a fixable host package finding of the Nodes
+// owner on agent group h%AgentGroups or, for even h, on every agent group.
+func (s *scaler) hostFinding(h int) {
+	adv := s.advisories[h]
+	var digests []string
+	for g, group := range s.groups {
+		if h%2 == 0 || g == h%len(s.groups) {
+			digests = append(digests, group.Digest)
+		}
+	}
+	priority := s.priorityDraw()
+	name, fixed := fmt.Sprintf("host-pkg-%d", h%50), "1.0-2"
+	s.findings = append(s.findings, model.Finding{
+		Fingerprint: model.FindingFingerprint(ClusterName, Nodes, model.HostRepo, adv.ID), Owner: Nodes, ImageRepo: model.HostRepo,
+		AdvisoryID: adv.ID, Packages: []model.FindingPackage{{Name: name, Ecosystem: "deb", Installed: "1.0-1", Fixed: []string{fixed}}},
+		Digests: digests, Severity: scaleSeverity[priority], SeveritySource: "ubuntu", FixState: model.FixFixed, FixAvailable: true,
+		Priority: priority, State: model.StateOpen, Published: adv.Published, Observed: Now, Matched: Now, LastSeen: Now,
+		Signals: model.FindingSignals{KEV: adv.KEVAdded != nil, EPSS: adv.EPSS, EPSSElevated: adv.EPSS >= s.f.Config.Priority.EPSSBump},
+		Fix:     packageFix("deb", name, "1.0-1", fixed),
+	})
 }
 
 // finding adds finding k in state.

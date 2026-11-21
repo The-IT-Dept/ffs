@@ -134,7 +134,7 @@ type exposureTable struct {
 	s      *Server
 	d      exposureData
 	expand map[string]bool
-	groups map[string]groupSignals // node group ID → its signals
+	groups map[string]groupSignals // node group ID → its signals, every group's once loaded (loadGroups)
 	rows   []apigen.ExposureRow
 }
 
@@ -387,19 +387,19 @@ func (t *exposureTable) hostnameRow(c *xrow) {
 // exposedNodes adds the "Exposed nodes" group: every node an exposed-node selector matched, with
 // its group's host findings.
 func (t *exposureTable) exposedNodes(ctx context.Context) error {
-	groups, err := t.s.nodeGroups(ctx)
+	set, err := t.s.groupSet(ctx)
 	if err != nil {
 		return err
 	}
+	if err := t.loadGroups(ctx, set); err != nil {
+		return err
+	}
 	nodes := &xrow{row: apigen.ExposureRow{Id: rowNodes, Kind: apigen.ExposureRowKindEntry, Label: "Exposed nodes"}, noun: "node"}
-	for _, g := range groups {
+	for _, g := range set.groups {
 		if len(g.ExposedNodes) == 0 {
 			continue
 		}
-		gs, err := t.groupSignals(ctx, g)
-		if err != nil {
-			return err
-		}
+		gs := t.groups[g.ID]
 		nodes.groups = append(nodes.groups, g.ID)
 		for _, n := range g.ExposedNodes {
 			nodes.children = append(nodes.children, t.nodeRow(rowNodes+"/"+n, n, g, gs))
@@ -413,24 +413,27 @@ func (t *exposureTable) exposedNodes(ctx context.Context) error {
 	return nil
 }
 
-// groupSignals reads (once) a node group's signal columns: its host findings and coverage, with no
-// privilege or service account columns.
-func (t *exposureTable) groupSignals(ctx context.Context, g model.NodeGroup) (groupSignals, error) {
-	if gs, ok := t.groups[g.ID]; ok {
-		return gs, nil
+// loadGroups reads, once, the signal columns of every node group in set: its host findings and
+// coverage, with no privilege or service account columns. The counts and the coverage figures of all
+// groups are each read in one pass (groupStatsOf, groupCoverage), not per group.
+func (t *exposureTable) loadGroups(ctx context.Context, set *groupSet) error {
+	if len(t.groups) > 0 || len(set.groups) == 0 {
+		return nil
 	}
-	st, err := t.s.groupStats(ctx, g)
+	stats, err := t.s.groupStatsOf(ctx, set.groups)
 	if err != nil {
-		return groupSignals{}, err
+		return err
 	}
-	cov, err := t.s.scopeCoverage(ctx, model.Scope{Kind: model.ScopeNodeGroup, Value: g.ID})
+	covs, err := t.s.groupCoverage(ctx, set)
 	if err != nil {
-		return groupSignals{}, err
+		return err
 	}
-	gs := groupSignals{sig: apigen.RowSignals{Urgent: st.Counts.Urgent, High: st.Counts.High, Fixable: st.Fixable,
-		Exploited: st.Exploited, Coverage: coverageFigure(cov)}, worst: st.Counts.Worst()}
-	t.groups[g.ID] = gs
-	return gs, nil
+	for i, g := range set.groups {
+		st := stats[g.ID]
+		t.groups[g.ID] = groupSignals{sig: apigen.RowSignals{Urgent: st.Counts.Urgent, High: st.Counts.High, Fixable: st.Fixable,
+			Exploited: st.Exploited, Coverage: coverageFigure(covs[i])}, worst: st.Counts.Worst()}
+	}
+	return nil
 }
 
 // sumGroups sums the signals of node groups, and their worst open priority.
@@ -524,13 +527,13 @@ func (t *exposureTable) byNode(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := t.loadGroups(ctx, set); err != nil {
+		return err
+	}
 	groups := set.groups
 	var rows []*xrow
 	for _, g := range groups {
-		gs, err := t.groupSignals(ctx, g)
-		if err != nil {
-			return err
-		}
+		gs := t.groups[g.ID]
 		id := "ng:" + set.key(g)
 		target := scopeRef(set.scope(g), g.Label)
 		x := &xrow{row: apigen.ExposureRow{Id: id, Kind: apigen.ExposureRowKindNodegroup, Label: g.Label, Signals: gs.sig,
