@@ -128,8 +128,8 @@ func TestFindings_GroupByFix(t *testing.T) {
 	first := got.GroupRows[0]
 	require.Equal(t, "upgrade:docker.io/library/nginx:1.30.7", first.Key)
 	require.NotNil(t, first.Fix)
-	require.Equal(t, "1.30.6 → 1.30.7", first.Fix.Label)
-	require.Equal(t, "1.30.6 → 1.30.7", first.Label)
+	require.Equal(t, "nginx:1.30.7", first.Fix.Label)
+	require.Equal(t, "nginx:1.30.7", first.Label)
 	require.Equal(t, apigen.PriorityCounts{Urgent: 1, High: 1}, first.Counts)
 	require.NotNil(t, first.Fix.Introduces)
 	require.Equal(t, apigen.PriorityCounts{}, *first.Fix.Introduces)

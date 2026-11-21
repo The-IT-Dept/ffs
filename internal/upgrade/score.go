@@ -184,24 +184,7 @@ func counts(m map[model.Priority]int) string {
 	return strings.Join(parts, ", ")
 }
 
-// syntheticRepos are the cluster-level subjects, whose versions read "kubernetes v1.35.10".
-var syntheticRepos = map[string]bool{"kubernetes": true, "containerd": true, "cri-o": true}
-
 // Target is what a suggestion moves to, as a user would write it: "nginx:1.30.7",
 // "ghcr.io/org/app:2.1.0 (new digest)" for a refresh, or "kubernetes v1.35.10". It is empty for a
-// suggestion with tier none.
-func Target(s model.Suggestion) string {
-	if s.Tier == model.TierNone {
-		return ""
-	}
-	if syntheticRepos[s.Repo] {
-		return s.Repo + " " + s.ToTag
-	}
-	repo := strings.TrimPrefix(s.Repo, "docker.io/library/")
-	repo = strings.TrimPrefix(repo, "docker.io/")
-	t := repo + ":" + s.ToTag
-	if s.Tier == model.TierRefresh {
-		t += " (new digest)"
-	}
-	return t
-}
+// suggestion with tier none. It is model.UpgradeTarget, which the best-fix label uses too.
+func Target(s model.Suggestion) string { return model.UpgradeTarget(s) }

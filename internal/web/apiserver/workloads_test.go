@@ -50,7 +50,7 @@ func TestWorkloads_ListsEntitiesWithCounts(t *testing.T) {
 	require.Equal(t, apigen.CoverageClassPartial, web.CoverageClass)
 	require.NotNil(t, web.BestFix)
 	require.Equal(t, apigen.FixKindUpgrade, web.BestFix.Kind)
-	require.Equal(t, "1.30.6 → 1.30.7", web.BestFix.Label)
+	require.Equal(t, "nginx:1.30.7", web.BestFix.Label, "the target alone, never from → to")
 	require.NotNil(t, web.ManagedBy)
 	require.Equal(t, "helm", web.ManagedBy.Tool)
 	require.Equal(t, apigen.PriorityCounts{Urgent: 1, High: 1, Medium: 1}, web.Counts)
