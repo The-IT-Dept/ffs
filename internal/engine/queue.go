@@ -174,13 +174,13 @@ func (e *Engine) catchUp(ctx context.Context) bool {
 	return true
 }
 
-// prune runs Prune and logs the outcome.
+// prune runs Prune and logs the outcome: a step that failed does not hide what the others pruned.
 func (e *Engine) prune(ctx context.Context) {
 	n, err := e.Prune(ctx)
-	switch {
-	case err != nil:
+	if err != nil {
 		e.o.Log.Error(err, "pruning the store failed")
-	case n > 0:
+	}
+	if n > 0 {
 		e.o.Log.Info("pruned resolved findings", "count", n)
 	}
 }
