@@ -402,7 +402,7 @@ export const copy = {
     none: 'No upgrade candidates.',
     cols: {
       image: 'Image',
-      change: 'Change',
+      change: 'Upgrade to',
       tier: 'Tier',
       fixes: 'Fixes',
       remaining: 'Remaining',

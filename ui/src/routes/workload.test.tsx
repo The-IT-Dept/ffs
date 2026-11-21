@@ -17,7 +17,7 @@ const groups = findingsPage({
       findings: 3,
       distinct: 3,
       counts: counts({ urgent: 2, high: 1 }),
-      fix: fixAction({ kind: 'upgrade', key: 'upgrade:ghcr.io/example/web:1.4.3', label: '1.4.2 → 1.4.3', introduces: counts() }),
+      fix: fixAction({ kind: 'upgrade', key: 'upgrade:ghcr.io/example/web:1.4.3', label: 'ghcr.io/example/web:1.4.3', introduces: counts() }),
     }),
     groupRow({
       key: 'package:deb:openssl:3.5.1-1:3.5.2-1',
@@ -49,7 +49,7 @@ const mocks = () =>
 test('groups findings by the fix that clears them', async () => {
   mocks()
   renderApp(workloadPath('Deployment', 'shop', 'web'))
-  expect(await screen.findByText('1.4.2 → 1.4.3 · clears 2 urgent, 1 high · introduces none')).toBeInTheDocument()
+  expect(await screen.findByText('ghcr.io/example/web:1.4.3 · clears 2 urgent, 1 high · introduces none')).toBeInTheDocument()
   expect(screen.getByText('openssl 3.5.1-1 → 3.5.2-1 · clears 1 urgent, 0 high')).toBeInTheDocument()
   expect(screen.getByText('No fix yet · 4 findings · 2 advisories')).toBeInTheDocument()
   expect(screen.getByRole('heading', { level: 1, name: 'web' })).toBeInTheDocument()

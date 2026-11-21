@@ -42,7 +42,7 @@ function UpgradeRow({ s, alternative }: { s: Suggestion; alternative?: boolean }
         <Mono>{s.repo}</Mono>
       </TableCell>
       <TableCell className="py-0">
-        <Mono>{`${s.fromTag} → ${s.toTag}`}</Mono>
+        {s.target ? <Mono>{s.target}</Mono> : <span className="text-muted-foreground">{copy.noValue}</span>}
       </TableCell>
       <TableCell className="py-0">{s.tier}</TableCell>
       <TableCell className="py-0">
@@ -66,7 +66,9 @@ function UpgradeRow({ s, alternative }: { s: Suggestion; alternative?: boolean }
 }
 
 // UpgradeTable lists upgrade candidates with what each fixes, leaves and introduces; each
-// candidate's alternatives follow it, indented and muted.
+// candidate's alternatives follow it, indented and muted. A candidate reads by the server's target
+// ("nginx:1.30.7", "ghcr.io/org/app:2.1.0 (new digest)"), never "from → to": an image referenced by
+// digest only has no from tag, and a refresh moves to the tag it runs.
 export function UpgradeTable({ suggestions }: { suggestions: Suggestion[] }) {
   if (suggestions.length === 0) return <EmptyState message={copy.upgrades.none} />
   const c = copy.upgrades.cols
