@@ -336,30 +336,20 @@ func (f *Feed) read(ctx context.Context, body []byte, wm time.Time) ([]Record, e
 }
 
 // taken reports whether rec's advisory is stored with rec's update time as its Modified: this
-// version of the record was taken in already. An OSV record of the same advisory can have set
-// another Modified since; the record is then taken again, which is harmless.
+// version of the record was taken in already, its ranges included (put stores them first). An OSV
+// record of the same advisory can have set another Modified since; the record is then taken again,
+// which is harmless.
 func (f *Feed) taken(ctx context.Context, rec Record) (bool, error) {
 	a, ok, err := f.o.Store.GetAdvisory(ctx, rec.ID)
 	return ok && a.Modified.Equal(rec.Updated), err
 }
 
-// put stores the advisory of rec and, per mapped product, its affected ranges (entries naming the
-// same product merged). The ranges replace every range stored for the CVE, so a product the record
-// no longer names, or a REJECTED record, leaves none behind for the upstream matcher.
+// put stores, per mapped product, the affected ranges of rec (entries naming the same product
+// merged) and then its advisory. The ranges replace every range stored for the CVE, so a product the
+// record no longer names, or a REJECTED record, leaves none behind for the upstream matcher. The
+// advisory goes last because its Modified is the marker taken reads: a record whose ranges failed to
+// store has no marker, so the next Sync takes it again.
 func (f *Feed) put(ctx context.Context, rec Record) error {
-	if err := f.o.Store.UpsertAdvisory(ctx, model.Advisory{
-		ID:          rec.ID,
-		Title:       rec.Title,
-		Published:   rec.Published,
-		Modified:    rec.Updated,
-		Links:       rec.Links,
-		CNASeverity: rec.Severity,
-		CNACVSS:     rec.CVSS,
-		CNASource:   rec.SeveritySource,
-		Withdrawn:   rec.State == stateRejected,
-	}); err != nil {
-		return err
-	}
 	byKey := map[string]upstream.CNARanges{}
 	for _, a := range rec.Affected {
 		e, ok := upstream.ForCNA(a.Vendor, a.Product)
@@ -381,7 +371,20 @@ func (f *Feed) put(ctx context.Context, rec Record) error {
 		}
 		byProduct[key] = raw
 	}
-	return f.o.Store.ReplaceUpstreamRanges(ctx, rec.ID, byProduct)
+	if err := f.o.Store.ReplaceUpstreamRanges(ctx, rec.ID, byProduct); err != nil {
+		return err
+	}
+	return f.o.Store.UpsertAdvisory(ctx, model.Advisory{
+		ID:          rec.ID,
+		Title:       rec.Title,
+		Published:   rec.Published,
+		Modified:    rec.Updated,
+		Links:       rec.Links,
+		CNASeverity: rec.Severity,
+		CNACVSS:     rec.CVSS,
+		CNASource:   rec.SeveritySource,
+		Withdrawn:   rec.State == stateRejected,
+	})
 }
 
 // readEntry reads a zip entry of at most maxRecordBytes.

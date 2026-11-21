@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 
 	"github.com/the-it-dept/ffs/internal/config"
@@ -43,6 +44,7 @@ type fakeBucket struct {
 	// listing and the record files. zipGen, when set, is all.zip's x-goog-generation instead of gen.
 	zipRecords map[string][]byte
 	zipGen     string
+	status     map[string]int // <id>.json answered with this status instead
 }
 
 // bucketServer serves <bucket>/modified_id.csv (with Range support), <bucket>/<id>.json and
@@ -111,6 +113,7 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	noRange := fb.noRange
+	status := fb.status[strings.TrimSuffix(file, ".json")]
 	s.mu.Unlock()
 
 	if gen != "" {
@@ -131,6 +134,10 @@ func (s *bucketServer) serve(w http.ResponseWriter, r *http.Request) {
 		s.zipBytes[b] += cw.n
 		s.mu.Unlock()
 	default:
+		if status != 0 {
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
 		raw, ok := records[strings.TrimSuffix(file, ".json")]
 		if !ok {
 			http.NotFound(w, r)
@@ -1422,10 +1429,20 @@ func TestAffectedHash_IncludesRatings(t *testing.T) {
 	require.Equal(t, base, hash(rated("GHSA-1", "MODERATE", "medium", now.Add(time.Hour))), "timestamps still do not count")
 	require.NotEqual(t, base, hash(rated("GHSA-1", "HIGH", "medium", now)), "GHSA rating")
 	require.NotEqual(t, base, hash(rated("GHSA-1", "MODERATE", "high", now)), "Ubuntu priority")
+
+	// W3: the hash is "<match>:<rating>"; a rating change leaves the match part alone.
+	matchPart := func(h string) string {
+		m, _, ok := strings.Cut(h, ":")
+		require.True(t, ok, h)
+		return m
+	}
+	require.Equal(t, matchPart(base), matchPart(hash(rated("GHSA-1", "HIGH", "high", now))))
+	require.NotEqual(t, matchPart(base), matchPart(hash(rated("GHSA-2", "MODERATE", "medium", now))), "aliases and affected")
 }
 
-// TestOSVSync_RatingOnlyChangeDelivered (F64): a record whose only change is its rating is handed
-// off, so findings take the new vendor severity without waiting for the weekly full re-match.
+// TestOSVSync_RatingOnlyChangeDelivered (F64, W3): a record whose only change is its rating is handed
+// off, so findings take the new vendor severity without waiting for the weekly full re-match, and
+// keeps its observation time.
 func TestOSVSync_RatingOnlyChangeDelivered(t *testing.T) {
 	e := newEnv(t)
 	e.inUse(t, python)
@@ -1442,8 +1459,16 @@ func TestOSVSync_RatingOnlyChangeDelivered(t *testing.T) {
 	e.srv.set("PyPI", &fakeBucket{csv: csvOf(rows...), records: records})
 	e.putMeta(t, map[string]string{"wm.PyPI": ts(t0), "setdiff": ts(now), "hashver": osv.HashVersion})
 
+	before, err := e.st.OSVRecordsObserved(ctx, []string{"GHSA-a", "GHSA-b", "GHSA-c"})
+	require.NoError(t, err)
+	require.Len(t, before, 3)
+
 	require.NoError(t, e.feed().Sync(ctx))
 	require.Equal(t, []string{"PyPI/GHSA-a", "PyPI/GHSA-b"}, e.sink.keys())
+	// W3: what the records match did not change, so new matches on them are not provisional again.
+	after, err := e.st.OSVRecordsObserved(ctx, []string{"GHSA-a", "GHSA-b", "GHSA-c"})
+	require.NoError(t, err)
+	require.Equal(t, before, after, "a rating-only change keeps the observation time")
 }
 
 // TestOSVSync_HashVersionUpgradeIsSilent (F64): records cached under the previous hash recipe are
@@ -1622,12 +1647,132 @@ func TestOSVSync_MissingRecordRetried(t *testing.T) {
 	require.Equal(t, "PYSEC-c "+now.Format(time.RFC3339), e.meta(t)["missing.PyPI"], "c keeps when it was first missed")
 	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
 
-	// A day after it was first missed, c is given up on.
-	clock = now.Add(missingFor)
+	// A day after it was first missed, c is given up on, and counted.
+	before := skipped(feeds.SkipNotFound)
+	clock = now.Add(osv.MissingFor)
 	require.NoError(t, f.Sync(ctx))
 	require.NotContains(t, e.meta(t), "missing.PyPI")
 	require.Equal(t, 2, e.srv.count("PyPI/PYSEC-c.json"))
 	require.Len(t, e.sink.all(), 2)
+	require.InDelta(t, 1, skipped(feeds.SkipNotFound)-before, 1e-9)
 }
 
-const missingFor = 24 * time.Hour
+// skipped returns ffs_feed_skipped_total{feed="osv", reason}.
+func skipped(reason string) float64 {
+	return testutil.ToFloat64(feeds.Skipped.WithLabelValues(feeds.NameOSV, reason))
+}
+
+// heldSince returns the missing.<bucket> meta value holding ids, each first missed at since.
+func heldSince(since time.Time, ids ...string) string {
+	lines := make([]string, len(ids))
+	for i, id := range ids {
+		lines[i] = id + " " + since.UTC().Format(time.RFC3339)
+	}
+	slices.Sort(lines)
+	return strings.Join(lines, "\n")
+}
+
+// TestOSVSync_PollRunsWhenRetryFails (W6): a held record whose retry keeps failing with an error
+// other than 404 holds back neither the other held records, the bucket's poll and its MAL- load,
+// nor the Sync: the records found are taken in and handed off, the Sync succeeds, and the failing
+// record stays held from when it was first missed, like one still not found, until both are given
+// up on and counted a day after.
+func TestOSVSync_PollRunsWhenRetryFails(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	missed := now.Add(-time.Hour)
+	held := []string{"PYSEC-failing", "PYSEC-found", "PYSEC-gone"}
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "hashver": osv.HashVersion,
+		"missing.PyPI": heldSince(missed, held...)})
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: csvOf(row{t1, "PYSEC-a"}, row{t1.Add(-5 * 24 * time.Hour), "MAL-2026-0001"}),
+		records: map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1), "MAL-2026-0001": pypi("MAL-2026-0001", "1.0", t1),
+			"PYSEC-found": pypi("PYSEC-found", "1.0", t1)},
+		status: map[string]int{"PYSEC-failing": http.StatusServiceUnavailable}})
+	clock := now
+	f := e.feed(func(o *osv.Options) { o.Now = func() time.Time { return clock } })
+
+	require.NoError(t, f.Sync(ctx))
+	require.Equal(t, []string{"PyPI/MAL-2026-0001", "PyPI/PYSEC-a", "PyPI/PYSEC-found"}, e.sink.keys())
+	m := e.meta(t)
+	require.Equal(t, ts(t1), m["wm.PyPI"], "the poll ran")
+	require.NotEmpty(t, m["mal.PyPI"], "the MAL- load ran")
+	require.Equal(t, heldSince(missed, "PYSEC-failing", "PYSEC-gone"), m["missing.PyPI"])
+	require.Empty(t, feeds.Pending(store.FeedState{Meta: m}))
+	require.Equal(t, 1, e.srv.count("PyPI/PYSEC-failing.json"))
+
+	// A day after they were first missed, both are given up on and counted.
+	before := skipped(feeds.SkipNotFound)
+	clock = missed.Add(osv.MissingFor)
+	require.NoError(t, f.Sync(ctx))
+	require.NotContains(t, e.meta(t), "missing.PyPI")
+	require.Equal(t, 1, e.srv.count("PyPI/PYSEC-failing.json"))
+	require.InDelta(t, 2, skipped(feeds.SkipNotFound)-before, 1e-9)
+}
+
+// TestOSVSync_RetryWithPendingStops (W6): a retry whose hand-off fails leaves its records pending,
+// and the bucket is not polled until they are handed off.
+func TestOSVSync_RetryWithPendingStops(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "setdiff": ts(now), "hashver": osv.HashVersion,
+		"missing.PyPI": heldSince(now.Add(-time.Hour), "PYSEC-held")})
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: csvOf(row{t1, "PYSEC-a"}),
+		records: map[string][]byte{"PYSEC-a": pypi("PYSEC-a", "1.0", t1), "PYSEC-held": pypi("PYSEC-held", "1.0", t1)}})
+	e.sink.fail = 1
+
+	require.ErrorContains(t, e.feed().Sync(ctx), "handler unavailable")
+	require.Zero(t, e.srv.count("PyPI/modified_id.csv"), "not polled while records are pending")
+	require.Equal(t, []string{"PyPI/PYSEC-held"}, feeds.Pending(store.FeedState{Meta: e.meta(t)}))
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Equal(t, []string{"PyPI/PYSEC-a", "PyPI/PYSEC-held"}, e.sink.keys())
+}
+
+// TestOSVSync_MissingRetryReadsRecordsOnly (W53): held records are asked for one GET each, even when
+// enough of them, at the bucket's measured record size, would have the poll look at all.zip.
+func TestOSVSync_MissingRetryReadsRecordsOnly(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	var ids []string
+	records := map[string][]byte{}
+	for i := range 40 {
+		id := fmt.Sprintf("PYSEC-%03d", i)
+		ids = append(ids, id)
+		if i%2 == 0 {
+			records[id] = pypi(id, "1.0", t1)
+		}
+	}
+	listing := csvOf(row{t1, "PYSEC-000"})
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(t1), "gen.PyPI": "1", "mal.PyPI": ts(now), "setdiff": ts(now),
+		"hashver": osv.HashVersion, "size.PyPI": "400000", "missing.PyPI": heldSince(now.Add(-time.Hour), ids...)})
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: listing, records: records})
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.Zero(t, e.srv.count("PyPI/all.zip"))
+	require.Equal(t, 40, e.srv.recordGETs("PyPI"))
+	require.Len(t, e.sink.all(), 20)
+	require.Len(t, strings.Split(e.meta(t)["missing.PyPI"], "\n"), 20)
+}
+
+// TestOSVSync_MissingOverflowCounted (W40): listed records not found beyond the MaxMissing held are
+// passed over and counted.
+func TestOSVSync_MissingOverflowCounted(t *testing.T) {
+	e := newEnv(t)
+	e.inUse(t, python)
+	t1 := now.Add(-10 * time.Minute)
+	held := make([]string, osv.MaxMissing)
+	for i := range held {
+		held[i] = fmt.Sprintf("PYSEC-held-%04d", i)
+	}
+	e.putMeta(t, map[string]string{"wm.PyPI": ts(now.Add(-time.Hour)), "mal.PyPI": ts(now), "setdiff": ts(now),
+		"hashver": osv.HashVersion, "missing.PyPI": heldSince(now.Add(-time.Hour), held...)})
+	e.srv.set("PyPI", &fakeBucket{gen: "1", csv: csvOf(row{t1, "PYSEC-new-1"}, row{t1, "PYSEC-new-2"}, row{t1, "PYSEC-new-3"})})
+	before := skipped(feeds.SkipMissingOverflow)
+
+	require.NoError(t, e.feed().Sync(ctx))
+	require.InDelta(t, 3, skipped(feeds.SkipMissingOverflow)-before, 1e-9)
+	require.Equal(t, heldSince(now.Add(-time.Hour), held...), e.meta(t)["missing.PyPI"])
+}

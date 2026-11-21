@@ -352,9 +352,11 @@ func (f *Feed) fewSBOMs(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// changedPackages diffs two DB directories with Options.Diff, under a timeout of twice the
-// interval, and returns the deduplicated, lowercased packages whose vulnerability records were
-// added, removed or modified.
+// changedPackages diffs two DB directories with Options.Diff and returns the deduplicated,
+// lowercased packages whose vulnerability records were added, removed or modified. The diff gets
+// the budget the feed runner gives the whole Sync, feeds.SyncTimeout: twice the interval, and at
+// least an hour. Under the runner the Sync's own deadline, which started earlier, ends first; the
+// diff's binds when Sync is called on its own.
 //
 // The differ opens both databases for writing first (it hydrates them: migrations and ANALYZE). The
 // Grype matcher holds oldDir's database open read-only, and Grype opens every database with SQLite's
@@ -372,11 +374,8 @@ func (f *Feed) changedPackages(ctx context.Context, oldDir, newDir string) ([]Pa
 	if err := os.CopyFS(oldCopy, os.DirFS(oldDir)); err != nil {
 		return nil, fmt.Errorf("grypedb: diff: copy the current database: %w", err)
 	}
-	if iv := f.o.Config.Interval; iv > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 2*iv)
-		defer cancel()
-	}
+	ctx, cancel := context.WithTimeout(ctx, feeds.SyncTimeout(f.o.Config.Interval))
+	defer cancel()
 	keys, err := f.o.Diff(ctx, oldCopy, newDir)
 	if err != nil {
 		return nil, fmt.Errorf("grypedb: diff: %w", err)

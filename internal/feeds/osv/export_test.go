@@ -8,6 +8,13 @@ import (
 	"github.com/the-it-dept/ffs/internal/store"
 )
 
+// MissingFor and MaxMissing are how long, and for how many records, the feed asks again for a
+// listed record the bucket answers 404 for.
+const (
+	MissingFor = missingFor
+	MaxMissing = maxMissing
+)
+
 // SetMaxZipBytes lowers the all.zip download cap for the test.
 func SetMaxZipBytes(t testing.TB, n int64) {
 	old := maxZipBytes

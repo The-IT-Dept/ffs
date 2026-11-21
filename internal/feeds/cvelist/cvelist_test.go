@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -470,7 +471,8 @@ func TestCVEList_HandlerFailureKeepsPending(t *testing.T) {
 
 // TestCVEList_RejectedClearsUpstreamRanges: when a CVE with stored CNA ranges is REJECTED, or its
 // record stops naming a mapped product, the stored ranges go, so the upstream matcher's ApplyCNA
-// drops the matches they made.
+// drops the matches they made. Its deltas are stored as the engine stores them: ApplyCNA returns a
+// delta for an advisory with no matches only when it has stored upstream matches to clear.
 func TestCVEList_RejectedClearsUpstreamRanges(t *testing.T) {
 	st := newStore(t)
 	setWatermark(t, st, "2026-11-18T00:00:00Z")
@@ -497,6 +499,8 @@ func TestCVEList_RejectedClearsUpstreamRanges(t *testing.T) {
 		ds, err := upstream.New(st).ApplyCNA(ctx, []string{"CVE-2024-11236"})
 		require.NoError(t, err)
 		require.Len(t, ds, 1)
+		_, err = st.ReplaceMatches(ctx, ds[0].Scope, ds[0].Matches)
+		require.NoError(t, err)
 		return ds[0].Matches
 	}
 
@@ -543,6 +547,47 @@ func TestCVEList_OverlapSkipsTakenRecords(t *testing.T) {
 	a, _, err := st.GetAdvisory(ctx, "CVE-2026-4003")
 	require.NoError(t, err)
 	require.Equal(t, time.Date(2026, 11, 19, 0, 50, 0, 0, time.UTC), a.Modified)
+}
+
+// TestCVEList_FailedRangesWriteRetakesTheRecord: a record of the overlap whose ranges fail to store
+// leaves no dedup marker (the advisory's Modified), so the next Sync takes it again and stores its
+// ranges, instead of passing over it as taken.
+func TestCVEList_FailedRangesWriteRetakesTheRecord(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ffs.db")
+	st, err := store.Open(ctx, path)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	setWatermark(t, st, "2026-11-19T01:00:00Z")
+	srv := newReleaseServer(t, map[string][]byte{
+		hourly("2026-11-19", 2): deltaZip(t, [][]byte{
+			restamp(t, fixture(t, "CVE-2024-11236"), "2026-11-19T00:45:00.000Z"), // in the overlap
+		}),
+	})
+	inj, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(5000)")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, inj.Close()) })
+	_, err = inj.ExecContext(ctx, `CREATE TRIGGER fail_ranges BEFORE INSERT ON upstream_ranges
+		BEGIN SELECT RAISE(ABORT, 'injected ranges failure'); END`)
+	require.NoError(t, err)
+
+	h := &handed{}
+	require.ErrorContains(t, newFeed(st, srv, "2026-11-19T02:20:00Z", h).Sync(ctx), "injected ranges failure")
+	_, ok, err := st.GetAdvisory(ctx, "CVE-2024-11236")
+	require.NoError(t, err)
+	require.False(t, ok, "no marker without the ranges")
+
+	_, err = inj.ExecContext(ctx, `DROP TRIGGER fail_ranges`)
+	require.NoError(t, err)
+	h.ids = nil
+	require.NoError(t, newFeed(st, srv, "2026-11-19T02:40:00Z", h).Sync(ctx))
+	require.Equal(t, []string{"CVE-2024-11236"}, h.ids, "taken again and handed off")
+	raw, err := st.UpstreamRanges(ctx, "php")
+	require.NoError(t, err)
+	require.Contains(t, raw, "CVE-2024-11236")
+	a, ok, err := st.GetAdvisory(ctx, "CVE-2024-11236")
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, time.Date(2026, 11, 19, 0, 45, 0, 0, time.UTC), a.Modified)
 }
 
 // TestCVEList_OversizedDeltaSkipped (F66): a delta over the size cap is logged, counted and passed

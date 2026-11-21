@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -19,6 +20,31 @@ type FeedState struct {
 	// succeeded is stale measured from it. Fails counts the syncs that failed since the last success.
 	FirstAttempt time.Time
 	Fails        int
+}
+
+// EarliestAttempt returns when the feed first started a sync: FirstAttempt, or, for a feed that
+// never succeeded and was last run by a version that did not store FirstAttempt (v0.0.1), its
+// LastAttempt, the earliest attempt known. It is zero when neither is known.
+func (st FeedState) EarliestAttempt() time.Time {
+	if st.FirstAttempt.IsZero() && st.LastSuccess.IsZero() {
+		return st.LastAttempt
+	}
+	return st.FirstAttempt
+}
+
+// StaleFrom returns the time the feed's staleness and lag are measured from: its last success, or,
+// for a feed that never succeeded, its earliest attempt (EarliestAttempt) when that is before
+// started, else started. started is when the caller began watching the feed: the feed runner, the
+// notify engine and the metrics collector each pass their own start, and all three measure from
+// this one rule.
+func (st FeedState) StaleFrom(started time.Time) time.Time {
+	if !st.LastSuccess.IsZero() {
+		return st.LastSuccess
+	}
+	if first := st.EarliestAttempt(); !first.IsZero() && first.Before(started) {
+		return first
+	}
+	return started
 }
 
 // FeedState returns the stored state of the named feed, or FeedState{Name: name} when unknown.
@@ -68,8 +94,11 @@ func (s *Store) PutOSVRecord(ctx context.Context, eco, id string, modified time.
 
 // PutOSVRecordAt caches a raw OSV record that ffs observed at observed. changed is true when there
 // was no prior row or its affected hash differs; the latest modified time and raw record are stored
-// either way. The record's observation time (OSVRecordsObserved) is observed when it changed, and
-// the stored one otherwise: it is when ffs first saw the record's current affected content.
+// either way. The affected hash is "<match>:<rating>" (osv.AffectedHash; a hash without a ':' is all
+// match part). The record's observation time (OSVRecordsObserved) is observed when the match part
+// changed, and the stored one otherwise: it is when ffs first saw what the record currently matches.
+// A rating-only change is a change, so the record is handed off and its findings re-rated, but it
+// keeps the observation time, which decides whether new matches on it are provisional.
 func (s *Store) PutOSVRecordAt(ctx context.Context, eco, id string, modified time.Time, affectedHash string, raw []byte, observed time.Time) (bool, error) {
 	var changed bool
 	err := s.inTx(ctx, func(tx *sql.Tx) (err error) {
@@ -104,6 +133,7 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	)
 	err := tx.QueryRowContext(ctx, `SELECT affected_hash, observed FROM osv_records WHERE ecosystem = ? AND id = ?`, eco, id).
 		Scan(&prev, &prevObs)
+	var matched bool // the stored match part equals affectedHash's
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		changed = true
@@ -111,9 +141,10 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 		return false, err
 	default:
 		changed = prev != affectedHash
+		matched = osvMatchPart(prev) == osvMatchPart(affectedHash)
 	}
 	obs := nanos(orNow(observed))
-	if !changed && prevObs.Valid {
+	if matched && prevObs.Valid {
 		obs = prevObs
 	}
 	_, err = tx.ExecContext(ctx, `INSERT OR REPLACE INTO osv_records(ecosystem, id, modified, affected_hash, raw_zst, observed)
@@ -121,9 +152,17 @@ func putOSVRecord(ctx context.Context, tx *sql.Tx, eco, id string, modified time
 	return changed, err
 }
 
-// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: enough
-// to keep the transactions few, few enough that 4 MiB records cannot hold much memory.
-const rehashPage = 64
+// osvMatchPart returns the match part of an OSV affected hash: what precedes its first ':', or all of
+// it.
+func osvMatchPart(h string) string {
+	m, _, _ := strings.Cut(h, ":")
+	return m
+}
+
+// rehashPage is how many cached OSV records RehashOSVRecords reads and rewrites at a time: few
+// enough that a page of records at the OSV feed's 4 MiB cap holds at most 64 MiB, the bound the
+// OSV fast path keeps to, and enough to keep the transactions few.
+const rehashPage = 16
 
 // RehashOSVRecords recomputes the affected hash of every cached OSV record with hash and stores it,
 // rehashPage records at a time, and returns how many hashes changed. Nothing else about a record
@@ -297,6 +336,21 @@ func (s *Store) OSVRecords(ctx context.Context, eco string, since time.Time) ([]
 // DeleteOSVRecords removes the cached records of eco with the given ids, and their index names.
 func (s *Store) DeleteOSVRecords(ctx context.Context, eco string, ids []string) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error { return deleteOSVRecords(ctx, tx, eco, ids) })
+}
+
+// AdvisoryIDsListed returns, sorted, those of ids whose advisory listed names: by the id itself, or
+// by its canonical id or any alias of that canonical (advisory_aliases). The KEV feed passes its
+// catalogue's CVE ids, so it reads and decodes only the advisories the catalogue can date.
+func (s *Store) AdvisoryIDsListed(ctx context.Context, ids, listed []string) ([]string, error) {
+	if len(ids) == 0 || len(listed) == 0 {
+		return nil, nil
+	}
+	return queryAll(ctx, s.rdb, scanString, `SELECT DISTINCT j.value FROM json_each(?) j
+		WHERE j.value IN (SELECT value FROM json_each(?)) OR EXISTS (
+			SELECT 1 FROM advisory_aliases a
+			WHERE a.canonical = COALESCE((SELECT c.canonical FROM advisory_aliases c WHERE c.alias = j.value), j.value)
+				AND a.alias IN (SELECT value FROM json_each(?)))
+		ORDER BY j.value`, idList(ids), idList(listed), idList(listed))
 }
 
 // PutUpstreamRanges stores the affected ranges of an advisory for an upstream product.

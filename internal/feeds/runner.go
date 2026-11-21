@@ -23,7 +23,7 @@ var (
 
 const (
 	staleCheckInterval = time.Minute
-	minSyncTimeout     = 30 * time.Minute
+	minSyncTimeout     = time.Hour
 	firstRetryDelay    = time.Minute
 	maxBackoffShift    = 20 // caps 1m×2^n well below Duration overflow; Interval is the real ceiling
 	jitterFraction     = 0.1
@@ -57,7 +57,7 @@ type feedRun struct {
 	running sync.Mutex // held for the whole of a Sync; taken with TryLock
 
 	lastSuccess  time.Time
-	firstAttempt time.Time // the stored first attempt (see firstAttemptOf), or when this Runner first started a sync
+	firstAttempt time.Time // the stored first attempt (store.FeedState.EarliestAttempt), or when this Runner first started a sync
 	fails        int       // consecutive failures, FeedState.Fails
 	notified     bool      // OnStale fired since the last success
 }
@@ -98,7 +98,7 @@ func (r *Runner) Run(ctx context.Context) error {
 			fr.lastSuccess = st.LastSuccess
 		}
 		if fr.firstAttempt.IsZero() {
-			fr.firstAttempt = firstAttemptOf(st)
+			fr.firstAttempt = st.EarliestAttempt()
 		}
 		if fr.fails == 0 {
 			fr.fails = failsOf(st)
@@ -170,16 +170,6 @@ func backoff(iv time.Duration, fails int) time.Duration {
 	return min(iv, firstRetryDelay<<min(fails-1, maxBackoffShift))
 }
 
-// firstAttemptOf returns when st's feed first started a sync: FeedState.FirstAttempt, or for a
-// feed that never succeeded and was last run by a version that did not store it, its last attempt,
-// the earliest one known.
-func firstAttemptOf(st store.FeedState) time.Time {
-	if st.FirstAttempt.IsZero() && st.LastSuccess.IsZero() {
-		return st.LastAttempt
-	}
-	return st.FirstAttempt
-}
-
 // failsOf returns st's count of consecutive failures; a failed last attempt recorded by a version
 // that did not count them is one.
 func failsOf(st store.FeedState) int {
@@ -201,7 +191,8 @@ func (r *Runner) SyncNow(ctx context.Context, name string) error {
 
 // syncFeed runs one Sync of fr unless one is already running, records its outcome and then
 // evaluates staleness. A Sync that fails because ctx ended (shutdown) is not recorded at all: it is
-// neither a failure nor an attempt, so the next start schedules from the attempt before it.
+// neither a failure nor an attempt, so the next start schedules from the attempt before it. Failing
+// to store the first attempt beforehand is logged, not returned: record stores it with the outcome.
 func (r *Runner) syncFeed(ctx context.Context, fr *feedRun) error {
 	name := fr.feed.Name()
 	if !fr.running.TryLock() {
@@ -209,10 +200,13 @@ func (r *Runner) syncFeed(ctx context.Context, fr *feedRun) error {
 	}
 	defer fr.running.Unlock()
 
-	persistErr := r.markFirstAttempt(ctx, fr)
+	if err := r.markFirstAttempt(ctx, fr); err != nil {
+		logr.FromContextOrDiscard(ctx).WithName("feeds").Error(err, "could not store the feed's first attempt ahead of its sync; it is stored with the outcome",
+			"feed", name)
+	}
 	err := callSync(ctx, fr.feed)
 	if err != nil && ctx.Err() != nil {
-		return errors.Join(err, persistErr)
+		return err
 	}
 	at := r.now()
 	r.mu.Lock()
@@ -227,11 +221,13 @@ func (r *Runner) syncFeed(ctx context.Context, fr *feedRun) error {
 		err = errors.Join(err, recErr)
 	}
 	r.checkStale(ctx, fr)
-	return errors.Join(err, persistErr)
+	return err
 }
 
 // markFirstAttempt notes now as fr's first attempt when it never succeeded and has none, and stores
 // it before the Sync runs, so a restart during a long first sync still measures staleness from it.
+// An earlier first attempt already stored (a SyncNow before Run has read the state) is adopted
+// instead.
 func (r *Runner) markFirstAttempt(ctx context.Context, fr *feedRun) error {
 	now := r.now()
 	r.mu.Lock()
@@ -245,19 +241,38 @@ func (r *Runner) markFirstAttempt(ctx context.Context, fr *feedRun) error {
 	}
 	name := fr.feed.Name()
 	st, err := r.st.FeedState(ctx, name)
-	if err == nil && st.FirstAttempt.IsZero() {
-		st.FirstAttempt = now
-		err = r.st.PutFeedState(ctx, st)
-	}
 	if err != nil {
+		return fmt.Errorf("feeds: record the first attempt of %s: %w", name, err)
+	}
+	if stored := st.EarliestAttempt(); !stored.IsZero() && stored.Before(now) {
+		r.mu.Lock()
+		if stored.Before(fr.firstAttempt) {
+			fr.firstAttempt = stored
+		}
+		r.mu.Unlock()
+		now = stored
+	}
+	if !st.FirstAttempt.IsZero() {
+		return nil
+	}
+	st.FirstAttempt = now
+	if err := r.st.PutFeedState(ctx, st); err != nil {
 		return fmt.Errorf("feeds: record the first attempt of %s: %w", name, err)
 	}
 	return nil
 }
 
-// callSync runs f.Sync under the sync timeout, turning a panic into an error.
+// SyncTimeout is how long the runner gives a Sync of a feed polled every iv: twice iv, and at least
+// an hour. The floor is the Grype DB feed's: a diff of two production builds takes tens of minutes
+// (37 at 1.3 cores in issue #7, more at its nice value), so twice a short interval would cut it off
+// at every update. That feed gives its diff the same budget.
+func SyncTimeout(iv time.Duration) time.Duration {
+	return max(2*iv, minSyncTimeout)
+}
+
+// callSync runs f.Sync under SyncTimeout, turning a panic into an error.
 func callSync(ctx context.Context, f Feed) (err error) {
-	ctx, cancel := context.WithTimeout(ctx, max(2*f.Interval(), minSyncTimeout))
+	ctx, cancel := context.WithTimeout(ctx, SyncTimeout(f.Interval()))
 	defer cancel()
 	defer func() {
 		if p := recover(); p != nil {
@@ -316,19 +331,14 @@ func (r *Runner) checkStale(ctx context.Context, fr *feedRun) {
 
 // staleLocked reports whether fr's last success is more than StaleAfter before now. A feed that
 // never succeeded is measured from its first attempt, stored across restarts, or from the Runner
-// start when that is earlier. A feed without a positive StaleAfter is never stale.
+// start when that is earlier (store.FeedState.StaleFrom). A feed without a positive StaleAfter is
+// never stale.
 func (r *Runner) staleLocked(fr *feedRun, now time.Time) bool {
 	limit := fr.feed.StaleAfter()
 	if limit <= 0 {
 		return false
 	}
-	ref := fr.lastSuccess
-	if ref.IsZero() {
-		ref = r.started
-		if !fr.firstAttempt.IsZero() && fr.firstAttempt.Before(ref) {
-			ref = fr.firstAttempt
-		}
-	}
+	ref := store.FeedState{LastSuccess: fr.lastSuccess, FirstAttempt: fr.firstAttempt}.StaleFrom(r.started)
 	return now.Sub(ref) > limit
 }
 

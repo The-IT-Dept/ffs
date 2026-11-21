@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
+	"runtime/debug"
+	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -29,6 +33,16 @@ const diffWaitDelay = 10 * time.Second
 
 // maxDiffStderr is how much of a diff process's last output an error carries.
 const maxDiffStderr = 2 << 10
+
+// diffMemoryShare is the share of the controller's GOMEMLIMIT a diff process gets: a quarter, which
+// the controller gives up for as long as the process runs (see shareMemoryLimit). Under the chart's
+// 1Gi default that is about 230 MiB, against the 123 MB a diff of two production builds was
+// measured at.
+const diffMemoryShare = 4
+
+// memLimitMu serialises shareMemoryLimit: the limit is this process's, so diffs take their share one
+// at a time.
+var memLimitMu sync.Mutex
 
 // Differ diffs two DB directories and returns the packages whose vulnerability records changed
 // (see Diff). It may write to oldDir, which is a copy; newDir is the build about to be installed.
@@ -86,9 +100,11 @@ func RunDiff(ctx context.Context, oldDir, newDir, out string) error {
 
 // ExecDiffer returns a Differ that runs each diff as `<this executable> grypedb-diff` in its own
 // process group at nice (0 to 19; 0 leaves the priority alone), so the diff neither competes with
-// the controller at full priority nor shares its memory. The process writes the keys to a file
-// beside oldDir, which the Differ reads and removes. When ctx ends, the whole process group is
-// killed. A process that fails is an error carrying the end of its output.
+// the controller at full priority nor shares its heap. The process runs in the controller's
+// container, under the same memory limit: it gets its own GOMEMLIMIT, a quarter of the
+// controller's, which the controller gives up while it runs (see shareMemoryLimit). The process
+// writes the keys to a file beside oldDir, which the Differ reads and removes. When ctx ends, the
+// whole process group is killed. A process that fails is an error carrying the end of its output.
 func ExecDiffer(nice int) Differ {
 	return func(ctx context.Context, oldDir, newDir string) ([]PackageKey, error) {
 		self, err := os.Executable()
@@ -101,14 +117,24 @@ func ExecDiffer(nice int) Differ {
 		}
 		defer func() { _ = os.Remove(out) }()
 
+		limit, restore := shareMemoryLimit()
+		defer restore()
+
 		var stderr tailBuffer
 		//nolint:gosec // G204: self is this binary, and the directories are the feed's own
 		cmd := exec.CommandContext(ctx, self, DiffCommand, "--old", oldDir, "--new", newDir, "--out", out)
+		cmd.Env = os.Environ()
+		if limit > 0 {
+			cmd.Env = append(cmd.Env, "GOMEMLIMIT="+strconv.FormatInt(limit, 10)) // the last one wins
+		}
 		cmd.Stderr = &stderr
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 		cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 		cmd.WaitDelay = diffWaitDelay
 		if err := cmd.Start(); err != nil {
+			if ctx.Err() != nil { // done before the start: the same error as a diff cut short
+				return nil, context.Cause(ctx)
+			}
 			return nil, fmt.Errorf("starting the diff process: %w", err)
 		}
 		if nice > 0 {
@@ -132,6 +158,29 @@ func ExecDiffer(nice int) Differ {
 			return nil, fmt.Errorf("diff process: %w", err)
 		}
 		return readKeys(out)
+	}
+}
+
+// shareMemoryLimit splits this process's GOMEMLIMIT with a diff process: it returns the process's
+// share (diffMemoryShare) and lowers this process's limit by as much until restore is called. The
+// two then stay within the one limit, which the chart sets to 90% of the container's memory limit:
+// they share the container's cgroup, and the kernel kills the whole container when the sum of their
+// memory crosses it. GOMEMLIMIT is a soft limit on what each Go runtime maps; the SQLite caches of
+// either process are outside it and come out of the remaining 10%. Without a limit (none set, or
+// "off") there is nothing to share: the share is 0 and the process inherits the environment as it
+// is.
+func shareMemoryLimit() (share int64, restore func()) {
+	memLimitMu.Lock()
+	cur := debug.SetMemoryLimit(-1)
+	if cur <= 0 || cur == math.MaxInt64 {
+		memLimitMu.Unlock()
+		return 0, func() {}
+	}
+	share = cur / diffMemoryShare
+	debug.SetMemoryLimit(cur - share)
+	return share, func() {
+		debug.SetMemoryLimit(cur)
+		memLimitMu.Unlock()
 	}
 }
 
