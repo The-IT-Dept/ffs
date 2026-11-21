@@ -357,7 +357,8 @@ jobs:
           test "$(printf '%s\n' "$PDS" | grep -c .)" = 2
           for pd in $PDS; do
             cosign verify "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID" --certificate-oidc-issuer "$ISS"
-            cosign verify-attestation --type spdxjson "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID" --certificate-oidc-issuer "$ISS"
+            # The attestation is the whole SBOM; print nothing, keep the result.
+            cosign verify-attestation --type spdxjson "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID" --certificate-oidc-issuer "$ISS" >/dev/null
             gh attestation verify "oci://ghcr.io/the-it-dept/ffs@$pd" -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
           done
           cosign verify ghcr.io/the-it-dept/charts/ffs@$CD --certificate-identity "$ID" --certificate-oidc-issuer $ISS
