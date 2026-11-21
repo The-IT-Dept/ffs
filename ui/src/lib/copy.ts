@@ -220,7 +220,8 @@ export const copy = {
     },
     node_agent_unsupported: {
       gap: 'not scheduled by the node agent',
-      todo: 'Its architecture or node selector excludes this node from the node agent.',
+      todo:
+        'Its architecture, the node selector or a taint the agent does not tolerate excludes this node from the node agent. To cover it, add it to nodeAgent.architectures, nodeAgent.nodeSelector or nodeAgent.tolerations.',
     },
     feed_stale: { gap: 'feed out of date', todo: 'Check that ffs can reach the {feed} feed; the last error is shown.' },
   } satisfies Record<GapCode, { gap: string; todo: string }>,

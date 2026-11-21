@@ -1534,7 +1534,7 @@ components:
         stale: {type: integer}
         never: {type: integer}
         disabled: {type: integer}
-        unsupported: {type: integer, description: Nodes the node agent does not schedule on (architecture or node selector).}
+        unsupported: {type: integer, description: 'Nodes the node agent does not schedule on: their architecture, the node selector or a taint the agent does not tolerate excludes them.'}
 
     NodeGroupDetail:
       allOf:

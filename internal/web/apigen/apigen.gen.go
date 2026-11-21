@@ -1040,7 +1040,7 @@ type AgentCounts struct {
 	ReportingWithoutInventory int `json:"reportingWithoutInventory"`
 	Stale                     int `json:"stale"`
 
-	// Unsupported Nodes the node agent does not schedule on (architecture or node selector).
+	// Unsupported Nodes the node agent does not schedule on: their architecture, the node selector or a taint the agent does not tolerate excludes them.
 	Unsupported int `json:"unsupported"`
 }
 

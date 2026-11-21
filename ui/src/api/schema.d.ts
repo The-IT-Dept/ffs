@@ -1085,7 +1085,7 @@ export interface components {
             stale: number;
             never: number;
             disabled: number;
-            /** @description Nodes the node agent does not schedule on (architecture or node selector). */
+            /** @description Nodes the node agent does not schedule on: their architecture, the node selector or a taint the agent does not tolerate excludes them. */
             unsupported: number;
         };
         NodeGroupDetail: components["schemas"]["Envelope"] & {
