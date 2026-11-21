@@ -269,3 +269,20 @@ func TestDocs_CallItTheWebUI(t *testing.T) {
 	}
 	require.Contains(t, readFile(t, "../../README.md"), "web UI")
 }
+
+// TestDocs_SnippetsUseTheNewestRelease (W12): the README's install and upgrade snippets and SECURITY.md's verify snippet
+// name the release of the newest Upgrading heading, so the tag commit cannot leave them at the release before.
+func TestDocs_SnippetsUseTheNewestRelease(t *testing.T) {
+	readme := readFile(t, "../../README.md")
+	newest := regexp.MustCompile(`(?m)^### v(\d+\.\d+\.\d+)$`).FindStringSubmatch(readme)
+	require.NotNil(t, newest, "README.md has no Upgrading heading")
+	v := newest[1]
+	pins := regexp.MustCompile(`(?m)^V=(\S+) +# the release to (?:install|upgrade to),`).FindAllStringSubmatch(readme, -1)
+	require.Len(t, pins, 2, "README.md's install and upgrade snippets")
+	for _, p := range pins {
+		require.Equal(t, v, p[1], "README.md: %s", p[0])
+	}
+	verify := regexp.MustCompile(`(?m)^TAG=v(\S+) V=(\S+) +# the release to verify$`).FindStringSubmatch(readFile(t, "../../SECURITY.md"))
+	require.NotNil(t, verify, "SECURITY.md has no verify snippet")
+	require.Equal(t, []string{v, v}, verify[1:], "SECURITY.md: %s", verify[0])
+}

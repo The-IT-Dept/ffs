@@ -22,12 +22,12 @@ Only the latest release receives fixes.
 Images and charts are signed with cosign keyless signing by the release workflow. Every image platform also has an SPDX SBOM attestation, and the image index, each platform image and the chart have SLSA build provenance in GitHub's attestation store. The commands below need `cosign`, `crane`, `jq`, `gh`, `helm` and `yq`.
 
 ```sh
-TAG=v0.0.1 V=0.0.1   # the release to verify
+TAG=v0.0.2 V=0.0.2   # the release to verify
 ID="https://github.com/The-IT-Dept/ffs/.github/workflows/release.yml@refs/tags/$TAG"
 ISS=https://token.actions.githubusercontent.com
 
-# The image index (linux/amd64 and linux/arm64 from v0.0.2), then each platform image with its SBOM
-# attestation and provenance. v0.0.1 is a single amd64 image, its own platform image.
+# The image index (linux/amd64 and linux/arm64), then each platform image with its SBOM attestation and
+# provenance. v0.0.1 is a single amd64 image, which the loop checks as its own platform image.
 D=$(crane digest ghcr.io/the-it-dept/ffs:$V)
 cosign verify ghcr.io/the-it-dept/ffs@$D --certificate-identity "$ID" --certificate-oidc-issuer $ISS
 gh attestation verify oci://ghcr.io/the-it-dept/ffs@$D -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
