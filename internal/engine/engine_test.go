@@ -48,9 +48,19 @@ type spyStore struct {
 	*store.Store
 	replaced []store.MatchScope
 	// afterMatches, when set, runs after each MatchesForDigests read; beforeMarkMatched before each
-	// MarkMatched write.
+	// MarkMatched write. packagesErr, when set, is the error of each PackagesForImage read.
 	afterMatches      func(digests []string)
 	beforeMarkMatched func(digest string)
+	packagesErr       func(digest string) error
+}
+
+func (s *spyStore) PackagesForImage(ctx context.Context, digest string) ([]model.Package, error) {
+	if s.packagesErr != nil {
+		if err := s.packagesErr(digest); err != nil {
+			return nil, err
+		}
+	}
+	return s.Store.PackagesForImage(ctx, digest)
 }
 
 func (s *spyStore) MatchesForDigests(ctx context.Context, digests []string) ([]model.Match, error) {
@@ -178,7 +188,8 @@ type harness struct {
 }
 
 // newHarness seeds a real store: catalogued images d1 (libssl3) and d2 (zlib1g), owners web/api on
-// d1 and shop/cart on d2, and advisory CVE-2026-41873 rated critical by its CNA. The clock is t0.
+// d1 and shop/cart on d2, and advisory CVE-2026-41873 rated critical by its CNA, with the current
+// matchers version recorded. The clock is t0.
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), "ffs.db"))
@@ -217,6 +228,9 @@ func newHarness(t *testing.T) *harness {
 	}
 	require.NoError(t, st.UpsertAdvisory(ctx, model.Advisory{ID: cve, Title: "OpenSSL buffer overflow",
 		Published: t0.Add(-48 * time.Hour), Observed: t0.Add(-24 * time.Hour), CNASeverity: model.SeverityCritical, CNASource: "openssl"}))
+
+	// Every matcher has re-matched with this code: a Grype DB update re-runs grype alone.
+	require.NoError(t, st.RecordMatchersVersion(ctx, engine.MatchersVersion))
 
 	cfg := config.Default()
 	cfg.ClusterName = "prod"
@@ -600,11 +614,11 @@ type failingLoad struct{ *fakeGrype }
 
 func (f *failingLoad) Load(string, time.Time) error { return errors.New("corrupt database") }
 
-// TestEngine_GrypeDBFullRunsGrypeAlone (W10): a full update (the first DB, the weekly one, and every
-// one below diffMinImages) re-matches every live digest with grype alone, taking the stored OSV
-// matches as its hints. The other matchers' results do not depend on the Grype DB: neither the OSV
-// fast path nor the upstream matcher runs, so one that would fail on every image does not hold the
-// build back either.
+// TestEngine_GrypeDBFullRunsGrypeAlone (W10): with the matchers version current, a full update (the
+// weekly one, and every one below diffMinImages) re-matches every live digest with grype alone,
+// taking the stored OSV matches as its hints. The other matchers' results do not depend on the
+// Grype DB: neither the OSV fast path nor the upstream matcher runs, so one that would fail on
+// every image does not hold the build back either.
 func TestEngine_GrypeDBFullRunsGrypeAlone(t *testing.T) {
 	h := newHarness(t)
 	osvMatch := newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1")
@@ -633,6 +647,130 @@ func TestEngine_GrypeDBFullRunsGrypeAlone(t *testing.T) {
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []time.Time{t0}, builds)
+}
+
+// TestEngine_GrypeDBRunsEveryMatcherOnceForANewMatchersVersion (W10, I1): the first Grype DB
+// update after an upgrade that bumped the matchers version re-matches every live digest with every
+// matcher, even when the feed sent an incremental update, so the stored matches catch up with the
+// matchers' code: here an OSV match whose record's rating changed while the older version ran.
+// Grype takes the fresh OSV matches as its hints. The version is then recorded and the next update
+// runs grype alone again.
+func TestEngine_GrypeDBRunsEveryMatcherOnceForANewMatchersVersion(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.RecordMatchersVersion(ctx, "1"))
+	stale := newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1")
+	stale.VendorSeverity, stale.VendorSeveritySource = model.SeverityLow, "debian"
+	_, err := h.st.Store.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceOSV, Digests: []string{d1}}, []model.Match{stale})
+	require.NoError(t, err)
+	fresh := stale
+	fresh.VendorSeverity = model.SeverityHigh
+	h.osv.fn = matchOn(nil, d1, fresh)
+	hints := map[string][]model.Match{}
+	h.grype.fn = func(in match.ImageInput) ([]model.Match, error) {
+		hints[in.Digest] = clearObserved(in.Hints)
+		return nil, nil
+	}
+	upstream := &fakeMatcher{src: model.SourceUpstream}
+	e := engine.New(engine.Options{Config: config.Default(), Store: h.st, Grype: h.grype,
+		Matchers: []match.Matcher{h.osv, upstream}, Records: []match.RecordMatcher{h.records}, Now: h.clock.Now})
+
+	b1 := t0.Add(time.Hour)
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/1", Built: b1, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "unrelated"}}}))
+	require.Empty(t, h.grype.affectedArgs, "the pass re-matches every live digest, reading no diff")
+	require.Equal(t, []string{d1, d2}, h.grype.matched)
+	require.Equal(t, 2, h.osv.calls, "the OSV fast path re-runs on every live digest")
+	require.Equal(t, 2, upstream.calls, "so does the upstream matcher")
+	require.Equal(t, []store.MatchScope{
+		{Source: model.SourceOSV, Digests: []string{d1}}, {Source: model.SourceUpstream, Digests: []string{d1}}, {Source: model.SourceGrype, Digests: []string{d1}},
+		{Source: model.SourceOSV, Digests: []string{d2}}, {Source: model.SourceUpstream, Digests: []string{d2}}, {Source: model.SourceGrype, Digests: []string{d2}},
+	}, h.st.replaced, "every matcher's matches, one digest at a time")
+	got := storedMatches(t, h.st.Store, d1, model.SourceOSV)
+	require.Len(t, got, 1)
+	require.Equal(t, model.SeverityHigh, got[0].VendorSeverity, "the stored OSV match takes the record's current rating")
+	require.Equal(t, []model.Match{fresh}, hints[d1], "grype's hints are the fresh OSV matches")
+	v, err := h.st.MatchersVersion(ctx)
+	require.NoError(t, err)
+	require.Equal(t, engine.MatchersVersion, v)
+	builds, err := h.st.GrypeDBBuilds(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []time.Time{b1}, builds)
+
+	// The version is current: the next update runs grype alone on the digests the diff selected.
+	h.grype.matched, h.grype.affected = nil, []string{d1}
+	b2 := t0.Add(25 * time.Hour)
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/2", Built: b2, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "libssl3"}}}))
+	require.Equal(t, []string{d1}, h.grype.matched)
+	require.Equal(t, 2, h.osv.calls, "the OSV fast path does not run again")
+	require.Equal(t, 2, upstream.calls, "nor does the upstream matcher")
+}
+
+// TestEngine_GrypeDBMatchersVersionWaitsForEveryMatcher (W10, I1): the matchers version is recorded
+// only once every other matcher has succeeded on every live digest, so each update runs the pass
+// again until one does. Another matcher's failure, or a digest that cannot be read, does not hold
+// the build back; an update that fails (grype failed on every digest) records neither.
+func TestEngine_GrypeDBMatchersVersionWaitsForEveryMatcher(t *testing.T) {
+	h := newHarness(t)
+	require.NoError(t, h.st.RecordMatchersVersion(ctx, "1"))
+	version := func() string {
+		t.Helper()
+		v, err := h.st.MatchersVersion(ctx)
+		require.NoError(t, err)
+		return v
+	}
+	builds := func() []time.Time {
+		t.Helper()
+		bs, err := h.st.GrypeDBBuilds(ctx)
+		require.NoError(t, err)
+		return bs
+	}
+	update := func(built time.Time) grypedb.Update {
+		return grypedb.Update{Path: "/db", Built: built, Changed: []grypedb.PackageKey{{Ecosystem: "deb", Name: "unrelated"}}}
+	}
+
+	h.grype.fn = func(match.ImageInput) ([]model.Match, error) {
+		return nil, errors.New("database disk image is malformed")
+	}
+	require.Error(t, h.e.OnGrypeDB(ctx, update(t0)))
+	require.Equal(t, 2, h.osv.calls, "the OSV fast path ran on both digests")
+	require.Equal(t, "1", version(), "a failed update records no version")
+	require.Empty(t, builds())
+
+	h.grype.fn = nil
+	h.osv.fn = func(in match.ImageInput) ([]model.Match, error) {
+		if in.Digest == d2 {
+			return nil, errors.New("osv cache unreadable")
+		}
+		return nil, nil
+	}
+	b1 := t0.Add(time.Hour)
+	require.NoError(t, h.e.OnGrypeDB(ctx, update(b1)))
+	require.Equal(t, 4, h.osv.calls)
+	require.Equal(t, "1", version(), "the OSV fast path failed on d2")
+	require.Equal(t, []time.Time{b1}, builds(), "grype re-matched every digest, so the build counts")
+
+	h.osv.fn = nil
+	h.st.packagesErr = func(digest string) error {
+		if digest == d2 {
+			return errors.New("database is locked")
+		}
+		return nil
+	}
+	b2 := t0.Add(25 * time.Hour)
+	require.NoError(t, h.e.OnGrypeDB(ctx, update(b2)))
+	require.Equal(t, 5, h.osv.calls, "the pass runs again; d2 cannot be read")
+	require.Equal(t, "1", version(), "no matcher re-matched d2")
+	require.Equal(t, []time.Time{b1, b2}, builds())
+
+	h.st.packagesErr = nil
+	b3 := t0.Add(49 * time.Hour)
+	require.NoError(t, h.e.OnGrypeDB(ctx, update(b3)))
+	require.Equal(t, 7, h.osv.calls, "the pass runs again")
+	require.Equal(t, engine.MatchersVersion, version())
+	require.Equal(t, []time.Time{b1, b2, b3}, builds())
+
+	b4 := t0.Add(73 * time.Hour)
+	require.NoError(t, h.e.OnGrypeDB(ctx, update(b4)))
+	require.Equal(t, 7, h.osv.calls, "and not once the version is recorded")
 }
 
 func TestEngine_AliasRekeyNoTransition(t *testing.T) {

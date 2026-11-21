@@ -307,6 +307,7 @@ type matchResult struct {
 	matches       []model.Match // of the matchers that succeeded
 	grypeNotReady bool          // grype ran with no DB loaded
 	grypeFailed   bool          // grype failed, or its matches could not be stored
+	othersFailed  bool          // another matcher failed, or its matches could not be stored
 }
 
 // matchImage runs the matchers of mode over a catalogued digest: the Matchers in order, then grype
@@ -358,6 +359,7 @@ func (e *Engine) matchImage(ctx context.Context, digest string, mode matchMode) 
 				res.grypeNotReady = true
 			} else {
 				res.grypeFailed = res.grypeFailed || grype
+				res.othersFailed = res.othersFailed || !grype
 				errs = append(errs, fmt.Errorf("engine: %s matcher on %s: %w", m.Source(), digest, err))
 			}
 			return nil, false
@@ -368,6 +370,7 @@ func (e *Engine) matchImage(ctx context.Context, digest string, mode matchMode) 
 			affected, err := e.o.Store.ReplaceMatches(ctx, scope, ms)
 			if err != nil {
 				res.grypeFailed = res.grypeFailed || grype
+				res.othersFailed = res.othersFailed || !grype
 				errs = append(errs, fmt.Errorf("engine: store %s matches of %s: %w", m.Source(), digest, err))
 			}
 			changed = changed || len(affected) > 0
