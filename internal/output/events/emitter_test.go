@@ -277,8 +277,9 @@ func TestEvents_UpgradeNoteUsesTarget(t *testing.T) {
 		"CVE-2026-0002 (upgrade to ghcr.io/example/app:1.30.7)", ev[0].Note)
 }
 
-// TestEvents_FeedStaleRepeatsWhileStale (F94): Events expire after about an hour, so a feed that stays
-// stale is reported again every hour until it syncs.
+// TestEvents_FeedStaleRepeatsWhileStale (F94, W34): Events expire an hour after their last update, so
+// a feed that stays stale is reported again every 50 minutes, before the last Event expires, until it
+// syncs.
 func TestEvents_FeedStaleRepeatsWhileStale(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t, self)
@@ -289,22 +290,25 @@ func TestEvents_FeedStaleRepeatsWhileStale(t *testing.T) {
 	h.em.FeedStale("osv", last, 2*time.Hour)
 	require.Len(t, h.byReason(ReasonFeedStale), 1)
 
-	now = now.Add(59 * time.Minute)
+	now = now.Add(49 * time.Minute)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 1, "within the hour the first Event is still visible")
+	require.Len(t, h.byReason(ReasonFeedStale), 1, "within 50 minutes the first Event is not repeated")
 	now = now.Add(time.Minute)
 	h.em.RepeatStale(ctx)
 	ev := h.byReason(ReasonFeedStale)
-	require.Len(t, ev, 2)
+	require.Len(t, ev, 2, "repeated at 50 minutes, ten before the first Event expires")
 	require.Equal(t, ev[0].Note, ev[1].Note)
 	now = now.Add(30 * time.Minute)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 2, "an hour from the repeat, not from the first")
+	require.Len(t, h.byReason(ReasonFeedStale), 2, "50 minutes from the repeat, not from the first")
+	now = now.Add(20 * time.Minute)
+	h.em.RepeatStale(ctx)
+	require.Len(t, h.byReason(ReasonFeedStale), 3)
 
 	require.NoError(t, h.st.PutFeedState(ctx, store.FeedState{Name: "osv", LastSuccess: now}))
 	now = now.Add(2 * time.Hour)
 	h.em.RepeatStale(ctx)
-	require.Len(t, h.byReason(ReasonFeedStale), 2, "a feed that synced is not reported again")
+	require.Len(t, h.byReason(ReasonFeedStale), 3, "a feed that synced is not reported again")
 	h.em.mu.Lock()
 	require.Empty(t, h.em.stale)
 	h.em.mu.Unlock()
