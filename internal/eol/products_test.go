@@ -53,6 +53,11 @@ func TestDistroProduct(t *testing.T) {
 		{&model.Distro{ID: "alpine", VersionID: "3.20.3"}, "docker.io/library/nginx", ProductVersion{"alpine-linux", "3.20.3"}},
 		{&model.Distro{ID: "amzn", VersionID: "2023"}, "docker.io/library/nginx", ProductVersion{"amazon-linux", "2023"}},
 		{&model.Distro{ID: "debian", VersionID: "12"}, "gcr.io/distroless/static-debian12", ProductVersion{"distroless", "12"}},
+		// CentOS Stream images carry ID=centos: from 9 they can only be Stream
+		{&model.Distro{ID: "centos", VersionID: "7"}, "quay.io/centos/centos", ProductVersion{"centos", "7"}},
+		{&model.Distro{ID: "centos", VersionID: "8"}, "quay.io/centos/centos", ProductVersion{"centos", "8"}},
+		{&model.Distro{ID: "centos", VersionID: "9"}, "quay.io/centos/centos", ProductVersion{"centos-stream", "9"}},
+		{&model.Distro{ID: "centos", VersionID: "10"}, "quay.io/centos/centos", ProductVersion{"centos-stream", "10"}},
 	} {
 		got, ok := DistroProduct(tc.d, tc.repo)
 		require.True(t, ok, tc.repo)

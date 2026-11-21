@@ -2,6 +2,7 @@ package eol
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/the-it-dept/ffs/internal/model"
@@ -68,7 +69,8 @@ func NodeOSProduct(osImage string) (ProductVersion, bool) {
 }
 
 // distroProducts maps an os-release ID to its product. Azure Linux 3.0 is "azurelinux"; its 1.0 and
-// 2.0 releases, under the CBL-Mariner name, are "mariner".
+// 2.0 releases, under the CBL-Mariner name, are "mariner". CentOS Stream shares CentOS Linux's ID,
+// "centos" (see centosProduct).
 var distroProducts = map[string]string{
 	"debian": "debian", "ubuntu": "ubuntu", "alpine": "alpine-linux", "rhel": "rhel", "rocky": "rocky-linux",
 	"almalinux": "almalinux", "amzn": "amazon-linux", "ol": "oracle-linux", "sles": "sles",
@@ -99,7 +101,9 @@ func Label(product string) string {
 }
 
 // DistroProduct maps an image's distro to its product and version. Images under gcr.io/distroless/
-// are the distroless product at their base Debian version.
+// are the distroless product at their base Debian version. A "centos" distro is CentOS Stream from
+// version 9, the first with no CentOS Linux release; version 8 had both, and maps to CentOS Linux
+// here (ImageEOL tells them apart by the release package).
 func DistroProduct(d *model.Distro, repo string) (ProductVersion, bool) {
 	if d == nil || d.VersionID == "" {
 		return ProductVersion{}, false
@@ -108,7 +112,20 @@ func DistroProduct(d *model.Distro, repo string) (ProductVersion, bool) {
 		return ProductVersion{"distroless", d.VersionID}, true
 	}
 	p, ok := distroProducts[d.ID]
+	if p == "centos" {
+		p = centosProduct(d.VersionID, false)
+	}
 	return ProductVersion{p, d.VersionID}, ok
+}
+
+// centosProduct is the product of a "centos" distro at versionID: CentOS Stream when stream (the image
+// holds the centos-stream-release package) or from version 9, else CentOS Linux.
+func centosProduct(versionID string, stream bool) string {
+	major, _, _ := strings.Cut(versionID, ".")
+	if n, err := strconv.Atoi(major); stream || (err == nil && n >= 9) {
+		return "centos-stream"
+	}
+	return "centos"
 }
 
 var runtimeBinaries = map[string]string{

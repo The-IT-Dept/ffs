@@ -110,6 +110,20 @@ func (s Status) name() string {
 	return s.Product
 }
 
+// centosStreamRelease is the package that names a CentOS Stream image; CentOS Linux images hold
+// centos-linux-release or centos-release instead.
+const centosStreamRelease = "centos-stream-release"
+
+// hasPackage reports whether pkgs holds a package named name.
+func hasPackage(pkgs []model.Package, name string) bool {
+	for _, p := range pkgs {
+		if p.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func trimVersion(v string) string {
 	v = strings.TrimPrefix(v, "v")
 	return strings.TrimPrefix(v, "go")
@@ -123,12 +137,17 @@ func firstTwo(v string) string {
 	return strings.Join(parts, ".")
 }
 
-// ImageEOL evaluates an image's distro and language runtimes, once per product cycle.
+// ImageEOL evaluates an image's distro and language runtimes, once per product cycle. A CentOS 8
+// image that holds the centos-stream-release package is CentOS Stream 8, which shares CentOS Linux
+// 8's os-release ID and version.
 func (e *Evaluator) ImageEOL(repo string, pkgs []model.Package) []Status {
 	var pvs []ProductVersion
 	for _, p := range pkgs {
 		if p.Distro != nil {
 			if pv, ok := DistroProduct(p.Distro, repo); ok {
+				if pv.Product == "centos" && hasPackage(pkgs, centosStreamRelease) {
+					pv.Product = centosProduct(pv.Version, true)
+				}
 				pvs = append(pvs, pv)
 			}
 			break
