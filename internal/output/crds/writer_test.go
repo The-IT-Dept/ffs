@@ -194,14 +194,14 @@ func TestCRWriter_DeletesStale(t *testing.T) {
 func TestCRWriter_ClusterLevelInFFSNamespace(t *testing.T) {
 	needEnv(t)
 	st := newStore(t)
-	prod := model.OwnerRef{Kind: "Cluster", Name: "prod"}
-	apply(t, st, openFinding(prod, "kubernetes", "CVE-2026-1111", model.PriorityUrgent, t0))
+	cluster := model.OwnerRef{Kind: "Cluster", Name: "test"}
+	apply(t, st, openFinding(cluster, "kubernetes", "CVE-2026-1111", model.PriorityUrgent, t0))
 	w, _ := newWriter(t, st, nil)
 
 	require.NoError(t, w.Sync(ctx))
 	crs := findingCRs(t)
-	require.Equal(t, []string{"ffs/cluster-prod-cve-2026-1111"}, keysOf(crs))
-	require.Equal(t, v1alpha1.OwnerReference{Kind: "Cluster", Name: "prod"}, crs["ffs/cluster-prod-cve-2026-1111"].Status.Subject.Owner)
+	require.Equal(t, []string{"ffs/cluster-test-cve-2026-1111"}, keysOf(crs))
+	require.Equal(t, v1alpha1.OwnerReference{Kind: "Cluster", Name: "test"}, crs["ffs/cluster-test-cve-2026-1111"].Status.Subject.Owner)
 }
 
 func TestCRWriter_VulnerabilityTopFiftyOwners(t *testing.T) {
@@ -264,8 +264,8 @@ func TestFindingStatus_Content(t *testing.T) {
 			PowerfulSA: true, SAReasons: []string{"service account can read secrets cluster-wide"}}}
 	adv := model.Advisory{ID: cve, Aliases: []string{ghsa}, Title: "openssl: buffer overflow", Links: []string{"https://example.com/" + cve}}
 
-	st := findingStatus("prod", f, owner, adv)
-	require.Equal(t, "prod", st.Cluster)
+	st := findingStatus("test", f, owner, adv)
+	require.Equal(t, "test", st.Cluster)
 	require.Equal(t, f.Fingerprint, st.Fingerprint)
 	require.Equal(t, v1alpha1.FindingSubject{Owner: v1alpha1.OwnerReference{Kind: "Deployment", Namespace: "web", Name: "api", UID: "uid-api"},
 		Containers: []string{"app", "migrate"}, ImageRepository: debianRepo, Digests: []string{"sha256:d1"},
@@ -285,7 +285,7 @@ func TestFindingStatus_Content(t *testing.T) {
 	require.Equal(t, t0.Add(-48*time.Hour), st.Published.Time)
 
 	f.Packages[0].Fixed, f.FixState, f.FixAvailable = nil, model.FixWontFix, false
-	require.Equal(t, "wont-fix", findingStatus("prod", f, owner, adv).Fix, "without a fixed version Fix is the fix state")
+	require.Equal(t, "wont-fix", findingStatus("test", f, owner, adv).Fix, "without a fixed version Fix is the fix state")
 }
 
 // TestCRWriter_ZeroMaxFindingsIsUnlimited pins the documented meaning of crd.maxFindings: 0 (F46):

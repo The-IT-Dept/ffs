@@ -13,7 +13,7 @@ import (
 func TestFindingName(t *testing.T) {
 	api := deployment("web", "api")
 	require.Equal(t, "deployment-api-cve-2026-41873", FindingName(api, "CVE-2026-41873"))
-	require.Equal(t, "cluster-prod-cve-2026-1111", FindingName(model.OwnerRef{Kind: "Cluster", Name: "prod"}, "CVE-2026-1111"))
+	require.Equal(t, "cluster-test-cve-2026-1111", FindingName(model.OwnerRef{Kind: "Cluster", Name: "test"}, "CVE-2026-1111"))
 	require.Equal(t, "deployment-api-opensuse-su-2026-1234-1", FindingName(api, "openSUSE-SU-2026:1234-1"))
 
 	valid := regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
