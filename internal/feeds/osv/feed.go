@@ -174,10 +174,11 @@ type recKey struct{ bucket, id string }
 
 func (k recKey) String() string { return k.bucket + "/" + k.id }
 
-// Sync hands off any pending records, asks again for listed records that were not found, polls
-// (or, for Go and GIT, first loads) every bucket in use, runs the weekly set-diff and prunes old
-// records. A failing bucket does not stop the others, unless it failed with records pending (a
-// handler error, say): those must be handed off before anything else is taken in.
+// Sync hands off any pending records, then for every bucket in use asks again for listed records
+// that were not found, polls it (or, for Go and GIT, first loads it) and loads its MAL- records, then
+// runs the weekly set-diff and prunes old records. A failing bucket does not stop the others, unless
+// it failed with records pending (a handler error, say): those must be handed off before anything
+// else is taken in.
 func (f *Feed) Sync(ctx context.Context) error {
 	st, err := f.o.Store.FeedState(ctx, feeds.NameOSV)
 	if err != nil {
@@ -202,16 +203,7 @@ func (f *Feed) Sync(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return errors.Join(append(errs, err)...)
 		}
-		err = f.retryMissing(ctx, &st, b)
-		if err == nil && f.needsBootstrap(st, b) {
-			err = f.bootstrap(ctx, &st, b)
-		} else if err == nil {
-			err = f.poll(ctx, &st, b)
-		}
-		if err == nil && needsMalicious(st, b) {
-			err = f.loadMalicious(ctx, &st, b)
-		}
-		if err != nil {
+		if err = f.syncBucket(ctx, &st, b); err != nil {
 			errs = append(errs, fmt.Errorf("osv: bucket %s: %w", b, err))
 			if len(feeds.Pending(st)) > 0 {
 				return errors.Join(errs...)
@@ -220,6 +212,29 @@ func (f *Feed) Sync(ctx context.Context) error {
 	}
 	errs = append(errs, f.setDiff(ctx, &st, buckets), f.prune(ctx))
 	return errors.Join(errs...)
+}
+
+// syncBucket asks again for b's listed records that were not found (retryMissing), bootstraps or
+// polls b, and loads its MAL- records when they are not loaded yet. The retry is best effort: a held
+// record that keeps failing (a 5xx or 403 for it, say) does not hold the bucket's new records back
+// until it is given up on, so its error is joined to what the rest returns. Only a retry that left
+// records pending (its hand-off failed) stops here: those go before anything else is taken in. A
+// failed bootstrap or poll still skips the MAL- load, which reads the same listing.
+func (f *Feed) syncBucket(ctx context.Context, st *store.FeedState, b string) error {
+	retryErr := f.retryMissing(ctx, st, b)
+	if retryErr != nil && len(feeds.Pending(*st)) > 0 {
+		return retryErr
+	}
+	var err error
+	if f.needsBootstrap(*st, b) {
+		err = f.bootstrap(ctx, st, b)
+	} else {
+		err = f.poll(ctx, st, b)
+	}
+	if err == nil && needsMalicious(*st, b) {
+		err = f.loadMalicious(ctx, st, b)
+	}
+	return errors.Join(retryErr, err)
 }
 
 // buckets returns the sorted buckets to poll: those of the ecosystems in use, plus Go and GIT.
@@ -313,8 +328,11 @@ func (f *Feed) rehash(ctx context.Context, st *store.FeedState) error {
 }
 
 // retryMissing asks again for the records of b that modified_id.csv listed but the bucket answered
-// 404 for, instead of passing over them for good: the watermark has moved past their rows. Those
-// found are cached and handed off like any other; those missing for missingFor are given up on.
+// 404 for, instead of passing over them for good: the watermark has moved past their rows. It GETs
+// each one rather than plan a transport (see take): the zip transports would read all.zip's central
+// directory, megabytes for Ubuntu, at every Sync, only to GET the records it lacks anyway. Those
+// found are cached and handed off like any other; those missing for missingFor are given up on and
+// counted in ffs_feed_skipped_total.
 func (f *Feed) retryMissing(ctx context.Context, st *store.FeedState, b string) error {
 	held := missingOf(*st, b)
 	if len(held) == 0 {
@@ -326,12 +344,13 @@ func (f *Feed) retryMissing(ctx context.Context, st *store.FeedState, b string) 
 		if now.Sub(since) >= missingFor {
 			logr.FromContextOrDiscard(ctx).Info("an OSV record that modified_id.csv lists is still not found; giving up on it",
 				"bucket", b, "id", id, "since", since)
+			feeds.Skipped.WithLabelValues(feeds.NameOSV, feeds.SkipNotFound).Inc()
 			delete(held, id)
 			continue
 		}
 		want[id] = time.Time{}
 	}
-	changed, missing, takeErr := f.take(ctx, st, b, want, "")
+	changed, missing, takeErr := f.takeVia(ctx, st, b, want, perRecord, zipProbe{})
 	if takeErr == nil {
 		still := make(map[string]time.Time, len(missing))
 		for _, id := range missing {
@@ -347,7 +366,8 @@ func (f *Feed) retryMissing(ctx context.Context, st *store.FeedState, b string) 
 }
 
 // holdMissing adds the records of b that were not found to those retryMissing asks for again,
-// keeping when each was first missed, up to maxMissing. The caller saves st.
+// keeping when each was first missed, up to maxMissing. Those beyond it are passed over, and counted
+// in ffs_feed_skipped_total. The caller saves st.
 func (f *Feed) holdMissing(ctx context.Context, st *store.FeedState, b string, ids []string) {
 	if len(ids) == 0 {
 		return
@@ -368,6 +388,7 @@ func (f *Feed) holdMissing(ctx context.Context, st *store.FeedState, b string, i
 	if dropped > 0 {
 		logr.FromContextOrDiscard(ctx).Info("too many OSV records that modified_id.csv lists are not found; not asking for the rest again",
 			"bucket", b, "held", len(held), "dropped", dropped)
+		feeds.Skipped.WithLabelValues(feeds.NameOSV, feeds.SkipMissingOverflow).Add(float64(dropped))
 	}
 	setMissing(st, b, held)
 }
@@ -580,12 +601,20 @@ func (f *Feed) take(ctx context.Context, st *store.FeedState, b string, want map
 	if len(want) == 0 {
 		return nil, nil, nil
 	}
-	ids := slices.Sorted(maps.Keys(want))
-	gitCached, err := f.gitCached(ctx, b)
+	how, probe, err := f.plan(ctx, st, b, len(want), csvGen)
 	if err != nil {
 		return nil, nil, err
 	}
-	how, probe, err := f.plan(ctx, st, b, len(ids), csvGen)
+	return f.takeVia(ctx, st, b, want, how, probe)
+}
+
+// takeVia is take with the transport chosen: how, with probe the all.zip probe for the zip ones.
+func (f *Feed) takeVia(ctx context.Context, st *store.FeedState, b string, want map[string]time.Time, how transport, probe zipProbe) ([]recKey, []string, error) {
+	if len(want) == 0 {
+		return nil, nil, nil
+	}
+	ids := slices.Sorted(maps.Keys(want))
+	gitCached, err := f.gitCached(ctx, b)
 	if err != nil {
 		return nil, nil, err
 	}
