@@ -190,6 +190,10 @@ func TestEvaluate_EPSSHysteresis(t *testing.T) {
 		{"high before for another reason, EPSS below both bands", in(low, epss(0.05), prev(pH)), pL},
 		{"not running, bumped before, inside the band", in(low, epss(0.095), notRunning, prev(pM)), pL},
 		{"medium severity exposed with a fix, high before, inside the band", in(med, exposed, fix("1.2"), epss(0.47), prev(pH)), pH},
+		// the band applies whatever raised the finding (docs/configuration.md): high for its exposure,
+		// the exposure gone, inside the bump band
+		{"high severity, high before for its exposure, inside the bump band", in(high, epss(0.095), prev(pH)), pH},
+		{"high severity, high before for its exposure, below the bump band", in(high, epss(0.0899), prev(pH)), pM},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
