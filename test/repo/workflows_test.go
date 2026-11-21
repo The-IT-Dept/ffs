@@ -296,7 +296,8 @@ func TestWorkflows_ReleaseIsGatedAndMultiArch(t *testing.T) {
 
 	notes := stepRuns(jobs["release"].Steps)
 	require.Contains(t, notes, `= "linux/amd64 linux/arm64"`, "the release notes check both platforms are in the index")
-	require.Contains(t, notes, "gh attestation verify oci://ghcr.io/the-it-dept/ffs@$pd", "and each platform's provenance")
+	require.Contains(t, notes, `gh attestation verify "oci://ghcr.io/the-it-dept/ffs@$pd"`, "and each platform's provenance")
+	require.Contains(t, notes, `test "$(printf '%s\n' "$PDS" | grep -c .)" = 2`, "the platform loop fails closed: exactly two platform images")
 }
 
 // TestWorkflows_E2EOnBothArchitectures: the kind suite runs natively on amd64 and arm64 (#17), and kind is installed
@@ -442,9 +443,9 @@ func TestWorkflows_ReleaseVerifiesBeforePublishing(t *testing.T) {
 	loop := regexp.MustCompile(`(?s)\nfor pd in [^\n]*; do\n(.*?)\ndone\n`).FindStringSubmatch(script)
 	require.NotNil(t, loop, script)
 	for _, want := range []string{
-		`cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID"`,
-		`cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID"`,
-		`gh attestation verify oci://ghcr.io/the-it-dept/ffs@$pd`,
+		`cosign verify "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID"`,
+		`cosign verify-attestation --type spdxjson "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID"`,
+		`gh attestation verify "oci://ghcr.io/the-it-dept/ffs@$pd"`,
 	} {
 		require.Contains(t, loop[1], want, "each platform image is verified")
 	}

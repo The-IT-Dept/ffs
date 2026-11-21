@@ -353,10 +353,12 @@ jobs:
           gh attestation verify oci://ghcr.io/the-it-dept/ffs@$D -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
           # The index holds linux/amd64 and linux/arm64; each platform image has its signature, SBOM and provenance.
           test "$(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '[.manifests[].platform | .os + "/" + .architecture] | sort | join(" ")')" = "linux/amd64 linux/arm64"
-          for pd in $(crane manifest ghcr.io/the-it-dept/ffs@$D | jq -r '.manifests[].digest'); do
-            cosign verify ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
-            cosign verify-attestation --type spdxjson ghcr.io/the-it-dept/ffs@$pd --certificate-identity "$ID" --certificate-oidc-issuer $ISS
-            gh attestation verify oci://ghcr.io/the-it-dept/ffs@$pd -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
+          PDS="$(crane manifest "ghcr.io/the-it-dept/ffs@$D" | jq -r '.manifests[].digest')"
+          test "$(printf '%s\n' "$PDS" | grep -c .)" = 2
+          for pd in $PDS; do
+            cosign verify "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID" --certificate-oidc-issuer "$ISS"
+            cosign verify-attestation --type spdxjson "ghcr.io/the-it-dept/ffs@$pd" --certificate-identity "$ID" --certificate-oidc-issuer "$ISS"
+            gh attestation verify "oci://ghcr.io/the-it-dept/ffs@$pd" -R The-IT-Dept/ffs --signer-workflow The-IT-Dept/ffs/.github/workflows/release.yml
           done
           cosign verify ghcr.io/the-it-dept/charts/ffs@$CD --certificate-identity "$ID" --certificate-oidc-issuer $ISS
           gh attestation verify oci://ghcr.io/the-it-dept/charts/ffs@$CD -R The-IT-Dept/ffs
