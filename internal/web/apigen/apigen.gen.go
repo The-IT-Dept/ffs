@@ -2042,7 +2042,7 @@ type Settings struct {
 // Severity defines model for Severity.
 type Severity string
 
-// Signal A ranking signal. epss means the EPSS score is at or above the configured threshold.
+// Signal A ranking signal. epss is the EPSS bump: the finding's EPSS score reached priority.epssBump and has not fallen below 90% of it since.
 type Signal string
 
 // Source An upstream data source, with the licence and attribution its terms ask for.

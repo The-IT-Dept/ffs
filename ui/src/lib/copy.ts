@@ -152,12 +152,14 @@ export const copy = {
       malicious: 'malicious',
       provisional: 'provisional',
       not_running: 'not running',
+      // The EPSS bump keeps a finding raised until its score falls below 90% of priority.epssBump, so a
+      // threshold ("EPSS ≥ 10%") would contradict a score shown just under it.
+      epss: 'EPSS bump',
     },
     priority: { urgent: 'urgent', high: 'high', medium: 'medium', low: 'low', none: 'no open findings' },
     coverage: { full: 'full detail', partial: 'partial detail', none: 'not seen into' },
     status: { pending: 'pending', catalogued: 'catalogued', unresolvable: 'unresolvable', catalogFailed: 'cataloguing failed' },
   } as Record<string, Record<string, string> | undefined>,
-  epss: (bump: number) => `EPSS ≥ ${formatPercent(bump)}`,
   clusterLevel: 'cluster-level',
   noValue: '—',
   coverageLink: 'Coverage',
@@ -556,8 +558,7 @@ const singular: Record<CountNoun, string> = {
 }
 
 // facetValueLabel is how a facet value reads in a facet list or a chip.
-export function facetValueLabel(facet: string, value: string, epssBump: number): string {
-  if (facet === 'signal' && value === 'epss') return copy.epss(epssBump)
+export function facetValueLabel(facet: string, value: string): string {
   // A cluster-level owner kind (store ClusterLevelKindPrefix) reads by what it holds, before the
   // server's facet label arrives.
   if (facet === 'kind' && value.startsWith('cluster-level:')) {

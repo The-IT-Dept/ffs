@@ -55,6 +55,8 @@ The explorer endpoints (`/findings`, `/workloads`, `/images` and `/packages`) fi
   | `/images` | `status`, `source`, `coverage`, `namespace`, `priority` |
   | `/packages` | `ecosystem`, `priority` |
 
+- The `epss` signal is the EPSS bump: the finding's EPSS score reached `priority.epssBump` and has not fallen below 90% of it since, so a finding can keep it at a score just under the threshold.
+- An upgrade fix's `label` is its target, as a user would write it: `nginx:1.30.7`, `ghcr.io/org/app:2.1.0 (new digest)` for a refresh of the running tag, or `kubernetes v1.35.10`. `fromTag` (empty for an image referenced by digest only) and `toTag` carry the tags.
 - The `kind` facet of `/findings` lists the cluster-level owners as `cluster-level:Cluster`, `cluster-level:ContainerRuntime` and `cluster-level:Nodes`, each with a `label`, apart from workloads of the same kind. `kind=` takes either form.
 - `group` on `/findings` takes `advisory`, `workload`, `image`, `package`, `namespace` or `fix`. A grouped response fills `groupRows` and leaves `rows` empty; `total` then counts groups and `findings` the findings across them.
 - `sort` takes one of these values. A leading `-` means descending.

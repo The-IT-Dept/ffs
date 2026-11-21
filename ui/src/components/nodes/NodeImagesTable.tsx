@@ -57,9 +57,9 @@ export function NodeImagesTable({ images }: { images: S<'NodeImage'>[] }) {
                 {im.status === undefined ? (
                   <span className="text-muted-foreground">{copy.noValue}</span>
                 ) : im.status === 'catalogued' ? (
-                  facetValueLabel('status', im.status, 0)
+                  facetValueLabel('status', im.status)
                 ) : (
-                  <CoverageMark title={im.statusReason || undefined}>{facetValueLabel('status', im.status, 0)}</CoverageMark>
+                  <CoverageMark title={im.statusReason || undefined}>{facetValueLabel('status', im.status)}</CoverageMark>
                 )}
               </TableCell>
             </TableRow>

@@ -55,7 +55,8 @@ test('changing any filter drops the cursor and never writes the default state', 
   const [chip] = chipsOf({ namespace: ['shop'], cursor: 'c1' })
   expect(chip).toEqual({ key: 'namespace', value: 'shop', label: 'Namespace: shop' })
   expect(removeChip({ namespace: ['shop'], cursor: 'c1' }, chip)).toEqual({})
-  expect(chipsOf({ signal: ['epss'] }, 0.1)[0].label).toBe('Signals: EPSS ≥ 10%')
+  // The EPSS bump is kept below the threshold that set it, so the chip names the bump, not a threshold.
+  expect(chipsOf({ signal: ['epss'] })[0].label).toBe('Signals: EPSS bump')
   expect(toggleExpand(toggleExpand(undefined, 'a'), 'b')).toBe('a,b')
   expect(toggleExpand('a', 'a')).toBeUndefined()
 })

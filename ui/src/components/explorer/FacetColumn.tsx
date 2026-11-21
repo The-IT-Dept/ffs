@@ -18,13 +18,11 @@ function FacetSection({
   name,
   values,
   search,
-  epssBump,
   onToggle,
 }: {
   name: string
   values: S<'FacetValue'>[]
   search: ExplorerSearch
-  epssBump: number
   onToggle: (key: keyof ExplorerSearch, value: string, on: boolean) => void
 }) {
   const [all, setAll] = useState(false)
@@ -42,7 +40,7 @@ function FacetSection({
                 checked={on.includes(v.value)}
                 onCheckedChange={(c) => onToggle(name as keyof ExplorerSearch, v.value, c === true)}
               />
-              <span className="min-w-0 flex-1 truncate">{v.label || facetValueLabel(name, v.value, epssBump)}</span>{' '}
+              <span className="min-w-0 flex-1 truncate">{v.label || facetValueLabel(name, v.value)}</span>{' '}
               <span className="text-muted-foreground tabular-nums">{formatCount(v.count)}</span>
             </label>
           </li>
@@ -69,14 +67,12 @@ export function FacetColumn({
   kind,
   facets,
   search,
-  epssBump,
   onToggle,
   className,
 }: {
   kind: ExplorerKind
   facets: S<'Facets'>
   search: ExplorerSearch
-  epssBump: number
   onToggle: (key: keyof ExplorerSearch, value: string, on: boolean) => void
   className?: string
 }) {
@@ -85,7 +81,7 @@ export function FacetColumn({
       {EXPLORERS[kind].facets
         .filter((name) => facets[name] !== undefined)
         .map((name) => (
-          <FacetSection key={name} name={name} values={facets[name]} search={search} epssBump={epssBump} onToggle={onToggle} />
+          <FacetSection key={name} name={name} values={facets[name]} search={search} onToggle={onToggle} />
         ))}
     </div>
   )

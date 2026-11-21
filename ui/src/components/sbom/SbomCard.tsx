@@ -55,7 +55,7 @@ export function SbomCard({ image }: { image: S<'ImageDetail'> }) {
           {copy.image.agent(sbom.agent.node, sbom.agent.agentVersion)} · <RelativeTime iso={sbom.agent.receivedAt} />
         </p>
       ) : null}
-      <p className="mt-1">{copy.workload.coverage(facetValueLabel('coverage', coverage.class, 0))}</p>
+      <p className="mt-1">{copy.workload.coverage(facetValueLabel('coverage', coverage.class))}</p>
       <ImageGaps image={image} className="mt-2" />
       {coverage.notes.length > 0 ? (
         <ul className="mt-2 list-disc pl-4 text-muted-foreground">

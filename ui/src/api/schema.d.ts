@@ -446,7 +446,7 @@ export interface components {
         /** @enum {string} */
         FixKind: "upgrade" | "rebuild" | "package" | "none" | "wontfix";
         /**
-         * @description A ranking signal. epss means the EPSS score is at or above the configured threshold.
+         * @description A ranking signal. epss is the EPSS bump: the finding's EPSS score reached priority.epssBump and has not fallen below 90% of it since.
          * @enum {string}
          */
         Signal: "exposed" | "privileged" | "sa_power" | "exploited" | "malicious" | "provisional" | "not_running" | "epss";

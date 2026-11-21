@@ -55,7 +55,7 @@ function head(label: string, right?: boolean) {
 
 function Chips({ d }: { d: Detail }) {
   const cls = coverageClassOf(d.coverage)
-  const coverage = copy.workload.coverage(facetValueLabel('coverage', cls, 0))
+  const coverage = copy.workload.coverage(facetValueLabel('coverage', cls))
   return (
     <div className="mb-1 flex flex-wrap items-center gap-1.5">
       {d.counts.urgent > 0 ? (
@@ -111,18 +111,18 @@ function Containers({ d, scope }: { d: Detail; scope: string }) {
               {ct.status === undefined ? (
                 <span className="text-muted-foreground">{copy.noValue}</span>
               ) : ct.status === 'catalogued' ? (
-                facetValueLabel('status', ct.status, 0)
+                facetValueLabel('status', ct.status)
               ) : (
-                <CoverageMark>{facetValueLabel('status', ct.status, 0)}</CoverageMark>
+                <CoverageMark>{facetValueLabel('status', ct.status)}</CoverageMark>
               )}
             </TableCell>
             <TableCell className="py-0">
               {ct.coverage === undefined ? (
                 <span className="text-muted-foreground">{copy.noValue}</span>
               ) : ct.coverage === 'full' ? (
-                facetValueLabel('coverage', ct.coverage, 0)
+                facetValueLabel('coverage', ct.coverage)
               ) : (
-                <CoverageMark>{facetValueLabel('coverage', ct.coverage, 0)}</CoverageMark>
+                <CoverageMark>{facetValueLabel('coverage', ct.coverage)}</CoverageMark>
               )}
             </TableCell>
           </TableRow>
