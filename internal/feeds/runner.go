@@ -23,7 +23,7 @@ var (
 
 const (
 	staleCheckInterval = time.Minute
-	minSyncTimeout     = 30 * time.Minute
+	minSyncTimeout     = time.Hour
 	firstRetryDelay    = time.Minute
 	maxBackoffShift    = 20 // caps 1m×2^n well below Duration overflow; Interval is the real ceiling
 	jitterFraction     = 0.1
@@ -262,9 +262,17 @@ func (r *Runner) markFirstAttempt(ctx context.Context, fr *feedRun) error {
 	return nil
 }
 
-// callSync runs f.Sync under the sync timeout, turning a panic into an error.
+// SyncTimeout is how long the runner gives a Sync of a feed polled every iv: twice iv, and at least
+// an hour. The floor is the Grype DB feed's: a diff of two production builds takes tens of minutes
+// (37 at 1.3 cores in issue #7, more at its nice value), so twice a short interval would cut it off
+// at every update. That feed gives its diff the same budget.
+func SyncTimeout(iv time.Duration) time.Duration {
+	return max(2*iv, minSyncTimeout)
+}
+
+// callSync runs f.Sync under SyncTimeout, turning a panic into an error.
 func callSync(ctx context.Context, f Feed) (err error) {
-	ctx, cancel := context.WithTimeout(ctx, max(2*f.Interval(), minSyncTimeout))
+	ctx, cancel := context.WithTimeout(ctx, SyncTimeout(f.Interval()))
 	defer cancel()
 	defer func() {
 		if p := recover(); p != nil {

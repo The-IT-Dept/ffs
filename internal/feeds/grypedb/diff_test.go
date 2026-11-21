@@ -223,11 +223,11 @@ func TestExecDiffer_SharesTheMemoryLimit(t *testing.T) {
 	})
 }
 
-// TestGrypeDB_DiffTimeout (W17): a diff may take twice the feed's interval, and never less than 30
-// minutes.
+// TestGrypeDB_DiffTimeout (W17): a diff may take twice the feed's interval, and never less than an
+// hour.
 func TestGrypeDB_DiffTimeout(t *testing.T) {
 	for _, tc := range []struct{ interval, want time.Duration }{
-		{10 * time.Minute, 30 * time.Minute},
+		{10 * time.Minute, time.Hour},
 		{time.Hour, 2 * time.Hour},
 	} {
 		t.Run(tc.interval.String(), func(t *testing.T) {

@@ -389,6 +389,31 @@ func TestRunner_SyncNowAdoptsStoredFirstAttempt(t *testing.T) {
 	}
 }
 
+// TestRunner_SyncTimeout (W17): a Sync may take twice the feed's interval, and never less than an
+// hour, the least a diff of two production Grype DB builds needs.
+func TestRunner_SyncTimeout(t *testing.T) {
+	for _, tc := range []struct{ interval, want time.Duration }{
+		{0, time.Hour},
+		{10 * time.Minute, time.Hour},
+		{time.Hour, 2 * time.Hour},
+		{24 * time.Hour, 48 * time.Hour},
+	} {
+		t.Run(tc.interval.String(), func(t *testing.T) {
+			require.Equal(t, tc.want, feeds.SyncTimeout(tc.interval))
+			var budget time.Duration
+			f := &fakeFeed{name: "fake", interval: tc.interval, staleAfter: 48 * time.Hour,
+				sync: func(c context.Context) error {
+					dl, ok := c.Deadline()
+					require.True(t, ok)
+					budget = time.Until(dl)
+					return nil
+				}}
+			require.NoError(t, feeds.NewRunner(newStore(t), []feeds.Feed{f}, feeds.RunnerOptions{}).SyncNow(ctx, "fake"))
+			require.InDelta(t, tc.want.Seconds(), budget.Seconds(), time.Minute.Seconds())
+		})
+	}
+}
+
 // TestRunner_FirstAttemptWriteFailureIsNotTheSyncs (W53): a sync that succeeds is a success even
 // when storing its first attempt beforehand failed; recording the outcome stores it.
 func TestRunner_FirstAttemptWriteFailureIsNotTheSyncs(t *testing.T) {

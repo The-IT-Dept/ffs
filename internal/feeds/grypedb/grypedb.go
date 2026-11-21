@@ -334,18 +334,6 @@ func (f *Feed) prune(keep ...string) error {
 	return nil
 }
 
-// minDiffTimeout is the least time a diff gets, as the least the feed runner gives a Sync: a diff of
-// two production builds takes tens of minutes (37 at 1.3 cores in issue #7), so twice a short
-// interval would cut it off at every update.
-const minDiffTimeout = 30 * time.Minute
-
-// diffTimeout is how long a diff of builds polled every iv may take: max(2×iv, 30m), the budget the
-// feed runner gives the whole Sync. Under the runner the Sync's own deadline, which started earlier,
-// ends first; the diff's binds when Sync is called on its own.
-func diffTimeout(iv time.Duration) time.Duration {
-	return max(2*iv, minDiffTimeout)
-}
-
 // fewSBOMs reports whether fewer SBOMs are catalogued than Options.DiffMinImages, so a new build
 // is cheaper to re-match in full than to diff.
 func (f *Feed) fewSBOMs(ctx context.Context) (bool, error) {
@@ -364,8 +352,11 @@ func (f *Feed) fewSBOMs(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
-// changedPackages diffs two DB directories with Options.Diff, under diffTimeout, and returns the
-// deduplicated, lowercased packages whose vulnerability records were added, removed or modified.
+// changedPackages diffs two DB directories with Options.Diff and returns the deduplicated,
+// lowercased packages whose vulnerability records were added, removed or modified. The diff gets
+// the budget the feed runner gives the whole Sync, feeds.SyncTimeout: twice the interval, and at
+// least an hour. Under the runner the Sync's own deadline, which started earlier, ends first; the
+// diff's binds when Sync is called on its own.
 //
 // The differ opens both databases for writing first (it hydrates them: migrations and ANALYZE). The
 // Grype matcher holds oldDir's database open read-only, and Grype opens every database with SQLite's
@@ -383,7 +374,7 @@ func (f *Feed) changedPackages(ctx context.Context, oldDir, newDir string) ([]Pa
 	if err := os.CopyFS(oldCopy, os.DirFS(oldDir)); err != nil {
 		return nil, fmt.Errorf("grypedb: diff: copy the current database: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(ctx, diffTimeout(f.o.Config.Interval))
+	ctx, cancel := context.WithTimeout(ctx, feeds.SyncTimeout(f.o.Config.Interval))
 	defer cancel()
 	keys, err := f.o.Diff(ctx, oldCopy, newDir)
 	if err != nil {
