@@ -600,18 +600,36 @@ type failingLoad struct{ *fakeGrype }
 
 func (f *failingLoad) Load(string, time.Time) error { return errors.New("corrupt database") }
 
-// TestEngine_GrypeDBFullRematchesEveryMatcher is part of the F22 regression: the weekly full update
-// is the safety net for every matcher, so it re-runs the OSV fast path too, on every live digest.
-func TestEngine_GrypeDBFullRematchesEveryMatcher(t *testing.T) {
+// TestEngine_GrypeDBFullRunsGrypeAlone (W10): a full update (the first DB, the weekly one, and every
+// one below diffMinImages) re-matches every live digest with grype alone, taking the stored OSV
+// matches as its hints. The other matchers' results do not depend on the Grype DB: neither the OSV
+// fast path nor the upstream matcher runs, so one that would fail on every image does not hold the
+// build back either.
+func TestEngine_GrypeDBFullRunsGrypeAlone(t *testing.T) {
 	h := newHarness(t)
-	require.NoError(t, h.e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/c", Built: t0, Full: true}))
-	require.Empty(t, h.grype.affectedArgs)
-	require.Equal(t, []string{d1, d2}, h.grype.matched)
-	require.Equal(t, 2, h.osv.calls, "the OSV fast path re-matches every live digest too")
-	require.ElementsMatch(t, []store.MatchScope{
-		{Source: model.SourceOSV, Digests: []string{d1}}, {Source: model.SourceGrype, Digests: []string{d1}},
-		{Source: model.SourceOSV, Digests: []string{d2}}, {Source: model.SourceGrype, Digests: []string{d2}},
-	}, h.st.replaced, "one digest at a time")
+	osvMatch := newMatch(h.libssl3, cve, model.SourceOSV, "3.0.15-1")
+	_, err := h.st.Store.ReplaceMatches(ctx, store.MatchScope{Source: model.SourceOSV, Digests: []string{d1}}, []model.Match{osvMatch})
+	require.NoError(t, err)
+	h.osv.fn = func(match.ImageInput) ([]model.Match, error) { return nil, errors.New("osv cache unreadable") }
+	hints := map[string][]model.Match{}
+	h.grype.fn = func(in match.ImageInput) ([]model.Match, error) {
+		hints[in.Digest] = clearObserved(in.Hints)
+		return nil, nil
+	}
+	upstream := &fakeMatcher{src: model.SourceUpstream}
+	e := engine.New(engine.Options{Config: config.Default(), Store: h.st, Grype: h.grype,
+		Matchers: []match.Matcher{h.osv, upstream}, Records: []match.RecordMatcher{h.records}, Now: h.clock.Now})
+
+	require.NoError(t, e.OnGrypeDB(ctx, grypedb.Update{Path: "/db/c", Built: t0, Full: true}))
+	require.Empty(t, h.grype.affectedArgs, "a full update reads no diff")
+	require.Equal(t, []string{d1, d2}, h.grype.matched, "every live digest")
+	require.Zero(t, h.osv.calls, "the OSV fast path does not run")
+	require.Zero(t, upstream.calls, "the upstream matcher does not run")
+	require.Equal(t, []store.MatchScope{{Source: model.SourceGrype, Digests: []string{d1}}, {Source: model.SourceGrype, Digests: []string{d2}}},
+		h.st.replaced, "grype's matches only, one digest at a time")
+	require.Equal(t, []model.Match{osvMatch}, hints[d1], "the stored OSV matches are grype's hints")
+	require.Contains(t, hints, d2)
+	require.Empty(t, hints[d2])
 	builds, err := h.st.GrypeDBBuilds(ctx)
 	require.NoError(t, err)
 	require.Equal(t, []time.Time{t0}, builds)

@@ -268,12 +268,17 @@ func (e *Engine) OnCNARecords(ctx context.Context, ids []string) error {
 	return errors.Join(errs...)
 }
 
-// OnGrypeDB loads a new Grype DB and re-matches, one digest at a time, the live digests (those an
-// owner runs or a suggestion holds) it can change:
-//   - on a full update (the first DB, then weekly), every live digest with every matcher: the
-//     safety net for anything an incremental path missed, OSV and upstream included;
-//   - otherwise, with grype alone, the digests whose packages the diff changed plus those with OSV
-//     matches grype has not ruled on yet (store.DigestsAwaitingGrype).
+// OnGrypeDB loads a new Grype DB and re-matches with grype alone, one digest at a time, the live
+// digests (those an owner runs or a suggestion holds) it can change:
+//   - on a full update (the first DB, the weekly one, and every one below
+//     feeds.grypedb.diffMinImages), every live digest;
+//   - otherwise the digests whose packages the diff changed plus those with OSV matches grype has
+//     not ruled on yet (store.DigestsAwaitingGrype).
+//
+// The other matchers' results do not depend on the Grype DB, so no update re-runs them, full or
+// not: every matcher runs on a digest when it is catalogued (OnImageCatalogued, the only pass that
+// runs them all and stores the result), and their matches follow their own feeds from then on
+// (OnOSVRecords, OnCNARecords). Grype takes the stored OSV matches as its hints.
 //
 // A digest that fails is logged and left for the next DB; it never fails the update on its own. The
 // update fails, before the build is recorded so the feed offers it again, only when it is cancelled
@@ -292,10 +297,6 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 	if err != nil {
 		return err
 	}
-	mode := matchGrype
-	if u.Full {
-		mode = matchPersist
-	}
 	var (
 		failed, skipped, grypeFailed int
 		lastErr                      error
@@ -304,7 +305,7 @@ func (e *Engine) OnGrypeDB(ctx context.Context, u grypedb.Update) error {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("engine: grype re-match: %w", err)
 		}
-		r, err := e.matchImage(ctx, d, mode)
+		r, err := e.matchImage(ctx, d, matchGrype)
 		if err != nil {
 			failed++
 			e.o.Log.Error(err, "re-matching an image with the new Grype DB failed; it waits for the next one", "digest", d)
