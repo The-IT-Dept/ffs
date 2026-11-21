@@ -199,4 +199,4 @@ These are top-level Helm values. The ones the controller also reads are in [conf
 | `nodeAgent.tls.caBundle` | `""` | PEM CA bundle the agents trust; required with cert-manager. |
 | `nodeAgent.seLinuxType` | `""` | SELinux type of the collector container, for example `spc_t`. |
 | `nodeAgent.openshift.scc` | `false` | Create a SecurityContextConstraints for the agent and bind its ServiceAccount to it. |
-| `nodeAgent.networkPolicy.enabled` | unset | Deprecated: use the top-level `networkPolicy.enabled` ([configuration.md](configuration.md#helm-only-values)). When set, v0.0.2 still uses it in place of `networkPolicy.enabled` and the install notes say it is deprecated; v0.0.3 removes it. See [Trust](#trust). |
+| `nodeAgent.networkPolicy.enabled` | unset | Deprecated: use the top-level `networkPolicy.enabled` ([configuration.md](configuration.md#helm-only-values)). When set, v0.0.2 still uses it in place of `networkPolicy.enabled` and the install notes say it is deprecated; v0.0.3 removes it. `null` unsets it. Under `helm upgrade --reuse-values` from v0.0.1, its v0.0.1 default, `true`, counts as unset. See [Trust](#trust). |

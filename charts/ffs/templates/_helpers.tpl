@@ -196,19 +196,43 @@ true
 {{- end -}}
 
 {{- /*
+ffs.v001Defaults is "true" when the values carry v0.0.1's defaults instead of this chart's, and "" otherwise. helm upgrade
+--reuse-values replaces the chart's defaults with the previous release's values, v0.0.1's defaults included. Those lack
+keys that this chart's defaults have: networkPolicy.enabled and config.feeds.grypedb.diffMinImages. A user who sets one
+of them in that upgrade, as the deprecation notice asks for networkPolicy.enabled, still lacks the other.
+*/ -}}
+{{- define "ffs.v001Defaults" -}}
+{{- $np := .Values.networkPolicy | default dict -}}
+{{- $grype := dig "feeds" "grypedb" (dict) (.Values.config | default dict) | default dict -}}
+{{- if or (not (hasKey $np "enabled")) (not (hasKey $grype "diffMinImages")) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- /*
 ffs.legacyNetworkPolicy is "true" when the deprecated nodeAgent.networkPolicy.enabled is set, and "" otherwise.
-It has no default, so it is set only when the user sets it, and it must then be true or false.
+It has no default, so it is set only when the user sets it, and it must then be true or false. null, which is how
+Helm unsets a key, leaves it unset, for nodeAgent.networkPolicy and for its enabled key. With v0.0.1's defaults
+(ffs.v001Defaults), true is v0.0.1's default for it, which the user need not have set, and the same as
+networkPolicy.enabled's default: it counts as unset, so it neither prints the deprecation notice nor overrides
+networkPolicy.enabled. false differs from that default, so it was set.
 */ -}}
 {{- define "ffs.legacyNetworkPolicy" -}}
 {{- $np := dig "networkPolicy" (dict) (.Values.nodeAgent | default dict) -}}
+{{- if kindIs "invalid" $np -}}
+{{- $np = dict -}}
+{{- end -}}
 {{- if not (kindIs "map" $np) -}}
 {{- fail "nodeAgent.networkPolicy must be a map with an enabled key; it is deprecated, so set networkPolicy.enabled instead" -}}
 {{- end -}}
-{{- if hasKey $np "enabled" -}}
-{{- if not (kindIs "bool" $np.enabled) -}}
-{{- fail (printf "nodeAgent.networkPolicy.enabled must be true or false, not %q; it is deprecated, so set networkPolicy.enabled instead" (toString $np.enabled)) -}}
+{{- $enabled := dig "enabled" nil $np -}}
+{{- if not (kindIs "invalid" $enabled) -}}
+{{- if not (kindIs "bool" $enabled) -}}
+{{- fail (printf "nodeAgent.networkPolicy.enabled must be true or false, not %q; it is deprecated, so set networkPolicy.enabled instead" (toString $enabled)) -}}
 {{- end -}}
+{{- if not (and $enabled (include "ffs.v001Defaults" .)) -}}
 true
+{{- end -}}
 {{- end -}}
 {{- end -}}
 
@@ -234,6 +258,18 @@ is true by default, so a false there was set on purpose, and the render fails if
 {{- if $enabled -}}
 true
 {{- end -}}
+{{- end -}}
+
+{{- /*
+ffs.logLevel is controller.logLevel, the controller's --zap-log-level: info, or debug to add its debug (V(1))
+messages. Values without it (helm upgrade --reuse-values from v0.0.1) give info.
+*/ -}}
+{{- define "ffs.logLevel" -}}
+{{- $level := .Values.controller.logLevel | default "info" | toString | trim -}}
+{{- if not (has $level (list "info" "debug")) -}}
+{{- fail (printf "controller.logLevel must be info or debug, not %q" $level) -}}
+{{- end -}}
+{{- $level -}}
 {{- end -}}
 
 {{- /*

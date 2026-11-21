@@ -62,6 +62,7 @@ spec:
           args:
             - controller
             - --config=/etc/ffs/config.yaml
+            - --zap-log-level={{ include "ffs.logLevel" . }}
           env:
             {{- include "ffs.goMemLimitEnv" (dict "container" "controller" "path" "controller.resources" "resources" .Values.controller.resources) | nindent 12 }}
           ports:

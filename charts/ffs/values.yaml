@@ -35,6 +35,8 @@ controller:
       memory: 1Gi
   # Size limit of the controller /tmp emptyDir. SQLite temporary files go to <dataDir>/tmp on the PVC instead.
   tmpSizeLimit: 1Gi
+  # Controller log level, passed as --zap-log-level: info, or debug to add its debug messages.
+  logLevel: info
 
 # Catalog container settings.
 catalog:
