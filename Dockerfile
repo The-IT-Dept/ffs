@@ -26,7 +26,7 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -buildvcs
 # Debian 12 regular support has ended, so the runtime base is Debian 13. The digest is from
 # `crane digest gcr.io/distroless/static-debian13:nonroot`; re-run it (and `crane digest
 # golang:1.27.1-trixie` for the builder) when bumping. Dependabot's docker ecosystem proposes bumps.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:aafe993665bf6200db38a02c11a9351e782a84b6a45e7f33b6695638c88e3931
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:8ce6dd87e9823c5b48dcfb2c8604714ccb351ce59607327bcc4957448da279b5
 LABEL org.opencontainers.image.source=https://github.com/The-IT-Dept/ffs org.opencontainers.image.licenses=Apache-2.0
 COPY --from=build /out/ffs /ffs
 # package.json manifests of the npm packages bundled into the web UI, so SBOMs of this image list them.
